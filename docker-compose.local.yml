@@ -1,0 +1,50 @@
+name: imageshield-local
+
+# Mirrors the Flashback agent service local stack (AgentMeeMaw
+# docker-compose.local.yml) minus Valkey (no working-memory concept here) and
+# with plain postgres:16 rather than pgvector — no vectors until we own
+# embeddings (CLAUDE.md §2). Host ports differ from Flashback's (15433/14566
+# vs 15432/4566) so both stacks can run side by side.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: imageshield-postgres
+    environment:
+      POSTGRES_DB: imageshield
+      POSTGRES_USER: imageshield
+      POSTGRES_PASSWORD: imageshield
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "15433:5432"
+    volumes:
+      - imageshield_postgres_data:/var/lib/postgresql/data
+      - ./migrations:/migrations:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imageshield -d imageshield"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: imageshield-localstack
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: ap-south-1
+      SERVICES: sqs
+    ports:
+      - "14566:4566"
+    volumes:
+      - imageshield_localstack_data:/var/lib/localstack
+      - ./scripts/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  imageshield_postgres_data:
+  imageshield_localstack_data:

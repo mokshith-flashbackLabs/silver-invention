@@ -1,0 +1,77 @@
+"""FastAPI application factory.
+
+Run via uvicorn::
+
+    uvicorn imageshield.http.app:create_app --factory --host 0.0.0.0 --port 8000
+
+or ``python -m imageshield``, which adds the friendlier boot-failure message.
+
+The factory pattern (Flashback convention, AgentMeeMaw src/flashback/http/app.py)
+lets tests construct an app with an explicit :class:`Config` and stubbed
+``app.state`` without re-importing the module.
+
+The interactive API docs are disabled: this service has no public ingress and
+no human callers, and an OpenAPI surface is deployment detail an attacker
+shouldn't get for free.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+import structlog
+from fastapi import FastAPI
+
+from imageshield.config import APP_VERSION, Config, load_config
+from imageshield.db.connection import make_async_pool, make_db_check
+from imageshield.http.logging import configure_logging, install_request_logging_middleware
+from imageshield.http.routes.health import router as health_router
+from imageshield.http.routes.ping import admin_router, v1_router
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    cfg: Config = app.state.config
+    pool = make_async_pool(
+        cfg.database_url,
+        min_size=cfg.db_pool_min_size,
+        max_size=cfg.db_pool_max_size,
+    )
+    await pool.open()
+    app.state.db_pool = pool
+    app.state.db_check = make_db_check(pool)
+    log = structlog.get_logger("imageshield.http")
+    log.info("service.started", version=APP_VERSION, environment=cfg.environment)
+    if cfg.auth_disabled:
+        log.warning("auth.disabled", environment=cfg.environment)
+    elif cfg.service_token_auth_disabled:
+        log.error(
+            "auth.bypass_ignored",
+            reason="SERVICE_TOKEN_AUTH_DISABLED=1 takes effect only when "
+            "ENVIRONMENT == 'development'",
+            environment=cfg.environment,
+        )
+    try:
+        yield
+    finally:
+        await pool.close()
+
+
+def create_app(config: Config | None = None) -> FastAPI:
+    cfg = config if config is not None else load_config()
+    configure_logging()
+    app = FastAPI(
+        title="ImageShield Services",
+        version=APP_VERSION,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=_lifespan,
+    )
+    app.state.config = cfg
+    install_request_logging_middleware(app)
+    app.include_router(health_router)
+    app.include_router(v1_router)
+    app.include_router(admin_router)
+    return app

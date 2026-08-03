@@ -1,0 +1,304 @@
+# ARCHITECTURE.md — ImageShield Services
+
+System-level reference for the ImageShield services repo. Companion to `CLAUDE.md` (operating manual),
+`SCHEMA.md` (table-level detail), `INVARIANTS.md` (the hard rules), and `PROXY_INTEGRATION.md` (the
+handoff brief for the proxy).
+
+> **Repo scope:** This is the **services** repo. The proxy (`ImageShieldPhotoShare`, Node/Express) is
+> a separate repo and remains the user-facing surface — login, OTP, sessions, profile, billing. We
+> document the full system here so our contract surface is clear, but only the service components are
+> implemented here.
+
+> **⚠ Specified ≠ in scope.** This document describes the whole system. **v1 of this repo is liveness
+> + third-party search provider integration only.** The match module, adjudication queue, report
+> surface, crop fetcher, and partner ingest adapter are designed here but **not built yet**. See
+> `CLAUDE.md` §6 for the scope table and `NEAR-TERM-BUILD.md` for the authoritative task list. Do not
+> build a component because this document describes it.
+
+---
+
+## 1. System overview
+
+```
+┌────────────┐     ┌────────────────────┐     ┌──────────────────────────┐
+│ Mobile /   │ ──▶ │  Proxy             │ ──▶ │  THIS REPO               │
+│ Web client │     │  (separate repo)   │     │  ImageShield Services    │
+└────────────┘     └────┬───────────────┘     └────┬─────────────────────┘
+                        │                          │
+                  ┌─────┼──────┐          ┌────────┼──────────┬──────────┐
+                  ▼     ▼      ▼          ▼        ▼          ▼          ▼
+              Dynamo   S3   Postgres   Postgres  Rekognition  SQS      Crop Fetcher
+             (sessions)    (UI reads)  (canonical  + Liveness  (3, via  (isolated
+                                        writes)               outbox)  deployable)
+```
+
+The proxy is the gateway for every external request. **The client never speaks to services directly.**
+Services never speak to DynamoDB, never hold AWS credentials for S3, and have no user model.
+
+Every request carries `user_ref` — an opaque UUID minted by the proxy. **Services never see a phone
+number.** `user_ref` maps 1:1 onto what becomes `user_id` in v2, so the two names refer to the same
+value at different stages of the migration.
+
+Services run five loops: Enrolment (synchronous), Forward Match (async), Backfill (async, long),
+Adjudication (human-in-loop), and Periodic (recheck + digest).
+
+---
+
+## 2. The five loops
+
+### 2.1 Enrolment loop (synchronous)
+
+Runs when a user completes liveness. The proxy has already authenticated them.
+
+1. **Proxy** creates a session via `POST /v1/liveness/sessions` with `{user_ref}`. Services call
+   `CreateFaceLivenessSession` and return the provider session ID.
+2. **Client** completes the challenge against Rekognition directly, using the Amplify
+   `FaceLivenessDetector`. **Services never proxy video.**
+3. **Proxy** calls `POST /v1/liveness/:session_id/result`, supplying **presigned PUT URLs** for the
+   reference and audit frames.
+4. **Services** call `GetFaceLivenessSessionResults`, receiving `Confidence`, `ReferenceImage`, and
+   `AuditImages[]`.
+5. On pass and `Confidence >= LIVENESS_MIN_CONFIDENCE`: PUT the frames through the presigned URLs,
+   then `IndexFaces` on the **`ReferenceImage`** into `identity-v1` with `ExternalImageId = user_ref`,
+   `QualityFilter: HIGH`, `MaxFaces: 1`. Write `liveness_enrolments`, set `consumed_at`, discard the
+   bytes.
+6. `NOTIFY enrolment_complete` and enqueue a backfill job via the outbox.
+
+**Enrol from `ReferenceImage`, never from a separately uploaded selfie.** If the indexed face is not
+the frame Rekognition validated, liveness proves a human was present and nothing about who got
+enrolled. This is the load-bearing detail of the whole loop.
+
+**Services hold no S3 credentials.** Presigned URLs only, minted by the proxy, valid ≥15 minutes
+because a result call may be retried.
+
+No `SearchFacesByImage` anywhere in this path (INVARIANTS #1). Identity is the `user_ref` the proxy
+supplies; a similarity score never determines who someone is. Sessions are single-use with a
+10-minute TTL — replay returns `410`.
+
+### 2.2 Forward match loop (async, minutes)
+
+Continuous. Drains `match:forward`.
+
+New content arrives from the partner ingest adapter → `content_items` + `content_faces` written
+(hashes and embeddings only, never bytes) → search against the identity index → candidates banded
+`auto_confirm` / `review` / `drop`.
+
+Latency budget: minutes. This is the loop that must not be starved.
+
+### 2.3 Backfill loop (async, hours)
+
+Drains `match:backfill`. Triggered by `enrolment_complete`.
+
+A new enrolment searches the entire content index. Rate-limited per user and priority-tiered, because
+ten signups would otherwise saturate the cluster. **Separate queue and separate worker pool from
+forward** (INVARIANTS #18) — a backfill must never delay live ingest.
+
+### 2.4 Adjudication loop (human)
+
+`review`-band candidates become `review_tasks`. A trained reviewer sees a **face crop only**, rendered
+live by the crop fetcher, and decides `confirmed` / `rejected` / `uncertain`.
+
+There is no timeout that auto-promotes a review-band candidate (INVARIANTS #19). If the queue backs
+up, the queue backs up.
+
+### 2.5 Periodic loop (cron)
+
+- **Recheck** — weekly re-probe of live hit URLs. Marks `url_alive = false`, never deletes. This is
+  the only good news v1 can deliver.
+- **Digest** — batched notification assembly. Never real-time, never 22:00–08:00 local
+  (INVARIANTS #24). Services assemble; the proxy delivers.
+
+---
+
+## 3. Component reference
+
+### 3.1 Identity module
+
+The only module holding Article 9 data. Own database, own credentials, own DB role. Nothing else may
+connect to it (INVARIANTS #14).
+
+Owns: liveness session lifecycle, enrolment, the Rekognition collection, consent artifacts, and the
+identity vector index.
+
+Does **not** own: `users`, phone numbers, OTP, sessions. Those are the proxy's. Identity keys everything on
+the opaque `user_ref` the proxy supplies.
+
+### 3.2 Partner ingest adapter
+
+Behind an interface (INVARIANTS #34). Consumes
+`{content_hash, source_url, face_bbox[], first_seen_at, partner_ref}` from the partner organisation.
+Idempotent on `content_hash`.
+
+**No image bytes cross this boundary.** If bytes ever cross, the legal separation between the two
+organisations is fiction.
+
+### 3.3 Match module
+
+Two workers over two queues. Owns `content_items`, `content_faces`, `match_candidates`, `search_runs`.
+
+Never joins to any user table — it holds `user_id` as an opaque value and nothing else.
+
+`search_runs.threshold_config` records the exact bands used per run, so retuning doesn't orphan the
+meaning of historical scores.
+
+### 3.4 Adjudication module
+
+Review queue, reviewer tooling, decisions. Crop-only display. Budget for reviewer welfare — this is an
+operating cost people forget, and crop-only rather than full-image is the cheapest mitigation
+available.
+
+### 3.5 Report module
+
+Owns `reports`, `report_hits`, `hit_feedback`, the recheck loop, and evidence export.
+
+**Server-authoritative scoring only.** The old system computed a score client-side *and* server-side
+with a −18 per active report divergence. For a product whose entire output is a score, that is
+disqualifying.
+
+### 3.6 Crop fetcher
+
+Its own deployable, on its own egress path, with **no VPC access to any internal service**.
+
+- Domain allowlist sourced from `content_items.source_domain`
+- SSRF guards applied **after** DNS resolution, not before
+- 5s timeout, 20MB cap, 2 redirects
+- Crops to `face_bbox` + 15% margin, returns the crop, discards everything else
+- `Cache-Control: no-store, private`. No CDN, no disk, no temp file
+- Runs on a read-only filesystem so a disk write fails loudly
+
+The full image exists only as a local variable inside the fetcher process and is never returned to the
+caller, even on error paths.
+
+---
+
+## 4. Data ownership
+
+| Concern | Owner | Store |
+|---|---|---|
+| Auth, OTP, sessions, `users` | **Proxy** | Proxy tables / DynamoDB |
+| Phone numbers, profile fields | **Proxy** | Proxy tables |
+| Billing, Stripe, Apple IAP | **Proxy** | Proxy tables |
+| Push tokens, notification delivery | **Proxy** | Proxy tables |
+| Enrolment selfies (S3) | **Proxy** | S3 |
+| Liveness sessions, enrolments, vectors | **Services** | Postgres (identity DB) |
+| Consent records + signed artifacts | **Services** | Postgres + S3 via presigned |
+| Content index, candidates, search runs | **Services** | Postgres |
+| Review queue and decisions | **Services** | Postgres |
+| Reports, hits, recheck state | **Services** | Postgres |
+| Report reads for the UI | **Proxy** | Postgres (read-only) |
+| Pushing onto any queue | **Services** | SQS (via outbox) |
+
+Services receive `user_ref` on every request and trust that the proxy has authorised the caller. **If the
+user is wrong, the proxy is wrong.**
+
+---
+
+## 5. Storage model
+
+Postgres, schema-per-module, distinct DB role per module. Full DDL in `SCHEMA.md`.
+
+Three properties that are load-bearing:
+
+**`enrolments` has `NOT NULL` FKs to both a passed liveness session and a signed consent record.** The
+schema makes it structurally impossible to index a face without both.
+
+**Every row that holds or references a vector carries `model_id`.** Vectors from different models are
+not comparable, and a cosine similarity between an AdaFace vector and anything else is a plausible-
+looking number that will quietly wreck your thresholds (INVARIANTS #4).
+
+**No image bytes anywhere outside the identity module.** A schema lint test fails the build on any
+column matching `image|thumbnail|blob|photo|local_path` in match, adjudication, or report.
+
+---
+
+## 6. Queues
+
+Three SQS queues, Standard (not FIFO — ordering is irrelevant here and the FIFO throughput ceiling
+isn't worth it). Each has its own worker and its own DLQ.
+
+| Queue | Producer | Message | Latency budget |
+|---|---|---|---|
+| `identity:index` | Enrolment handler | `{enrolment_id}` | Seconds |
+| `match:forward` | Ingest adapter | `{content_face_id}` | Minutes |
+| `match:backfill` | `enrolment_complete` | `{user_id, page_from, page_to}` | Hours |
+
+### The outbox is mandatory
+
+SQS gives no transactional enqueue, so producers write to an `outbox` table **in the same transaction
+as the domain row**, and a relay publishes and marks rows published.
+
+Without it, three failure modes are live:
+
+- Row committed, `SendMessage` fails → user enrolled, backfill never runs, **silently unmonitored**
+- Message published, transaction rolls back → job references a row that doesn't exist
+- Worker consumes before the write is visible → no-op or spurious failure
+
+Delivery is at-least-once, so **every consumer must be idempotent**. `match_candidates` gets this from
+`ON CONFLICT DO NOTHING` on `(user_id, content_face_id, model_id)`; `enrolments` from the unique index
+on `(collection_id, external_face_id)`.
+
+### Rules
+
+- **Messages carry IDs, never payloads.** The worker re-reads from Postgres — the row may have changed
+  since enqueue, and the stored value wins. Also keeps clear of the 256 KB message ceiling.
+- **Backfill is chunked by page range.** A whole-index backfill can run for tens of minutes; if
+  processing exceeds the visibility timeout the message is redelivered and N workers duplicate the
+  same run. Short jobs make the timeout easy to size and let progress survive a worker dying.
+- **Visibility timeout ≥ 3× measured p99 processing time** per queue, sized independently.
+- **DLQ on every queue, with a depth alarm.** Nothing polls the DLQ; an unwatched gauge means
+  permanently failing jobs are invisible.
+- **Reconciliation sweep as the backstop.** A periodic job finds `content_items` with no covering
+  `search_run` and `users` marked active with no completed backfill. This catches what the outbox
+  misses and is the only thing that detects a silently unmonitored user.
+
+---
+
+## 7. Async completion — NOTIFY, don't poll
+
+Services emit Postgres `NOTIFY` inside the writing transaction:
+
+| Channel | Fired when | Proxy's response |
+|---|---|---|
+| `enrolment_complete` | Third pose indexed, user active | Update UI, stop showing "setting up" |
+| `match_batch_complete` | A backfill run finishes | Refresh the report surface |
+| `hit_created` | A new hit reaches a report | Queue a digest entry — **never an immediate push** |
+
+The proxy holds one dedicated `LISTEN` connection on a **session-pinned** connection. A transaction-mode
+pooler silently drops `LISTEN`; the listener must bypass it.
+
+Treat `NOTIFY` as a wake-up only — read the authoritative state from the table. On listener reconnect,
+re-query for rows newer than the last-seen watermark, because `NOTIFY` is fire-and-forget and the row
+is the truth.
+
+A backfill that finds **zero** matches is a normal and common outcome. Polling for the appearance of
+hit rows cannot distinguish "still running" from "nothing will ever come."
+
+---
+
+## 8. What's deferred from v1
+
+- Takedown / DMCA — detection only
+- Minors under 18, guardian co-signature, the CSAM reporting pipeline
+- Age assurance vendor (self-declared DOB, `DetectFaces` `AgeRange` as a soft flag)
+- Non-partner corpus sources — social platforms, image hosts, search
+- Self-hosted embedding stack (staying on Rekognition means rented embeddings and vendor-side
+  thresholds; `enrolments.source_object_uri` is the migration path)
+- Kafka, service mesh, Kubernetes, event sourcing, CQRS, gRPC
+
+---
+
+## 9. Open questions
+
+- **The partner's embedding model.** Blocks the match module entirely. Determines whether
+  `content_faces.embedding_ref` points into a vector store we run, whether matching goes through
+  `SearchFacesByImage` behind the isolated fetcher, and which `model_id` values are legal.
+- Recall on AI-generated faces. Nothing in this document solves it; the architecture exists to let us
+  *measure* it honestly. A held-out eval set of known deepfakes of consenting test subjects should
+  exist before the product is sold against a recall claim.
+- Rekognition demographic accuracy disparities (NIST FRVT). A fairness exposure to measure rather than
+  assume away, and one that can't be tuned around while the threshold is a single vendor-side number.
+
+---
+
+*This document evolves with the system. When the boundary or schema changes shape, update here in the
+same PR.*
