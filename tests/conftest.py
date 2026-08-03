@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from imageshield.config import Config
 from imageshield.http.app import create_app
+from tests.db import throwaway_db as throwaway_db  # re-exported for fixture discovery
 
 SERVICE_TOKEN = "service-token-for-tests-0001"
 ADMIN_SERVICE_TOKEN = "admin-token-for-tests-0002"
