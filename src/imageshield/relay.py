@@ -1,0 +1,283 @@
+"""Outbox relay: the consumer side of the transactional outbox (Task 4).
+
+Runs as a **separate process** (``python -m imageshield.relay``) — never
+imported by the HTTP app, which is why the ``TID251`` boto3 ban
+(``pyproject.toml``) carries a per-file ignore for exactly this module. The
+HTTP app and every other producer write outbox rows on their own connection
+(:mod:`imageshield.outbox`); this module is the only place that reads them
+back out and calls ``SendMessage``.
+
+Poll loop, once per cycle:
+
+1. ``SELECT ... FOR UPDATE SKIP LOCKED`` a batch of unpublished, non-dead rows
+   — ``SKIP LOCKED`` means two relay processes running concurrently never
+   double-send the same row.
+2. For each row, in order: **publish first, mark second** — call
+   ``SendMessage``, and only once that returns does the row get
+   ``published_at = now()``. A crash between the two leaves the row
+   unpublished, so the next poll retries it. Duplicates are the expected
+   outcome of at-least-once delivery; every consumer downstream must be
+   idempotent (CLAUDE.md §10) — this module does not try to prevent
+   duplicates, only to never lose a row.
+3. All row updates in the batch are applied on one open transaction and
+   **committed once, after the whole batch** — not per row. A row whose send
+   fails does not stall the rest of the batch: the failure is caught,
+   recorded (``attempts += 1``, ``last_error``), and the loop continues.
+4. A row that fails is not retried immediately. Backoff is tracked as
+   ``outbox_id -> earliest-retry monotonic time`` **in process memory only**
+   (``base * 2 ** attempts``, capped at 5 minutes). The DDL
+   (``migrations/0001_initial_schema.up.sql``) has no ``next_attempt_at``
+   column — that is a deliberate, verbatim spec choice, not an oversight —
+   so **a relay restart resets every row's backoff to zero**. That is an
+   accepted tradeoff: worst case after a restart is a burst of eager retries
+   against rows that were already going to be retried anyway, not lost
+   messages or lost dead-letter state (dead-letter status is durable, in the
+   `attempts` column itself, not in memory — see below).
+5. Rows reach `outbox_max_attempts` are dead letters. The poll query already
+   excludes them (`attempts < outbox_max_attempts`), so they stop being
+   touched entirely. The transition into dead-letter state is logged once,
+   at error level, at the exact moment `attempts` reaches the ceiling —
+   because after that moment the row is never selected again, so this branch
+   can only run for a given row a single time. Ops finds dead rows via
+   ``published_at IS NULL AND attempts >= outbox_max_attempts``; the log line
+   is a bell, that query is the durable source of truth.
+"""
+
+from __future__ import annotations
+
+import json
+import signal
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
+
+import psycopg
+import structlog
+
+from imageshield.config import Config, ConfigError, load_config
+from imageshield.http.logging import configure_logging
+from imageshield.outbox import QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS
+
+_BACKOFF_BASE_SECONDS = 1.0
+_BACKOFF_CAP_SECONDS = 300.0  # ~5 minutes
+
+_QUEUE_NAME_TO_CONFIG_FIELD = {
+    QUEUE_IDENTITY_INDEX: "sqs_identity_index_url",
+    QUEUE_SEARCH_RUNS: "sqs_search_runs_url",
+}
+
+_SELECT_BATCH_SQL = """
+    SELECT outbox_id, queue_name, payload
+    FROM outbox
+    WHERE published_at IS NULL AND attempts < %(max_attempts)s
+    ORDER BY outbox_id
+    LIMIT %(batch_size)s
+    FOR UPDATE SKIP LOCKED
+"""
+
+_MARK_PUBLISHED_SQL = """
+    UPDATE outbox SET published_at = now() WHERE outbox_id = %(outbox_id)s
+"""
+
+_RECORD_FAILURE_SQL = """
+    UPDATE outbox
+    SET attempts = attempts + 1, last_error = %(error)s
+    WHERE outbox_id = %(outbox_id)s
+    RETURNING attempts
+"""
+
+
+class SqsClient(Protocol):
+    """The one SQS operation this module needs, typed by hand.
+
+    boto3 ships no bundled type stubs (no ``boto3-stubs`` dependency in this
+    repo), so a hand-written ``Protocol`` is what keeps ``mypy --strict``
+    happy *and* keeps the client injectable — tests pass a plain stub object
+    that satisfies this shape, no moto/LocalStack required.
+    """
+
+    def send_message(self, *, QueueUrl: str, MessageBody: str) -> object: ...
+
+
+def _localstack_endpoint_url(queue_url: str) -> str | None:
+    """Derive ``endpoint_url`` for the boto3 client when a queue URL points at
+    localhost/LocalStack; ``None`` for a real AWS endpoint (region routing is
+    enough there)."""
+    parsed = urlsplit(queue_url)
+    host = parsed.hostname or ""
+    if host in {"localhost", "127.0.0.1"} or "localstack" in host:
+        return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    return None
+
+
+def build_sqs_client(config: Config) -> SqsClient:
+    """Default SQS client factory. The only function in this module allowed
+    to import boto3 at call time; injected callers (tests) never need it."""
+    import boto3
+
+    kwargs: dict[str, Any] = {"region_name": config.aws_region}
+    endpoint_url = _localstack_endpoint_url(config.sqs_identity_index_url)
+    if endpoint_url is not None:
+        kwargs["endpoint_url"] = endpoint_url
+    client: SqsClient = boto3.client("sqs", **kwargs)
+    return client
+
+
+@dataclass
+class BackoffTracker:
+    """In-memory ``outbox_id -> earliest-retry time`` map. See the module
+    docstring for why this is memory-only rather than a DB column."""
+
+    _next_attempt_at: dict[int, float] = field(default_factory=dict)
+
+    def blocked(self, outbox_id: int, *, now: float) -> bool:
+        deadline = self._next_attempt_at.get(outbox_id)
+        return deadline is not None and now < deadline
+
+    def record_failure(self, outbox_id: int, attempts: int, *, now: float) -> None:
+        delay = min(_BACKOFF_BASE_SECONDS * (2**attempts), _BACKOFF_CAP_SECONDS)
+        self._next_attempt_at[outbox_id] = now + delay
+
+    def clear(self, outbox_id: int) -> None:
+        self._next_attempt_at.pop(outbox_id, None)
+
+
+@dataclass(frozen=True)
+class PollStats:
+    published: int
+    failed: int
+    skipped_backoff: int
+
+
+def _queue_url(config: Config, queue_name: str) -> str | None:
+    field_name = _QUEUE_NAME_TO_CONFIG_FIELD.get(queue_name)
+    if field_name is None:
+        return None
+    value = getattr(config, field_name)
+    return value if isinstance(value, str) else None
+
+
+def poll_once(
+    conn: psycopg.Connection[Any],
+    config: Config,
+    client: SqsClient,
+    backoff: BackoffTracker,
+    *,
+    logger: structlog.stdlib.BoundLogger | Any = None,
+) -> PollStats:
+    """Run one poll/publish cycle. One transaction, one commit, at the end.
+
+    Safe to call repeatedly (e.g. from :func:`run_forever`, or directly from
+    tests) — each call is a complete, self-contained batch.
+    """
+    log = logger if logger is not None else structlog.get_logger("imageshield.relay")
+    published = 0
+    failed = 0
+    skipped_backoff = 0
+    now = time.monotonic()
+
+    with conn.cursor() as cur:
+        cur.execute(
+            _SELECT_BATCH_SQL,
+            {"max_attempts": config.outbox_max_attempts, "batch_size": config.outbox_batch_size},
+        )
+        rows = cur.fetchall()
+
+        for outbox_id, queue_name, payload in rows:
+            if backoff.blocked(outbox_id, now=now):
+                skipped_backoff += 1
+                continue
+
+            try:
+                queue_url = _queue_url(config, queue_name)
+                if queue_url is None:
+                    raise ValueError(f"unknown queue_name {queue_name!r}")
+                client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(payload))
+            except Exception as exc:  # broad on purpose: one bad row must never stall the batch
+                cur.execute(
+                    _RECORD_FAILURE_SQL,
+                    {"outbox_id": outbox_id, "error": str(exc)},
+                )
+                row = cur.fetchone()
+                assert row is not None
+                attempts = row[0]
+                backoff.record_failure(outbox_id, attempts, now=now)
+                failed += 1
+                log.warning(
+                    "outbox.publish_failed",
+                    outbox_id=outbox_id,
+                    queue_name=queue_name,
+                    attempts=attempts,
+                    error=str(exc),
+                )
+                if attempts >= config.outbox_max_attempts:
+                    # First (and only) time this row can ever hit this branch:
+                    # the poll query excludes attempts >= max on every future
+                    # cycle, so this row will never be selected again.
+                    log.error(
+                        "outbox.dead_letter",
+                        outbox_id=outbox_id,
+                        queue_name=queue_name,
+                        attempts=attempts,
+                    )
+            else:
+                cur.execute(_MARK_PUBLISHED_SQL, {"outbox_id": outbox_id})
+                backoff.clear(outbox_id)
+                published += 1
+
+    conn.commit()
+    return PollStats(published=published, failed=failed, skipped_backoff=skipped_backoff)
+
+
+def run_forever(config: Config, *, client: SqsClient | None = None) -> None:
+    """The real relay loop: poll, sleep, repeat, until asked to stop."""
+    log = structlog.get_logger("imageshield.relay")
+    sqs_client = client if client is not None else build_sqs_client(config)
+    backoff = BackoffTracker()
+
+    stop_requested = False
+
+    def _handle_stop(signum: int, _frame: object) -> None:
+        nonlocal stop_requested
+        log.info("relay.stop_requested", signal=signum)
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    log.info(
+        "relay.started",
+        poll_interval_seconds=config.outbox_poll_interval_seconds,
+        batch_size=config.outbox_batch_size,
+        max_attempts=config.outbox_max_attempts,
+    )
+    with psycopg.connect(config.database_url) as conn:
+        while not stop_requested:
+            stats = poll_once(conn, config, sqs_client, backoff, logger=log)
+            if stats.published or stats.failed:
+                log.info(
+                    "relay.poll_completed",
+                    published=stats.published,
+                    failed=stats.failed,
+                    skipped_backoff=stats.skipped_backoff,
+                )
+            time.sleep(config.outbox_poll_interval_seconds)
+    log.info("relay.stopped")
+
+
+def main() -> int:
+    configure_logging()
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    run_forever(config)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

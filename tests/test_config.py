@@ -97,3 +97,27 @@ def test_config_is_frozen(config: Config) -> None:
 
     with pytest.raises(ValidationError):
         config.service_token = "mutated-token-value-000"  # type: ignore[misc]
+
+
+def test_outbox_field_defaults(config: Config) -> None:
+    assert config.outbox_poll_interval_seconds == 1.0
+    assert config.outbox_batch_size == 50
+    assert config.outbox_max_attempts == 8
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("outbox_poll_interval_seconds", 0.0),
+        ("outbox_poll_interval_seconds", -1.0),
+        ("outbox_batch_size", 0),
+        ("outbox_batch_size", -5),
+        ("outbox_max_attempts", 0),
+        ("outbox_max_attempts", -1),
+    ],
+)
+def test_outbox_fields_reject_non_positive_values(field: str, bad_value: float) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(**{field: bad_value})

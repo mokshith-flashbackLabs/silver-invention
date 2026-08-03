@@ -62,6 +62,13 @@ class Config(BaseSettings):
     sqs_identity_index_url: str
     sqs_search_runs_url: str
 
+    # Outbox relay (Task 4, src/imageshield/relay.py). Defaulted rather than
+    # required — the HTTP process never reads these, only the relay does, and
+    # they are safe to run with sensible defaults out of the box.
+    outbox_poll_interval_seconds: float = 1.0
+    outbox_batch_size: int = 50
+    outbox_max_attempts: int = 8
+
     # Requested via SERVICE_TOKEN_AUTH_DISABLED=1; only takes effect in
     # development — see :attr:`auth_disabled`.
     service_token_auth_disabled: bool = False
@@ -125,11 +132,23 @@ class Config(BaseSettings):
             raise ValueError("must be between 0 and 130")
         return value
 
-    @field_validator("liveness_session_ttl_seconds", "liveness_max_attempts_24h")
+    @field_validator(
+        "liveness_session_ttl_seconds",
+        "liveness_max_attempts_24h",
+        "outbox_batch_size",
+        "outbox_max_attempts",
+    )
     @classmethod
     def _positive(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("must be a positive integer")
+        return value
+
+    @field_validator("outbox_poll_interval_seconds")
+    @classmethod
+    def _positive_float(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("must be a positive number")
         return value
 
     @model_validator(mode="after")

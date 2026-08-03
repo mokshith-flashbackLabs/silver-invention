@@ -58,6 +58,13 @@ plugins = ["pydantic.mypy"]
 mypy_path = "src"
 packages = ["imageshield"]
 
+[[tool.mypy.overrides]]
+# boto3 ships no bundled type stubs and this repo doesn't depend on
+# boto3-stubs/mypy-boto3 (relay.py, the sole importer, wraps every call it
+# needs behind the hand-written `SqsClient` Protocol instead).
+module = "boto3"
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
