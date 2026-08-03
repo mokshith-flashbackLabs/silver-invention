@@ -1,0 +1,4 @@
+# LF everywhere — init-sqs.sh runs under bash inside the LocalStack container
+# and CRLF would break it; Python/SQL/YAML tooling is happiest with LF too.
+* text=auto eol=lf
+*.ps1 text eol=crlf
