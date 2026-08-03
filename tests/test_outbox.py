@@ -8,16 +8,14 @@ either.
 
 ``imageshield.outbox.enqueue`` is async and runs real queries against real
 Postgres over psycopg's async I/O, which cannot run on Windows' default
-Proactor event loop (same constraint ``src/imageshield/__main__.py`` works
-around for uvicorn) — the ``event_loop_policy`` override below swaps in a
-selector-based loop for this module's tests only, on Windows only.
+Proactor event loop; ``tests/conftest.py`` installs a selector-loop factory
+via the ``pytest_asyncio_loop_factories`` hook (Windows only) so every async
+test in the suite, this file included, gets a compatible loop with no
+per-file setup here.
 """
 
 from __future__ import annotations
 
-import asyncio
-import selectors
-import sys
 from uuid import UUID, uuid4
 
 import psycopg
@@ -26,16 +24,6 @@ from pydantic import ValidationError
 
 from imageshield.outbox import QUEUE_IDENTITY_INDEX, QUEUES, OutboxPayload, enqueue, enqueue_sync
 from tests.db import run_migrate
-
-if sys.platform == "win32":
-
-    @pytest.fixture(scope="module")
-    def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
-        class _SelectorEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-            def new_event_loop(self) -> asyncio.AbstractEventLoop:
-                return asyncio.SelectorEventLoop(selectors.SelectSelector())
-
-        return _SelectorEventLoopPolicy()
 
 
 @pytest.fixture

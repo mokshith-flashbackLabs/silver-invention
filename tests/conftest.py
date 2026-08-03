@@ -12,6 +12,10 @@ real DB pool it opens) never runs; DB behaviour is stubbed via
 
 from __future__ import annotations
 
+import asyncio
+import selectors
+import sys
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import pytest
@@ -20,6 +24,23 @@ from fastapi.testclient import TestClient
 from imageshield.config import Config
 from imageshield.http.app import create_app
 from tests.db import throwaway_db as throwaway_db  # re-exported for fixture discovery
+
+if sys.platform == "win32":
+    # psycopg's async I/O cannot run on Windows' default Proactor event loop
+    # (the same constraint src/imageshield/__main__.py already works around
+    # for uvicorn — see its comment). Rather than the deprecated
+    # `event_loop_policy` fixture-override mechanism, this uses the current
+    # pytest-asyncio hook so every async test in the suite (this repo's DB
+    # tests, and any future ones e.g. Task 4's relay) gets a selector-based
+    # loop with zero deprecation warnings and no per-file duplication.
+    def _selector_event_loop() -> asyncio.AbstractEventLoop:
+        return asyncio.SelectorEventLoop(selectors.SelectSelector())
+
+    def pytest_asyncio_loop_factories(
+        config: pytest.Config, item: pytest.Item
+    ) -> Mapping[str, Callable[[], asyncio.AbstractEventLoop]]:
+        return {"selector": _selector_event_loop}
+
 
 SERVICE_TOKEN = "service-token-for-tests-0001"
 ADMIN_SERVICE_TOKEN = "admin-token-for-tests-0002"
