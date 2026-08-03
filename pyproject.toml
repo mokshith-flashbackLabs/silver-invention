@@ -30,7 +30,10 @@ dependencies = [
 dev = [
     "pytest>=8.3.3,<9.0",
     "pytest-postgresql>=6.1.1",
-    "pytest-asyncio>=0.24.0",
+    # 1.4.0 is the first release with the `pytest_asyncio_loop_factories`
+    # hook (tests/conftest.py's Windows selector-event-loop workaround);
+    # anything older fails collection with an unrecognised-hook error.
+    "pytest-asyncio>=1.4.0",
     "mypy>=1.13",
     "ruff>=0.7",
 ]
@@ -87,7 +90,7 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]
 "boto3" = { msg = "Direct SQS access bypasses the transactional outbox — use imageshield.outbox.enqueue() instead. Only the relay (src/imageshield/relay.py, Task 4) is allowed to import boto3." }
 
 [tool.ruff.lint.per-file-ignores]
-# The relay (Task 4, not yet created) is the one place allowed to publish to
-# SQS directly — it's the consumer side of the outbox pattern, reading
-# unpublished rows and calling SendMessage itself.
+# The relay (Task 4) is the one place allowed to publish to SQS directly —
+# it's the consumer side of the outbox pattern, reading unpublished rows and
+# calling SendMessage itself.
 "src/imageshield/relay.py" = ["TID251"]

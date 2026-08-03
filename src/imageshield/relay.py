@@ -46,6 +46,16 @@ Poll loop, once per cycle, up to ``outbox_batch_size`` rows:
    can only run for a given row a single time. Ops finds dead rows via
    ``published_at IS NULL AND attempts >= outbox_max_attempts``; the log line
    is a bell, that query is the durable source of truth.
+
+``run_forever`` reconnects on DB connectivity loss. A ``psycopg.OperationalError``
+(connection blip, Postgres restart) is caught at the reconnect loop around
+``poll_once``/the connection itself — never left to unwind the process — and
+retried with exponential backoff (base 1s, capped at 30s), reset to the base
+after every successful poll. This process is the only outbox→SQS path, so a
+transient DB hiccup must not be fatal. This does **not** replace a process
+supervisor: anything other than ``psycopg.OperationalError`` (an unhandled
+bug, an out-of-memory kill, ...) still crashes the process, and a supervisor
+(systemd unit, ECS service restart policy) is expected to bring it back up.
 """
 
 from __future__ import annotations
@@ -54,6 +64,7 @@ import json
 import signal
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
@@ -67,6 +78,9 @@ from imageshield.outbox import QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS
 
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_CAP_SECONDS = 300.0  # ~5 minutes
+
+_RECONNECT_BASE_SECONDS = 1.0
+_RECONNECT_CAP_SECONDS = 30.0
 
 _QUEUE_NAME_TO_CONFIG_FIELD = {
     QUEUE_IDENTITY_INDEX: "sqs_identity_index_url",
@@ -85,7 +99,8 @@ _SELECT_NEXT_SQL = """
 """
 
 _MARK_PUBLISHED_SQL = """
-    UPDATE outbox SET published_at = now() WHERE outbox_id = %(outbox_id)s
+    UPDATE outbox SET published_at = now(), last_error = NULL
+    WHERE outbox_id = %(outbox_id)s
 """
 
 _RECORD_FAILURE_SQL = """
@@ -241,13 +256,18 @@ def poll_once(
             if attempts >= config.outbox_max_attempts:
                 # First (and only) time this row can ever hit this branch:
                 # the poll query excludes attempts >= max on every future
-                # cycle, so this row will never be selected again.
+                # cycle, so this row will never be selected again. Evict its
+                # backoff entry now — record_failure() just added one above,
+                # and with the row never selected again nothing will ever
+                # call clear() for it otherwise, leaking one dict entry per
+                # dead-lettered row for the life of the process.
                 log.error(
                     "outbox.dead_letter",
                     outbox_id=outbox_id,
                     queue_name=queue_name,
                     attempts=attempts,
                 )
+                backoff.clear(outbox_id)
         else:
             with conn.cursor() as cur:
                 cur.execute(_MARK_PUBLISHED_SQL, {"outbox_id": outbox_id})
@@ -258,8 +278,60 @@ def poll_once(
     return PollStats(published=published, failed=failed, skipped_backoff=skipped_backoff)
 
 
+def _reconnect_and_poll_forever(
+    config: Config,
+    client: SqsClient,
+    backoff: BackoffTracker,
+    log: Any,
+    *,
+    stop_requested: Callable[[], bool],
+    connect: Callable[[], psycopg.Connection[Any]],
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """The reconnect-with-backoff outer loop, factored out of
+    :func:`run_forever` so it's testable without a real Postgres outage or a
+    real clock: inject ``connect``/``sleep``/``stop_requested``.
+
+    A ``psycopg.OperationalError`` raised either by ``connect()`` itself or
+    by a ``poll_once`` call on the connection it opened (a connection blip,
+    Postgres restarting) is caught here — logged at error level, then
+    retried after an exponentially growing sleep (capped at
+    ``_RECONNECT_CAP_SECONDS``). The backoff resets to
+    ``_RECONNECT_BASE_SECONDS`` after every successful poll, so a brief
+    outage doesn't leave the relay sleeping 30s between polls forever
+    afterwards. Anything other than ``OperationalError`` propagates and is
+    fatal — see the module docstring on the supervisor expectation.
+    """
+    reconnect_delay = _RECONNECT_BASE_SECONDS
+    while not stop_requested():
+        try:
+            with connect() as conn:
+                while not stop_requested():
+                    stats = poll_once(conn, config, client, backoff, logger=log)
+                    reconnect_delay = _RECONNECT_BASE_SECONDS
+                    if stats.published or stats.failed:
+                        log.info(
+                            "relay.poll_completed",
+                            published=stats.published,
+                            failed=stats.failed,
+                            skipped_backoff=stats.skipped_backoff,
+                        )
+                    sleep(config.outbox_poll_interval_seconds)
+        except psycopg.OperationalError as exc:
+            log.error(
+                "relay.db_connection_error",
+                error=str(exc),
+                retry_in_seconds=reconnect_delay,
+            )
+            sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, _RECONNECT_CAP_SECONDS)
+
+
 def run_forever(config: Config, *, client: SqsClient | None = None) -> None:
-    """The real relay loop: poll, sleep, repeat, until asked to stop."""
+    """The real relay loop: connect, poll, sleep, repeat, until asked to
+    stop — reconnecting with backoff on DB connectivity loss rather than
+    dying (see the module docstring and :func:`_reconnect_and_poll_forever`).
+    """
     log = structlog.get_logger("imageshield.relay")
     sqs_client = client if client is not None else build_sqs_client(config)
     backoff = BackoffTracker()
@@ -280,17 +352,14 @@ def run_forever(config: Config, *, client: SqsClient | None = None) -> None:
         batch_size=config.outbox_batch_size,
         max_attempts=config.outbox_max_attempts,
     )
-    with psycopg.connect(config.database_url) as conn:
-        while not stop_requested:
-            stats = poll_once(conn, config, sqs_client, backoff, logger=log)
-            if stats.published or stats.failed:
-                log.info(
-                    "relay.poll_completed",
-                    published=stats.published,
-                    failed=stats.failed,
-                    skipped_backoff=stats.skipped_backoff,
-                )
-            time.sleep(config.outbox_poll_interval_seconds)
+    _reconnect_and_poll_forever(
+        config,
+        sqs_client,
+        backoff,
+        log,
+        stop_requested=lambda: stop_requested,
+        connect=lambda: psycopg.connect(config.database_url),
+    )
     log.info("relay.stopped")
 
 

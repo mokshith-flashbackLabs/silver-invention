@@ -24,7 +24,13 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from imageshield.outbox import QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS, OutboxPayload, enqueue_sync
-from imageshield.relay import BackoffTracker, build_sqs_client, poll_once
+from imageshield.relay import (
+    _RECONNECT_BASE_SECONDS,
+    BackoffTracker,
+    _reconnect_and_poll_forever,
+    build_sqs_client,
+    poll_once,
+)
 from tests.conftest import VALID_ENV, make_config
 from tests.db import run_migrate
 
@@ -221,9 +227,12 @@ def test_failing_client_records_attempts_then_later_poll_retries(migrated_db: st
         assert stats2.failed == 0
         assert len(working_client.sent) == 1
 
-        published_at2, attempts2, _ = _row_state(conn, outbox_id)
+        published_at2, attempts2, last_error2 = _row_state(conn, outbox_id)
         assert published_at2 is not None
         assert attempts2 == 1, "the successful publish must not bump attempts further"
+        assert last_error2 is None, (
+            "a row that failed once then published must not carry a stale last_error"
+        )
 
 
 def test_backoff_blocks_immediate_retry_with_same_tracker(migrated_db: str) -> None:
@@ -389,6 +398,78 @@ def test_unknown_queue_name_recorded_as_failure_no_crash(migrated_db: str) -> No
         assert attempts == 1
         assert last_error is not None
         assert "unknown queue_name" in last_error
+
+
+def test_reconnect_loop_survives_one_operational_error_then_resumes(
+    migrated_db: str,
+) -> None:
+    """A `connect()` that raises `psycopg.OperationalError` once (simulating
+    a connection blip/Postgres restart) and then succeeds must not kill the
+    loop: it logs the error, backs off, reconnects, and resumes polling —
+    proven here by an enqueued row actually getting published after the
+    simulated blip."""
+    config = _relay_config()
+    payload = OutboxPayload(event="enrolment.created", id=uuid4())
+
+    with psycopg.connect(migrated_db) as setup_conn:
+        outbox_id = enqueue_sync(setup_conn, QUEUE_IDENTITY_INDEX, payload)
+        setup_conn.commit()
+
+    connect_attempts = 0
+    opened_conns: list[psycopg.Connection[Any]] = []
+
+    def fake_connect() -> psycopg.Connection[Any]:
+        nonlocal connect_attempts
+        connect_attempts += 1
+        if connect_attempts == 1:
+            raise psycopg.OperationalError("simulated connection blip")
+        conn = psycopg.connect(migrated_db)
+        opened_conns.append(conn)
+        return conn
+
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def stop_requested() -> bool:
+        # Stop once the backoff sleep (1st call) and one post-poll sleep
+        # (2nd call) have both happened -- i.e. after exactly one successful
+        # poll cycle following the reconnect.
+        return len(sleeps) >= 2
+
+    client = StubSqsClient()
+    logger = _RecordingLogger()
+
+    try:
+        _reconnect_and_poll_forever(
+            config,
+            client,
+            BackoffTracker(),
+            logger,
+            stop_requested=stop_requested,
+            connect=fake_connect,
+            sleep=fake_sleep,
+        )
+    finally:
+        for conn in opened_conns:
+            conn.close()
+
+    assert connect_attempts == 2, "first connect must fail, second must be tried"
+    assert len(client.sent) == 1, "the row must be published after the reconnect"
+
+    error_events = logger.of_level("error", "relay.db_connection_error")
+    assert len(error_events) == 1
+    assert "simulated connection blip" in error_events[0]["error"]
+    assert error_events[0]["retry_in_seconds"] == _RECONNECT_BASE_SECONDS
+
+    assert sleeps[0] == _RECONNECT_BASE_SECONDS, "backoff sleep uses the base delay"
+    assert sleeps[1] == config.outbox_poll_interval_seconds, "poll loop sleep is unaffected"
+
+    with psycopg.connect(migrated_db) as verify_conn:
+        published_at, attempts, _ = _row_state(verify_conn, outbox_id)
+    assert published_at is not None
+    assert attempts == 0
 
 
 def test_build_sqs_client_derives_localstack_endpoint() -> None:

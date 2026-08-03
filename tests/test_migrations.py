@@ -13,7 +13,8 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from tests.db import run_migrate
+from tests.db import run_migrate  # re-exported
+from tests.db import second_throwaway_db as second_throwaway_db
 
 CORE_TABLES = {
     "liveness_sessions",
@@ -122,3 +123,50 @@ def test_imageshield_app_role_is_insert_only_on_audit_log(throwaway_db: str) -> 
         conn.execute("RESET ROLE")
         (count,) = conn.execute("SELECT count(*) FROM audit_log").fetchone()  # type: ignore[misc]
         assert count == 1
+
+
+def test_down_all_on_one_db_does_not_break_role_for_sibling_db(
+    throwaway_db: str, second_throwaway_db: str
+) -> None:
+    """The cluster-global ``imageshield_app`` role must survive tearing down
+    ONE of two databases on the same server that both have 0001 applied —
+    mirrors two concurrent pytest sessions against one compose Postgres, or
+    a second app database sharing the cluster. Before the down-migration fix
+    this failed with "role ... cannot be dropped because some objects
+    depend on it" (the role is still granted on db B's audit_log) and left
+    db A's own teardown broken.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(second_throwaway_db, "down", "--all")
+
+    up_a = run_migrate(throwaway_db, "up")
+    up_b = run_migrate(second_throwaway_db, "up")
+    assert up_a.returncode == 0, up_a.stderr
+    assert up_b.returncode == 0, up_b.stderr
+
+    down_a = run_migrate(throwaway_db, "down", "--all")
+    assert down_a.returncode == 0, down_a.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        assert _table_names(conn) == {"schema_migrations"}
+
+    # db B is untouched: same assertions as
+    # test_imageshield_app_role_is_insert_only_on_audit_log, run against db B
+    # *after* db A's teardown, proving the role and its grants there are
+    # unaffected by whatever db A's down migration did to the role.
+    with psycopg.connect(second_throwaway_db, autocommit=True) as conn:
+        conn.execute("SET ROLE imageshield_app")
+        conn.execute("INSERT INTO audit_log (actor_type, action) VALUES ('system', 'test')")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE audit_log SET action = 'changed'")
+        conn.execute("RESET ROLE")
+        (count,) = conn.execute("SELECT count(*) FROM audit_log").fetchone()  # type: ignore[misc]
+        assert count == 1
+
+    # db B was the last remaining dependant on the role: tearing it down too
+    # must succeed and this time actually remove the role from the cluster.
+    down_b = run_migrate(second_throwaway_db, "down", "--all")
+    assert down_b.returncode == 0, down_b.stderr
+
+    with psycopg.connect(second_throwaway_db, autocommit=True) as conn:
+        assert _role_exists(conn) is False

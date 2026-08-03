@@ -56,6 +56,21 @@ def _server_reachable(url: str) -> bool:
     return True
 
 
+def _create_scratch_database(maintenance_url: str) -> tuple[str, str]:
+    """Create a uniquely named scratch database; return ``(db_name, url)``."""
+    db_name = f"imageshield_test_{uuid.uuid4().hex[:16]}"
+    create_stmt = sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name))
+    with psycopg.connect(maintenance_url, autocommit=True) as admin:
+        admin.execute(create_stmt)
+    return db_name, _with_database(maintenance_url, db_name)
+
+
+def _drop_scratch_database(maintenance_url: str, db_name: str) -> None:
+    drop_stmt = sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(db_name))
+    with psycopg.connect(maintenance_url, autocommit=True) as admin:
+        admin.execute(drop_stmt)
+
+
 @pytest.fixture(scope="session")
 def throwaway_db() -> Iterator[str]:
     """Yield the DATABASE_URL of a uniquely named, disposable database.
@@ -74,18 +89,31 @@ def throwaway_db() -> Iterator[str]:
             pytest.fail(message)
         pytest.skip(message)
 
-    db_name = f"imageshield_test_{uuid.uuid4().hex[:16]}"
-    create_stmt = sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name))
-    drop_stmt = sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(db_name))
-
-    with psycopg.connect(maintenance_url, autocommit=True) as admin:
-        admin.execute(create_stmt)
-
+    db_name, db_url = _create_scratch_database(maintenance_url)
     try:
-        yield _with_database(maintenance_url, db_name)
+        yield db_url
     finally:
-        with psycopg.connect(maintenance_url, autocommit=True) as admin:
-            admin.execute(drop_stmt)
+        _drop_scratch_database(maintenance_url, db_name)
+
+
+@pytest.fixture
+def second_throwaway_db(throwaway_db: str) -> Iterator[str]:
+    """A second, independent scratch database on the same maintenance server
+    as :func:`throwaway_db`.
+
+    Function-scoped (unlike the session-scoped ``throwaway_db``): it exists
+    only for tests that specifically need two live databases at once on one
+    server — e.g. proving that a cluster-global role (``imageshield_app``)
+    can be torn down from one database without breaking the other. Depending
+    on ``throwaway_db`` reuses its reachability check rather than duplicating
+    it.
+    """
+    maintenance_url = _maintenance_url()
+    db_name, db_url = _create_scratch_database(maintenance_url)
+    try:
+        yield db_url
+    finally:
+        _drop_scratch_database(maintenance_url, db_name)
 
 
 def run_migrate(database_url: str, *args: str) -> subprocess.CompletedProcess[str]:
