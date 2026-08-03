@@ -7,22 +7,27 @@ HTTP app and every other producer write outbox rows on their own connection
 (:mod:`imageshield.outbox`); this module is the only place that reads them
 back out and calls ``SendMessage``.
 
-Poll loop, once per cycle:
+Poll loop, once per cycle, up to ``outbox_batch_size`` rows:
 
-1. ``SELECT ... FOR UPDATE SKIP LOCKED`` a batch of unpublished, non-dead rows
+1. ``SELECT ... LIMIT 1 FOR UPDATE SKIP LOCKED`` the single next eligible row
    — ``SKIP LOCKED`` means two relay processes running concurrently never
    double-send the same row.
-2. For each row, in order: **publish first, mark second** — call
-   ``SendMessage``, and only once that returns does the row get
-   ``published_at = now()``. A crash between the two leaves the row
-   unpublished, so the next poll retries it. Duplicates are the expected
-   outcome of at-least-once delivery; every consumer downstream must be
-   idempotent (CLAUDE.md §10) — this module does not try to prevent
-   duplicates, only to never lose a row.
-3. All row updates in the batch are applied on one open transaction and
-   **committed once, after the whole batch** — not per row. A row whose send
-   fails does not stall the rest of the batch: the failure is caught,
-   recorded (``attempts += 1``, ``last_error``), and the loop continues.
+2. **Publish first, mark second, commit per row** — call ``SendMessage``, and
+   only once that returns does the row get ``published_at = now()``; that
+   single row's transaction is committed immediately, before moving on. A
+   crash between send and mark leaves that one row unpublished, so the next
+   poll retries it — but every row already committed before the crash stays
+   published. The blast radius of a mid-batch crash is exactly one row, never
+   the whole batch. Duplicates are the expected outcome of at-least-once
+   delivery; every consumer downstream must be idempotent (CLAUDE.md §10) —
+   this module does not try to prevent duplicates, only to never lose a row.
+3. Each row's ``SELECT ... FOR UPDATE`` lock is held only for that one row's
+   ``SendMessage`` round-trip, not for the whole batch's worth of network
+   calls — a slow or stalled provider blocks at most one row's lock, not up
+   to ``outbox_batch_size`` of them sitting open against Postgres at once. A
+   row whose send fails does not stall the rest of the batch: the failure is
+   caught, recorded (``attempts += 1``, ``last_error``), committed, and the
+   loop moves to the next row.
 4. A row that fails is not retried immediately. Backoff is tracked as
    ``outbox_id -> earliest-retry monotonic time`` **in process memory only**
    (``base * 2 ** attempts``, capped at 5 minutes). The DDL
@@ -68,12 +73,14 @@ _QUEUE_NAME_TO_CONFIG_FIELD = {
     QUEUE_SEARCH_RUNS: "sqs_search_runs_url",
 }
 
-_SELECT_BATCH_SQL = """
+_SELECT_NEXT_SQL = """
     SELECT outbox_id, queue_name, payload
     FROM outbox
-    WHERE published_at IS NULL AND attempts < %(max_attempts)s
+    WHERE published_at IS NULL
+      AND attempts < %(max_attempts)s
+      AND NOT (outbox_id = ANY(%(skip_ids)s::bigint[]))
     ORDER BY outbox_id
-    LIMIT %(batch_size)s
+    LIMIT 1
     FOR UPDATE SKIP LOCKED
 """
 
@@ -167,67 +174,87 @@ def poll_once(
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
 ) -> PollStats:
-    """Run one poll/publish cycle. One transaction, one commit, at the end.
+    """Run one poll/publish cycle, up to ``outbox_batch_size`` rows.
+
+    Each row gets its own transaction: fetch (``FOR UPDATE SKIP LOCKED``),
+    publish, mark, **commit** — before the next row is even selected. This
+    bounds both the blast radius of a mid-batch crash (one row, not the whole
+    batch — see module docstring point 2) and how long any single row's lock
+    is held (one ``SendMessage`` round-trip, not up to ``outbox_batch_size``
+    of them).
 
     Safe to call repeatedly (e.g. from :func:`run_forever`, or directly from
-    tests) — each call is a complete, self-contained batch.
+    tests) — each call is a complete, self-contained cycle.
     """
     log = logger if logger is not None else structlog.get_logger("imageshield.relay")
     published = 0
     failed = 0
     skipped_backoff = 0
-    now = time.monotonic()
+    # Rows seen-and-deferred (backoff) within *this* call, so the scan moves
+    # on to the next distinct row instead of re-selecting the same blocked
+    # one every iteration — bounded by outbox_batch_size either way.
+    skip_ids: list[int] = []
 
-    with conn.cursor() as cur:
-        cur.execute(
-            _SELECT_BATCH_SQL,
-            {"max_attempts": config.outbox_max_attempts, "batch_size": config.outbox_batch_size},
-        )
-        rows = cur.fetchall()
+    for _ in range(config.outbox_batch_size):
+        now = time.monotonic()
 
-        for outbox_id, queue_name, payload in rows:
-            if backoff.blocked(outbox_id, now=now):
-                skipped_backoff += 1
-                continue
+        with conn.cursor() as cur:
+            cur.execute(
+                _SELECT_NEXT_SQL,
+                {"max_attempts": config.outbox_max_attempts, "skip_ids": skip_ids},
+            )
+            row = cur.fetchone()
 
-            try:
-                queue_url = _queue_url(config, queue_name)
-                if queue_url is None:
-                    raise ValueError(f"unknown queue_name {queue_name!r}")
-                client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(payload))
-            except Exception as exc:  # broad on purpose: one bad row must never stall the batch
-                cur.execute(
-                    _RECORD_FAILURE_SQL,
-                    {"outbox_id": outbox_id, "error": str(exc)},
-                )
-                row = cur.fetchone()
-                assert row is not None
-                attempts = row[0]
-                backoff.record_failure(outbox_id, attempts, now=now)
-                failed += 1
-                log.warning(
-                    "outbox.publish_failed",
+        if row is None:
+            conn.rollback()  # nothing was written; ends the (empty) transaction
+            break
+
+        outbox_id, queue_name, payload = row
+
+        if backoff.blocked(outbox_id, now=now):
+            conn.rollback()  # release this row's lock; nothing was written
+            skip_ids.append(outbox_id)
+            skipped_backoff += 1
+            continue
+
+        try:
+            queue_url = _queue_url(config, queue_name)
+            if queue_url is None:
+                raise ValueError(f"unknown queue_name {queue_name!r}")
+            client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(payload))
+        except Exception as exc:  # broad on purpose: one bad row must never stall the batch
+            with conn.cursor() as cur:
+                cur.execute(_RECORD_FAILURE_SQL, {"outbox_id": outbox_id, "error": str(exc)})
+                failure_row = cur.fetchone()
+            conn.commit()
+            assert failure_row is not None
+            attempts = failure_row[0]
+            backoff.record_failure(outbox_id, attempts, now=now)
+            failed += 1
+            log.warning(
+                "outbox.publish_failed",
+                outbox_id=outbox_id,
+                queue_name=queue_name,
+                attempts=attempts,
+                error=str(exc),
+            )
+            if attempts >= config.outbox_max_attempts:
+                # First (and only) time this row can ever hit this branch:
+                # the poll query excludes attempts >= max on every future
+                # cycle, so this row will never be selected again.
+                log.error(
+                    "outbox.dead_letter",
                     outbox_id=outbox_id,
                     queue_name=queue_name,
                     attempts=attempts,
-                    error=str(exc),
                 )
-                if attempts >= config.outbox_max_attempts:
-                    # First (and only) time this row can ever hit this branch:
-                    # the poll query excludes attempts >= max on every future
-                    # cycle, so this row will never be selected again.
-                    log.error(
-                        "outbox.dead_letter",
-                        outbox_id=outbox_id,
-                        queue_name=queue_name,
-                        attempts=attempts,
-                    )
-            else:
+        else:
+            with conn.cursor() as cur:
                 cur.execute(_MARK_PUBLISHED_SQL, {"outbox_id": outbox_id})
-                backoff.clear(outbox_id)
-                published += 1
+            conn.commit()
+            backoff.clear(outbox_id)
+            published += 1
 
-    conn.commit()
     return PollStats(published=published, failed=failed, skipped_backoff=skipped_backoff)
 
 

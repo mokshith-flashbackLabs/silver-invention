@@ -95,6 +95,28 @@ class SelectiveFailingSqsClient:
         return {"MessageId": "stub-message-id"}
 
 
+class _SimulatedCrash(BaseException):
+    """Deliberately NOT an ``Exception`` subclass: it must escape relay.py's
+    ``except Exception`` handler exactly the way a real process crash
+    (SIGKILL, an unhandled fatal error) would — used only to prove the
+    per-row commit boundary in tests, never a real relay failure mode."""
+
+
+class CrashAfterNSendsClient:
+    """Succeeds for the first ``n`` sends, then "crashes" (raises a
+    BaseException that poll_once does not catch) on the next one."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.sent: list[tuple[str, dict[str, Any]]] = []
+
+    def send_message(self, *, QueueUrl: str, MessageBody: str) -> dict[str, str]:
+        if len(self.sent) >= self.n:
+            raise _SimulatedCrash("process died mid-publish")
+        self.sent.append((QueueUrl, json.loads(MessageBody)))
+        return {"MessageId": "stub-message-id"}
+
+
 def _relay_config(**overrides: Any) -> Any:
     values: dict[str, Any] = {
         "sqs_identity_index_url": VALID_ENV["SQS_IDENTITY_INDEX_URL"],
@@ -303,6 +325,48 @@ def test_mixed_batch_one_failure_does_not_block_others(migrated_db: str) -> None
         assert fail_published_at is None
         assert fail_attempts == 1
         assert fail_error is not None
+
+
+def test_crash_mid_batch_leaves_earlier_row_published_and_later_row_untouched(
+    migrated_db: str,
+) -> None:
+    """Per-row commit boundary, proven directly: row1 publishes and commits;
+    the process then "dies" (a BaseException escapes poll_once, simulating a
+    crash) while row2's SendMessage is in flight, before row2's SELECT ...
+    FOR UPDATE transaction ever writes or commits anything. Row1 must survive
+    the crash; row2 must be completely untouched — not even attempts bumped.
+    """
+    config = _relay_config()
+    payload1 = OutboxPayload(event="enrolment.created", id=uuid4())
+    payload2 = OutboxPayload(event="enrolment.created", id=uuid4())
+
+    with psycopg.connect(migrated_db) as conn:
+        id1 = enqueue_sync(conn, QUEUE_IDENTITY_INDEX, payload1)
+        id2 = enqueue_sync(conn, QUEUE_IDENTITY_INDEX, payload2)
+        conn.commit()
+
+        client = CrashAfterNSendsClient(n=1)
+        with pytest.raises(_SimulatedCrash):
+            poll_once(conn, config, client, BackoffTracker(), logger=_RecordingLogger())
+        assert len(client.sent) == 1, "row1's send must have happened before the crash"
+
+        # Simulate the abrupt process death for real: drop the connection
+        # without an explicit commit/rollback. Postgres itself rolls back
+        # row2's still-open FOR UPDATE transaction on disconnect — exactly
+        # what happens when a real process is killed mid-transaction.
+        conn.close()
+
+    with psycopg.connect(migrated_db) as verify_conn:
+        published_at1, attempts1, error1 = _row_state(verify_conn, id1)
+        published_at2, attempts2, error2 = _row_state(verify_conn, id2)
+
+    assert published_at1 is not None, "row1's commit must survive the crash"
+    assert attempts1 == 0
+    assert error1 is None
+
+    assert published_at2 is None, "row2 must never have been marked"
+    assert attempts2 == 0, "row2 must not even be recorded as a failure"
+    assert error2 is None
 
 
 def test_unknown_queue_name_recorded_as_failure_no_crash(migrated_db: str) -> None:
