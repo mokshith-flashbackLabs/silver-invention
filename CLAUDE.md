@@ -129,9 +129,12 @@ code being written **now**, carrying the same numbers.
    The old repo calls `DeleteFaces` nowhere, under a comment claiming BIPA compliance.
 8. **`MIN_ENROLMENT_AGE` is read from config at request time.** v1 ships at 18. v2 lowers it. That
    must not be a code change.
-9. **No image bytes persisted outside the identity module.** A schema lint test fails the build on any
-   column matching `image|thumbnail|blob|photo|local_path`. If you're tempted to add one, you're
-   solving the wrong problem.
+9. **No image bytes persisted. Anywhere.** We store pointers into the proxy's S3, never payloads.
+   The schema lint has three parts: (a) **no `bytea` column anywhere** — the real rule, since it
+   catches the failure whatever the column is named; (b) a name gate on
+   `/_(data|blob|bytes|b64)$|thumbnail|local_path/`; (c) `*_uri` and `*_url` explicitly allowed.
+   `reference_image_uri` and `source_object_uri` must pass. Match on suffix and type, never on the
+   substring "image". See `INVARIANTS.md` #9.
 19. **Nothing reaches a user from the `review` band without a human decision.** There is no timeout
    that auto-promotes. If the queue backs up, the queue backs up.
 21. **Scores are computed server-side, once.** The old system computes one client-side and one
