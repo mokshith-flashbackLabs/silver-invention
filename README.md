@@ -7,7 +7,7 @@ never calls us, every request carries a service token and an opaque `user_ref`,
 and we hold **no S3 credentials**.
 
 Read [CLAUDE.md](CLAUDE.md) before touching code. System shape:
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (most of it is specified, not in scope).
+[ARCHITECTURE.md](ARCHITECTURE.md) (most of it is specified, not in scope).
 
 ## Stack
 
