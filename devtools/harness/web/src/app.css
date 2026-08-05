@@ -1,0 +1,139 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  background: #0f1117;
+  color: #e6e8ee;
+}
+.shell {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+header h1 {
+  margin: 0 0 4px;
+  font-size: 1.5rem;
+}
+.sub {
+  color: #9aa1b2;
+  margin: 0 0 16px;
+}
+nav {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+nav button {
+  padding: 8px 18px;
+  border-radius: 8px;
+  border: 1px solid #2a2f3d;
+  background: #181b24;
+  color: #e6e8ee;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+nav button.active {
+  background: #2b4bd7;
+  border-color: #2b4bd7;
+}
+.hint {
+  color: #9aa1b2;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+button.primary {
+  padding: 10px 22px;
+  border-radius: 8px;
+  border: none;
+  background: #2b4bd7;
+  color: white;
+  font-size: 1rem;
+  cursor: pointer;
+}
+button.primary:disabled {
+  opacity: 0.5;
+}
+.liveness-box {
+  margin-top: 16px;
+  background: white;
+  border-radius: 12px;
+  padding: 8px;
+}
+.result-card {
+  margin-top: 20px;
+  border: 1px solid #2a2f3d;
+  border-radius: 12px;
+  padding: 16px 20px;
+  background: #181b24;
+}
+.result-card.pass {
+  border-color: #1f9d55;
+}
+.result-card.fail {
+  border-color: #c53030;
+}
+.result-card h2 {
+  margin-top: 0;
+  font-size: 1.1rem;
+}
+.result-card table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.92rem;
+}
+.result-card td,
+.result-card th {
+  padding: 6px 10px;
+  border-bottom: 1px solid #242938;
+  text-align: left;
+}
+.result-card figure {
+  margin: 16px 0 0;
+}
+.result-card img {
+  max-width: 260px;
+  border-radius: 8px;
+  display: block;
+}
+.result-card figcaption {
+  color: #9aa1b2;
+  font-size: 0.8rem;
+  margin-top: 6px;
+  max-width: 420px;
+}
+.hive-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0;
+}
+.hive-form input[type='url'] {
+  width: 320px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #2a2f3d;
+  background: #0f1117;
+  color: #e6e8ee;
+}
+.or {
+  color: #9aa1b2;
+}
+pre.error {
+  background: #2b1214;
+  border: 1px solid #c53030;
+  border-radius: 8px;
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+details pre {
+  max-height: 420px;
+  overflow: auto;
+  background: #0f1117;
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 0.8rem;
+}

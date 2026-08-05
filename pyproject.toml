@@ -36,6 +36,8 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "mypy>=1.13",
     "ruff>=0.7",
+    # devtools/harness only: file-upload form parsing for the local test UI.
+    "python-multipart>=0.0.9",
 ]
 
 [tool.setuptools.packages.find]
