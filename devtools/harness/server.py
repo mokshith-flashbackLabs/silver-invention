@@ -59,10 +59,18 @@ app.add_middleware(
 # ---------------------------------------------------------------- liveness
 
 
+CHALLENGE_TYPES = ("FaceMovementAndLightChallenge", "FaceMovementChallenge")
+
+
 @app.post("/api/liveness/sessions")
-def create_liveness_session() -> dict[str, Any]:
-    resp = rekognition.create_face_liveness_session()
-    return {"session_id": resp["SessionId"], "region": AWS_REGION}
+def create_liveness_session(challenge: str | None = None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if challenge:
+        if challenge not in CHALLENGE_TYPES:
+            raise HTTPException(status_code=422, detail=f"challenge must be one of {CHALLENGE_TYPES}")
+        kwargs["Settings"] = {"ChallengePreferences": [{"Type": challenge}]}
+    resp = rekognition.create_face_liveness_session(**kwargs)
+    return {"session_id": resp["SessionId"], "region": AWS_REGION, "challenge": challenge}
 
 
 @app.get("/api/liveness/sessions/{session_id}/result")

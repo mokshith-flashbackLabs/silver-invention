@@ -23,6 +23,7 @@ export default function LivenessTab() {
   const [checkCount, setCheckCount] = useState(
     () => Number(localStorage.getItem('livenessChecks') || 0),
   )
+  const [challenge, setChallenge] = useState('FaceMovementAndLightChallenge')
 
   const bumpCount = () => {
     const n = checkCount + 1
@@ -35,7 +36,7 @@ export default function LivenessTab() {
     setError(null)
     setResult(null)
     try {
-      const r = await fetch('/api/liveness/sessions', { method: 'POST' })
+      const r = await fetch(`/api/liveness/sessions?challenge=${challenge}`, { method: 'POST' })
       if (!r.ok) throw new Error(`session create failed: ${r.status} ${await r.text()}`)
       setSession(await r.json())
       setPhase('challenge')
@@ -68,9 +69,29 @@ export default function LivenessTab() {
       </p>
 
       {(phase === 'idle' || phase === 'done' || phase === 'error') && (
-        <button className="primary" onClick={start}>
-          Start liveness check
-        </button>
+        <>
+          <div className="challenge-picker">
+            <label>
+              <input
+                type="radio"
+                checked={challenge === 'FaceMovementAndLightChallenge'}
+                onChange={() => setChallenge('FaceMovementAndLightChallenge')}
+              />{' '}
+              Flash challenge (color lights, highest accuracy)
+            </label>
+            <label>
+              <input
+                type="radio"
+                checked={challenge === 'FaceMovementChallenge'}
+                onChange={() => setChallenge('FaceMovementChallenge')}
+              />{' '}
+              No-flash challenge (movement only, faster, photosensitivity-safe)
+            </label>
+          </div>
+          <button className="primary" onClick={start}>
+            Start liveness check
+          </button>
+        </>
       )}
       {phase === 'starting' && <p>Creating Rekognition session…</p>}
 

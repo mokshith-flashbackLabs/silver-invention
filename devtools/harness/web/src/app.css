@@ -103,6 +103,13 @@ button.primary:disabled {
   margin-top: 6px;
   max-width: 420px;
 }
+.challenge-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+  font-size: 0.92rem;
+}
 .hive-form {
   display: flex;
   flex-wrap: wrap;
