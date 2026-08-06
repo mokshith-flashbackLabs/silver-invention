@@ -49,6 +49,34 @@ def _role_exists(conn: psycopg.Connection[tuple[str]]) -> bool:
     return row is not None
 
 
+def _external_dependant_dbs(conn: psycopg.Connection[tuple[str]], own: set[str]) -> set[str]:
+    """Databases OTHER than the test's own that hold grants on the
+    cluster-global ``imageshield_app`` role.
+
+    The role can only be dropped once no database on the cluster grants it
+    anything (the down migration documents this). On a dev machine the
+    persistent compose database (``imageshield``, used by the devtools
+    harness) typically has 0001 applied, so the role legitimately survives a
+    throwaway database's ``down --all``. Tests that assert the role is gone
+    must therefore branch on this, or they fail on any machine where the
+    harness has ever run.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT d.datname"
+        " FROM pg_shdepend s"
+        " JOIN pg_database d ON d.oid = s.dbid"
+        " JOIN pg_roles r ON r.oid = s.refobjid"
+        " WHERE r.rolname = 'imageshield_app'"
+    ).fetchall()
+    return {row[0] for row in rows} - own
+
+
+def _db_name(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).path.lstrip("/")
+
+
 def test_up_from_empty_applies_0001_cleanly(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
 
@@ -80,10 +108,17 @@ def test_down_all_after_up_leaves_no_phase2_objects(throwaway_db: str) -> None:
         tables = _table_names(conn)
         types = _type_names(conn)
         role_exists = _role_exists(conn)
+        external = _external_dependant_dbs(conn, {_db_name(throwaway_db)})
 
     assert tables == {"schema_migrations"}
     assert types == set()
-    assert role_exists is False
+    if external:
+        # Another database on this cluster (e.g. the compose dev database the
+        # harness migrated) still grants the role: the down migration's
+        # documented behaviour is to leave it in place.
+        assert role_exists is True
+    else:
+        assert role_exists is False
 
 
 def test_up_down_up_round_trip(throwaway_db: str) -> None:
@@ -163,10 +198,18 @@ def test_down_all_on_one_db_does_not_break_role_for_sibling_db(
         (count,) = conn.execute("SELECT count(*) FROM audit_log").fetchone()  # type: ignore[misc]
         assert count == 1
 
-    # db B was the last remaining dependant on the role: tearing it down too
-    # must succeed and this time actually remove the role from the cluster.
+    # db B was the last of the TEST databases depending on the role: tearing
+    # it down too must succeed, and — unless some other database on the
+    # cluster (e.g. the compose dev database) still grants the role — must
+    # actually remove it from the cluster.
     down_b = run_migrate(second_throwaway_db, "down", "--all")
     assert down_b.returncode == 0, down_b.stderr
 
+    own = {_db_name(throwaway_db), _db_name(second_throwaway_db)}
     with psycopg.connect(second_throwaway_db, autocommit=True) as conn:
-        assert _role_exists(conn) is False
+        external = _external_dependant_dbs(conn, own)
+        role_exists = _role_exists(conn)
+    if external:
+        assert role_exists is True
+    else:
+        assert role_exists is False
