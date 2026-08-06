@@ -20,7 +20,14 @@ The stored ``reference_image_uri``/``audit_image_uris`` are the presigned
 URLs with the query string stripped: the query is the signature — a
 credential — and must not be persisted or logged.
 
-``enrolled`` is always False here. Indexing is step 4.
+Step 4: after the presigned PUTs succeed on a passed session, the
+ReferenceImage bytes still in memory are indexed into the Rekognition
+collection (``QualityFilter='HIGH'``, ``ExternalImageId=user_ref``), and the
+enrolments row + session consumption + ``NOTIFY enrolment_complete`` land in
+ONE transaction. Quality rejection consumes the session without enrolling
+(response ``reason='quality_rejected'``); a transient indexing failure is a
+503 that writes and consumes nothing, so the proxy retries with the same
+``Idempotency-Key``.
 """
 
 from __future__ import annotations
@@ -33,9 +40,17 @@ import structlog
 from fastapi import APIRouter, Depends, Header
 
 from imageshield.config import Config
+from imageshield.enrolment.faceindex import FaceIndex
+from imageshield.enrolment.models import (
+    QUALITY_REJECTED_REASON,
+    FaceIndexUnavailable,
+    IndexRejected,
+    NewEnrolment,
+)
 from imageshield.http.auth import require_service_token
 from imageshield.http.deps import (
     get_config,
+    get_face_index,
     get_liveness_provider,
     get_liveness_store,
     get_object_uploader,
@@ -57,7 +72,7 @@ from imageshield.liveness.models import (
 from imageshield.liveness.provider import LivenessProvider
 from imageshield.liveness.store import LivenessStore
 from imageshield.liveness.uploader import ObjectUploader
-from imageshield.types import SessionId
+from imageshield.types import SessionId, UserRef
 
 log = structlog.get_logger("imageshield.liveness")
 
@@ -98,15 +113,27 @@ def _require_presigned(url: str) -> None:
         )
 
 
+def _enrolled(row: LivenessSessionRow) -> bool:
+    # A consumed session was necessarily passed — only the enrolment and
+    # quality-rejected paths consume, and the latter sets failure_reason.
+    return row.consumed_at is not None and row.failure_reason is None
+
+
 def _result_response(row: LivenessSessionRow) -> LivenessResultResponse:
-    if row.status not in ("passed", "failed"):
+    status = "passed" if row.status == "consumed" else row.status
+    if status not in ("passed", "failed"):
         raise ServiceError(
             502,
             "liveness_result_inconsistent",
             f"Session finalised with unexpected status {row.status!r}.",
             retryable=True,
         )
-    return LivenessResultResponse(status=row.status, confidence=row.confidence)
+    reason = (
+        "quality_rejected" if row.failure_reason == QUALITY_REJECTED_REASON else None
+    )
+    return LivenessResultResponse(
+        status=status, confidence=row.confidence, enrolled=_enrolled(row), reason=reason
+    )
 
 
 def _expired(row: LivenessSessionRow, now: datetime) -> bool:
@@ -173,6 +200,7 @@ async def post_liveness_result(
     store: LivenessStore = Depends(get_liveness_store),
     provider: LivenessProvider = Depends(get_liveness_provider),
     uploader: ObjectUploader = Depends(get_object_uploader),
+    face_index: FaceIndex = Depends(get_face_index),
 ) -> LivenessResultResponse:
     if idempotency_key is None:
         raise ServiceError(
@@ -196,13 +224,9 @@ async def post_liveness_result(
     row = await store.get_session(sid)
     if row is None:
         raise ServiceError(404, "session_not_found", "Unknown liveness session.", retryable=False)
-    if row.consumed_at is not None:
-        raise ServiceError(
-            410,
-            "liveness_consumed",
-            "This liveness session has already been consumed.",
-            retryable=False,
-        )
+    # Same-key replay check runs FIRST: a consumed (enrolled) session always
+    # has completed_at set, and a legitimate idempotent retry of the call
+    # that consumed it must replay the stored outcome, not 410.
     if row.completed_at is not None:
         if row.result_idempotency_key == idempotency_key:
             return _result_response(row)  # idempotent replay of the same request
@@ -210,6 +234,13 @@ async def post_liveness_result(
             410,
             "liveness_consumed",
             "This liveness session already has a recorded result.",
+            retryable=False,
+        )
+    if row.consumed_at is not None:
+        raise ServiceError(
+            410,
+            "liveness_consumed",
+            "This liveness session has already been consumed.",
             retryable=False,
         )
     if _expired(row, datetime.now(UTC)):
@@ -305,15 +336,91 @@ async def post_liveness_result(
             retryable=True,
         ) from None
 
-    final = await store.finalize_result(
+    # Liveness passed and the frames are persisted. Index the ReferenceImage —
+    # the bytes already in memory from GetFaceLivenessSessionResults; there is
+    # no S3 client to re-fetch with, by design (CLAUDE.md §3.3).
+    source_object_uri = _strip_query(body.reference_put_url)
+    try:
+        indexed = await face_index.index_face(
+            collection_id=cfg.rekognition_collection_id,
+            external_image_id=str(row.user_ref),  # user_ref and NOTHING else
+            image_bytes=result.reference_image,
+        )
+    except FaceIndexUnavailable:
+        # Write nothing, consume nothing: the proxy retries the whole result
+        # call with the same Idempotency-Key (step-4 brief, transient failure).
+        raise ServiceError(
+            503,
+            "face_index_unavailable",
+            "Face indexing is temporarily unavailable; retry with the same"
+            " Idempotency-Key.",
+            retryable=True,
+        ) from None
+
+    if isinstance(indexed, IndexRejected):
+        # Liveness passed; the HIGH quality filter rejected the frame. Consume
+        # the session anyway — leaving it unconsumed would 409-lock the user
+        # out of a fresh attempt — but write NO enrolment.
+        log.info(
+            "liveness.enrolment_quality_rejected",
+            session_id=str(sid),
+            reasons=list(indexed.reasons),
+        )
+        rejected = await store.finalize_quality_rejected(
+            sid,
+            confidence=result.confidence,
+            reference_image_uri=source_object_uri,
+            audit_image_uris=tuple(stored_audit_uris),
+        )
+        if rejected is None:
+            return await _completed_replay(store, sid, idempotency_key)
+        return _finish(rejected, cfg)
+
+    outcome = await store.finalize_enrolled(
         sid,
-        status="passed",
         confidence=result.confidence,
-        failure_reason=None,
-        reference_image_uri=_strip_query(body.reference_put_url),
+        reference_image_uri=source_object_uri,
         audit_image_uris=tuple(stored_audit_uris),
+        enrolment=NewEnrolment(
+            user_ref=UserRef(row.user_ref),
+            collection_id=cfg.rekognition_collection_id,
+            external_face_id=indexed.face_id,
+            quality_score=indexed.quality_score,
+            model_id=indexed.model_id,
+            source_object_uri=source_object_uri,
+        ),
+    )
+    if outcome is None:
+        # A concurrent result call finalized first — the face just indexed is
+        # a duplicate. Remove it so the collection keeps exactly one face per
+        # active enrolment (step-4 done-when), then replay/410 as appropriate.
+        await face_index.delete_faces(cfg.rekognition_collection_id, (indexed.face_id,))
+        return await _completed_replay(store, sid, idempotency_key)
+
+    final, enrolment = outcome
+    log.info(
+        "liveness.enrolled",
+        session_id=str(sid),
+        external_face_id=enrolment.external_face_id,
+        model_id=enrolment.model_id,
+        quality_score=enrolment.quality_score,
     )
     return _finish(final, cfg)
+
+
+async def _completed_replay(
+    store: LivenessStore, sid: SessionId, idempotency_key: str
+) -> LivenessResultResponse:
+    """Race loser's exit: someone else finalized this session mid-flight."""
+    row = await store.get_session(sid)
+    if row is not None and row.result_idempotency_key == idempotency_key:
+        return _result_response(row)
+    raise ServiceError(
+        410,
+        "liveness_consumed",
+        "This liveness session has already been consumed.",
+        retryable=False,
+    )
 
 
 def _finish(row: LivenessSessionRow, cfg: Config) -> LivenessResultResponse:
@@ -336,7 +443,9 @@ async def get_liveness_session(
     row = await store.get_session(SessionId(session_id))
     if row is None:
         raise ServiceError(404, "session_not_found", "Unknown liveness session.", retryable=False)
-    return LivenessStatusResponse(status=_effective_status(row), confidence=row.confidence)
+    return LivenessStatusResponse(
+        status=_effective_status(row), confidence=row.confidence, enrolled=_enrolled(row)
+    )
 
 
 def _effective_status(

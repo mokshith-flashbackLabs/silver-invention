@@ -31,6 +31,14 @@ from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
+from imageshield.enrolment.models import (
+    QUALITY_REJECTED_REASON,
+    EnrolmentRow,
+    FaceIndexUnavailable,
+    IndexedFace,
+    IndexRejected,
+    NewEnrolment,
+)
 from imageshield.http.app import create_app
 from imageshield.liveness.models import (
     CreateRejection,
@@ -73,6 +81,8 @@ class FakeLivenessStore:
 
     def __init__(self) -> None:
         self.rows: dict[UUID, LivenessSessionRow] = {}
+        self.enrolments: dict[UUID, EnrolmentRow] = {}  # keyed by session_id
+        self.notifies: list[str] = []
 
     def add(self, row: LivenessSessionRow) -> LivenessSessionRow:
         self.rows[row.session_id] = row
@@ -148,6 +158,65 @@ class FakeLivenessStore:
             return self.set(session_id, status="expired")
         return self.rows[session_id]
 
+    async def finalize_enrolled(
+        self,
+        session_id: UUID,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+        enrolment: NewEnrolment,
+    ) -> tuple[LivenessSessionRow, EnrolmentRow] | None:
+        if self.rows[session_id].completed_at is not None:
+            return None
+        row = self.set(
+            session_id,
+            status="consumed",
+            confidence=confidence,
+            failure_reason=None,
+            reference_image_uri=reference_image_uri,
+            audit_image_uris=audit_image_uris,
+            completed_at=_now(),
+            consumed_at=_now(),
+        )
+        enrolment_row = EnrolmentRow(
+            enrolment_id=uuid4(),
+            session_id=session_id,
+            user_ref=enrolment.user_ref,
+            collection_id=enrolment.collection_id,
+            external_face_id=enrolment.external_face_id,
+            quality_score=enrolment.quality_score,
+            model_id=enrolment.model_id,
+            source_object_uri=enrolment.source_object_uri,
+            status="active",
+            created_at=_now(),
+            deleted_at=None,
+        )
+        self.enrolments[session_id] = enrolment_row
+        self.notifies.append(str(session_id))
+        return row, enrolment_row
+
+    async def finalize_quality_rejected(
+        self,
+        session_id: UUID,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+    ) -> LivenessSessionRow | None:
+        if self.rows[session_id].completed_at is not None:
+            return None
+        return self.set(
+            session_id,
+            status="consumed",
+            confidence=confidence,
+            failure_reason=QUALITY_REJECTED_REASON,
+            reference_image_uri=reference_image_uri,
+            audit_image_uris=audit_image_uris,
+            completed_at=_now(),
+            consumed_at=_now(),
+        )
+
 
 class FakeLivenessProvider:
     def __init__(self) -> None:
@@ -179,15 +248,58 @@ class FakeUploader:
         self.puts.append((url, data, content_type))
 
 
+class FakeFaceIndex:
+    """In-memory Rekognition collection. Every accepted index mints a fresh
+    FaceId — exactly like the real thing, which is why two lookalikes can
+    never collapse into one identity here: nothing ever searches (this class,
+    like the production FaceIndex protocol, has no search method at all)."""
+
+    def __init__(self) -> None:
+        self.index_calls: list[dict[str, Any]] = []
+        self.faces: dict[str, tuple[str, str]] = {}  # face_id -> (collection, external_image_id)
+        self.next_result: IndexRejected | Exception | None = None
+        self._counter = 0
+
+    async def index_face(
+        self, *, collection_id: str, external_image_id: str, image_bytes: bytes
+    ) -> IndexedFace | IndexRejected:
+        self.index_calls.append(
+            {
+                "collection_id": collection_id,
+                "external_image_id": external_image_id,
+                "image_bytes": image_bytes,
+            }
+        )
+        if isinstance(self.next_result, Exception):
+            raise self.next_result
+        if self.next_result is not None:
+            return self.next_result
+        self._counter += 1
+        face_id = f"face-{self._counter}"
+        self.faces[face_id] = (collection_id, external_image_id)
+        return IndexedFace(face_id=face_id, quality_score=99.0, model_id="rekognition:7.0")
+
+    async def delete_faces(self, collection_id: str, face_ids: tuple[str, ...]) -> None:
+        for face_id in face_ids:
+            self.faces.pop(face_id, None)
+
+    async def list_face_ids(
+        self, collection_id: str, face_ids: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return tuple(face_id for face_id in face_ids if face_id in self.faces)
+
+
 class Harness:
     def __init__(self, **config_overrides: Any) -> None:
         self.store = FakeLivenessStore()
         self.provider = FakeLivenessProvider()
         self.uploader = FakeUploader()
+        self.face_index = FakeFaceIndex()
         app = create_app(config=make_config(**config_overrides))
         app.state.liveness_store = self.store
         app.state.liveness_provider = self.provider
         app.state.object_uploader = self.uploader
+        app.state.face_index = self.face_index
         self.client = TestClient(app)
 
     # -- convenience -------------------------------------------------------
@@ -352,7 +464,12 @@ def test_result_passed_persists_reference_image_through_presigned_put() -> None:
     response = h.result(row.session_id)
 
     assert response.status_code == 200
-    assert response.json() == {"status": "passed", "confidence": 99.5, "enrolled": False}
+    assert response.json() == {
+        "status": "passed",
+        "confidence": 99.5,
+        "enrolled": True,  # step 4: a passed, indexed session enrols
+        "reason": None,
+    }
 
     put_urls = [url for url, _, _ in h.uploader.puts]
     assert put_urls[0].startswith("https://proxy-s3.example/ref.jpg")
@@ -360,7 +477,7 @@ def test_result_passed_persists_reference_image_through_presigned_put() -> None:
     assert len(h.uploader.puts) == 3  # reference + 2 audit frames
 
     stored = h.store.rows[row.session_id]
-    assert stored.status == "passed"
+    assert stored.status == "consumed"  # step 4: enrolment consumes the session
     assert stored.completed_at is not None
     assert stored.reference_image_uri == "https://proxy-s3.example/ref.jpg"
     assert stored.audit_image_uris == (
@@ -391,7 +508,12 @@ def test_result_below_threshold_fails_and_skips_puts() -> None:
     response = h.result(row.session_id)
 
     assert response.status_code == 200
-    assert response.json() == {"status": "failed", "confidence": 85.0, "enrolled": False}
+    assert response.json() == {
+        "status": "failed",
+        "confidence": 85.0,
+        "enrolled": False,
+        "reason": None,
+    }
     assert h.uploader.puts == [], "a failed check must not persist images"
     stored = h.store.rows[row.session_id]
     assert stored.status == "failed"
@@ -580,7 +702,7 @@ def test_result_upload_failure_is_502_then_same_key_retry_succeeds() -> None:
     second = h.result(row.session_id, key="idem-A")
     assert second.status_code == 200
     assert second.json()["status"] == "passed"
-    assert h.store.rows[row.session_id].status == "passed"
+    assert h.store.rows[row.session_id].status == "consumed"  # step 4: retry enrols
 
 
 def test_result_uploads_pair_audit_images_with_urls() -> None:
@@ -663,3 +785,169 @@ def test_get_requires_service_token() -> None:
     row = h.store.add(make_row())
     response = h.client.get(f"/v1/liveness/{row.session_id}")
     assert response.status_code == 401
+
+
+# ── Step 4: enrolment on pass ────────────────────────────────────────────────
+
+
+def test_passed_session_enrols_and_consumes() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "passed",
+        "confidence": 99.5,
+        "enrolled": True,
+        "reason": None,
+    }
+    (call,) = h.face_index.index_calls
+    assert call["external_image_id"] == str(row.user_ref)  # ExternalImageId = user_ref
+    assert call["collection_id"] == "identity-v1"
+    assert call["image_bytes"] == b"reference-jpeg-bytes"  # in-memory bytes, not a re-fetch
+    stored = h.store.rows[row.session_id]
+    assert stored.status == "consumed" and stored.consumed_at is not None
+    enrolment = h.store.enrolments[row.session_id]
+    assert enrolment.source_object_uri == "https://proxy-s3.example/ref.jpg"
+    assert h.store.notifies == [str(row.session_id)]
+
+
+def test_lookalike_users_enrol_as_two_distinct_identities() -> None:
+    """PERMANENT TEST — never delete (step-4 done-when; CLAUDE.md §10).
+
+    Two lookalike faces enrol as two distinct user_refs, each with its own
+    external_face_id. This is the regression guard for the fragmentation bug
+    class that leaks one user's sexual-content matches to another: the old
+    system searched the collection first and minted/overwrote identity from a
+    similarity score (server.js:9585). Identity here comes from the request,
+    every index call mints a fresh FaceId, and FakeFaceIndex — like the
+    production FaceIndex protocol — has no search method at all.
+    """
+    h = Harness()
+    user_a, user_b = uuid4(), uuid4()
+    lookalike = b"nearly-identical-face-jpeg"
+    row_a = h.store.add(make_row(user_ref=user_a))
+    row_b = h.store.add(make_row(user_ref=user_b))
+    for row in (row_a, row_b):
+        h.provider.results[row.provider_session_id] = ProviderResult(
+            status="succeeded",
+            confidence=99.0,
+            reference_image=lookalike,
+            audit_images=(),
+        )
+
+    first = h.result(row_a.session_id, key="idem-a")
+    second = h.result(row_b.session_id, key="idem-b")
+
+    assert first.status_code == 200 and first.json()["enrolled"] is True
+    assert second.status_code == 200 and second.json()["enrolled"] is True
+    enrolment_a = h.store.enrolments[row_a.session_id]
+    enrolment_b = h.store.enrolments[row_b.session_id]
+    assert enrolment_a.user_ref == user_a
+    assert enrolment_b.user_ref == user_b
+    assert enrolment_a.external_face_id != enrolment_b.external_face_id
+    bindings = {binding for _, binding in h.face_index.faces.values()}
+    assert bindings == {str(user_a), str(user_b)}
+    assert not hasattr(h.face_index, "search_faces")  # no search path exists to collapse them
+
+
+def test_quality_rejection_consumes_without_enrolment() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    h.face_index.next_result = IndexRejected(reasons=("LOW_SHARPNESS",))
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "passed",
+        "confidence": 99.5,
+        "enrolled": False,
+        "reason": "quality_rejected",
+    }
+    stored = h.store.rows[row.session_id]
+    assert stored.status == "consumed" and stored.consumed_at is not None
+    assert row.session_id not in h.store.enrolments
+    # Consumed, so the session no longer blocks: a FRESH create is allowed
+    # (no passed-unconsumed 409 lockout).
+    assert h.create(row.user_ref).status_code == 201
+
+
+def test_transient_index_failure_returns_503_and_consumes_nothing() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    h.face_index.next_result = FaceIndexUnavailable("IndexFaces failed with ThrottlingException")
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 503
+    envelope = error_body(response)
+    assert envelope["code"] == "face_index_unavailable" and envelope["retryable"] is True
+    stored = h.store.rows[row.session_id]
+    assert stored.completed_at is None and stored.consumed_at is None
+    assert row.session_id not in h.store.enrolments
+
+    # The proxy retries the whole call with the SAME key once AWS recovers.
+    h.face_index.next_result = None
+    retry = h.result(row.session_id)
+    assert retry.status_code == 200 and retry.json()["enrolled"] is True
+
+
+def test_same_key_replay_after_enrolment_does_not_double_index() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    first = h.result(row.session_id, key="idem-1")
+    assert first.status_code == 200
+
+    replay = h.result(row.session_id, key="idem-1")
+
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert replay.json()["enrolled"] is True
+    assert len(h.face_index.index_calls) == 1  # replay did NOT re-index
+    assert len(h.store.enrolments) == 1
+
+
+def test_different_key_after_enrolment_is_410() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    assert h.result(row.session_id, key="idem-1").status_code == 200
+
+    replay = h.result(row.session_id, key="idem-2")
+
+    assert replay.status_code == 410
+    assert error_body(replay)["code"] == "liveness_consumed"
+    assert len(h.face_index.index_calls) == 1
+
+
+def test_failed_session_never_reaches_the_index() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.provider.results[row.provider_session_id] = ProviderResult(
+        status="failed", confidence=12.0, reference_image=None, audit_images=()
+    )
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 200
+    assert response.json()["enrolled"] is False
+    assert h.face_index.index_calls == []
+
+
+def test_get_status_reports_enrolled() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    h.result(row.session_id)
+
+    response = h.client.get(f"/v1/liveness/{row.session_id}", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "consumed", "confidence": 99.5, "enrolled": True}

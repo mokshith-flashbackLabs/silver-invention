@@ -60,8 +60,11 @@ class LivenessResultRequest(ServiceModel):
 class LivenessResultResponse(BaseModel):
     status: Literal["passed", "failed"]
     confidence: float | None
-    # Always False in step 3 — indexing is step 4 (CLAUDE.md §8).
+    # True iff IndexFaces accepted the ReferenceImage and the enrolments row
+    # was written (step 4). 'passed' + enrolled=False + reason tells the proxy
+    # to start a FRESH liveness session.
     enrolled: bool = False
+    reason: Literal["quality_rejected"] | None = None
 
 
 class LivenessStatusResponse(BaseModel):
