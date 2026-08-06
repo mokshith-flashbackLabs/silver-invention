@@ -12,6 +12,7 @@ things the in-memory fake in ``tests/test_liveness_routes.py`` cannot prove.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ import psycopg
 import pytest
 
 from imageshield.db.connection import make_async_pool
+from imageshield.enrolment.models import QUALITY_REJECTED_REASON, NewEnrolment
 from imageshield.liveness.models import CreateRejection, LivenessSessionRow
 from imageshield.liveness.store import PostgresLivenessStore
 from tests.db import run_migrate
@@ -241,3 +243,117 @@ async def test_mark_expired_sets_status(store: PostgresLivenessStore) -> None:
 
 async def test_get_unknown_session_returns_none(store: PostgresLivenessStore) -> None:
     assert await store.get_session(uuid4()) is None
+
+
+# --- Step 4: finalize_enrolled / finalize_quality_rejected -------------------
+
+
+def _new_enrolment(user_ref: object) -> NewEnrolment:
+    return NewEnrolment(
+        user_ref=user_ref,  # type: ignore[arg-type]
+        collection_id="identity-v1",
+        external_face_id=f"face-{uuid4()}",
+        quality_score=99.5,
+        model_id="rekognition:7.0",
+        source_object_uri="https://proxy-s3.example/ref.jpg",
+    )
+
+
+async def test_finalize_enrolled_consumes_and_inserts_atomically(
+    store: PostgresLivenessStore,
+) -> None:
+    row = await _create(store)
+    await store.claim_result(row.session_id, "idem-1")
+
+    outcome = await store.finalize_enrolled(
+        row.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=("https://proxy-s3.example/audit-0.jpg",),
+        enrolment=_new_enrolment(row.user_ref),
+    )
+
+    assert outcome is not None
+    session, enrolment = outcome
+    assert session.status == "consumed"
+    assert session.consumed_at is not None
+    assert session.completed_at is not None
+    assert session.failure_reason is None
+    assert session.confidence == 98.7
+    assert enrolment.session_id == row.session_id
+    assert enrolment.user_ref == row.user_ref
+    assert enrolment.status == "active"
+    assert enrolment.model_id == "rekognition:7.0"
+
+
+async def test_finalize_enrolled_returns_none_when_already_finalized(
+    store: PostgresLivenessStore,
+) -> None:
+    row = await _create(store)
+    await store.finalize_result(
+        row.session_id,
+        status="failed",
+        confidence=10.0,
+        failure_reason="provider_reported_failure",
+        reference_image_uri=None,
+        audit_image_uris=None,
+    )
+
+    outcome = await store.finalize_enrolled(
+        row.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+        enrolment=_new_enrolment(row.user_ref),
+    )
+
+    assert outcome is None  # and, per the FK, no enrolment row can exist
+    refetched = await store.get_session(row.session_id)
+    assert refetched is not None and refetched.status == "failed"
+
+
+async def test_finalize_quality_rejected_consumes_without_enrolment(
+    store: PostgresLivenessStore, migrated_db: str
+) -> None:
+    row = await _create(store)
+
+    session = await store.finalize_quality_rejected(
+        row.session_id,
+        confidence=97.0,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+    )
+
+    assert session is not None
+    assert session.status == "consumed"
+    assert session.consumed_at is not None
+    assert session.failure_reason == QUALITY_REJECTED_REASON
+    async with await psycopg.AsyncConnection.connect(migrated_db) as conn:
+        cur = await conn.execute(
+            "SELECT count(*) FROM enrolments WHERE session_id = %s", (row.session_id,)
+        )
+        record = await cur.fetchone()
+        assert record is not None and record[0] == 0
+
+
+async def test_finalize_enrolled_emits_notify_in_the_transaction(
+    store: PostgresLivenessStore, migrated_db: str
+) -> None:
+    row = await _create(store)
+    async with await psycopg.AsyncConnection.connect(
+        migrated_db, autocommit=True
+    ) as listener:
+        await listener.execute("LISTEN enrolment_complete")
+
+        await store.finalize_enrolled(
+            row.session_id,
+            confidence=98.7,
+            reference_image_uri="https://proxy-s3.example/ref.jpg",
+            audit_image_uris=(),
+            enrolment=_new_enrolment(row.user_ref),
+        )
+
+        gen = listener.notifies()
+        notification = await asyncio.wait_for(anext(gen), timeout=5)
+        await gen.aclose()
+    assert notification.payload == str(row.session_id)

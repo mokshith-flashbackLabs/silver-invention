@@ -14,6 +14,8 @@ from typing import Any, Protocol
 
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.enrolment.models import QUALITY_REJECTED_REASON, EnrolmentRow, NewEnrolment
+from imageshield.enrolment.store import to_enrolment_row
 from imageshield.liveness.models import CreateRejection, LivenessSessionRow
 from imageshield.types import SessionId, UserRef
 
@@ -77,6 +79,41 @@ _MARK_EXPIRED_SQL = f"""
     RETURNING {_COLUMNS}
 """
 
+# Consumption: UPDATE must precede the enrolment INSERT in the same
+# transaction — migration 0003's composite FK requires the session's CURRENT
+# status to be 'consumed' at insert time. completed_at IS NULL guards against
+# a concurrent finalizer: the second writer sees zero rows and backs off.
+_CONSUME_SQL = f"""
+    UPDATE liveness_sessions
+    SET status = 'consumed',
+        confidence = %(confidence)s,
+        failure_reason = %(failure_reason)s,
+        reference_image_uri = %(reference_image_uri)s,
+        audit_image_uris = %(audit_image_uris)s,
+        completed_at = now(),
+        consumed_at = now()
+    WHERE session_id = %(session_id)s AND completed_at IS NULL
+    RETURNING {_COLUMNS}
+"""
+
+_ENROLMENT_COLUMNS = (
+    "enrolment_id, session_id, user_ref, collection_id, external_face_id,"
+    " quality_score, model_id, source_object_uri, status, created_at, deleted_at"
+)
+
+_INSERT_ENROLMENT_SQL = f"""
+    INSERT INTO enrolments
+      (session_id, session_status, user_ref, collection_id, external_face_id,
+       quality_score, model_id, source_object_uri)
+    VALUES
+      (%(session_id)s, 'consumed', %(user_ref)s, %(collection_id)s,
+       %(external_face_id)s, %(quality_score)s, %(model_id)s,
+       %(source_object_uri)s)
+    RETURNING {_ENROLMENT_COLUMNS}
+"""
+
+_NOTIFY_SQL = "SELECT pg_notify('enrolment_complete', %(session_id)s::text)"
+
 
 class LivenessStore(Protocol):
     async def check_create_allowed(
@@ -108,6 +145,25 @@ class LivenessStore(Protocol):
     ) -> LivenessSessionRow: ...
 
     async def mark_expired(self, session_id: SessionId) -> LivenessSessionRow: ...
+
+    async def finalize_enrolled(
+        self,
+        session_id: SessionId,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+        enrolment: NewEnrolment,
+    ) -> tuple[LivenessSessionRow, EnrolmentRow] | None: ...
+
+    async def finalize_quality_rejected(
+        self,
+        session_id: SessionId,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+    ) -> LivenessSessionRow | None: ...
 
 
 def _to_row(record: tuple[Any, ...]) -> LivenessSessionRow:
@@ -257,3 +313,65 @@ class PostgresLivenessStore:
         if existing is None:
             raise LookupError(f"liveness session {session_id} does not exist")
         return existing
+
+    async def finalize_enrolled(
+        self,
+        session_id: SessionId,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+        enrolment: NewEnrolment,
+    ) -> tuple[LivenessSessionRow, EnrolmentRow] | None:
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                _CONSUME_SQL,
+                {
+                    "session_id": session_id,
+                    "confidence": confidence,
+                    "failure_reason": None,
+                    "reference_image_uri": reference_image_uri,
+                    "audit_image_uris": list(audit_image_uris),
+                },
+            )
+            session_record = await cur.fetchone()
+            if session_record is None:
+                return None  # concurrent finalizer won; caller compensates
+            cur = await conn.execute(
+                _INSERT_ENROLMENT_SQL,
+                {
+                    "session_id": session_id,
+                    "user_ref": enrolment.user_ref,
+                    "collection_id": enrolment.collection_id,
+                    "external_face_id": enrolment.external_face_id,
+                    "quality_score": enrolment.quality_score,
+                    "model_id": enrolment.model_id,
+                    "source_object_uri": enrolment.source_object_uri,
+                },
+            )
+            enrolment_record = await cur.fetchone()
+            assert enrolment_record is not None
+            await conn.execute(_NOTIFY_SQL, {"session_id": session_id})
+        return _to_row(session_record), to_enrolment_row(enrolment_record)
+
+    async def finalize_quality_rejected(
+        self,
+        session_id: SessionId,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+    ) -> LivenessSessionRow | None:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _CONSUME_SQL,
+                {
+                    "session_id": session_id,
+                    "confidence": confidence,
+                    "failure_reason": QUALITY_REJECTED_REASON,
+                    "reference_image_uri": reference_image_uri,
+                    "audit_image_uris": list(audit_image_uris),
+                },
+            )
+            record = await cur.fetchone()
+        return _to_row(record) if record is not None else None
