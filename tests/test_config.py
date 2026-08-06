@@ -121,3 +121,22 @@ def test_outbox_fields_reject_non_positive_values(field: str, bad_value: float) 
 
     with pytest.raises(ValidationError):
         make_config(**{field: bad_value})
+
+
+def test_liveness_cost_defaults_to_devtools_measured_figure(config: Config) -> None:
+    """$0.015 per completed check, measured 2026-08-05 (devtools/harness
+    README). Lives in config because it feeds the step-8 budget logic."""
+    assert config.liveness_cost_per_check_usd == 0.015
+
+
+def test_liveness_cost_env_override(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("LIVENESS_COST_PER_CHECK_USD", "0.02")
+    assert load_config().liveness_cost_per_check_usd == 0.02
+
+
+@pytest.mark.parametrize("bad_value", [0.0, -0.01])
+def test_liveness_cost_rejects_non_positive_values(bad_value: float) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(liveness_cost_per_check_usd=bad_value)

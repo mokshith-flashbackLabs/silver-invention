@@ -27,7 +27,38 @@ For frontend iteration, `npm run dev` serves on :5173 and proxies `/api` to :890
 
 ## Costs
 
-Each completed liveness check ≈ $0.015. Hive calls bill per your key's plan.
+Each completed liveness check ≈ $0.015 (now also `LIVENESS_COST_PER_CHECK_USD` in config — the
+step-8 budget input). Hive calls bill per your key's plan.
+
+## Step-3 service mode (real-device E2E)
+
+The Liveness tab has two modes. "Via ImageShield service" drives the real step-3 endpoints with
+the harness playing the proxy — the browser never talks to the service directly, matching the
+production topology. `/api/fake-s3/*` stands in for proxy-minted presigned URLs: the service PUTs
+the ReferenceImage/AuditImages there and the UI fetches them back, proving an object exists at the
+stored `reference_image_uri`.
+
+```bash
+# 1. local stack (Postgres on :15433) + migrations
+docker compose -f docker-compose.local.yml up -d
+DATABASE_URL=postgresql://imageshield:imageshield@localhost:15433/imageshield \
+  .venv/Scripts/python scripts/migrate.py up
+
+# 2. the real service on :8000
+.venv/Scripts/python -m imageshield
+
+# 3. this harness on :8900 (serves the UI and plays the proxy)
+.venv/Scripts/python -m uvicorn server:app --port 8900 --app-dir devtools/harness
+```
+
+Then open http://localhost:8900 → Liveness → "Via ImageShield service". A real face should come
+back `passed` with the persisted reference image rendered from fake-s3; a photo of a face on
+another screen should come back `failed`. The result card's buttons demonstrate the idempotency
+contract: same-key retry replays the stored 200, a new key gets 410, and a second session create
+after a pass gets 409 (passed-but-unconsumed).
+
+Fake-s3 is in-memory: restarting the harness empties it (stored URIs will 404 afterwards — the
+DB row still proves what was written).
 
 ## What we learned about Hive's API (for the Phase 4 adapter)
 

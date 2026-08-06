@@ -55,6 +55,12 @@ class Config(BaseSettings):
     min_enrolment_age: int
     liveness_session_ttl_seconds: int
     liveness_max_attempts_24h: int
+    # Measured, not guessed: ≈$0.015 per completed Face Liveness check
+    # (devtools/harness README, verified 2026-08-05 against real Rekognition).
+    # Config rather than a devtools note because it feeds the step-8 budget
+    # logic. Defaulted: it is a billing fact, not a secret or an environment
+    # difference.
+    liveness_cost_per_check_usd: float = 0.015
 
     hive_api_key: str
     hive_base_url: str
@@ -144,7 +150,7 @@ class Config(BaseSettings):
             raise ValueError("must be a positive integer")
         return value
 
-    @field_validator("outbox_poll_interval_seconds")
+    @field_validator("outbox_poll_interval_seconds", "liveness_cost_per_check_usd")
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:

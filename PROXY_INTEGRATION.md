@@ -153,7 +153,11 @@ Retry `5xx`, connection errors, and timeouts. Exponential backoff, jitter, max 3
 first is consumed on the client, producing an enrolment that references a session the user never
 completed.
 
-All mutating endpoints accept `Idempotency-Key`. The proxy sends one on every POST.
+All mutating endpoints accept `Idempotency-Key`, with one deliberate exception:
+`POST /v1/liveness/sessions` **rejects** the header with `400` (CLAUDE.md §9). It creates a provider
+session and burns a rate-limit attempt, so a caller must never be allowed to assume retrying it is
+safe. `POST /v1/liveness/{sid}/result` **requires** the header: a same-key retry replays the stored
+outcome; a different key against a completed session gets `410`.
 
 ### Errors
 
@@ -186,8 +190,9 @@ Full shapes in `docs/services/identity.md`. Summary:
 | `GET /v1/users/{id}` | Enrolment + consent status. Never returns vectors or face IDs |
 | `PATCH /v1/users/{id}` | Profile fields. Partial — absent fields untouched |
 | `POST /v1/users/{id}/consent` | Render, hash, store, create DocuSeal submission. Takes `return_url` from the client |
-| `POST /v1/users/{id}/liveness` | Create session. Returns `provider_session_id` for the client SDK |
-| `GET /v1/liveness/{sid}` | Poll result. Triggers enrolment on first `passed` |
+| `POST /v1/liveness/sessions` | Create session (built, step 3). Returns `provider_session_id` for the client SDK. Rejects `Idempotency-Key` — see §3 |
+| `POST /v1/liveness/{sid}/result` | Retrieve + persist the result (built, step 3). Requires `Idempotency-Key` and presigned PUT URLs. `enrolled` is always `false` until step 4 |
+| `GET /v1/liveness/{sid}` | Read session status (built, step 3). Pure read — no side effects; enrolment is triggered by the result call, from step 4 |
 | `POST /v1/users/{id}/enrolment/upload-url` | Presigned PUT for a selfie. See §5 |
 | `DELETE /v1/users/{id}` | `DeleteFaces` → verify → tombstone |
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |

@@ -246,18 +246,34 @@ finding out before the integration is built rather than after.
 
 ## 8. Build order (this repo)
 
-Per `NEAR-TERM-BUILD.md`:
+**This numbering is canonical.** `BUILD-PROMPT-v1.md` groups the same work into 5 coarser phases
+(its Phase 3 = steps 3–4, its Phase 4 = steps 5–8, its Phase 5 = step 9). When they disagree on
+granularity, follow this list and say which step you are on.
 
-1. Repo scaffold, config validation at boot, service-token auth middleware, migrations in CI.
-2. Schema lint test (invariant #9) — verify it fails when you add a `thumbnail_uri` column.
+1. Repo scaffold, config validation at boot, service-token auth, migrations in CI.
+2. Migration 0001 + schema lint (invariant #9) + transactional outbox and relay.
+   Verify the lint by adding `photo bytea` and watching the build fail — **not**
+   `thumbnail_uri`, which is a legitimate column name under #9(c).
 3. Liveness session lifecycle + Rekognition integration.
 4. Enrolment from `ReferenceImage`, `DeleteFaces` path.
 5. Provider adapter interface + first adapter.
 6. URL normalisation, dedup, attestations.
 7. Calibration harness + banding.
 8. Cost tracking, circuit breakers, kill switches.
+9. **Infrastructure and CI.** IaC for SQS + DLQs, the `identity-v1` collection, per-module DB roles,
+   and an IAM role with **no `s3:*` permissions**. Blocking CI gates: mypy strict, schema lint,
+   route-auth coverage, and greps for `SearchFacesByImage` and any S3 client. Plus
+   `docs/OPERATIONS.md`.
+
+Step 9 is not optional and not last-by-importance. The IAM grant is one of only three places the
+data boundary is enforced by something other than discipline — the other two are the schema lint
+(step 2) and the structlog redaction processor (step 1).
 
 Do not start step 5 before step 4 is verified end-to-end on a real device.
+
+Spike work — throwaway harnesses, vendor evaluation, credential and region checks — belongs in
+`devtools/`, outside the numbered steps. It does not advance the build order, and it should not be
+reported as a step being complete.
 
 ---
 

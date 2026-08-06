@@ -7,18 +7,30 @@ Run:
     .venv/Scripts/python -m uvicorn server:app --port 8900 --app-dir devtools/harness
 
 Then open http://localhost:8900 (after building the frontend in web/).
+
+For the step-3 real-device E2E, the harness also plays the PROXY in front of
+the real ImageShield service (``python -m imageshield`` on :8000):
+
+- ``/api/service/liveness/*`` forwards to the service with the local
+  ``SERVICE_TOKEN`` — the browser never talks to the service directly, same
+  topology as production (Client -> Proxy -> Services);
+- ``/api/fake-s3/{key}`` is the stand-in for proxy-minted presigned URLs:
+  the service PUTs the ReferenceImage/AuditImages here and the UI GETs them
+  back, which is how "an object exists at that URI" gets verified locally.
 """
 
 from __future__ import annotations
 
 import base64
+import uuid
 from pathlib import Path
 from typing import Any
 
 import boto3  # noqa: TID251 — dev harness, not service code
 import httpx
-from fastapi import FastAPI, Form, HTTPException, UploadFile
+from fastapi import FastAPI, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +58,14 @@ LIVENESS_MIN_CONFIDENCE = float(ENV.get("LIVENESS_MIN_CONFIDENCE", "90"))
 GOOGLE_VISION_API_KEY = ENV.get("GOOGLE_VISION_API_KEY", "")
 GOOGLE_VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
 
+# The real ImageShield service (step 3), started separately with
+# `.venv/Scripts/python -m imageshield`. The harness forwards to it as the
+# proxy would, carrying the shared service token from .env.local.
+SERVICE_BASE_URL = ENV.get("SERVICE_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+SERVICE_TOKEN = ENV.get("SERVICE_TOKEN", "")
+# Where the service reaches THIS harness for the fake presigned PUTs.
+HARNESS_BASE_URL = ENV.get("HARNESS_BASE_URL", "http://127.0.0.1:8900").rstrip("/")
+
 rekognition = boto3.client("rekognition", region_name=AWS_REGION)
 sts = boto3.client("sts", region_name=AWS_REGION)
 
@@ -69,7 +89,9 @@ def create_liveness_session(challenge: str | None = None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if challenge:
         if challenge not in CHALLENGE_TYPES:
-            raise HTTPException(status_code=422, detail=f"challenge must be one of {CHALLENGE_TYPES}")
+            raise HTTPException(
+                status_code=422, detail=f"challenge must be one of {CHALLENGE_TYPES}"
+            )
         kwargs["Settings"] = {"ChallengePreferences": [{"Type": challenge}]}
     resp = rekognition.create_face_liveness_session(**kwargs)
     return {"session_id": resp["SessionId"], "region": AWS_REGION, "challenge": challenge}
@@ -114,6 +136,109 @@ def aws_creds() -> dict[str, str]:
         "sessionToken": c["SessionToken"],
         "expiration": c["Expiration"].isoformat(),
     }
+
+
+# ------------------------------------------- step-3 service (harness-as-proxy)
+
+# In production the proxy mints presigned S3 PUT/GET URLs. Locally there is
+# deliberately no S3 anywhere near this repo, so the harness IS the bucket:
+# an in-memory dict keyed by object path. Restarting the harness empties it.
+FAKE_S3: dict[str, bytes] = {}
+
+
+@app.put("/api/fake-s3/{key:path}")
+async def fake_s3_put(key: str, request: Request) -> dict[str, Any]:
+    FAKE_S3[key] = await request.body()
+    return {"stored": key, "bytes": len(FAKE_S3[key])}
+
+
+@app.get("/api/fake-s3/{key:path}")
+def fake_s3_get(key: str) -> Response:
+    data = FAKE_S3.get(key)
+    if data is None:
+        raise HTTPException(status_code=404, detail="no such object")
+    return Response(content=data, media_type="image/jpeg")
+
+
+def _service_headers() -> dict[str, str]:
+    if not SERVICE_TOKEN:
+        raise HTTPException(
+            status_code=500, detail="SERVICE_TOKEN missing from .env.local"
+        )
+    return {"X-Service-Token": SERVICE_TOKEN}
+
+
+def _passthrough(resp: httpx.Response) -> JSONResponse:
+    """Return the service's response verbatim (status + body) so the UI shows
+    the real contract — 201/200/400/404/409/410/429 and the error envelope."""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {"non_json_body": resp.text[:2000]}
+    return JSONResponse(status_code=resp.status_code, content=body)
+
+
+# The last Idempotency-Key used per session, so the UI can demonstrate the
+# difference between a same-key retry (200 replay) and a new-key replay (410).
+_LAST_RESULT_KEY: dict[str, str] = {}
+
+
+@app.post("/api/service/liveness/sessions")
+async def service_create_session(payload: dict[str, Any]) -> JSONResponse:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{SERVICE_BASE_URL}/v1/liveness/sessions",
+            json={"user_ref": payload.get("user_ref")},
+            headers=_service_headers(),
+        )
+    return _passthrough(resp)
+
+
+@app.post("/api/service/liveness/{session_id}/result")
+async def service_post_result(
+    session_id: str, payload: dict[str, Any] | None = None
+) -> JSONResponse:
+    reuse_key = bool(payload and payload.get("reuse_key"))
+    if reuse_key and session_id in _LAST_RESULT_KEY:
+        idempotency_key = _LAST_RESULT_KEY[session_id]
+    else:
+        idempotency_key = str(uuid.uuid4())
+        _LAST_RESULT_KEY[session_id] = idempotency_key
+
+    prefix = f"liveness/{session_id}"
+    reference_put_url = f"{HARNESS_BASE_URL}/api/fake-s3/{prefix}/reference.jpg"
+    audit_put_urls = [
+        f"{HARNESS_BASE_URL}/api/fake-s3/{prefix}/audit-{i}.jpg" for i in range(4)
+    ]
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{SERVICE_BASE_URL}/v1/liveness/{session_id}/result",
+            json={"reference_put_url": reference_put_url, "audit_put_urls": audit_put_urls},
+            headers={**_service_headers(), "Idempotency-Key": idempotency_key},
+        )
+    out = _passthrough(resp)
+    if resp.status_code == 200:
+        # Hand the UI the GET URLs so it can prove the objects exist at the
+        # stored URIs ("done when": an object exists at that URI).
+        body = resp.json()
+        body["reference_image_url"] = f"/api/fake-s3/{prefix}/reference.jpg"
+        body["audit_image_urls"] = [
+            f"/api/fake-s3/{prefix}/audit-{i}.jpg"
+            for i in range(4)
+            if f"{prefix}/audit-{i}.jpg" in FAKE_S3
+        ]
+        body["idempotency_key"] = idempotency_key
+        return JSONResponse(status_code=200, content=body)
+    return out
+
+
+@app.get("/api/service/liveness/{session_id}")
+async def service_get_session(session_id: str) -> JSONResponse:
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{SERVICE_BASE_URL}/v1/liveness/{session_id}", headers=_service_headers()
+        )
+    return _passthrough(resp)
 
 
 # -------------------------------------------------------------------- hive

@@ -18,6 +18,10 @@ from imageshield.config import Config
 if TYPE_CHECKING:
     from psycopg_pool import AsyncConnectionPool
 
+    from imageshield.liveness.provider import LivenessProvider
+    from imageshield.liveness.store import LivenessStore
+    from imageshield.liveness.uploader import ObjectUploader
+
 DbCheck = Callable[[], Awaitable[None]]
 
 
@@ -38,3 +42,28 @@ async def _db_not_ready() -> None:
 def get_db_check(request: Request) -> DbCheck:
     check: DbCheck = getattr(request.app.state, "db_check", _db_not_ready)
     return check
+
+
+def _required_state(request: Request, attribute: str) -> object:
+    value = getattr(request.app.state, attribute, None)
+    if value is None:
+        raise RuntimeError(
+            f"app.state.{attribute} is not wired — the lifespan sets it in production;"
+            " tests must set it explicitly"
+        )
+    return value
+
+
+def get_liveness_store(request: Request) -> LivenessStore:
+    store: LivenessStore = _required_state(request, "liveness_store")  # type: ignore[assignment]
+    return store
+
+
+def get_liveness_provider(request: Request) -> LivenessProvider:
+    provider: LivenessProvider = _required_state(request, "liveness_provider")  # type: ignore[assignment]
+    return provider
+
+
+def get_object_uploader(request: Request) -> ObjectUploader:
+    uploader: ObjectUploader = _required_state(request, "object_uploader")  # type: ignore[assignment]
+    return uploader

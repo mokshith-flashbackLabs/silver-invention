@@ -64,10 +64,11 @@ mypy_path = "src"
 packages = ["imageshield"]
 
 [[tool.mypy.overrides]]
-# boto3 ships no bundled type stubs and this repo doesn't depend on
-# boto3-stubs/mypy-boto3 (relay.py, the sole importer, wraps every call it
-# needs behind the hand-written `SqsClient` Protocol instead).
-module = "boto3"
+# boto3/botocore ship no bundled type stubs and this repo doesn't depend on
+# boto3-stubs/mypy-boto3 (the two importers — relay.py and
+# liveness/provider.py — wrap the calls they need behind hand-written
+# Protocols instead).
+module = ["boto3", "botocore", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
@@ -89,10 +90,13 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]
 # enqueue must land in one Postgres transaction, not a Postgres write plus a
 # same-process SendMessage. Route all producers through
 # `imageshield.outbox.enqueue` / `enqueue_sync` instead.
-"boto3" = { msg = "Direct SQS access bypasses the transactional outbox — use imageshield.outbox.enqueue() instead. Only the relay (src/imageshield/relay.py, Task 4) is allowed to import boto3." }
+"boto3" = { msg = "Direct SQS access bypasses the transactional outbox — use imageshield.outbox.enqueue() instead. Only the relay (src/imageshield/relay.py) and the Rekognition liveness provider (src/imageshield/liveness/provider.py) may import boto3 — and NEVER for an S3 client (CLAUDE.md §3.3)." }
 
 [tool.ruff.lint.per-file-ignores]
-# The relay (Task 4) is the one place allowed to publish to SQS directly —
-# it's the consumer side of the outbox pattern, reading unpublished rows and
-# calling SendMessage itself.
+# The two sanctioned boto3 importers:
+# - the relay (Task 4): the consumer side of the outbox pattern, the only
+#   place that calls SendMessage;
+# - the liveness provider (step 3): Rekognition Face Liveness only. No S3
+#   client anywhere — presigned URLs via httpx are the only S3 path.
 "src/imageshield/relay.py" = ["TID251"]
+"src/imageshield/liveness/provider.py" = ["TID251"]
