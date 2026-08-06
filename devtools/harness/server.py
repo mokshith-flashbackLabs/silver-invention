@@ -43,6 +43,8 @@ ENV = _load_env_local()
 HIVE_API_KEY = ENV.get("HIVE_API_KEY", "")
 HIVE_BASE_URL = ENV.get("HIVE_BASE_URL", "https://api.thehive.ai").rstrip("/")
 LIVENESS_MIN_CONFIDENCE = float(ENV.get("LIVENESS_MIN_CONFIDENCE", "90"))
+GOOGLE_VISION_API_KEY = ENV.get("GOOGLE_VISION_API_KEY", "")
+GOOGLE_VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
 
 rekognition = boto3.client("rekognition", region_name=AWS_REGION)
 sts = boto3.client("sts", region_name=AWS_REGION)
@@ -171,6 +173,81 @@ async def hive_search(
     return {
         "http_status": resp.status_code,
         "matches": _summarise_hive(payload),
+        "raw_payload": payload,
+    }
+
+
+# ------------------------------------------------------- google web detection
+
+
+@app.post("/api/google/search")
+async def google_search(
+    media: UploadFile | None = None, url: str | None = Form(default=None)
+) -> dict[str, Any]:
+    """Google Cloud Vision WEB_DETECTION — image-search kind, like Hive.
+
+    Response sections (see raw_payload): fullMatchingImages (exact copies),
+    partialMatchingImages (crops/variants), pagesWithMatchingImages (backlink
+    equivalent), visuallySimilarImages (loose), webEntities (what Google
+    thinks the image depicts, with scores).
+    """
+    if not GOOGLE_VISION_API_KEY:
+        raise HTTPException(
+            status_code=400,
+            detail="GOOGLE_VISION_API_KEY missing — add it to .env.local and restart the harness",
+        )
+    if media is None and not url:
+        raise HTTPException(status_code=422, detail="provide an image file ('media') or a 'url'")
+
+    if media is not None:
+        content = await media.read()  # stays in memory only
+        image: dict[str, Any] = {"content": base64.b64encode(content).decode("ascii")}
+    else:
+        image = {"source": {"imageUri": url}}
+
+    body = {
+        "requests": [
+            {"image": image, "features": [{"type": "WEB_DETECTION", "maxResults": 50}]}
+        ]
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            GOOGLE_VISION_ENDPOINT, params={"key": GOOGLE_VISION_API_KEY}, json=body
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"non_json_body": resp.text[:2000]}
+
+    wd = {}
+    if isinstance(payload, dict):
+        responses = payload.get("responses") or [{}]
+        wd = responses[0].get("webDetection") or {}
+
+    def flatten(section: str, score_key: str = "score") -> list[dict[str, Any]]:
+        return [
+            {"kind": section, "url": item.get("url", ""), "score": item.get(score_key)}
+            for item in wd.get(section) or []
+        ]
+
+    matches = (
+        flatten("fullMatchingImages")
+        + flatten("partialMatchingImages")
+        + flatten("pagesWithMatchingImages")
+    )
+    return {
+        "http_status": resp.status_code,
+        "matches": matches,
+        "entities": [
+            {"description": e.get("description"), "score": e.get("score")}
+            for e in wd.get("webEntities") or []
+            if e.get("description")
+        ],
+        "best_guess": [
+            label.get("label") for label in wd.get("bestGuessLabels") or []
+        ],
+        "similar_count": len(wd.get("visuallySimilarImages") or []),
         "raw_payload": payload,
     }
 
