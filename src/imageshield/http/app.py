@@ -25,6 +25,7 @@ from fastapi import FastAPI
 
 from imageshield.config import APP_VERSION, Config, load_config
 from imageshield.db.connection import make_async_pool, make_db_check
+from imageshield.enrolment.faceindex import RekognitionFaceIndex
 from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
 from imageshield.http.routes.health import router as health_router
@@ -54,6 +55,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.liveness_provider = RekognitionLivenessProvider(region=cfg.aws_region)
     if getattr(app.state, "object_uploader", None) is None:
         app.state.object_uploader = HttpxObjectUploader()
+    if getattr(app.state, "face_index", None) is None:
+        app.state.face_index = RekognitionFaceIndex(region=cfg.aws_region)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     if cfg.auth_disabled:

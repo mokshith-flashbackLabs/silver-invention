@@ -18,6 +18,8 @@ from imageshield.config import Config
 if TYPE_CHECKING:
     from psycopg_pool import AsyncConnectionPool
 
+    from imageshield.enrolment.faceindex import FaceIndex
+    from imageshield.enrolment.store import EnrolmentStore
     from imageshield.liveness.provider import LivenessProvider
     from imageshield.liveness.store import LivenessStore
     from imageshield.liveness.uploader import ObjectUploader
@@ -67,3 +69,13 @@ def get_liveness_provider(request: Request) -> LivenessProvider:
 def get_object_uploader(request: Request) -> ObjectUploader:
     uploader: ObjectUploader = _required_state(request, "object_uploader")  # type: ignore[assignment]
     return uploader
+
+
+def get_face_index(request: Request) -> FaceIndex:
+    face_index: FaceIndex = _required_state(request, "face_index")  # type: ignore[assignment]
+    return face_index
+
+
+def get_enrolment_store(request: Request) -> EnrolmentStore:
+    store: EnrolmentStore = _required_state(request, "enrolment_store")  # type: ignore[assignment]
+    return store
