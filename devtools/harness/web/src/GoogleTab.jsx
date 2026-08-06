@@ -108,7 +108,10 @@ export default function GoogleTab() {
           )}
           {resp.entities?.length > 0 && (
             <details>
-              <summary>Web entities ({resp.entities.length})</summary>
+              <summary>
+                Google&apos;s content guesses ({resp.entities.length}) — what it thinks is IN the
+                image, not where it appears
+              </summary>
               <table>
                 <tbody>
                   {resp.entities.map((e, i) => (

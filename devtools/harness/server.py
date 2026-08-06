@@ -239,11 +239,16 @@ async def google_search(
     return {
         "http_status": resp.status_code,
         "matches": matches,
-        "entities": [
-            {"description": e.get("description"), "score": e.get("score")}
-            for e in wd.get("webEntities") or []
-            if e.get("description")
-        ],
+        # Google's guesses at image CONTENT (not matches) — noisy below ~0.5.
+        "entities": sorted(
+            (
+                {"description": e.get("description"), "score": e.get("score")}
+                for e in wd.get("webEntities") or []
+                if e.get("description") and (e.get("score") or 0) >= 0.5
+            ),
+            key=lambda e: e["score"] or 0,
+            reverse=True,
+        ),
         "best_guess": [
             label.get("label") for label in wd.get("bestGuessLabels") or []
         ],
