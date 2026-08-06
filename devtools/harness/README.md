@@ -39,3 +39,13 @@ Each completed liveness check ≈ $0.015. Hive calls bill per your key's plan.
 - Which product a key hits is determined by the Hive **project** the key belongs to, not the URL.
 - Record the verbatim response as `raw_payload` (CLAUDE.md §7.2); the harness shows it unparsed
   for exactly this reason.
+
+## Observed: Google Web Detection (2026-08-06)
+
+- Full/partial matches carry **no similarity score** (`score: null`) — a production adapter's
+  score mapping must be category-based (full match / partial match / page), not numeric.
+- Web entities name **famous people only** (knowledge-graph lookup); non-public figures get
+  generic content labels. Google deliberately does not identify faces.
+- Confirms CLAUDE.md §7.1 empirically: image-search providers (Google, Hive) find copies of a
+  known photo; they can never find a *different* photo of the same person, so deepfake coverage
+  requires a face-search provider — none is integrated yet.
