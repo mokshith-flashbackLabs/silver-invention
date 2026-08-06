@@ -26,8 +26,10 @@ from fastapi import FastAPI
 from imageshield.config import APP_VERSION, Config, load_config
 from imageshield.db.connection import make_async_pool, make_db_check
 from imageshield.enrolment.faceindex import RekognitionFaceIndex
+from imageshield.enrolment.store import PostgresEnrolmentStore
 from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
+from imageshield.http.routes.enrolments import router as enrolments_router
 from imageshield.http.routes.health import router as health_router
 from imageshield.http.routes.liveness import router as liveness_router
 from imageshield.http.routes.ping import admin_router, v1_router
@@ -57,6 +59,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.object_uploader = HttpxObjectUploader()
     if getattr(app.state, "face_index", None) is None:
         app.state.face_index = RekognitionFaceIndex(region=cfg.aws_region)
+    if getattr(app.state, "enrolment_store", None) is None:
+        app.state.enrolment_store = PostgresEnrolmentStore(pool)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     if cfg.auth_disabled:
@@ -91,5 +95,6 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(v1_router)
     app.include_router(liveness_router)
+    app.include_router(enrolments_router)
     app.include_router(admin_router)
     return app
