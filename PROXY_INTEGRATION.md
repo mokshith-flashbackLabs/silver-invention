@@ -191,13 +191,19 @@ Full shapes in `docs/services/identity.md`. Summary:
 | `PATCH /v1/users/{id}` | Profile fields. Partial — absent fields untouched |
 | `POST /v1/users/{id}/consent` | Render, hash, store, create DocuSeal submission. Takes `return_url` from the client |
 | `POST /v1/liveness/sessions` | Create session (built, step 3). Returns `provider_session_id` for the client SDK. Rejects `Idempotency-Key` — see §3 |
-| `POST /v1/liveness/{sid}/result` | Retrieve + persist the result (built, step 3). Requires `Idempotency-Key` and presigned PUT URLs. `enrolled` is always `false` until step 4 |
-| `GET /v1/liveness/{sid}` | Read session status (built, step 3). Pure read — no side effects; enrolment is triggered by the result call, from step 4 |
+| `POST /v1/liveness/{sid}/result` | Retrieve + persist the result, index on pass (built, steps 3–4). Requires `Idempotency-Key` and presigned PUT URLs. `enrolled: true` once `IndexFaces` succeeds; `passed` + `enrolled: false` + `reason: 'quality_rejected'` means the frame failed the HIGH quality gate — start a FRESH session. 503 (`face_index_unavailable`) means retry with the same key |
+| `GET /v1/liveness/{sid}` | Read session status + `enrolled` (built, steps 3–4). Pure read — no side effects; enrolment is triggered by the result call |
 | `POST /v1/users/{id}/enrolment/upload-url` | Presigned PUT for a selfie. See §5 |
-| `DELETE /v1/users/{id}` | `DeleteFaces` → verify → tombstone |
+| `DELETE /v1/enrolments/{user_ref}` | `DeleteFaces` → verify via `ListFaces` → tombstone (built, step 4). Idempotent 204; nothing calls it in v1. Full user deletion (`DELETE /v1/users/{id}`) remains specified-not-built — this is the enrolment-owning piece of it |
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |
 | `GET /v1/hits/{hit_id}/crop` | Blurred face crop, streamed. `Cache-Control: no-store` |
 | `POST /v1/admin/backfill` | Trigger a backfill run. Admin token required |
+
+### Enrolment completion also signals via `NOTIFY`
+
+A successful enrolment emits Postgres `NOTIFY enrolment_complete` with the `session_id` as payload,
+inside the writing transaction (CLAUDE.md §9). Treat it as a wake-up only — read authoritative state
+from the table; the synchronous result response already carries the same outcome.
 
 ### `return_url` is client-supplied
 

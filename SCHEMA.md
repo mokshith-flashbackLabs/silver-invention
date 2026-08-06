@@ -146,6 +146,15 @@ Both FKs are `NOT NULL`. **The schema makes it impossible to enrol a face withou
 a signed consent record.** That's the invariant from three messages ago, expressed where it can't be
 forgotten.
 
+**Built in v1 (migration 0003):** the "no enrolment without a passed session" half of that invariant
+already holds at the DB level. `liveness_sessions` carries `UNIQUE (session_id, status)`, and the v1
+`enrolments` table carries `session_status liveness_status NOT NULL DEFAULT 'consumed'` with
+`CHECK (session_status = 'consumed')` plus a composite FK `(session_id, session_status) →
+liveness_sessions (session_id, status)`. An enrolment row can only reference a session whose current
+status is `'consumed'` — and only passed sessions are ever consumed. The FK also pins a consumed
+session's status while its enrolment exists. The v2 migration must preserve this mechanism (or an
+equivalent constraint) when the `consent_id` FK is added.
+
 `source_object_uri` points at the user's own selfie in your bucket. Keep it — it is the only way to
 re-embed the whole userbase when you move off Rekognition without making everyone redo liveness.
 
