@@ -881,10 +881,15 @@ Banding sits in the write path of a scan, and a crash there would fail a run
 over a provider's malformed row. ``review`` means a human looks, which is the
 correct outcome for anything we do not understand.
 
-**No arithmetic across providers.** No mean, no average, no max-of-scores —
-only max-of-ordinal-band. Provider A's 0.92 and Provider B's 0.92 are
-different quantities with different distributions (CLAUDE.md §7.2), and an
-average of them is a meaningless number that looks entirely plausible.
+**No arithmetic across providers.** Nothing here combines two providers'
+scores — not by summing them, not by taking a central value, not by
+comparing them. The only combination is max-of-ordinal-band. Provider A's
+0.92 and Provider B's 0.92 are different quantities with different
+distributions (CLAUDE.md §7.2), and combining them yields a meaningless
+number that looks entirely plausible.
+
+Phrased without the forbidden words on purpose: ``test_boundaries.py`` greps
+this directory for them and has no allowlist, which is the point.
 """
 
 from __future__ import annotations
@@ -5099,7 +5104,9 @@ def test_no_cross_provider_averaging_in_scoring_code() -> None:
 python -m pytest tests/test_boundaries.py -v
 ```
 
-Expected: PASS. **If it fails, do not add an allowlist** — read the offending line and remove the arithmetic. The one likely false positive is prose in a docstring saying "average"; reword the prose.
+Expected: PASS. **If it fails, do not add an allowlist** — read the offending line and remove the arithmetic.
+
+The grep scans docstrings and comments, not just code, and that is deliberate: a module explaining at length why it does not average scores is indistinguishable, to a grep, from one that does. Task 2's `bands.py` docstring is already worded to state the rule without using the words — if a later edit reintroduces them in prose, reword the prose rather than weakening the test. An allowlist here would be a hole in the only mechanical guard against the mistake `NEAR-TERM-BUILD.md` §2.3 originally asked for.
 
 - [ ] **Step 3: Verify the tripwire actually catches something**
 
