@@ -63,7 +63,7 @@ class FakeStore:
     async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None:
         self.calls.append((run_id, result))
 
-    async def record_matches(
+    async def record_infringements(
         self,
         run_id: UUID,
         user_ref: UserRef,

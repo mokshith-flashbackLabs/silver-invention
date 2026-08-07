@@ -37,7 +37,7 @@ class WorkerFakeStore:
         if self.fail_execution:
             raise RuntimeError("db went away")
 
-    async def record_matches(self, *a: Any, **k: Any) -> int:
+    async def record_infringements(self, *a: Any, **k: Any) -> int:
         return 0
 
     async def complete_run(

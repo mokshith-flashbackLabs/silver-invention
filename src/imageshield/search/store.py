@@ -9,19 +9,27 @@ Load-bearing choices:
   queued → running exactly once, completed never re-executes, and a
   'running' claim older than ``_STALE_CLAIM_MINUTES`` is reclaimable (a
   worker died mid-run; SQS redelivered).
-- ``record_matches`` writes ``band = 'review'`` unconditionally. No
+- ``record_infringements`` writes ``band = 'review'`` unconditionally. No
   calibration exists yet (step 7), and an uncalibrated provider must not be
   able to tell someone their face was found without a human looking first.
-- The url_hash is normalisation v1 (``search/urlhash.py``); the unique index
-  ``(run_id, url_hash, provider_id)`` + ``ON CONFLICT DO NOTHING`` makes
-  duplicate deliveries and repeated provider entries harmless.
+- Writes are **upserts, never appends** (step 6). One infringement per
+  ``(user_ref, url_hash)``, one attestation per ``(infringement, provider)``,
+  and a rescan that finds the same unchanged URL updates counters instead of
+  inserting. Row count grows with content, not with time.
+- The url_hash is normalisation v1 (``search/urlhash.py``), computed over the
+  **page** where a provider reports one — the page is what a user acts on.
+
+Two counters that are easy to confuse: ``seen_count`` counts provider
+observations of an infringement (two providers in one run bump it twice), so
+it answers "how often has anything seen this". ``confirm_count`` is
+per-provider and is the clean per-provider signal.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from uuid import UUID
 
 from psycopg.types.json import Jsonb
@@ -36,8 +44,19 @@ from imageshield.search.models import (
     SeedRow,
 )
 from imageshield.search.provider import ProviderMatch, ProviderResult
-from imageshield.search.urlhash import source_domain, url_hash
-from imageshield.types import ProviderId, UserRef, parse_provider_id, parse_user_ref
+from imageshield.search.urlhash import (
+    NORMALISATION_VERSION,
+    canonicalise,
+    source_domain,
+    url_hash,
+)
+from imageshield.types import (
+    ProviderId,
+    UrlHash,
+    UserRef,
+    parse_provider_id,
+    parse_user_ref,
+)
 
 RUN_REQUESTED_EVENT = "search.run_requested"
 
@@ -96,27 +115,51 @@ _RECORD_CALL_SQL = """
 """
 
 _UPSERT_URL_SQL = """
-    INSERT INTO content_urls (url_hash, url, source_domain)
-    VALUES (%(url_hash)s, %(url)s, %(source_domain)s)
+    INSERT INTO content_urls (url_hash, url, source_domain, canonical_url,
+                              normalisation_version)
+    VALUES (%(url_hash)s, %(url)s, %(source_domain)s, %(canonical_url)s,
+            %(normalisation_version)s)
     ON CONFLICT (url_hash) DO UPDATE SET last_seen_at = now()
 """
 
-_INSERT_MATCH_SQL = """
-    INSERT INTO search_matches (run_id, url_hash, user_ref, provider_id,
-                                image_url, page_url, provider_score, score_version,
-                                band, score_kind, provider_category, query_quality)
-    VALUES (%(run_id)s, %(url_hash)s, %(user_ref)s, %(provider_id)s,
-            %(image_url)s, %(page_url)s, %(provider_score)s, %(score_version)s,
-            'review', %(score_kind)s, %(provider_category)s, %(query_quality)s)
-    ON CONFLICT (run_id, url_hash, provider_id) DO NOTHING
+# Rescan semantics (step 6): found again -> UPDATE, never a second row. Not
+# found -> touched by nothing, and a stale last_seen_at IS the signal; the
+# recheck loop that sets url_alive = false is not in v1.
+_UPSERT_INFRINGEMENT_SQL = """
+    INSERT INTO infringements (user_ref, url_hash, page_url, image_url, keyed_on)
+    VALUES (%(user_ref)s, %(url_hash)s, %(page_url)s, %(image_url)s, %(keyed_on)s)
+    ON CONFLICT (user_ref, url_hash) DO UPDATE
+      SET last_seen_at = now(),
+          seen_count = infringements.seen_count + 1
+    RETURNING infringement_id
+"""
+
+# provider_score is taken from the new observation: a provider's score for
+# the same URL can move between runs, and the latest raw value is the one
+# step 7 calibrates. It is still RAW — nothing here rescales.
+_UPSERT_ATTESTATION_SQL = """
+    INSERT INTO attestations (infringement_id, provider_id, score_kind,
+                              provider_score, provider_category, query_quality,
+                              score_version, last_run_id)
+    VALUES (%(infringement_id)s, %(provider_id)s, %(score_kind)s,
+            %(provider_score)s, %(provider_category)s, %(query_quality)s,
+            %(score_version)s, %(run_id)s)
+    ON CONFLICT (infringement_id, provider_id) DO UPDATE
+      SET last_confirmed_at = now(),
+          confirm_count = attestations.confirm_count + 1,
+          provider_score = EXCLUDED.provider_score,
+          provider_category = EXCLUDED.provider_category,
+          query_quality = EXCLUDED.query_quality,
+          score_version = EXCLUDED.score_version,
+          last_run_id = EXCLUDED.last_run_id
 """
 
 _COMPLETE_RUN_SQL = """
     UPDATE search_runs
     SET status = 'completed',
         providers_succeeded = %(providers_succeeded)s,
-        matches_found = (SELECT count(*) FROM search_matches
-                         WHERE run_id = %(run_id)s),
+        matches_found = (SELECT count(*) FROM attestations
+                         WHERE last_run_id = %(run_id)s),
         completed_at = now()
     WHERE run_id = %(run_id)s
 """
@@ -129,6 +172,41 @@ _LIST_MATCHES_SQL = """
       AND (%(since)s::timestamptz IS NULL OR created_at >= %(since)s)
     ORDER BY created_at DESC, match_id
 """
+
+
+class _InfringementKey(NamedTuple):
+    url_hash: UrlHash
+    key_url: str
+    keyed_on: str  # 'page_url' | 'image_url'
+    match: ProviderMatch
+
+
+def _fan_out(matches: Sequence[ProviderMatch]) -> list[_InfringementKey]:
+    """One key per page the image was found on; image_url as the fallback
+    when the provider reported no page at all.
+
+    Keying on the page rather than the image is the whole dedup decision: the
+    page is what a user acts on — a takedown notice, a lawyer, a report — so
+    one match with three backlinks becomes three infringements.
+
+    Collapsed on url_hash **within the batch**, so the same page returned
+    twice in one run (different image URLs, or the same page with different
+    tracking params) is one write rather than a self-inflicted double count.
+    First occurrence wins: providers return relevance order, and raw_response
+    keeps everything regardless.
+    """
+    seen: dict[UrlHash, _InfringementKey] = {}
+    for match in matches:
+        targets = (
+            [(page, "page_url") for page in match.page_urls]
+            if match.page_urls
+            else [(match.image_url, "image_url")]
+        )
+        for key_url, keyed_on in targets:
+            digest = url_hash(key_url)
+            if digest not in seen:
+                seen[digest] = _InfringementKey(digest, key_url, keyed_on, match)
+    return list(seen.values())
 
 
 class SearchStore(Protocol):
@@ -150,7 +228,7 @@ class SearchStore(Protocol):
 
     async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None: ...
 
-    async def record_matches(
+    async def record_infringements(
         self,
         run_id: UUID,
         user_ref: UserRef,
@@ -279,43 +357,56 @@ class PostgresSearchStore:
                 },
             )
 
-    async def record_matches(
+    async def record_infringements(
         self,
         run_id: UUID,
         user_ref: UserRef,
         provider: ProviderDescriptor,
         matches: Sequence[ProviderMatch],
     ) -> int:
-        inserted = 0
+        """Upsert one infringement per page found and one attestation per
+        (infringement, provider). Returns the number of infringements touched
+        — inserted or updated, since a rescan legitimately touches without
+        inserting."""
+        keys = _fan_out(matches)
         async with self._pool.connection() as conn, conn.transaction():
-            for match in matches:
-                url_hash_value = url_hash(match.image_url)
+            for key in keys:
                 await conn.execute(
                     _UPSERT_URL_SQL,
                     {
-                        "url_hash": url_hash_value,
-                        "url": match.image_url,
-                        "source_domain": source_domain(match.image_url),
+                        "url_hash": key.url_hash,
+                        "url": key.key_url,
+                        "source_domain": source_domain(key.key_url),
+                        "canonical_url": canonicalise(key.key_url),
+                        "normalisation_version": NORMALISATION_VERSION,
                     },
                 )
                 cur = await conn.execute(
-                    _INSERT_MATCH_SQL,
+                    _UPSERT_INFRINGEMENT_SQL,
                     {
-                        "run_id": run_id,
-                        "url_hash": url_hash_value,
                         "user_ref": user_ref,
-                        "provider_id": provider.provider_id,
-                        "image_url": match.image_url,
-                        "page_url": match.page_urls[0] if match.page_urls else None,
-                        "provider_score": match.provider_score,
-                        "score_version": provider.score_version,
-                        "score_kind": provider.score_kind,
-                        "provider_category": match.provider_category,
-                        "query_quality": match.query_quality,
+                        "url_hash": key.url_hash,
+                        "page_url": key.key_url,
+                        "image_url": key.match.image_url,
+                        "keyed_on": key.keyed_on,
                     },
                 )
-                inserted += cur.rowcount
-        return inserted
+                row = await cur.fetchone()
+                assert row is not None
+                await conn.execute(
+                    _UPSERT_ATTESTATION_SQL,
+                    {
+                        "infringement_id": row[0],
+                        "provider_id": provider.provider_id,
+                        "score_kind": provider.score_kind,
+                        "provider_score": key.match.provider_score,
+                        "provider_category": key.match.provider_category,
+                        "query_quality": key.match.query_quality,
+                        "score_version": provider.score_version,
+                        "run_id": run_id,
+                    },
+                )
+        return len(keys)
 
     async def complete_run(
         self, run_id: UUID, providers_succeeded: Sequence[ProviderId]
