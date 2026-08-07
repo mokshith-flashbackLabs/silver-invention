@@ -26,7 +26,8 @@ CORE_TABLES = {
     "search_runs",
     "content_urls",
     "provider_calls",
-    "search_matches",
+    "infringements",
+    "attestations",
     "outbox",
     "audit_log",
 }
@@ -173,6 +174,11 @@ def test_0004_score_shape_check_constraint(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     up = run_migrate(throwaway_db, "up")
     assert up.returncode == 0, up.stderr
+    # search_matches is dropped by 0006; its constraint is asserted at the
+    # migration state where the table still exists. The same shape rule lives
+    # on `attestations` now — see test_0005_uniques_enforce_the_dedup_key.
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to_0004())
+    assert back.returncode == 0, back.stderr
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         conn.execute(
@@ -442,3 +448,14 @@ def test_0005_migrates_existing_search_matches_rows(throwaway_db: str) -> None:
             "SELECT normalisation_version, canonical_url FROM content_urls"
         ).fetchall()
         assert version == [("v0-interim", "https://x/page")]
+
+
+def test_0006_drops_search_matches(throwaway_db: str) -> None:
+    """The superseded table is gone and nothing references it. 0005 migrated
+    its rows; keeping it would leave two competing sources of truth."""
+    run_migrate(throwaway_db, "down", "--all")
+    result = run_migrate(throwaway_db, "up")
+    assert result.returncode == 0, result.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        assert "search_matches" not in _table_names(conn)

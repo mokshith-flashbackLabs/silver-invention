@@ -7,7 +7,7 @@ Two layers, per the task-2 brief:
 - DB-backed cases run against the real, migrated throwaway database (Task 1
   harness): a blocking check over every column the migration actually creates
   (this is the test that fails the build if a ``thumbnail_blob`` column is
-  ever added to ``search_matches``), plus three fixture cases that each
+  ever added to ``infringements``), plus three fixture cases that each
   create a scratch table, lint it through real ``information_schema``, and
   drop it — proving the gate works against Postgres's own type reporting, not
   just against hand-typed fixtures.
@@ -110,7 +110,7 @@ def test_unit_violation_str_is_informative() -> None:
 def test_migrated_schema_has_zero_violations(throwaway_db: str) -> None:
     """The build-blocking check: every column in the real, migrated schema
     must pass the lint. This is what would fail if `thumbnail_blob` were
-    added to `search_matches` in migrations/0001_initial_schema.up.sql.
+    added to `infringements` in migrations/0005_infringements_attestations.up.sql.
     """
     run_migrate(throwaway_db, "down", "--all")
     up_result = run_migrate(throwaway_db, "up")
@@ -200,19 +200,19 @@ def test_fixture_thumbnail_uri_still_fails_despite_uri_suffix(
     assert [v.column_name for v in violations] == ["thumbnail_uri"]
 
 
-def test_fixture_smuggled_thumbnail_blob_on_search_matches_fails(
+def test_fixture_smuggled_thumbnail_blob_on_infringements_fails(
     scratch_conn: psycopg.Connection[ColumnRow],
 ) -> None:
     """Demonstrates the gate against the exact scenario the brief names: a
-    `thumbnail_blob` column smuggled onto the real `search_matches` table
+    `thumbnail_blob` column smuggled onto the real `infringements` table
     (not `0001_initial_schema.up.sql` itself — this ALTERs a scratch copy of
     the already-migrated table and reverts it, leaving the migration file
     untouched).
     """
-    scratch_conn.execute("ALTER TABLE search_matches ADD COLUMN thumbnail_blob TEXT")
+    scratch_conn.execute("ALTER TABLE infringements ADD COLUMN thumbnail_blob TEXT")
     try:
-        violations = _lint_table(scratch_conn, "search_matches")
+        violations = _lint_table(scratch_conn, "infringements")
 
         assert [v.column_name for v in violations] == ["thumbnail_blob"]
     finally:
-        scratch_conn.execute("ALTER TABLE search_matches DROP COLUMN thumbnail_blob")
+        scratch_conn.execute("ALTER TABLE infringements DROP COLUMN thumbnail_blob")
