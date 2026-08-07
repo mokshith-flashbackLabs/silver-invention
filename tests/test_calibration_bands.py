@@ -217,6 +217,107 @@ def test_calibration_version_is_stamped_on_a_real_decision() -> None:
     assert d.calibration_version == "hive-cal-v1"
 
 
+# ── Review fixes: non-finite scores, unbounded domains, and the top-band ──
+# ── inclusivity bug (CRITICAL C2, IMPORTANT I1 & I2) ──────────────────────
+
+@pytest.mark.parametrize(
+    "bad", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")]
+)
+def test_non_finite_score_is_review_not_a_crash(bad: Decimal) -> None:
+    """C2. provider_score is NUMERIC(6,4) and Postgres NUMERIC accepts NaN
+    and the infinities; provider_score is an unvalidated Decimal. Comparing
+    a non-finite value against band edges must not raise
+    decimal.InvalidOperation, and it must be diagnosably different from an
+    in-range-but-impossible value: its own reason, not score_out_of_domain.
+    """
+    d = band_for_attestation(hive_entry(), "numeric", bad, None)
+    assert d.band == "review"
+    assert d.reason == "score_not_finite"
+
+
+def test_unbounded_score_domain_is_review_not_a_silent_pass() -> None:
+    """I2 — the most important one. score_domain is nullable in the DB. A
+    provider row with no domain recorded produces ScoreDomain() with every
+    field None. Before this fix, `_in_domain` treated "no bounds" as
+    "everything passes", so an impossible value like -5 would be read as a
+    low score and silently banded `drop` — invisible forever, reached
+    through a missing config row rather than through the score itself.
+    """
+    entry = PolicyEntry(
+        provider_id=HIVE,
+        calibrated=True,
+        score_domain=ScoreDomain(),
+        config=hive_config(),
+    )
+    d = band_for_attestation(entry, "numeric", Decimal("-5"), None)
+    assert d.band == "review"
+    assert d.reason == "score_domain_unknown"
+
+
+def _gap_entry() -> PolicyEntry:
+    """A deliberately gappy config: drop tops out at 0.72, auto_confirm
+    covers 0.72–0.90, but the domain runs to 1.0. Nothing covers [0.90, 1.0)."""
+    return PolicyEntry(
+        provider_id=HIVE,
+        calibrated=True,
+        score_domain=ScoreDomain(min=Decimal("0.5"), max=Decimal("1.0")),
+        config=CalibrationConfig(
+            config_id=uuid4(),
+            provider_id=HIVE,
+            version="gap-cal-v1",
+            score_kind="numeric",
+            numeric_bands=(
+                NumericBand(band="drop", max=Decimal("0.72")),
+                NumericBand(
+                    band="auto_confirm", min=Decimal("0.72"), max=Decimal("0.90")
+                ),
+            ),
+        ),
+    )
+
+
+def test_top_band_below_domain_ceiling_does_not_get_inclusive_max() -> None:
+    """I1 regression — the reviewer's exact finding. The old `_numeric_band`
+    granted inclusive-max to whichever configured band nothing else started
+    above, regardless of where the domain actually ends. `auto_confirm`
+    (min=0.72, max=0.90) was the highest-starting band, so 0.90 wrongly
+    banded `auto_confirm` even though the domain runs to 1.0 and the stated
+    convention is max-exclusive except for the band that owns the domain's
+    actual top. A person would have been told, unreviewed, at a boundary the
+    semantics make exclusive. It must now fall through to
+    `no_band_covers_score` — this is also the only covering test for that
+    reason string, which was previously unreachable.
+    """
+    d = band_for_attestation(_gap_entry(), "numeric", Decimal("0.90"), None)
+    assert d.band == "review"
+    assert d.reason == "no_band_covers_score"
+
+
+def test_top_band_whose_max_equals_domain_ceiling_stays_inclusive() -> None:
+    """Companion to the fix above: when the top band's max genuinely reaches
+    the domain ceiling, the ceiling value must still land inside it — the
+    fix must not have swung to always excluding the top band's max."""
+    entry = PolicyEntry(
+        provider_id=HIVE,
+        calibrated=True,
+        score_domain=ScoreDomain(min=Decimal("0.5"), max=Decimal("1.0")),
+        config=CalibrationConfig(
+            config_id=uuid4(),
+            provider_id=HIVE,
+            version="explicit-max-cal-v1",
+            score_kind="numeric",
+            numeric_bands=(
+                NumericBand(band="drop", max=Decimal("0.72")),
+                NumericBand(
+                    band="auto_confirm", min=Decimal("0.72"), max=Decimal("1.0")
+                ),
+            ),
+        ),
+    )
+    d = band_for_attestation(entry, "numeric", Decimal("1.00"), None)
+    assert d.band == "auto_confirm"
+
+
 # ── Band JSON validation, used by `propose` ──────────────────────────────
 
 def test_valid_bands_have_no_problems() -> None:
@@ -248,3 +349,40 @@ def test_overlap_is_rejected() -> None:
     )
     problems = validate_numeric_bands(bad, HIVE_DOMAIN)
     assert any("overlap" in p for p in problems)
+
+
+def test_zero_width_band_is_rejected() -> None:
+    """I4. drop(max=0.72) / review(0.72, 0.72) / auto_confirm(min=0.72) tiles
+    the domain with no gap and no overlap by every other check here, but
+    `review`'s min==max means it can never fire — `_numeric_band` is
+    min-inclusive/max-exclusive, so nothing ever lands in [0.72, 0.72)."""
+    bad = (
+        NumericBand(band="drop", max=Decimal("0.72")),
+        NumericBand(band="review", min=Decimal("0.72"), max=Decimal("0.72")),
+        NumericBand(band="auto_confirm", min=Decimal("0.72")),
+    )
+    problems = validate_numeric_bands(bad, HIVE_DOMAIN)
+    assert any("zero width" in p for p in problems)
+
+
+def test_unbounded_domain_min_is_rejected_not_silently_valid() -> None:
+    """I3. With domain.min unset, the coverage walk's cursor starts at None
+    and the first band's gap check was silently skipped — bands (0.8–0.9,
+    0.9–inf) against ScoreDomain(min=None, max=1.0) used to report no
+    problems despite an obvious gap below 0.8."""
+    bands = (
+        NumericBand(band="review", min=Decimal("0.8"), max=Decimal("0.9")),
+        NumericBand(band="auto_confirm", min=Decimal("0.9")),
+    )
+    domain = ScoreDomain(min=None, max=Decimal("1.0"))
+    problems = validate_numeric_bands(bands, domain)
+    assert any("unbounded" in p for p in problems)
+
+
+def test_numeric_bands_against_categorical_only_domain_is_rejected() -> None:
+    """I3. A categorical ScoreDomain (categories set, min/max both None) is
+    nonsensical to validate numeric bands against — it used to report no
+    problems for exactly that reason: both bounds None means the coverage
+    walk never runs."""
+    problems = validate_numeric_bands(HIVE_BANDS, GOOGLE_DOMAIN)
+    assert any("unbounded" in p for p in problems)

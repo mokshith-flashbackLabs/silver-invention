@@ -70,3 +70,24 @@ def test_roll_up_never_returns_a_band_no_provider_gave() -> None:
     for bands in (["drop"], ["drop", "drop"], ["auto_confirm", "review"]):
         result, _ = roll_up(bands)
         assert result in set(bands) | {"review"}
+
+
+def test_unrecognised_band_value_is_review_not_a_crash() -> None:
+    """C3. These values are read back out of the database. A value that
+    isn't one of the three known bands used to raise KeyError inside
+    BAND_ORDER[b] via min()/max(); it must resolve to review instead, in the
+    safe direction, with the offending value named in the reason."""
+    band, reason = roll_up(["drop", "bogus"])  # type: ignore[list-item]
+    assert band == "review"
+    assert reason == "unknown_band:bogus"
+
+
+def test_bare_string_passed_instead_of_a_list_is_review_not_a_crash() -> None:
+    """C3, the specific case named in review: a caller who forgot to wrap a
+    single band in a list passes a bare str. Sequence[Band] silently accepts
+    it at the type level and Python iterates it character by character
+    ('d', 'r', 'o', 'p', ...), none of which is a real band. That must
+    resolve to review, not raise partway through min()/max()."""
+    band, reason = roll_up("drop")  # type: ignore[arg-type]
+    assert band == "review"
+    assert reason == "unknown_band:d"

@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from imageshield.types import ProviderId
 
@@ -79,6 +80,18 @@ class CalibrationConfig(BaseModel):
 
     Exactly one of ``numeric_bands`` / ``categorical_bands`` is populated,
     determined by ``score_kind``.
+
+    ``categorical_bands`` is frozen into a ``MappingProxyType`` on
+    validation (see ``_freeze_categorical_bands`` below), not just typed as
+    ``Mapping``. ``model_config = ConfigDict(frozen=True)`` only stops
+    reassigning the *attribute*; a plain ``dict`` stored in it would stay
+    mutable in place, which would let a caller holding a reference change
+    ``declares()``'s answer for a config snapshotted mid-run. This closes
+    that: ``self.categorical_bands["x"] = "auto_confirm"`` raises
+    ``TypeError`` at runtime, matching the frozen contract this whole model
+    otherwise implies. (The tuple already used for ``numeric_bands`` has the
+    same property for free — tuples are immutable — which is why only
+    ``categorical_bands`` needed this treatment.)
     """
 
     model_config = ConfigDict(frozen=True)
@@ -88,7 +101,22 @@ class CalibrationConfig(BaseModel):
     version: str
     score_kind: ScoreKind
     numeric_bands: tuple[NumericBand, ...] = ()
-    categorical_bands: Mapping[str, Band] = {}
+    # default_factory=dict (not a bare MappingProxyType default) plus
+    # validate_default=True: pydantic deep-copies non-"safe" default values
+    # on every instantiation unless given a factory, and copy.deepcopy
+    # cannot pickle a mappingproxy — a factory sidesteps that, and
+    # validate_default makes the freeze validator below run even when the
+    # caller never passes this field, so the invariant holds unconditionally.
+    categorical_bands: Mapping[str, Band] = Field(
+        default_factory=dict, validate_default=True
+    )
+
+    @field_validator("categorical_bands", mode="after")
+    @classmethod
+    def _freeze_categorical_bands(
+        cls, value: Mapping[str, Band]
+    ) -> Mapping[str, Band]:
+        return MappingProxyType(dict(value))
 
     def declares(self, band: Band) -> bool:
         """Whether this config can ever produce ``band``.
