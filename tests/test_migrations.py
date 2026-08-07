@@ -160,6 +160,75 @@ def test_imageshield_app_role_is_insert_only_on_audit_log(throwaway_db: str) -> 
         assert count == 1
 
 
+def test_0004_score_shape_check_constraint(throwaway_db: str) -> None:
+    """A match row must carry a numeric score OR a category — never neither.
+
+    Migration 0004 relaxes ``provider_score`` to nullable (Google Web
+    Detection returns ``score: null`` and the adapter must not invent a
+    number) and the CHECK constraint is what keeps the relaxation from
+    admitting score-less numeric rows.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO search_seeds (seed_id, user_ref, seed_kind, source_object_uri)"
+            " VALUES ('00000000-0000-0000-0000-000000000001',"
+            "  '00000000-0000-0000-0000-0000000000aa', 'user_supplied', 'https://x/img.jpg')"
+        )
+        conn.execute(
+            "INSERT INTO search_runs (run_id, seed_id, user_ref, providers_attempted,"
+            " threshold_config) VALUES ('00000000-0000-0000-0000-000000000002',"
+            " '00000000-0000-0000-0000-000000000001',"
+            " '00000000-0000-0000-0000-0000000000aa', '{hive}', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO content_urls (url_hash, url, source_domain)"
+            f" VALUES ('{'a' * 64}', 'https://x/img.jpg', 'x')"
+        )
+
+        common = (
+            "INSERT INTO search_matches (run_id, url_hash, user_ref, provider_id,"
+            " image_url, score_version, band, score_kind, provider_score, provider_category)"
+            " VALUES ('00000000-0000-0000-0000-000000000002', %s,"
+            " '00000000-0000-0000-0000-0000000000aa', %s, 'https://x/img.jpg', 'v1',"
+            " 'review', %s, %s, %s)"
+        )
+        # numeric with a score: fine
+        conn.execute(common, ("a" * 64, "hive", "numeric", "0.8712", None))
+        # categorical with a category and NULL score: fine
+        conn.execute(common, ("a" * 64, "google", "categorical", None, "full_match"))
+        # neither score nor category: rejected by the CHECK
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(common, ("a" * 64, "hive", "numeric", None, None))
+
+
+def test_0004_providers_seeded_with_score_domain(throwaway_db: str) -> None:
+    """Step 7 reads the score domain from here — Hive's floor is 0.5, and
+    banding 0.5–1.0 as though it were 0–1 reads weak matches as moderate."""
+    run_migrate(throwaway_db, "down", "--all")
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        rows = dict(
+            conn.execute(
+                "SELECT provider_id, score_domain FROM providers"
+                " WHERE provider_id IN ('hive', 'google')"
+            ).fetchall()
+        )
+        (run_status,) = conn.execute(
+            "SELECT column_default FROM information_schema.columns"
+            " WHERE table_name = 'search_runs' AND column_name = 'status'"
+        ).fetchone()  # type: ignore[misc]
+
+    assert rows["hive"] == {"min": 0.5, "max": 1.0}
+    assert rows["google"] == {"categories": ["full_match", "partial_match", "page_match"]}
+    assert run_status == "'queued'::text"
+
+
 def test_down_all_on_one_db_does_not_break_role_for_sibling_db(
     throwaway_db: str, second_throwaway_db: str
 ) -> None:
