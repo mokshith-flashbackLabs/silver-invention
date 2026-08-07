@@ -243,6 +243,162 @@ loops emitting duplicates for the same pair. Use `ON CONFLICT DO NOTHING`.
 
 ---
 
+## 2b. Provider search — **built** (steps 5–6)
+
+Everything above in §2 is the partner-embedding match module: **specified, not built**. This section
+is the third-party provider search that exists in the code today, and the two are separate pipelines
+that will eventually feed the same report surface.
+
+Tables: `search_seeds`, `search_runs`, `content_urls`, `provider_calls`, `infringements`,
+`attestations`. Migrations `0001`, `0004`, `0005`, `0006`.
+
+### The thing found vs. the observation of it
+
+This split is the whole point of step 6 and it is worth stating plainly, because the alternative was
+already built once and had to be replaced.
+
+`search_matches` (migration 0001, dropped in 0006) was keyed `UNIQUE (run_id, url_hash,
+provider_id)` — **per run**. A weekly rescan finding the same unchanged URL wrote a new row every
+week:
+
+```
+100k users x 20 matches x 2 providers x 52 weeks  =  ~208M rows/year, growing with TIME
+```
+
+That is the same failure class as the old system's `matches[].seenInScans`, which appends one date
+string per scan forever against DynamoDB's 400 KB item cap with the write error swallowed
+(`weeklyInfringementScanner.js:1016`).
+
+Separating the stable infringement from the per-provider attestation makes a rescan an `UPDATE`:
+
+```
+100k users x 20 matches x 2 providers  =  ~4M rows TOTAL, growing with CONTENT
+```
+
+`tests/test_search_store.py::test_52_weekly_rescans_over_static_corpus_add_zero_rows` is the
+permanent regression test for this. Do not delete it.
+
+```sql
+-- Stable. One row per (user_ref, url_hash). The thing the user acts on.
+CREATE TABLE infringements (
+  infringement_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_ref         UUID NOT NULL,
+  url_hash         TEXT NOT NULL REFERENCES content_urls(url_hash),
+  page_url         TEXT NOT NULL,
+  image_url        TEXT,
+  keyed_on         TEXT NOT NULL DEFAULT 'page_url'
+                   CHECK (keyed_on IN ('page_url', 'image_url')),
+  first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  seen_count       INT NOT NULL DEFAULT 1,
+  url_alive        BOOLEAN NOT NULL DEFAULT true,
+  last_checked_at  TIMESTAMPTZ,
+  band             TEXT NOT NULL DEFAULT 'review',
+  status           TEXT NOT NULL DEFAULT 'new',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_ref, url_hash)
+);
+
+CREATE INDEX infringements_user_idx ON infringements (user_ref, last_seen_at DESC);
+CREATE INDEX infringements_review_idx ON infringements (band) WHERE band = 'review';
+
+-- One row per (infringement, provider). UPDATED on rescan, never appended.
+CREATE TABLE attestations (
+  attestation_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  infringement_id    UUID NOT NULL REFERENCES infringements(infringement_id) ON DELETE CASCADE,
+  provider_id        TEXT NOT NULL REFERENCES providers(provider_id),
+  score_kind         TEXT NOT NULL,
+  provider_score     NUMERIC(6,4),
+  provider_category  TEXT,
+  query_quality      TEXT,
+  score_version      TEXT NOT NULL,
+  first_confirmed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_confirmed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  confirm_count      INT NOT NULL DEFAULT 1,
+  last_run_id        UUID REFERENCES search_runs(run_id),
+  UNIQUE (infringement_id, provider_id),
+  CONSTRAINT attestation_score_shape CHECK (
+    (score_kind = 'numeric'     AND provider_score    IS NOT NULL) OR
+    (score_kind = 'categorical' AND provider_category IS NOT NULL)
+  )
+);
+
+CREATE INDEX attestations_infringement_idx ON attestations (infringement_id);
+CREATE INDEX attestations_run_idx ON attestations (last_run_id);
+```
+
+`provider_score` is **raw and provider-native**. Provider A's 0.92 and Provider B's 0.92 are
+different quantities; calibration is a separate, versioned step (step 7) and `band` stays `'review'`
+until it lands. The `attestation_score_shape` CHECK is what lets one table hold both a numeric
+provider (Hive Web Search, 0.5–1.0) and a categorical one (Google Web Detection, which returns
+`score: null`) without an adapter inventing a number.
+
+### Dedup rules
+
+| Case | Result |
+|---|---|
+| One match with 3 backlinks | **Three** infringements — three places to act |
+| Same page twice in one run, different image URLs | **One** infringement, collapsed before the write |
+| No backlink available | Key on `image_url`, record that in `keyed_on` |
+| Hive and Google both find page X for user Y | **One** infringement, **two** attestations |
+| Same URL found for two different users | **Two** infringements — cross-user is never dedup |
+
+The last row is enforced by `UNIQUE (user_ref, url_hash)`, and it is a safety boundary rather than a
+modelling preference: collapsing across users leaks one person's matches to another.
+
+Two counters are easy to confuse. `seen_count` counts provider observations of an infringement (two
+providers in one run bump it twice), so it answers "how often has anything seen this". `confirm_count`
+is per-provider and is the clean per-provider signal. `provider_count` on the API surface is simply
+the number of attestations — an agreement signal, not a hit count.
+
+### Rescan semantics
+
+```
+Found again  -> UPDATE infringements SET last_seen_at, seen_count + 1
+                UPDATE attestations  SET last_confirmed_at, confirm_count + 1,
+                                         provider_score (may have moved)
+Not found    -> touch nothing. A stale last_confirmed_at is the signal.
+                Do NOT delete, do NOT mark dead — url_alive is the recheck
+                loop's job, and that is not in v1.
+New          -> INSERT both
+```
+
+All writes are `INSERT ... ON CONFLICT ... DO UPDATE`. A rescan must never raise a duplicate-key
+error and must never insert.
+
+### URL normalisation and `content_urls`
+
+```sql
+ALTER TABLE content_urls
+  ADD COLUMN normalisation_version TEXT NOT NULL DEFAULT 'v1',
+  ADD COLUMN canonical_url TEXT;
+```
+
+`url_hash = sha256(canonical_url)` under the v1 rules in `src/imageshield/search/urlhash.py`:
+lowercase scheme and host, punycode the host, strip default ports, strip the fragment, resolve dot
+segments, **preserve path case**, strip tracking params (`utm_*`, `fbclid`, `gclid`, `msclkid`,
+`mc_eid`, `ref`, `ref_src`, `source`, `igshid`, `_ga`, `yclid`), sort the remaining query params,
+normalise percent-encoding, and strip one trailing slash except on a bare root.
+
+The scheme is deliberately preserved: `http://example.com/a` and `https://example.com/a` are
+different origins and must not collapse.
+
+`canonical_url` is stored because debugging a dedup failure without it means re-deriving the
+normalisation by hand. `normalisation_version` is stored per row because changing the rules
+invalidates every stored hash — a future v2 must bump it rather than silently splitting the dedup
+into two populations that never match. Rows written before step 6 carry `'v0-interim'`: they were
+hashed from the raw, unnormalised URL.
+
+### `provider_calls.raw_response` retention
+
+`raw_response` is stored verbatim on every call, including failures — it is the only way to recompute
+bands over history when a provider retunes. One row per (run, provider) is bounded by runs, but the
+JSONB is not, so `python -m imageshield.search.retention` nulls payloads older than
+`RAW_RESPONSE_RETENTION_DAYS` (default 90) and leaves the metadata row — status, http_status,
+latency, cost — intact.
+
+---
+
 ## 3. Adjudication service
 
 ```sql

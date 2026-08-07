@@ -60,7 +60,7 @@ class WorkerFakeStore:
     async def enabled_provider_ids(self) -> tuple[ProviderId, ...]:
         raise NotImplementedError
 
-    async def list_matches(self, *a: Any, **k: Any) -> Any:
+    async def list_infringements(self, *a: Any, **k: Any) -> Any:
         raise NotImplementedError
 
 

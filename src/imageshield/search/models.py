@@ -63,8 +63,9 @@ class ClaimedRun(BaseModel):
 
 
 class ProviderDescriptor(BaseModel):
-    """The three facts record_matches needs about the provider that produced
-    a batch of matches — carried by the adapter, not looked up per row."""
+    """The three facts record_infringements needs about the provider that
+    produced a batch of matches — carried by the adapter, not looked up per
+    row."""
 
     model_config = ConfigDict(frozen=True)
 
