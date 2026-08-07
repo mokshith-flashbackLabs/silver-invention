@@ -12,10 +12,9 @@ Load-bearing choices:
 - ``record_matches`` writes ``band = 'review'`` unconditionally. No
   calibration exists yet (step 7), and an uncalibrated provider must not be
   able to tell someone their face was found without a human looking first.
-- The url_hash is the step-5 interim raw hash (``search/urlhash.py``); the
-  unique index ``(run_id, url_hash, provider_id)`` + ``ON CONFLICT DO
-  NOTHING`` makes duplicate deliveries and repeated provider entries
-  harmless.
+- The url_hash is normalisation v1 (``search/urlhash.py``); the unique index
+  ``(run_id, url_hash, provider_id)`` + ``ON CONFLICT DO NOTHING`` makes
+  duplicate deliveries and repeated provider entries harmless.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ from imageshield.search.models import (
     SeedRow,
 )
 from imageshield.search.provider import ProviderMatch, ProviderResult
-from imageshield.search.urlhash import interim_url_hash, source_domain
+from imageshield.search.urlhash import source_domain, url_hash
 from imageshield.types import ProviderId, UserRef, parse_provider_id, parse_user_ref
 
 RUN_REQUESTED_EVENT = "search.run_requested"
@@ -290,11 +289,11 @@ class PostgresSearchStore:
         inserted = 0
         async with self._pool.connection() as conn, conn.transaction():
             for match in matches:
-                url_hash = interim_url_hash(match.image_url)
+                url_hash_value = url_hash(match.image_url)
                 await conn.execute(
                     _UPSERT_URL_SQL,
                     {
-                        "url_hash": url_hash,
+                        "url_hash": url_hash_value,
                         "url": match.image_url,
                         "source_domain": source_domain(match.image_url),
                     },
@@ -303,7 +302,7 @@ class PostgresSearchStore:
                     _INSERT_MATCH_SQL,
                     {
                         "run_id": run_id,
-                        "url_hash": url_hash,
+                        "url_hash": url_hash_value,
                         "user_ref": user_ref,
                         "provider_id": provider.provider_id,
                         "image_url": match.image_url,
