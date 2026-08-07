@@ -33,9 +33,11 @@ from imageshield.http.routes.enrolments import router as enrolments_router
 from imageshield.http.routes.health import router as health_router
 from imageshield.http.routes.liveness import router as liveness_router
 from imageshield.http.routes.ping import admin_router, v1_router
+from imageshield.http.routes.search import router as search_router
 from imageshield.liveness.provider import RekognitionLivenessProvider
 from imageshield.liveness.store import PostgresLivenessStore
 from imageshield.liveness.uploader import HttpxObjectUploader
+from imageshield.search.store import PostgresSearchStore
 
 
 @asynccontextmanager
@@ -61,6 +63,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.face_index = RekognitionFaceIndex(region=cfg.aws_region)
     if getattr(app.state, "enrolment_store", None) is None:
         app.state.enrolment_store = PostgresEnrolmentStore(pool)
+    if getattr(app.state, "search_store", None) is None:
+        app.state.search_store = PostgresSearchStore(pool)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     if cfg.auth_disabled:
@@ -96,5 +100,6 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(v1_router)
     app.include_router(liveness_router)
     app.include_router(enrolments_router)
+    app.include_router(search_router)
     app.include_router(admin_router)
     return app

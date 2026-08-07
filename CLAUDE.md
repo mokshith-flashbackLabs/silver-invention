@@ -198,13 +198,21 @@ provider becomes a re-audit rather than a config change.
 
 ### 7.1 Face search and image search are different products
 
-- **Image search** (TinEye, Google Vision Web Detection) finds *this image* and near-duplicates.
+- **Image search** (TinEye, Google Vision Web Detection, Hive **Web Search** — reverse image search
+  over ~25B indexed images) finds *this image* and near-duplicates.
 - **Face search** (PimEyes-class) finds *this person* in images that never existed before.
 
 A deepfake is a novel image. Pixel-wise it has no relationship to anything the user uploaded. Image
 search returns nothing for it, silently, and the scan looks clean. **Our product promise is about
 AI-generated likeness abuse, which is face search almost exclusively.** Every adapter declares its
 `kind` and the orchestrator knows the difference.
+
+**Hive naming trap:** our Hive product is **Web Search**. Hive's separately-named "Media Search"
+matches movies and TV content — not ours. Which product a key hits is determined by **the Hive
+project the key belongs to, not the URL** — both go to `POST {HIVE_BASE_URL}/api/v2/task/sync`. A
+key provisioned against the wrong project returns plausible-looking wrong results rather than an
+error; the adapter treats a 200 without the Web Search `matches` path as `error`, never as "no
+matches found".
 
 ### 7.2 Adapters return raw scores. They never normalise
 

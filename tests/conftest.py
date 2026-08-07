@@ -58,6 +58,7 @@ VALID_ENV: dict[str, str] = {
     "LIVENESS_MAX_ATTEMPTS_24H": "5",
     "HIVE_API_KEY": "hive-key-for-tests",
     "HIVE_BASE_URL": "https://api.thehive.ai",
+    "GOOGLE_VISION_API_KEY": "google-key-for-tests",
     "SQS_IDENTITY_INDEX_URL": "http://localhost:14566/000000000000/imageshield-identity-index",
     "SQS_SEARCH_RUNS_URL": "http://localhost:14566/000000000000/imageshield-search-runs",
 }
@@ -78,6 +79,7 @@ def make_config(**overrides: Any) -> Config:
         "liveness_max_attempts_24h": 5,
         "hive_api_key": "hive-key-for-tests",
         "hive_base_url": "https://api.thehive.ai",
+        "google_vision_api_key": "google-key-for-tests",
         "sqs_identity_index_url": VALID_ENV["SQS_IDENTITY_INDEX_URL"],
         "sqs_search_runs_url": VALID_ENV["SQS_SEARCH_RUNS_URL"],
     }

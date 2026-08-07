@@ -90,16 +90,23 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]
 # enqueue must land in one Postgres transaction, not a Postgres write plus a
 # same-process SendMessage. Route all producers through
 # `imageshield.outbox.enqueue` / `enqueue_sync` instead.
-"boto3" = { msg = "Direct SQS access bypasses the transactional outbox — use imageshield.outbox.enqueue() instead. Only the relay (src/imageshield/relay.py) and the Rekognition liveness provider (src/imageshield/liveness/provider.py) may import boto3 — and NEVER for an S3 client (CLAUDE.md §3.3)." }
+"boto3" = { msg = "Direct SQS access bypasses the transactional outbox — use imageshield.outbox.enqueue() instead. Only the relay (src/imageshield/relay.py), the search:runs worker (src/imageshield/search/worker.py, SQS receive only), and the Rekognition liveness provider (src/imageshield/liveness/provider.py) may import boto3 — and NEVER for an S3 client (CLAUDE.md §3.3)." }
 
 [tool.ruff.lint.per-file-ignores]
-# The three sanctioned boto3 importers:
-# - the relay (Task 4): the consumer side of the outbox pattern, the only
-#   place that calls SendMessage;
+# The four sanctioned boto3 importers:
+# - the relay (Task 4): the producer→SQS side of the outbox pattern, the
+#   only place that calls SendMessage;
+# - the search:runs worker (step 5): SQS ReceiveMessage/DeleteMessage only —
+#   the consumer counterpart of the relay;
 # - the liveness provider (step 3): Rekognition Face Liveness only;
 # - the face index (step 4): Rekognition collection ops (IndexFaces /
 #   DeleteFaces / ListFaces) only. No S3 client anywhere — presigned URLs via
 #   httpx are the only S3 path.
 "src/imageshield/relay.py" = ["TID251"]
+"src/imageshield/search/worker.py" = ["TID251"]
 "src/imageshield/liveness/provider.py" = ["TID251"]
 "src/imageshield/enrolment/faceindex.py" = ["TID251"]
+# Spike/eval harnesses (CLAUDE.md §8: devtools/ is outside the numbered
+# steps). Not application code; the outbox rule protects request handlers,
+# not one-off credential/region checks.
+"devtools/*" = ["TID251"]

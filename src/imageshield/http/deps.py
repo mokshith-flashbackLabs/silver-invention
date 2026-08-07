@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from imageshield.liveness.provider import LivenessProvider
     from imageshield.liveness.store import LivenessStore
     from imageshield.liveness.uploader import ObjectUploader
+    from imageshield.search.store import SearchStore
 
 DbCheck = Callable[[], Awaitable[None]]
 
@@ -78,4 +79,9 @@ def get_face_index(request: Request) -> FaceIndex:
 
 def get_enrolment_store(request: Request) -> EnrolmentStore:
     store: EnrolmentStore = _required_state(request, "enrolment_store")  # type: ignore[assignment]
+    return store
+
+
+def get_search_store(request: Request) -> SearchStore:
+    store: SearchStore = _required_state(request, "search_store")  # type: ignore[assignment]
     return store
