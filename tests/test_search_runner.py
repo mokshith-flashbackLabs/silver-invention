@@ -21,7 +21,7 @@ GOOGLE = ProviderId("google")
 def _match(url: str) -> ProviderMatch:
     return ProviderMatch(
         image_url=url,
-        page_url=None,
+        page_urls=[],
         provider_score=Decimal("0.9"),
         provider_category=None,
         query_quality=None,

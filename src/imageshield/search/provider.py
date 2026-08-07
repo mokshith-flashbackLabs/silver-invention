@@ -39,7 +39,12 @@ class ProviderMatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     image_url: str
-    page_url: str | None            # backlinks[0].url for Hive when present
+    # EVERY page carrying the matched image (Hive's backlinks[]), order
+    # preserved, duplicates collapsed. One infringement per entry: the page
+    # is what a user acts on, so one match on three pages is three places to
+    # act. Empty means the provider reported no host page, and the store
+    # falls back to keying on image_url.
+    page_urls: list[str]
     provider_score: Decimal | None  # numeric providers only — RAW, never rescaled
     provider_category: str | None   # categorical providers only
     query_quality: str | None

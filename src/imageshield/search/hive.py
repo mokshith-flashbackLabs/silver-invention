@@ -194,14 +194,21 @@ def _raw_score(entry: dict[str, Any]) -> Decimal | None:
 
 
 def _to_match(entry: dict[str, Any], query_quality: str | None) -> ProviderMatch:
+    # Every backlink, not backlinks[0]: each page carrying the image is a
+    # separate place a user has to act, and the step-6 store makes one
+    # infringement per page. Malformed entries are skipped rather than
+    # guessed at — raw_response keeps them either way.
     backlinks = entry.get("backlinks")
-    page_url: str | None = None
-    if isinstance(backlinks, list) and backlinks and isinstance(backlinks[0], dict):
-        first = backlinks[0].get("url")
-        page_url = str(first) if first is not None else None
+    page_urls: list[str] = []
+    if isinstance(backlinks, list):
+        for link in backlinks:
+            if isinstance(link, dict) and link.get("url") is not None:
+                url = str(link["url"])
+                if url not in page_urls:
+                    page_urls.append(url)
     return ProviderMatch(
         image_url=str(entry.get("url", "")),
-        page_url=page_url,
+        page_urls=page_urls,
         provider_score=_raw_score(entry),
         provider_category=None,
         query_quality=query_quality,

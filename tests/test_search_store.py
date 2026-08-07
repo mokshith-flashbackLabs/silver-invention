@@ -51,10 +51,12 @@ def _user() -> UserRef:
     return UserRef(uuid4())
 
 
-def _hive_match(url: str, score: str = "0.87") -> ProviderMatch:
+def _hive_match(
+    url: str, score: str = "0.87", pages: list[str] | None = None
+) -> ProviderMatch:
     return ProviderMatch(
         image_url=url,
-        page_url=f"{url}?page=1",
+        page_urls=pages if pages is not None else [f"{url}?page=1"],
         provider_score=Decimal(score),
         provider_category=None,
         query_quality="good",
@@ -64,7 +66,7 @@ def _hive_match(url: str, score: str = "0.87") -> ProviderMatch:
 def _google_match(url: str, category: str = "full_match") -> ProviderMatch:
     return ProviderMatch(
         image_url=url,
-        page_url=None,
+        page_urls=[url] if category == "page_match" else [],
         provider_score=None,
         provider_category=category,
         query_quality=None,

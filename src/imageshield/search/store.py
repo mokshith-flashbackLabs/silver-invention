@@ -306,7 +306,7 @@ class PostgresSearchStore:
                         "user_ref": user_ref,
                         "provider_id": provider.provider_id,
                         "image_url": match.image_url,
-                        "page_url": match.page_url,
+                        "page_url": match.page_urls[0] if match.page_urls else None,
                         "provider_score": match.provider_score,
                         "score_version": provider.score_version,
                         "score_kind": provider.score_kind,

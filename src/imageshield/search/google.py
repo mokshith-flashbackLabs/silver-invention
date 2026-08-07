@@ -155,8 +155,9 @@ def _to_matches(web_detection: dict[str, Any]) -> list[ProviderMatch]:
                 ProviderMatch(
                     image_url=url,
                     # a page_match entry IS a page; full/partial are images
-                    # whose host page Google does not report.
-                    page_url=url if category == "page_match" else None,
+                    # whose host page Google does not report, so they carry no
+                    # page at all and the store keys them on the image URL.
+                    page_urls=[url] if category == "page_match" else [],
                     provider_score=None,  # NULL. Always. Never synthesised.
                     provider_category=category,
                     query_quality=None,

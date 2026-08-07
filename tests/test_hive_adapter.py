@@ -49,7 +49,13 @@ async def test_search_parses_matches_raw_scores_and_backlinks() -> None:
                     {
                         "url": "https://img.example/a.jpg",
                         "score": 0.8712,
-                        "backlinks": [{"url": "https://page.example/post/1"}],
+                        "backlinks": [
+                            {"url": "https://page.example/post/1"},
+                            {"url": "https://page.example/post/2"},
+                            {"url": "https://page.example/post/1"},  # duplicate
+                            {"noturl": True},  # malformed entry
+                            {"url": "https://mirror.example/copy"},
+                        ],
                     },
                     {"url": "https://img.example/b.jpg", "score": 0.5001, "backlinks": []},
                 ]
@@ -66,11 +72,18 @@ async def test_search_parses_matches_raw_scores_and_backlinks() -> None:
     assert result.http_status == 200
     first, second = result.matches
     assert first.provider_score == Decimal("0.8712")  # RAW — no rescale, ever
-    assert first.page_url == "https://page.example/post/1"
+    # EVERY backlink: one match with three distinct pages is three places to
+    # act, so the store makes three infringements out of it. Order preserved,
+    # duplicates collapsed, malformed entries skipped.
+    assert first.page_urls == [
+        "https://page.example/post/1",
+        "https://page.example/post/2",
+        "https://mirror.example/copy",
+    ]
     assert first.provider_category is None
     assert first.query_quality == "good"
     assert second.provider_score == Decimal("0.5001")
-    assert second.page_url is None
+    assert second.page_urls == []
     # raw_response is the verbatim body, sufficient to recompute everything
     assert result.raw_response["status"][0]["response"]["output"]["matches"][0]["score"] == 0.8712
 

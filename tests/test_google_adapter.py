@@ -64,9 +64,9 @@ async def test_categories_mapped_and_scores_always_null() -> None:
     assert set(by_category) == {"full_match", "partial_match", "page_match"}
     assert all(m.provider_score is None for m in result.matches)  # NULL. Always.
     assert by_category["full_match"].image_url == "https://a/full.jpg"
-    assert by_category["full_match"].page_url is None
+    assert by_category["full_match"].page_urls == []  # Google reports no host page
     assert by_category["page_match"].image_url == "https://a/page.html"
-    assert by_category["page_match"].page_url == "https://a/page.html"  # it IS a page
+    assert by_category["page_match"].page_urls == ["https://a/page.html"]  # it IS a page
 
 
 async def test_web_entities_never_become_matches() -> None:
