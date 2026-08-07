@@ -179,3 +179,14 @@ def test_raw_response_retention_rejects_non_positive_values(bad_value: int) -> N
 
     with pytest.raises(ValidationError):
         make_config(raw_response_retention_days=bad_value)
+
+
+def test_calibration_min_eval_items_defaults_to_200() -> None:
+    assert make_config().calibration_min_eval_items == 200
+
+
+def test_calibration_min_eval_items_must_be_positive() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(calibration_min_eval_items=0)

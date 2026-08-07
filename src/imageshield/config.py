@@ -83,6 +83,14 @@ class Config(BaseSettings):
     # of an otherwise run-bounded table.
     raw_response_retention_days: int = 90
 
+    # Floor on eval set size before a calibration config may activate a
+    # non-review band. 200 is a policy choice, not a statistical derivation:
+    # it is the point below which a precision figure is too weak to justify
+    # alarming a person without a human looking. Config rather than a
+    # constant so tightening it is an ops change, but note that LOOSENING it
+    # still cannot bypass the zero-lookalike refusal, which is unconditional.
+    calibration_min_eval_items: int = 200
+
     sqs_identity_index_url: str
     sqs_search_runs_url: str
 
@@ -167,6 +175,7 @@ class Config(BaseSettings):
         "outbox_batch_size",
         "outbox_max_attempts",
         "raw_response_retention_days",
+        "calibration_min_eval_items",
     )
     @classmethod
     def _positive(cls, value: int) -> int:

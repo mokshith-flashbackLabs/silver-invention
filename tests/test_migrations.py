@@ -459,3 +459,113 @@ def test_0006_drops_search_matches(throwaway_db: str) -> None:
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         assert "search_matches" not in _table_names(conn)
+
+
+CALIBRATION_TABLES = {
+    "calibration_configs",
+    "eval_items",
+    "eval_observations",
+    "eval_seed_coverage",
+}
+
+
+def test_0007_creates_calibration_tables(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        assert CALIBRATION_TABLES <= _table_names(conn)
+
+
+def test_0007_down_removes_them_and_the_added_columns(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "1")
+    with psycopg.connect(throwaway_db) as conn:
+        assert CALIBRATION_TABLES & _table_names(conn) == set()
+        cols = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'attestations'"
+            ).fetchall()
+        }
+        assert "band" not in cols
+        assert "calibration_version" not in cols
+
+
+def test_0007_eval_item_without_consent_basis_is_rejected(throwaway_db: str) -> None:
+    """Invariant: no eval item without a traceable consent basis. NOT NULL
+    alone lets '' through, so the btrim CHECK is what actually enforces it."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        for bad in ("", "   ", "\t\n"):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                with conn.transaction():
+                    conn.execute(
+                        "INSERT INTO eval_items (eval_set_id, seed_uri, candidate_url,"
+                        " label, label_kind, consent_basis, labelled_by)"
+                        " VALUES ('v1', 's3://seed', 'https://x.test/a',"
+                        " 'true_match', 'same_person', %s, 'tester')",
+                        (bad,),
+                    )
+
+
+@pytest.mark.parametrize(
+    ("label_kind", "label", "allowed"),
+    [
+        ("same_person", "true_match", True),
+        ("same_person", "false_match", False),
+        ("derived_edit", "true_match", True),
+        ("derived_edit", "false_match", False),   # the inversion that must be impossible
+        ("derived_edit", "uncertain", True),
+        ("novel_generation", "true_match", True),
+        ("novel_generation", "false_match", False),
+        ("lookalike", "false_match", True),
+        ("lookalike", "true_match", False),
+        ("lookalike", "uncertain", True),
+        ("unrelated", "false_match", True),
+        ("unrelated", "true_match", False),
+    ],
+)
+def test_0007_label_kind_and_label_must_agree(
+    throwaway_db: str, label_kind: str, label: str, allowed: bool
+) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        stmt = (
+            "INSERT INTO eval_items (eval_set_id, seed_uri, candidate_url,"
+            " label, label_kind, consent_basis, labelled_by)"
+            " VALUES ('v1', 's3://seed', %s, %s, %s, 'team member, written consent', 'tester')"
+        )
+        url = f"https://x.test/{label_kind}-{label}"
+        if allowed:
+            with conn.transaction():
+                conn.execute(stmt, (url, label, label_kind))
+        else:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                with conn.transaction():
+                    conn.execute(stmt, (url, label, label_kind))
+
+
+def test_0007_only_one_active_config_per_provider(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        stmt = (
+            "INSERT INTO calibration_configs (provider_id, version, score_kind, bands, active)"
+            " VALUES ('hive', %s, 'numeric', '[]'::jsonb, true)"
+        )
+        with conn.transaction():
+            conn.execute(stmt, ("v1",))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            with conn.transaction():
+                conn.execute(stmt, ("v2",))
+        # Inactive rows are unconstrained — many may coexist.
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO calibration_configs (provider_id, version, score_kind, bands)"
+                " VALUES ('hive', 'v3', 'numeric', '[]'::jsonb),"
+                "        ('hive', 'v4', 'numeric', '[]'::jsonb)"
+            )
