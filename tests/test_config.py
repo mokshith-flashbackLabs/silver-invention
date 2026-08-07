@@ -140,3 +140,23 @@ def test_liveness_cost_rejects_non_positive_values(bad_value: float) -> None:
 
     with pytest.raises(ValidationError):
         make_config(liveness_cost_per_check_usd=bad_value)
+
+
+def test_google_vision_api_key_sentinel_rejected() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(google_vision_api_key="changeme")
+
+
+def test_google_vision_and_provider_timeout_defaults() -> None:
+    cfg = make_config()
+    assert cfg.google_vision_endpoint.startswith("https://vision.googleapis.com/")
+    assert cfg.provider_timeout_seconds == 120.0
+
+
+def test_provider_timeout_must_be_positive() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(provider_timeout_seconds=0)

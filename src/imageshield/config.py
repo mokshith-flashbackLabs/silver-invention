@@ -65,6 +65,18 @@ class Config(BaseSettings):
     hive_api_key: str
     hive_base_url: str
 
+    # Google Cloud Vision Web Detection (the second step-5 search provider).
+    # The endpoint is a stable public constant, defaulted; the key is a secret
+    # and required.
+    google_vision_api_key: str
+    google_vision_endpoint: str = "https://vision.googleapis.com/v1/images:annotate"
+
+    # One HTTP timeout for provider search calls. Hive's synchronous
+    # /api/v2/task/sync can run long (the harness used 120s and the old
+    # lambda 60s); a provider hitting this surfaces as status='timeout' on
+    # its provider_calls row — it never fails the run.
+    provider_timeout_seconds: float = 120.0
+
     sqs_identity_index_url: str
     sqs_search_runs_url: str
 
@@ -95,7 +107,7 @@ class Config(BaseSettings):
             raise ValueError("is still set to a placeholder")
         return value
 
-    @field_validator("hive_api_key")
+    @field_validator("hive_api_key", "google_vision_api_key")
     @classmethod
     def _secret_not_placeholder(cls, value: str) -> str:
         if not value:
@@ -118,7 +130,12 @@ class Config(BaseSettings):
             raise ValueError("must not be empty")
         return value
 
-    @field_validator("hive_base_url", "sqs_identity_index_url", "sqs_search_runs_url")
+    @field_validator(
+        "hive_base_url",
+        "google_vision_endpoint",
+        "sqs_identity_index_url",
+        "sqs_search_runs_url",
+    )
     @classmethod
     def _http_url(cls, value: str) -> str:
         AnyHttpUrl(value)
@@ -150,7 +167,11 @@ class Config(BaseSettings):
             raise ValueError("must be a positive integer")
         return value
 
-    @field_validator("outbox_poll_interval_seconds", "liveness_cost_per_check_usd")
+    @field_validator(
+        "outbox_poll_interval_seconds",
+        "liveness_cost_per_check_usd",
+        "provider_timeout_seconds",
+    )
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:
