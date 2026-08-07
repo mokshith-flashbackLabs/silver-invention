@@ -6,6 +6,8 @@ can hurt someone.
 
 from __future__ import annotations
 
+import json
+import warnings
 from decimal import Decimal
 from uuid import uuid4
 
@@ -217,6 +219,40 @@ def test_calibration_version_is_stamped_on_a_real_decision() -> None:
     assert d.calibration_version == "hive-cal-v1"
 
 
+def test_categorical_config_json_round_trips_without_warning() -> None:
+    """F1. Wrapping categorical_bands in MappingProxyType (I5) made the
+    model JSON-unserializable — model_dump_json() raised
+    PydanticSerializationError('Unable to serialize unknown type:
+    mappingproxy') and plain model_dump() emitted a pydantic serializer
+    UserWarning on every call, silently, right up until a caller (Task 6,
+    writing calibration_configs.bands to Postgres) hit it. The
+    field_serializer fixes both; assert the JSON round-trips AND that no
+    warning fires under either dump mode — a test that only checks the
+    exception is gone would miss the warning half.
+    """
+    config = google_config()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        raw = config.model_dump_json()
+        dumped_json_mode = config.model_dump(mode="json")
+        dumped_python_mode = config.model_dump()
+    expected = {
+        "full_match": "auto_confirm",
+        "partial_match": "review",
+        "page_match": "review",
+    }
+    assert json.loads(raw)["categorical_bands"] == expected
+    assert dumped_json_mode["categorical_bands"] == expected
+    assert dumped_python_mode["categorical_bands"] == expected
+    # And a numeric config, whose categorical_bands is the empty-default
+    # MappingProxyType rather than one explicitly passed in, serializes
+    # cleanly too — the fix is not special-cased to the non-empty case.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        hive_dumped = hive_config().model_dump()
+    assert hive_dumped["categorical_bands"] == {}
+
+
 # ── Review fixes: non-finite scores, unbounded domains, and the top-band ──
 # ── inclusivity bug (CRITICAL C2, IMPORTANT I1 & I2) ──────────────────────
 
@@ -247,6 +283,36 @@ def test_unbounded_score_domain_is_review_not_a_silent_pass() -> None:
         provider_id=HIVE,
         calibrated=True,
         score_domain=ScoreDomain(),
+        config=hive_config(),
+    )
+    d = band_for_attestation(entry, "numeric", Decimal("-5"), None)
+    assert d.band == "review"
+    assert d.reason == "score_domain_unknown"
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
+        ScoreDomain(min=None, max=Decimal("1.0")),
+        ScoreDomain(min=Decimal("0.5"), max=None),
+    ],
+    ids=["min_missing", "max_missing"],
+)
+def test_half_open_domain_is_also_score_domain_unknown(domain: ScoreDomain) -> None:
+    """F2. Guarding only 'both bounds None' still lets a half-open domain
+    through: ScoreDomain(min=None, max=1.0) with score=-5 used to band
+    `drop` — the same silent-discard harm the all-None case guards against,
+    just on the unbounded side. This is a precondition of the algorithm, not
+    extra validation: I1's inclusive-max rule is defined in terms of
+    domain.max, so a missing max leaves no defined top-of-domain and the
+    banding semantics are genuinely undefined. Checking the reason string,
+    not just the band, so this cannot pass via some unrelated path to
+    review.
+    """
+    entry = PolicyEntry(
+        provider_id=HIVE,
+        calibrated=True,
+        score_domain=domain,
         config=hive_config(),
     )
     d = band_for_attestation(entry, "numeric", Decimal("-5"), None)

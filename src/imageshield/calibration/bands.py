@@ -88,14 +88,22 @@ def band_for_attestation(
         if not provider_score.is_finite():
             return _review("score_not_finite", version)
         domain = entry.score_domain
-        # Rule 3c — an unbounded domain (no row in `providers.score_domain`,
-        # or one with neither bound set) means we do not know how to
-        # interpret the numbers at all. Without this check, `_in_domain`
-        # treats "no bounds" as "everything passes", so an impossible value
-        # like -5 would be read as a low score and silently banded `drop` —
+        # Rule 3c — a domain missing EITHER bound (no row in
+        # `providers.score_domain`, a half-open range, or one with neither
+        # bound set) means we do not know how to interpret the numbers.
+        # This is a precondition of the algorithm, not defensive padding:
+        # I1's inclusive-max rule for the top band is defined in terms of
+        # `domain.max` (`_numeric_band` below), so with no max there is no
+        # defined top-of-domain and the banding semantics are genuinely
+        # undefined, not merely unvalidated. Requiring both bounds also
+        # makes this agree with `validate_numeric_bands`, which already
+        # rejects a config against a domain missing either bound (a
+        # half-open domain still lets `_in_domain` treat the unbounded side
+        # as "everything passes", so an impossible value like -5 would be
+        # read as a low score and silently banded `drop` on that side too —
         # exactly the failure this module exists to prevent, reached through
-        # a missing config row instead of through code.
-        if domain.min is None and domain.max is None:
+        # a missing/partial config row instead of through code).
+        if domain.min is None or domain.max is None:
             return _review("score_domain_unknown", version)
         # Rule 4 — a value the provider cannot legitimately report.
         if not _in_domain(provider_score, domain):

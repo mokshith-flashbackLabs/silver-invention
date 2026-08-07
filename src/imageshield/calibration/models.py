@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from imageshield.types import ProviderId
 
@@ -117,6 +117,20 @@ class CalibrationConfig(BaseModel):
         cls, value: Mapping[str, Band]
     ) -> Mapping[str, Band]:
         return MappingProxyType(dict(value))
+
+    # A pydantic serializer has no built-in handling for `mappingproxy` — it
+    # is not one of the types the JSON/python serializers recognise — so
+    # without this, `model_dump_json()` raises PydanticSerializationError
+    # and plain `model_dump()` emits a warning on every call, silently,
+    # right up until a caller (Task 6, writing `calibration_configs.bands`
+    # to Postgres) hits it. Serialise back to a plain dict; the frozen
+    # MappingProxyType is a construction-time/in-memory guarantee, not a
+    # wire format.
+    @field_serializer("categorical_bands")
+    def _serialize_categorical_bands(
+        self, value: Mapping[str, Band]
+    ) -> dict[str, Band]:
+        return dict(value)
 
     def declares(self, band: Band) -> bool:
         """Whether this config can ever produce ``band``.
