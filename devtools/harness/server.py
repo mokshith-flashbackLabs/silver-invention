@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import boto3  # noqa: TID251 — dev harness, not service code
+import boto3
 import httpx
 from fastapi import FastAPI, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware

@@ -14,7 +14,7 @@ a provider retunes.
 Two score shapes exist and neither is converted into the other:
 
 - ``numeric`` — the provider reports a similarity number (Hive Web Search,
-  0.5–1.0). Stored raw in ``provider_score``.
+  0.5-1.0). Stored raw in ``provider_score``.
 - ``categorical`` — the provider reports membership in a category and no
   number (Google Web Detection: full_match / partial_match / page_match).
   ``provider_score`` stays NULL; inventing a number here would be

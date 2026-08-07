@@ -5,7 +5,6 @@ results, and providers_succeeded reflects only the one that worked."""
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID, uuid4

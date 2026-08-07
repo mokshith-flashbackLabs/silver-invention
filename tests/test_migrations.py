@@ -207,7 +207,7 @@ def test_0004_score_shape_check_constraint(throwaway_db: str) -> None:
 
 def test_0004_providers_seeded_with_score_domain(throwaway_db: str) -> None:
     """Step 7 reads the score domain from here — Hive's floor is 0.5, and
-    banding 0.5–1.0 as though it were 0–1 reads weak matches as moderate."""
+    banding 0.5-1.0 as though it were 0-1 reads weak matches as moderate."""
     run_migrate(throwaway_db, "down", "--all")
     up = run_migrate(throwaway_db, "up")
     assert up.returncode == 0, up.stderr

@@ -40,7 +40,7 @@ async def _call_provider(
     can never take the gather() — and with it the whole run — down."""
     try:
         return await provider.search(seed_url)
-    except Exception as exc:  # noqa: BLE001 — deliberate: isolate per provider
+    except Exception as exc:  # broad on purpose: isolate failures per provider
         log.error("search.provider_crashed", provider_id=provider_id, error=str(exc))
         return ProviderResult(
             provider_id=provider_id,

@@ -14,7 +14,7 @@ repo's weeklyInfringementScanner.js:1078-1160 — read, not ported. Its three
 defects are deliberately absent here:
 
 - ``similarity_score * 100`` rescaling (js:1129). Scores here stay raw
-  ``Decimal`` in Hive's native 0.5–1.0 domain, where 0.5 is the floor (the
+  ``Decimal`` in Hive's native 0.5-1.0 domain, where 0.5 is the floor (the
   lowest score Hive reports), not a midpoint.
 - unbounded recursive retry on 429 (js:1148). Here: one bounded retry.
 - unnormalised URL hashing — not this module's business at all.

@@ -1,7 +1,7 @@
 """Hive Web Search adapter tests, over httpx.MockTransport.
 
 The three old-repo defects are pinned absent: scores stay raw Decimal in
-0.5–1.0 (never * 100 — weeklyInfringementScanner.js:1129), the 429 retry is
+0.5-1.0 (never rescaled to percent — weeklyInfringementScanner.js:1129), the 429 retry is
 bounded (js:1148 recursed without a depth counter), and hashing is not this
 module's business at all.
 """
