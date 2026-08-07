@@ -1,0 +1,11 @@
+-- Step 6 (contract half): search_matches is superseded by infringements +
+-- attestations, and 0005 migrated its rows across. Nothing in the codebase
+-- references it as of this migration.
+--
+-- Kept as a separate migration from 0005 so the commit that stops writing to
+-- the table lands before the commit that removes it: no revision of the repo
+-- ever has code pointing at a table that isn't there.
+--
+-- provider_calls.raw_response remains the verbatim per-run record; this drop
+-- loses no provider payload.
+DROP TABLE search_matches;

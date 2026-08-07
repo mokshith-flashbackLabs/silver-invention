@@ -86,13 +86,21 @@ async def main() -> int:
         print(f"providers_succeeded     {list(run.providers_succeeded)}")
         print(f"matches_found           {run.matches_found}")
 
-        matches = await store.list_matches(user_ref, None)
-        for m in matches[:10]:
-            score = m.provider_score if m.provider_score is not None else m.provider_category
-            print(f"  [{m.provider_id:6}] {m.score_kind:11} {score!s:12} band={m.band} "
-                  f"{m.image_url[:90]}")
-        if len(matches) > 10:
-            print(f"  ... and {len(matches) - 10} more")
+        infringements = await store.list_infringements(user_ref, None)
+        print(f"infringements           {len(infringements)}")
+        for inf in infringements[:10]:
+            print(f"  band={inf.band} providers={len(inf.attestations)} "
+                  f"keyed_on={inf.keyed_on} {inf.page_url[:80]}")
+            for att in inf.attestations:
+                score = (
+                    att.provider_score
+                    if att.provider_score is not None
+                    else att.provider_category
+                )
+                print(f"      [{att.provider_id:6}] {att.score_kind:11} {score!s:12} "
+                      f"confirmed x{att.confirm_count}")
+        if len(infringements) > 10:
+            print(f"  ... and {len(infringements) - 10} more")
 
         both_ok = set(outcome.providers_succeeded) == {"hive", "google"}
         any_matches = run.matches_found > 0

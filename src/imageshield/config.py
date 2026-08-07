@@ -77,6 +77,12 @@ class Config(BaseSettings):
     # its provider_calls row — it never fails the run.
     provider_timeout_seconds: float = 120.0
 
+    # How long provider_calls.raw_response is kept before the retention job
+    # nulls it (the metadata row stays). Recalibrating over history needs
+    # recent payloads, not all of them, and the JSONB is the unbounded part
+    # of an otherwise run-bounded table.
+    raw_response_retention_days: int = 90
+
     sqs_identity_index_url: str
     sqs_search_runs_url: str
 
@@ -160,6 +166,7 @@ class Config(BaseSettings):
         "liveness_max_attempts_24h",
         "outbox_batch_size",
         "outbox_max_attempts",
+        "raw_response_retention_days",
     )
     @classmethod
     def _positive(cls, value: int) -> int:

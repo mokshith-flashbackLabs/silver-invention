@@ -17,7 +17,7 @@ def test_provider_match_forbids_unknown_fields() -> None:
     with pytest.raises(ValidationError):
         ProviderMatch(
             image_url="https://x/a.jpg",
-            page_url=None,
+            page_urls=[],
             provider_score=Decimal("0.9"),
             provider_category=None,
             query_quality=None,
@@ -40,7 +40,7 @@ def test_provider_result_status_is_closed_enum() -> None:
 def test_provider_score_stays_decimal_raw() -> None:
     match = ProviderMatch(
         image_url="https://x/a.jpg",
-        page_url=None,
+        page_urls=[],
         provider_score=Decimal("0.5001"),
         provider_category=None,
         query_quality=None,

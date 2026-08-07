@@ -111,21 +111,35 @@ class SearchRunStatusResponse(BaseModel):
     matches_found: int
 
 
-class SearchMatchItem(BaseModel):
-    match_id: UUID
-    run_id: UUID
+class AttestationItem(BaseModel):
     provider_id: str
-    image_url: str
-    page_url: str | None
     score_kind: Literal["numeric", "categorical"]
     # Presentation-layer float; the DB keeps the exact NUMERIC and
     # raw_response keeps the verbatim provider value.
     provider_score: float | None
     provider_category: str | None
     query_quality: str | None
+    score_version: str
+    first_confirmed_at: datetime
+    last_confirmed_at: datetime
+    confirm_count: int
+
+
+class InfringementItem(BaseModel):
+    infringement_id: UUID
+    page_url: str
+    image_url: str | None
+    keyed_on: Literal["page_url", "image_url"]
+    first_seen_at: datetime
+    last_seen_at: datetime
+    seen_count: int
     band: str
-    created_at: datetime
+    status: str
+    # Agreement signal, not a hit count: three independent providers agreeing
+    # is meaningfully different from one (CLAUDE.md §7.4).
+    provider_count: int
+    attestations: list[AttestationItem]
 
 
-class SearchMatchesResponse(BaseModel):
-    matches: list[SearchMatchItem]
+class InfringementsResponse(BaseModel):
+    infringements: list[InfringementItem]

@@ -91,7 +91,7 @@ async def execute_run(
             continue
         succeeded.append(result.provider_id)
         adapter = providers[result.provider_id]
-        matches_recorded += await store.record_matches(
+        matches_recorded += await store.record_infringements(
             claim.run_id,
             claim.user_ref,
             ProviderDescriptor(

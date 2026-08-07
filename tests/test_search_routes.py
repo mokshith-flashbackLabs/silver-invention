@@ -26,7 +26,13 @@ from uuid import UUID, uuid4
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
-from imageshield.search.models import MatchRow, ProviderDescriptor, RunRow, SeedRow
+from imageshield.search.models import (
+    AttestationRow,
+    InfringementRow,
+    ProviderDescriptor,
+    RunRow,
+    SeedRow,
+)
 from imageshield.search.provider import ProviderMatch, ProviderResult
 from imageshield.types import ProviderId, UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
@@ -38,7 +44,7 @@ class FakeSearchStore:
     def __init__(self) -> None:
         self.seeds: dict[UUID, SeedRow] = {}
         self.runs: dict[UUID, RunRow] = {}
-        self.matches: list[MatchRow] = []
+        self.infringements: list[InfringementRow] = []
         self.created_runs: list[tuple[UserRef, UUID, tuple[ProviderId, ...]]] = []
         self.enabled: tuple[ProviderId, ...] = (ProviderId("google"), ProviderId("hive"))
 
@@ -78,7 +84,7 @@ class FakeSearchStore:
     async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None:
         raise NotImplementedError
 
-    async def record_matches(
+    async def record_infringements(
         self,
         run_id: UUID,
         user_ref: UserRef,
@@ -92,10 +98,10 @@ class FakeSearchStore:
     ) -> None:
         raise NotImplementedError
 
-    async def list_matches(
+    async def list_infringements(
         self, user_ref: UserRef, since: datetime | None
-    ) -> tuple[MatchRow, ...]:
-        return tuple(self.matches)
+    ) -> tuple[InfringementRow, ...]:
+        return tuple(self.infringements)
 
 
 def make_client() -> tuple[TestClient, FakeSearchStore]:
@@ -118,7 +124,7 @@ def test_all_routes_require_service_token() -> None:
     assert client.post("/v1/seeds", json={}).status_code == 401
     assert client.post("/v1/search", json={}).status_code == 401
     assert client.get(f"/v1/search/runs/{uuid4()}").status_code == 401
-    assert client.get(f"/v1/search/matches?user_ref={uuid4()}").status_code == 401
+    assert client.get(f"/v1/search/infringements?user_ref={uuid4()}").status_code == 401
 
 
 def test_create_seed_201() -> None:
@@ -242,47 +248,66 @@ def test_run_status_keeps_attempted_and_succeeded_distinct() -> None:
     assert client.get(f"/v1/search/runs/{uuid4()}", headers=AUTH).status_code == 404
 
 
-def test_matches_serialise_both_score_shapes() -> None:
+def test_infringements_nest_attestations_and_serialise_both_score_shapes() -> None:
+    """One page found by two providers is ONE entry with TWO attestations,
+    and provider_count is the agreement signal the report surface reads."""
     client, store = make_client()
-    run_id, user_ref = uuid4(), uuid4()
+    user_ref = uuid4()
     now = datetime.now(UTC)
-    store.matches = [
-        MatchRow(
-            match_id=uuid4(),
-            run_id=run_id,
-            provider_id="hive",
-            image_url="https://x/a.jpg",
+    store.infringements = [
+        InfringementRow(
+            infringement_id=uuid4(),
             page_url="https://page/a",
-            score_kind="numeric",
-            provider_score=Decimal("0.8712"),
-            provider_category=None,
-            query_quality="good",
-            band="review",
-            created_at=now,
-        ),
-        MatchRow(
-            match_id=uuid4(),
-            run_id=run_id,
-            provider_id="google",
             image_url="https://x/a.jpg",
-            page_url=None,
-            score_kind="categorical",
-            provider_score=None,
-            provider_category="full_match",
-            query_quality=None,
+            keyed_on="page_url",
+            first_seen_at=now,
+            last_seen_at=now,
+            seen_count=2,
             band="review",
-            created_at=now,
-        ),
+            status="new",
+            attestations=(
+                AttestationRow(
+                    provider_id="hive",
+                    score_kind="numeric",
+                    provider_score=Decimal("0.8712"),
+                    provider_category=None,
+                    query_quality="good",
+                    score_version="hive-web-search-v1",
+                    first_confirmed_at=now,
+                    last_confirmed_at=now,
+                    confirm_count=3,
+                ),
+                AttestationRow(
+                    provider_id="google",
+                    score_kind="categorical",
+                    provider_score=None,
+                    provider_category="full_match",
+                    query_quality=None,
+                    score_version="google-web-detection-v1",
+                    first_confirmed_at=now,
+                    last_confirmed_at=now,
+                    confirm_count=1,
+                ),
+            ),
+        )
     ]
 
-    response = client.get(f"/v1/search/matches?user_ref={user_ref}", headers=AUTH)
+    response = client.get(f"/v1/search/infringements?user_ref={user_ref}", headers=AUTH)
 
     assert response.status_code == 200
-    numeric, categorical = response.json()["matches"]
+    (entry,) = response.json()["infringements"]
+    assert entry["page_url"] == "https://page/a"
+    assert entry["keyed_on"] == "page_url"
+    assert entry["provider_count"] == 2  # two providers, ONE infringement
+    assert entry["band"] == "review"  # uncalibrated -> review, no exceptions
+    assert entry["seen_count"] == 2
+
+    numeric, categorical = entry["attestations"]
+    assert numeric["provider_id"] == "hive"
     assert numeric["score_kind"] == "numeric"
-    assert numeric["provider_score"] == 0.8712
+    assert numeric["provider_score"] == 0.8712  # RAW, never rescaled
     assert numeric["provider_category"] is None
-    assert numeric["band"] == "review"
+    assert numeric["confirm_count"] == 3
     assert categorical["score_kind"] == "categorical"
     assert categorical["provider_score"] is None
     assert categorical["provider_category"] == "full_match"

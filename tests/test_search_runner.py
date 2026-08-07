@@ -21,7 +21,7 @@ GOOGLE = ProviderId("google")
 def _match(url: str) -> ProviderMatch:
     return ProviderMatch(
         image_url=url,
-        page_url=None,
+        page_urls=[],
         provider_score=Decimal("0.9"),
         provider_category=None,
         query_quality=None,
@@ -63,7 +63,7 @@ class FakeStore:
     async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None:
         self.calls.append((run_id, result))
 
-    async def record_matches(
+    async def record_infringements(
         self,
         run_id: UUID,
         user_ref: UserRef,
@@ -97,7 +97,7 @@ class FakeStore:
     async def enabled_provider_ids(self) -> tuple[ProviderId, ...]:
         raise NotImplementedError
 
-    async def list_matches(self, *a: Any, **k: Any) -> Any:
+    async def list_infringements(self, *a: Any, **k: Any) -> Any:
         raise NotImplementedError
 
 

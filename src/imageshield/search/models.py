@@ -17,6 +17,10 @@ from pydantic import BaseModel, ConfigDict
 from imageshield.types import ProviderId, UserRef
 
 RunStatus = Literal["queued", "running", "completed"]
+ScoreKind = Literal["numeric", "categorical"]
+# Which URL the infringement's url_hash was computed over: the page a
+# provider reported, or the image itself when it reported no page.
+KeyedOn = Literal["page_url", "image_url"]
 
 SEED_KINDS = ("enrolment", "user_supplied", "public_profile")
 
@@ -59,27 +63,47 @@ class ClaimedRun(BaseModel):
 
 
 class ProviderDescriptor(BaseModel):
-    """The three facts record_matches needs about the provider that produced
-    a batch of matches — carried by the adapter, not looked up per row."""
+    """The three facts record_infringements needs about the provider that
+    produced a batch of matches — carried by the adapter, not looked up per
+    row."""
 
     model_config = ConfigDict(frozen=True)
 
     provider_id: ProviderId
-    score_kind: Literal["numeric", "categorical"]
+    score_kind: ScoreKind
     score_version: str
 
 
-class MatchRow(BaseModel):
+class AttestationRow(BaseModel):
+    """One provider's observation of an infringement. Rescans update this row
+    rather than appending, so the counters are the history."""
+
     model_config = ConfigDict(frozen=True)
 
-    match_id: UUID
-    run_id: UUID
     provider_id: str
-    image_url: str
-    page_url: str | None
-    score_kind: str
-    provider_score: Decimal | None
+    score_kind: ScoreKind
+    provider_score: Decimal | None  # RAW and provider-native. Never rescaled.
     provider_category: str | None
     query_quality: str | None
+    score_version: str
+    first_confirmed_at: datetime
+    last_confirmed_at: datetime
+    confirm_count: int
+
+
+class InfringementRow(BaseModel):
+    """The thing a user acts on: one page, with every provider that attested
+    to it. Never shared across users — see the UNIQUE (user_ref, url_hash)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    infringement_id: UUID
+    page_url: str
+    image_url: str | None
+    keyed_on: KeyedOn
+    first_seen_at: datetime
+    last_seen_at: datetime
+    seen_count: int
     band: str
-    created_at: datetime
+    status: str
+    attestations: tuple[AttestationRow, ...]
