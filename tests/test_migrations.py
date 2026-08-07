@@ -10,6 +10,8 @@ the session.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import psycopg
 import pytest
 
@@ -282,3 +284,161 @@ def test_down_all_on_one_db_does_not_break_role_for_sibling_db(
         assert role_exists is True
     else:
         assert role_exists is False
+
+
+def _steps_back_to_0004() -> str:
+    """How many `down --steps N` to land just after 0004.
+
+    Computed from the migrations directory rather than hardcoded, so adding
+    0007 doesn't silently turn this into "revert 0006 and stop".
+    """
+    from tests.db import ROOT
+
+    later = [p for p in (ROOT / "migrations").glob("*.up.sql") if p.name >= "0005"]
+    return str(len(later))
+
+
+def test_0005_creates_infringements_and_attestations(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    result = run_migrate(throwaway_db, "up")
+    assert result.returncode == 0, result.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        assert {"infringements", "attestations"} <= _table_names(conn)
+
+        cols = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name = 'content_urls'"
+            ).fetchall()
+        }
+        assert {"normalisation_version", "canonical_url"} <= cols
+
+        # The retention job (step 6) must be able to null the payload while
+        # keeping the metadata row; 0001 declared this column NOT NULL.
+        nullable = conn.execute(
+            "SELECT is_nullable FROM information_schema.columns"
+            " WHERE table_name = 'provider_calls' AND column_name = 'raw_response'"
+        ).fetchone()
+        assert nullable == ("YES",)
+
+
+def test_0005_uniques_enforce_the_dedup_key(throwaway_db: str) -> None:
+    """The two constraints step 6 exists to establish: one infringement per
+    (user, url) — never collapsed across users — and one attestation per
+    (infringement, provider)."""
+    run_migrate(throwaway_db, "down", "--all")
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    user_a = "00000000-0000-0000-0000-0000000000aa"
+    user_b = "00000000-0000-0000-0000-0000000000bb"
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO content_urls (url_hash, url, source_domain, canonical_url)"
+            f" VALUES ('{'a' * 64}', 'https://x/p', 'x', 'https://x/p')"
+        )
+        insert = (
+            "INSERT INTO infringements (user_ref, url_hash, page_url)"
+            f" VALUES (%s, '{'a' * 64}', 'https://x/p') RETURNING infringement_id"
+        )
+        (inf_a,) = conn.execute(insert, (user_a,)).fetchone()  # type: ignore[misc]
+
+        # Same URL, DIFFERENT user -> a second infringement. Cross-user is
+        # never dedup; collapsing here would leak one person's matches.
+        conn.execute(insert, (user_b,))
+        (count,) = conn.execute("SELECT count(*) FROM infringements").fetchone()  # type: ignore[misc]
+        assert count == 2
+
+        # Same URL, SAME user -> rejected. A rescan must UPDATE, not INSERT.
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, (user_a,))
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        attest = (
+            "INSERT INTO attestations (infringement_id, provider_id, score_kind,"
+            " provider_score, score_version) VALUES (%s, 'hive', 'numeric', 0.87, 'v1')"
+        )
+        conn.execute(attest, (inf_a,))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(attest, (inf_a,))
+
+    # Score shape carries over from 0004: neither a score nor a category is
+    # not a storable attestation.
+    with (
+        psycopg.connect(throwaway_db, autocommit=True) as conn,
+        pytest.raises(psycopg.errors.CheckViolation),
+    ):
+        conn.execute(
+            "INSERT INTO attestations (infringement_id, provider_id, score_kind,"
+            " score_version) VALUES (%s, 'google', 'numeric', 'v1')",
+            (inf_a,),
+        )
+
+
+def test_0005_migrates_existing_search_matches_rows(throwaway_db: str) -> None:
+    """Step-5 rows become one infringement per (user, url) with one
+    attestation per provider, and pre-existing content_urls rows are labelled
+    v0-interim — they were hashed by the raw-URL placeholder, and calling
+    them v1 would be exactly the silent split the version column prevents."""
+    run_migrate(throwaway_db, "down", "--all")
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to_0004())
+    assert back.returncode == 0, back.stderr
+
+    user = "00000000-0000-0000-0000-0000000000aa"
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO search_seeds (seed_id, user_ref, seed_kind, source_object_uri)"
+            " VALUES ('00000000-0000-0000-0000-000000000001',"
+            f"  '{user}', 'user_supplied', 'https://x/img.jpg')"
+        )
+        conn.execute(
+            "INSERT INTO search_runs (run_id, seed_id, user_ref, providers_attempted,"
+            " threshold_config) VALUES ('00000000-0000-0000-0000-000000000002',"
+            " '00000000-0000-0000-0000-000000000001',"
+            f" '{user}', '{{hive,google}}', '{{}}')"
+        )
+        conn.execute(
+            "INSERT INTO content_urls (url_hash, url, source_domain)"
+            f" VALUES ('{'a' * 64}', 'https://x/page', 'x')"
+        )
+        common = (
+            "INSERT INTO search_matches (run_id, url_hash, user_ref, provider_id,"
+            " image_url, page_url, score_version, band, score_kind, provider_score,"
+            " provider_category) VALUES ('00000000-0000-0000-0000-000000000002',"
+            f" '{'a' * 64}', '{user}', %s, 'https://x/img.jpg', 'https://x/page',"
+            " 'v1', 'review', %s, %s, %s)"
+        )
+        conn.execute(common, ("hive", "numeric", "0.8712", None))
+        conn.execute(common, ("google", "categorical", None, "full_match"))
+
+    forward = run_migrate(throwaway_db, "up")
+    assert forward.returncode == 0, forward.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        infringements = conn.execute(
+            "SELECT infringement_id, page_url, image_url, keyed_on, seen_count"
+            " FROM infringements"
+        ).fetchall()
+        assert len(infringements) == 1  # two providers, ONE infringement
+        assert infringements[0][1] == "https://x/page"
+        assert infringements[0][2] == "https://x/img.jpg"
+        assert infringements[0][3] == "page_url"
+        assert infringements[0][4] == 2
+
+        attestations = conn.execute(
+            "SELECT provider_id, score_kind, provider_score, provider_category,"
+            " confirm_count FROM attestations ORDER BY provider_id"
+        ).fetchall()
+        assert attestations == [
+            ("google", "categorical", None, "full_match", 1),
+            ("hive", "numeric", Decimal("0.8712"), None, 1),
+        ]
+
+        version = conn.execute(
+            "SELECT normalisation_version, canonical_url FROM content_urls"
+        ).fetchall()
+        assert version == [("v0-interim", "https://x/page")]
