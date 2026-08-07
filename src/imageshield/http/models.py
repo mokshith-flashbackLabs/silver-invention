@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from imageshield.types import UserRef
 
@@ -71,3 +71,61 @@ class LivenessStatusResponse(BaseModel):
     status: Literal["created", "pending", "passed", "failed", "expired", "consumed"]
     confidence: float | None
     enrolled: bool = False
+
+
+class SeedCreateRequest(ServiceModel):
+    user_ref: UserRef
+    seed_kind: Literal["enrolment", "user_supplied", "public_profile"]
+    source_object_uri: str  # proxy's S3, http(s) presigned GET — never s3://
+
+    @field_validator("source_object_uri")
+    @classmethod
+    def _http_only(cls, value: str) -> str:
+        if not value.startswith(("https://", "http://")):
+            raise ValueError(
+                "must be an http(s) URL (presigned GET) — this service holds no S3 credentials"
+            )
+        return value
+
+
+class SeedCreateResponse(BaseModel):
+    seed_id: UUID
+
+
+class SearchCreateRequest(ServiceModel):
+    user_ref: UserRef
+    seed_id: UUID
+    providers: list[str] | None = None  # default: all enabled providers
+
+
+class SearchCreateResponse(BaseModel):
+    run_id: UUID
+
+
+class SearchRunStatusResponse(BaseModel):
+    status: Literal["queued", "running", "completed"]
+    providers_attempted: list[str]
+    # MUST stay distinguishable from providers_attempted: a silent provider
+    # outage must never look identical to "nothing found".
+    providers_succeeded: list[str]
+    matches_found: int
+
+
+class SearchMatchItem(BaseModel):
+    match_id: UUID
+    run_id: UUID
+    provider_id: str
+    image_url: str
+    page_url: str | None
+    score_kind: Literal["numeric", "categorical"]
+    # Presentation-layer float; the DB keeps the exact NUMERIC and
+    # raw_response keeps the verbatim provider value.
+    provider_score: float | None
+    provider_category: str | None
+    query_quality: str | None
+    band: str
+    created_at: datetime
+
+
+class SearchMatchesResponse(BaseModel):
+    matches: list[SearchMatchItem]
