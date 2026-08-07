@@ -155,7 +155,39 @@ Owns `reports`, `report_hits`, `hit_feedback`, the recheck loop, and evidence ex
 with a −18 per active report divergence. For a product whose entire output is a score, that is
 disqualifying.
 
-### 3.6 Crop fetcher
+### 3.6 Search provider adapters (v1 — built)
+
+The step-5 adapter layer: `SearchProvider` implementations translate a provider's response into
+match rows and stop. Adapters never normalise, band, threshold, rescale, or compare — calibration
+is a separate, versioned, config-driven step (step 7), and `raw_response` is stored verbatim on
+every call (including failures) so history can be recomputed when a provider retunes. Uncalibrated
+providers reach `review` band only.
+
+Two providers are integrated, with different score shapes recorded in `providers.score_kind` /
+`score_domain`:
+
+| Provider | Product | Score shape |
+|---|---|---|
+| `hive` | Hive **Web Search** (reverse image search, ~25B images) | numeric, raw 0.5–1.0 (0.5 is the floor, not a midpoint) |
+| `google` | Google Vision **Web Detection** | categorical: `full_match` / `partial_match` / `page_match`; no number, ever |
+
+**Hive naming trap:** Hive's separately-named "Media Search" matches movies/TV — not ours. Which
+product a key hits is determined by the **Hive project the key belongs to, not the URL** (all
+task-based products share `POST /api/v2/task/sync`), so a key provisioned against the wrong project
+returns plausible-looking wrong results rather than an error.
+
+Google's `webEntities` are never read: knowledge-graph lookups name famous people only, and are not
+evidence about our user.
+
+Both are `image_search` kind — they find copies of a known photo and can never find a deepfake
+(§7.1 of `CLAUDE.md`); face-search coverage requires a face-search provider, none integrated yet.
+
+Runs execute asynchronously: `POST /v1/search` writes the run and its outbox row in one
+transaction, and the `search:runs` worker (the queue's consumer, a separate process like the
+relay) claims and executes it. One provider failing never fails the run;
+`search_runs.providers_succeeded` stays distinguishable from `providers_attempted`.
+
+### 3.7 Crop fetcher
 
 Its own deployable, on its own egress path, with **no VPC access to any internal service**.
 
