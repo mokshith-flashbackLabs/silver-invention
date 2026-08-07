@@ -160,3 +160,22 @@ def test_provider_timeout_must_be_positive() -> None:
 
     with pytest.raises(ValidationError):
         make_config(provider_timeout_seconds=0)
+
+
+def test_raw_response_retention_defaults_to_90_days(config: Config) -> None:
+    """Long enough to recalibrate over recent history, short enough that the
+    JSONB does not become the largest thing in the database."""
+    assert config.raw_response_retention_days == 90
+
+
+def test_raw_response_retention_env_override(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("RAW_RESPONSE_RETENTION_DAYS", "30")
+    assert load_config().raw_response_retention_days == 30
+
+
+@pytest.mark.parametrize("bad_value", [0, -1])
+def test_raw_response_retention_rejects_non_positive_values(bad_value: int) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(raw_response_retention_days=bad_value)
