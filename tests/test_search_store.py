@@ -469,3 +469,64 @@ async def test_list_infringements_filters_by_user_and_nests_attestations(
     future = datetime.now(UTC) + timedelta(hours=1)
     assert await store.list_infringements(user_ref, future) == ()
     assert await store.list_infringements(_user(), None) == ()
+
+
+async def test_52_weekly_rescans_over_static_corpus_add_zero_rows(
+    store: PostgresSearchStore, migrated_db: str
+) -> None:
+    """THE regression test for the defect step 6 exists to fix.
+
+    The old system's matches[].seenInScans appended one entry per scan
+    forever (weeklyInfringementScanner.js:1016). Row count here must grow
+    with CONTENT, never with TIME: 52 weekly rescans of a static corpus add
+    zero rows, and only seen_count, confirm_count, last_seen_at and
+    last_confirmed_at move.
+
+    DO NOT DELETE OR WEAKEN THIS TEST — step-6 spec, "Done when".
+    """
+    user_ref = _user()
+    seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
+    # Three pages, each found by Hive (via a backlink) and by Google (as a
+    # page match) — the cross-provider case, rescanned.
+    hive_corpus = [
+        _hive_match(f"https://cdn.example/{i}.jpg", pages=[f"https://site{i}.example/p"])
+        for i in range(3)
+    ]
+    google_corpus = [
+        _google_match(f"https://site{i}.example/p", "page_match") for i in range(3)
+    ]
+
+    def _counts() -> tuple[int, int, int]:
+        return (
+            _query(migrated_db, "SELECT count(*) FROM infringements")[0][0],
+            _query(migrated_db, "SELECT count(*) FROM attestations")[0][0],
+            _query(migrated_db, "SELECT count(*) FROM content_urls")[0][0],
+        )
+
+    first_week_counts: tuple[int, int, int] | None = None
+    for week in range(52):
+        run_id = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
+        await store.record_infringements(run_id, user_ref, HIVE_DESC, hive_corpus)
+        await store.record_infringements(run_id, user_ref, GOOGLE_DESC, google_corpus)
+        await store.complete_run(run_id, (HIVE, GOOGLE))
+        if week == 0:
+            first_week_counts = _counts()
+
+    # 3 pages -> 3 infringements, 2 attestations each, 3 content_urls
+    assert first_week_counts == (3, 6, 3)
+    assert _counts() == first_week_counts  # 51 further rescans added ZERO rows
+
+    rows = _query(
+        migrated_db,
+        "SELECT seen_count FROM infringements WHERE user_ref = %s",
+        (user_ref,),
+    )
+    assert all(r[0] == 104 for r in rows)  # 2 providers x 52 observations
+    assert all(
+        r[0] == 52 for r in _query(migrated_db, "SELECT confirm_count FROM attestations")
+    )
+
+    # The read surface still shows three things to act on, not 312.
+    listed = await store.list_infringements(user_ref, None)
+    assert len(listed) == 3
+    assert all(len(inf.attestations) == 2 for inf in listed)
