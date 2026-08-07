@@ -77,13 +77,13 @@ def install_request_logging_middleware(app: FastAPI) -> None:
         except Exception:
             log.exception(
                 "request.failed",
-                duration_ms=int((time.perf_counter() - started) * 1000),
+                duration_ms=int(1000 * (time.perf_counter() - started)),
             )
             raise
         response.headers["X-Request-Id"] = request_id
         log.info(
             "request.completed",
             status=response.status_code,
-            duration_ms=int((time.perf_counter() - started) * 1000),
+            duration_ms=int(1000 * (time.perf_counter() - started)),
         )
         return response

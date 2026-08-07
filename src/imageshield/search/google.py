@@ -79,7 +79,7 @@ class GoogleWebDetectionProvider:
                 matches=matches or [],
                 raw_response=raw,
                 http_status=http_status,
-                latency_ms=int((time.monotonic() - started) * 1000),
+                latency_ms=int(1000 * (time.monotonic() - started)),
             )
 
         body = {
