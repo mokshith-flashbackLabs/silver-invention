@@ -37,8 +37,9 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.outbox import QUEUE_SEARCH_RUNS, OutboxPayload, enqueue
 from imageshield.search.models import (
+    AttestationRow,
     ClaimedRun,
-    MatchRow,
+    InfringementRow,
     ProviderDescriptor,
     RunRow,
     SeedRow,
@@ -164,13 +165,19 @@ _COMPLETE_RUN_SQL = """
     WHERE run_id = %(run_id)s
 """
 
-_LIST_MATCHES_SQL = """
-    SELECT match_id, run_id, provider_id, image_url, page_url, score_kind,
-           provider_score, provider_category, query_quality, band, created_at
-    FROM search_matches
-    WHERE user_ref = %(user_ref)s
-      AND (%(since)s::timestamptz IS NULL OR created_at >= %(since)s)
-    ORDER BY created_at DESC, match_id
+# An infringement with no attestation cannot exist (the write path always
+# creates both), so the inner JOIN is not hiding rows.
+_LIST_INFRINGEMENTS_SQL = """
+    SELECT i.infringement_id, i.page_url, i.image_url, i.keyed_on,
+           i.first_seen_at, i.last_seen_at, i.seen_count, i.band, i.status,
+           a.provider_id, a.score_kind, a.provider_score, a.provider_category,
+           a.query_quality, a.score_version, a.first_confirmed_at,
+           a.last_confirmed_at, a.confirm_count
+    FROM infringements i
+    JOIN attestations a ON a.infringement_id = i.infringement_id
+    WHERE i.user_ref = %(user_ref)s
+      AND (%(since)s::timestamptz IS NULL OR i.last_seen_at >= %(since)s)
+    ORDER BY i.last_seen_at DESC, i.infringement_id, a.provider_id
 """
 
 
@@ -240,9 +247,9 @@ class SearchStore(Protocol):
         self, run_id: UUID, providers_succeeded: Sequence[ProviderId]
     ) -> None: ...
 
-    async def list_matches(
+    async def list_infringements(
         self, user_ref: UserRef, since: datetime | None
-    ) -> tuple[MatchRow, ...]: ...
+    ) -> tuple[InfringementRow, ...]: ...
 
 
 class PostgresSearchStore:
@@ -417,28 +424,56 @@ class PostgresSearchStore:
                 {"run_id": run_id, "providers_succeeded": list(providers_succeeded)},
             )
 
-    async def list_matches(
+    async def list_infringements(
         self, user_ref: UserRef, since: datetime | None
-    ) -> tuple[MatchRow, ...]:
+    ) -> tuple[InfringementRow, ...]:
+        """One row per infringement with its attestations nested. ``since``
+        filters on ``last_seen_at``, so a rescan that re-confirms an old
+        infringement brings it back into a recent window — which is the
+        point: it is still there."""
         async with self._pool.connection() as conn:
             cur = await conn.execute(
-                _LIST_MATCHES_SQL, {"user_ref": user_ref, "since": since}
+                _LIST_INFRINGEMENTS_SQL, {"user_ref": user_ref, "since": since}
             )
             rows = await cur.fetchall()
-        return tuple(_to_match_row(row) for row in rows)
+        return _group_infringements(rows)
 
 
-def _to_match_row(row: tuple[Any, ...]) -> MatchRow:
-    return MatchRow(
-        match_id=row[0],
-        run_id=row[1],
-        provider_id=row[2],
-        image_url=row[3],
-        page_url=row[4],
-        score_kind=row[5],
-        provider_score=row[6],
-        provider_category=row[7],
-        query_quality=row[8],
-        band=row[9],
-        created_at=row[10],
+def _group_infringements(rows: Sequence[tuple[Any, ...]]) -> tuple[InfringementRow, ...]:
+    """Collapse the joined (infringement x attestation) rows, preserving the
+    query's ordering."""
+    heads: dict[UUID, tuple[Any, ...]] = {}
+    attestations: dict[UUID, list[AttestationRow]] = {}
+    for row in rows:
+        infringement_id: UUID = row[0]
+        if infringement_id not in heads:
+            heads[infringement_id] = row
+            attestations[infringement_id] = []
+        attestations[infringement_id].append(
+            AttestationRow(
+                provider_id=row[9],
+                score_kind=row[10],
+                provider_score=row[11],
+                provider_category=row[12],
+                query_quality=row[13],
+                score_version=row[14],
+                first_confirmed_at=row[15],
+                last_confirmed_at=row[16],
+                confirm_count=row[17],
+            )
+        )
+    return tuple(
+        InfringementRow(
+            infringement_id=head[0],
+            page_url=head[1],
+            image_url=head[2],
+            keyed_on=head[3],
+            first_seen_at=head[4],
+            last_seen_at=head[5],
+            seen_count=head[6],
+            band=head[7],
+            status=head[8],
+            attestations=tuple(attestations[key]),
+        )
+        for key, head in heads.items()
     )

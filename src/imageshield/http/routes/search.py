@@ -22,10 +22,11 @@ from imageshield.http.auth import require_service_token
 from imageshield.http.deps import get_search_store
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
+    AttestationItem,
+    InfringementItem,
+    InfringementsResponse,
     SearchCreateRequest,
     SearchCreateResponse,
-    SearchMatchesResponse,
-    SearchMatchItem,
     SearchRunStatusResponse,
     SeedCreateRequest,
     SeedCreateResponse,
@@ -121,29 +122,50 @@ async def get_search_run(
     )
 
 
-@router.get("/search/matches")
-async def list_search_matches(
+@router.get("/search/infringements")
+async def list_infringements(
     user_ref: UUID,
     since: datetime | None = Query(default=None),
     store: SearchStore = Depends(get_search_store),
-) -> SearchMatchesResponse:
-    rows = await store.list_matches(UserRef(user_ref), since)
-    return SearchMatchesResponse(
-        matches=[
-            SearchMatchItem(
-                match_id=row.match_id,
-                run_id=row.run_id,
-                provider_id=row.provider_id,
-                image_url=row.image_url,
+) -> InfringementsResponse:
+    """One entry per page found, with every provider that attested to it.
+
+    Absence here means "no matches in monitored sources", never "you're
+    safe" — the corpus is a partner-supplied set of known sites, and the
+    caller is responsible for saying so (CLAUDE.md §4 #26).
+    """
+    rows = await store.list_infringements(UserRef(user_ref), since)
+    return InfringementsResponse(
+        infringements=[
+            InfringementItem(
+                infringement_id=row.infringement_id,
                 page_url=row.page_url,
-                score_kind=row.score_kind,
-                provider_score=(
-                    float(row.provider_score) if row.provider_score is not None else None
-                ),
-                provider_category=row.provider_category,
-                query_quality=row.query_quality,
+                image_url=row.image_url,
+                keyed_on=row.keyed_on,
+                first_seen_at=row.first_seen_at,
+                last_seen_at=row.last_seen_at,
+                seen_count=row.seen_count,
                 band=row.band,
-                created_at=row.created_at,
+                status=row.status,
+                provider_count=len(row.attestations),
+                attestations=[
+                    AttestationItem(
+                        provider_id=att.provider_id,
+                        score_kind=att.score_kind,
+                        provider_score=(
+                            float(att.provider_score)
+                            if att.provider_score is not None
+                            else None
+                        ),
+                        provider_category=att.provider_category,
+                        query_quality=att.query_quality,
+                        score_version=att.score_version,
+                        first_confirmed_at=att.first_confirmed_at,
+                        last_confirmed_at=att.last_confirmed_at,
+                        confirm_count=att.confirm_count,
+                    )
+                    for att in row.attestations
+                ],
             )
             for row in rows
         ]

@@ -4,6 +4,7 @@ tests/test_enrolment_store.py: own down --all + up arrange step)."""
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -430,3 +431,41 @@ async def test_rescan_updates_never_inserts_and_moves_the_score(
     assert rows[0][2] == Decimal("0.9300")  # the newer raw score won
     assert rows[0][3] == second_run  # last_run_id follows the latest run
     assert rows[0][4] is True
+
+
+async def test_list_infringements_filters_by_user_and_nests_attestations(
+    store: PostgresSearchStore,
+) -> None:
+    user_ref, other = _user(), _user()
+    _, run_id = await _seeded_run(store, user_ref)
+    _, other_run = await _seeded_run(store, other)
+    await store.record_infringements(
+        run_id,
+        user_ref,
+        HIVE_DESC,
+        [_hive_match("https://x/a.jpg", pages=["https://site/a"])],
+    )
+    await store.record_infringements(
+        run_id, user_ref, GOOGLE_DESC, [_google_match("https://site/a", "page_match")]
+    )
+    await store.record_infringements(
+        other_run,
+        other,
+        HIVE_DESC,
+        [_hive_match("https://x/b.jpg", pages=["https://site/b"])],
+    )
+
+    mine = await store.list_infringements(user_ref, None)
+    assert len(mine) == 1  # never another user's row
+    assert mine[0].page_url == "https://site/a"
+    assert mine[0].keyed_on == "page_url"
+    assert mine[0].band == "review"
+    assert {a.provider_id for a in mine[0].attestations} == {"hive", "google"}
+    assert all(a.confirm_count == 1 for a in mine[0].attestations)
+    hive_att = next(a for a in mine[0].attestations if a.provider_id == "hive")
+    assert hive_att.provider_score == Decimal("0.8700")  # RAW
+    assert hive_att.score_kind == "numeric"
+
+    future = datetime.now(UTC) + timedelta(hours=1)
+    assert await store.list_infringements(user_ref, future) == ()
+    assert await store.list_infringements(_user(), None) == ()
