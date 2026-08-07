@@ -52,17 +52,22 @@ CREATE TABLE eval_items (
   label_kind     TEXT NOT NULL
                  CHECK (label_kind IN ('same_person','derived_edit',
                                        'novel_generation','lookalike','unrelated')),
-  -- NOT NULL alone permits ''. The btrim check is what actually rejects an
-  -- item with no traceable consent basis. Consenting participants,
-  -- public-domain, or synthetic only -- never real victim content, never
-  -- scraped material.
+  -- NOT NULL alone permits ''. The regex is what actually rejects an item
+  -- with no traceable consent basis. Consenting participants, public-domain,
+  -- or synthetic only -- never real victim content, never scraped material.
   --
-  -- Explicit character set, not bare btrim(): Postgres's single-argument
-  -- btrim() strips only the space character, so a tab/newline-only value
-  -- like E'\t\n' passes bare btrim(consent_basis) <> '' even though it
-  -- carries no real content. Trimming " \t\n\r" explicitly is what actually
-  -- catches that case.
-  consent_basis  TEXT NOT NULL CHECK (btrim(consent_basis, E' \t\n\r') <> ''),
+  -- '\S' (any non-whitespace character), not an enumerated trim charset:
+  -- Postgres's single-argument btrim() strips only the space character, so a
+  -- tab/newline-only value like E'\t\n' passed bare
+  -- btrim(consent_basis) <> ''. Enumerating " \t\n\r" fixed that case but is
+  -- still a list, not the rule -- it still admitted a lone vertical tab
+  -- (chr(11)) or form feed (chr(12)). '\S' expresses "has non-whitespace
+  -- content" directly. NOTE: it does not close every gap -- U+00A0
+  -- (non-breaking space, chr(160)) matches '\S' in this database's
+  -- collation, i.e. is NOT treated as whitespace by Postgres's regex engine,
+  -- so a consent_basis of a lone NBSP still passes. See task-1-report.md for
+  -- the verification and the decision to document rather than patch it.
+  consent_basis  TEXT NOT NULL CHECK (consent_basis ~ '\S'),
   labelled_by    TEXT NOT NULL,
   labelled_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- A derived_edit labelled false_match would tune thresholds to suppress

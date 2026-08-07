@@ -495,11 +495,23 @@ def test_0007_down_removes_them_and_the_added_columns(throwaway_db: str) -> None
 
 def test_0007_eval_item_without_consent_basis_is_rejected(throwaway_db: str) -> None:
     """Invariant: no eval item without a traceable consent basis. NOT NULL
-    alone lets '' through, so the btrim CHECK is what actually enforces it."""
+    alone lets '' through, so the '\\S' CHECK is what actually enforces it.
+
+    Includes chr(11) (vertical tab) and chr(12) (form feed): an earlier
+    version of this constraint enumerated a trim charset (" \\t\\n\\r") that
+    fixed tab/newline but still admitted these two — a test that pinned only
+    the cases already known would not have caught that gap. chr(160)
+    (non-breaking space) is deliberately NOT included here: Postgres's regex
+    engine in this database's collation treats it as non-whitespace, so
+    '\\S' does not reject it either. That is a known, documented boundary —
+    see test_0007_consent_basis_regex_accepts_nbsp below and
+    task-1-report.md — not something this test should paper over by silently
+    expecting a rejection that doesn't happen.
+    """
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
     with psycopg.connect(throwaway_db) as conn:
-        for bad in ("", "   ", "\t\n"):
+        for bad in ("", "   ", "\t\n", chr(11), chr(12)):
             with pytest.raises(psycopg.errors.CheckViolation):
                 with conn.transaction():
                     conn.execute(
@@ -509,6 +521,32 @@ def test_0007_eval_item_without_consent_basis_is_rejected(throwaway_db: str) -> 
                         " 'true_match', 'same_person', %s, 'tester')",
                         (bad,),
                     )
+
+
+def test_0007_consent_basis_regex_accepts_nbsp(throwaway_db: str) -> None:
+    """Documents a known, deliberate gap rather than hiding it: a
+    consent_basis of a single non-breaking space (chr(160)) is NOT rejected.
+    Postgres's '\\S' (any non-whitespace character) does not treat U+00A0 as
+    whitespace in this database's collation, so this insert succeeds. If a
+    future migration tightens the check to close this gap, this test should
+    start failing and be updated deliberately — it must not be deleted
+    silently.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO eval_items (eval_set_id, seed_uri, candidate_url,"
+                " label, label_kind, consent_basis, labelled_by)"
+                " VALUES ('v1', 's3://seed', 'https://x.test/nbsp',"
+                " 'true_match', 'same_person', %s, 'tester')",
+                (chr(160),),
+            )
+        (stored,) = conn.execute(
+            "SELECT consent_basis FROM eval_items WHERE candidate_url = 'https://x.test/nbsp'"
+        ).fetchone()  # type: ignore[misc]
+        assert stored == chr(160)
 
 
 @pytest.mark.parametrize(
