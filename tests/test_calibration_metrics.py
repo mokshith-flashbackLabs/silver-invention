@@ -213,14 +213,47 @@ def test_sweep_reports_a_point_per_observed_score() -> None:
 
 def test_sweep_recommends_the_lowest_threshold_meeting_the_precision_floor() -> None:
     """Lowest, not highest: subject to precision >= 0.99, more recall is
-    strictly better, so take the loosest boundary that still clears the bar."""
+    strictly better, so take the loosest boundary that still clears the bar.
+
+    Needs genuine middle-region ambiguity -- scores at 0.90 that go both
+    ways -- so a real review band survives between the two recommendations.
+    Verified by hand:
+      t=0.96: tp=200,fp=0   -> precision 1.0   (only true_match>=0.96 passes)
+      t=0.90: tp=400,fp=200 -> precision 0.667 (both true_match groups pass,
+              plus the lookalikes AT 0.90 -- inclusive threshold)
+      so auto_min (lowest t with precision>=0.99) is 0.96, not 0.90.
+      npv_below(0.90): predicted-negative = lookalike@0.60 only (200) ->
+              fn=0, tn=200 -> npv 1.0
+      npv_below(0.96): predicted-negative = everything but true_match@0.96
+              (600) -> fn=200 (true_match@0.90), tn=400 -> npv 0.667
+      so drop_max (highest t with npv>=0.99) is 0.90, not 0.96.
+    """
+    rows = (
+        [num("true_match", "same_person", "0.96") for _ in range(200)]
+        + [num("true_match", "same_person", "0.90") for _ in range(200)]
+        + [num("false_match", "lookalike", "0.90") for _ in range(200)]
+        + [num("false_match", "lookalike", "0.60") for _ in range(200)]
+    )
+    sweep = sweep_numeric(rows, HIVE_DOMAIN)
+    assert sweep.recommended_auto_confirm_min == Decimal("0.96")
+    assert sweep.recommended_drop_max == Decimal("0.90")
+
+
+def test_sweep_refuses_when_boundaries_touch_with_no_review_gap() -> None:
+    """Cleanly separated data drives both boundaries to the same value (both
+    0.94 here): no score in the eval set falls strictly between drop and
+    auto_confirm. The honest read is that this set never measured a review
+    band, not that scores can skip straight from drop to auto_confirm --
+    real traffic will produce borderline scores this set didn't sample."""
     rows = (
         [num("true_match", "same_person", "0.96") for _ in range(200)]
         + [num("true_match", "same_person", "0.94") for _ in range(200)]
         + [num("false_match", "lookalike", "0.80") for _ in range(200)]
     )
     sweep = sweep_numeric(rows, HIVE_DOMAIN)
-    assert sweep.recommended_auto_confirm_min == Decimal("0.94")
+    assert sweep.recommended_auto_confirm_min is None
+    assert sweep.recommended_drop_max is None
+    assert any("review band" in w for w in sweep.warnings)
 
 
 def test_sweep_refuses_to_recommend_when_the_floor_is_unreachable() -> None:
@@ -249,14 +282,34 @@ def test_sweep_refuses_when_recommended_bands_would_overlap() -> None:
 
 
 def test_every_sweep_point_carries_sample_size() -> None:
+    """Not just non-negative (vacuous on an int field) -- the denominator at
+    each threshold must be the exact count of rows that landed in that
+    cell, worked out by hand from the fixture:
+      candidates = [0.5, 0.7, 0.95, 1.0] (domain edges + the two scores)
+      t=0.5, 0.7: both rows predicted positive -> precision denom 2 (tp+fp),
+                  recall denom 1 (tp+fn), npv denom 0 (tn+fn)
+      t=0.95:     only the 0.95 true_match clears -> precision denom 1,
+                  recall denom 1, npv denom 1
+      t=1.0:      neither clears -> precision denom 0, recall denom 1,
+                  npv denom 2
+    """
     rows = [
         num("true_match", "same_person", "0.95"),
         num("false_match", "lookalike", "0.70"),
     ]
-    for p in sweep_numeric(rows, HIVE_DOMAIN).points:
-        assert p.precision_at_or_above.denominator >= 0
-        assert p.recall_at_or_above.denominator >= 0
-        assert p.npv_below.denominator >= 0
+    expected = {
+        Decimal("0.5"): (2, 1, 0),
+        Decimal("0.7"): (2, 1, 0),
+        Decimal("0.95"): (1, 1, 1),
+        Decimal("1.0"): (0, 1, 2),
+    }
+    by_threshold = {p.threshold: p for p in sweep_numeric(rows, HIVE_DOMAIN).points}
+    assert set(by_threshold) == set(expected)
+    for threshold, (prec_d, rec_d, npv_d) in expected.items():
+        p = by_threshold[threshold]
+        assert p.precision_at_or_above.denominator == prec_d
+        assert p.recall_at_or_above.denominator == rec_d
+        assert p.npv_below.denominator == npv_d
 
 
 # ── Categorical sweep ────────────────────────────────────────────────────
@@ -276,10 +329,36 @@ def test_categorical_sweep_reports_precision_per_category() -> None:
 
 
 def test_categorical_sweep_never_reads_provider_score() -> None:
-    rows = [cat("true_match", "same_person", "full_match")]
-    sweep = sweep_categorical(rows, GOOGLE_CATEGORIES)
-    assert all(r.provider_score is None for r in rows)
-    assert sweep.points
+    """A property of the code under test, not of the fixture: a categorical
+    row that happens to carry a stray, misleading provider_score must
+    produce the exact same result as the same row with no score at all --
+    sweep_categorical's precision has to come from provider_category alone."""
+    row_with_score = EvalRow(
+        label="true_match",
+        label_kind="same_person",
+        observed=True,
+        provider_score=Decimal("0.01"),  # would fail any real threshold
+        provider_category="full_match",
+    )
+    row_without_score = EvalRow(
+        label="true_match",
+        label_kind="same_person",
+        observed=True,
+        provider_score=None,
+        provider_category="full_match",
+    )
+    with_score = {
+        p.category: p for p in sweep_categorical([row_with_score], GOOGLE_CATEGORIES).points
+    }
+    without_score = {
+        p.category: p
+        for p in sweep_categorical([row_without_score], GOOGLE_CATEGORIES).points
+    }
+    assert with_score["full_match"].precision.value == pytest.approx(1.0)
+    assert (
+        with_score["full_match"].precision.value
+        == without_score["full_match"].precision.value
+    )
 
 
 def test_categorical_recommendation_only_auto_confirms_at_the_floor() -> None:
@@ -291,3 +370,74 @@ def test_categorical_recommendation_only_auto_confirms_at_the_floor() -> None:
     assert sweep.recommended["partial_match"] == "drop"
     # A category with no items at all cannot be promoted or dropped.
     assert sweep.recommended["page_match"] == "review"
+
+
+def test_all_uncertain_category_is_never_dropped_for_free() -> None:
+    """A category whose every row is label='uncertain' contributes nothing
+    to any confusion cell -- precision.denominator is 0, real zero evidence.
+    Once a real category (partial_match) is already committed to the drop
+    set, adding page_match on top of it leaves total/wrong unchanged, so a
+    guard that only checks raw row count would let it ride along into
+    drop for free. It must stay review."""
+    rows = (
+        [cat("true_match", "same_person", "full_match") for _ in range(200)]
+        + [cat("false_match", "lookalike", "partial_match") for _ in range(200)]
+        + [cat("uncertain", "lookalike", "page_match") for _ in range(50)]
+    )
+    sweep = sweep_categorical(rows, GOOGLE_CATEGORIES)
+    by_cat = {p.category: p for p in sweep.points}
+    assert by_cat["page_match"].precision.denominator == 0
+    assert sweep.recommended["page_match"] == "review"
+
+
+def test_all_unobserved_category_is_never_dropped_for_free() -> None:
+    """Same failure mode as the uncertain case, via a different route: a row
+    with observed=False can never be predicted positive regardless of its
+    category, so it can never contribute to tp/fp for that category either.
+    50 such rows tagged page_match must still leave page_match at zero
+    evidence, not drop it."""
+    rows = (
+        [cat("true_match", "same_person", "full_match") for _ in range(200)]
+        + [cat("false_match", "lookalike", "partial_match") for _ in range(200)]
+        + [
+            EvalRow(
+                label="false_match",
+                label_kind="unrelated",
+                observed=False,
+                provider_score=None,
+                provider_category="page_match",
+            )
+            for _ in range(50)
+        ]
+    )
+    sweep = sweep_categorical(rows, GOOGLE_CATEGORIES)
+    by_cat = {p.category: p for p in sweep.points}
+    assert by_cat["page_match"].precision.denominator == 0
+    assert sweep.recommended["page_match"] == "review"
+
+
+# ── Numeric and categorical recall must agree on a malformed row ────────
+
+def test_null_score_row_is_treated_consistently_by_confusion_and_recall() -> None:
+    """observed=True with provider_score=None is a malformed numeric row --
+    the provider answered but supplied no score. confusion_at_threshold
+    treats it as a false negative (no score to clear the threshold with).
+    recall_by_label_kind must agree: it is not "found" just because the row
+    was returned, unlike the categorical case where absence of a score is
+    normal, not malformed."""
+    rows = [
+        EvalRow(
+            label="true_match",
+            label_kind="same_person",
+            observed=True,
+            provider_score=None,
+            provider_category=None,
+        ),
+    ]
+    c = confusion_at_threshold(rows, Decimal("0.90"))
+    assert c.fn == 1
+    assert c.tp == 0
+    by_kind = recall_by_label_kind(rows, Decimal("0.90"))
+    assert by_kind["same_person"].value == pytest.approx(0.0)
+    assert by_kind["same_person"].numerator == 0
+    assert by_kind["same_person"].denominator == 1

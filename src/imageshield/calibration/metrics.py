@@ -55,7 +55,7 @@ class Metric(BaseModel):
 
     def render(self) -> str:
         if self.value is None:
-            return f"n/a (0/{self.denominator})"
+            return f"n/a ({self.numerator}/{self.denominator})"
         lower = (
             f", 95% lower bound {self.wilson_lower_95:.3f}"
             if self.wilson_lower_95 is not None
@@ -211,20 +211,31 @@ def recall_by_label_kind(
     hold and recall there will be near zero. One averaged figure hides that;
     reporting the split puts the product's real coverage gap in every
     calibration report as a number.
+
+    Must agree with :func:`confusion_at_threshold` on every row, or the two
+    figures in the same report can disagree about what "found" means. For a
+    real numeric threshold, found = observed AND a score exists AND it clears
+    the threshold — a row with ``observed=True`` but ``provider_score=None``
+    is a malformed observation and is NOT found, exactly as
+    ``confusion_at_threshold`` scores it. Only the ``_NO_THRESHOLD`` sentinel
+    (categorical providers, which never carry a numeric score at all) falls
+    back to "found = returned at all".
     """
     out: dict[LabelKind, Metric] = {}
     for kind in sorted(TRUE_MATCH_KINDS):
         subset = [r for r in rows if r.label_kind == kind and r.label == "true_match"]
         if not subset:
             continue
-        found = sum(
-            1
-            for r in subset
-            if r.observed
-            and (
-                r.provider_score is None or r.provider_score >= threshold
+        if threshold == _NO_THRESHOLD:
+            found = sum(1 for r in subset if r.observed)
+        else:
+            found = sum(
+                1
+                for r in subset
+                if r.observed
+                and r.provider_score is not None
+                and r.provider_score >= threshold
             )
-        )
         out[kind] = metric(found, len(subset))
     return out
 
@@ -315,10 +326,22 @@ def sweep_numeric(
             f"no threshold reaches NPV >= {target} — drop is not supportable "
             "by this set."
         )
-    if auto_min is not None and drop_max is not None and auto_min < drop_max:
+    # `<=`, not `<`: a config where drop and auto_confirm boundaries merely
+    # TOUCH (auto_min == drop_max) still leaves no review band at all for
+    # this provider — every score in between drop and auto_confirm is a
+    # region this eval set happened not to sample, not a region proven safe
+    # to skip straight through. Real traffic will produce borderline scores;
+    # touching boundaries would route every one of them to an irreversible
+    # outcome the data never measured. `validate_numeric_bands` (Task 2)
+    # independently rejects a zero-width review band as unreachable config,
+    # which is the same conclusion from the config side.
+    if auto_min is not None and drop_max is not None and auto_min <= drop_max:
         warnings.append(
-            f"recommended bands overlap (drop < {drop_max}, auto_confirm >= "
-            f"{auto_min}); no recommendation issued"
+            f"recommended auto_confirm boundary ({auto_min}) does not sit "
+            f"strictly above the recommended drop boundary ({drop_max}): "
+            "the eval set has no observations between them, so this would "
+            "produce a config with no review band. Reporting the gap, not "
+            "shipping a boundary the data did not measure."
         )
         auto_min = None
         drop_max = None
@@ -342,6 +365,13 @@ class CategoryPoint(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     category: str
+    # Equal to precision.denominator (tp + fp), by construction: what
+    # actually entered the arithmetic for this category, not a raw row
+    # count. A row whose provider_category happens to equal this category
+    # but is excluded from the tally (label == "uncertain", or a malformed
+    # observed=False row) must not inflate this — otherwise a report can
+    # show "page_match 50  n/a (0/0)", which reads like 50 items of evidence
+    # sitting behind an unmeasured figure.
     count: int
     precision: Metric
 
@@ -362,17 +392,23 @@ def sweep_categorical(
     target: Decimal = Decimal("0.99"),
 ) -> CategoricalSweep:
     """Greedy and deterministic, documented as such: auto_confirm any category
-    whose own precision clears the floor; then drop the remaining categories,
-    largest-NPV-first, while the drop set keeps NPV at the floor."""
+    whose own precision clears the floor. Then, among what's left, add
+    categories to the drop set in ascending order of their own precision —
+    the ones least likely to contain a true match go first — re-checking
+    after each addition that the drop set as a whole still keeps NPV at the
+    floor. A category with zero evidence (no row of it ever entered the
+    confusion tally) is skipped outright: it can be neither promoted nor
+    dropped on data that doesn't exist."""
     target_f = float(target)
     points: list[CategoryPoint] = []
     for category in categories:
         c = confusion_for_categories(rows, frozenset({category}))
+        cat_precision = precision(c)
         points.append(
             CategoryPoint(
                 category=category,
-                count=sum(1 for r in rows if r.provider_category == category),
-                precision=precision(c),
+                count=cat_precision.denominator,
+                precision=cat_precision,
             )
         )
 
@@ -383,13 +419,23 @@ def sweep_categorical(
 
     remaining = [p for p in points if recommended[p.category] == "review"]
     drop_set: set[str] = set()
-    for p in sorted(remaining, key=lambda x: x.precision.value or 0.0):
-        if p.count == 0:
-            # A category with no items at all contributes nothing to the
-            # confusion counts whether or not it joins the drop set — the
-            # totals-unchanged guard below would pass trivially and drop it
-            # for free. Zero items is neither evidence of safety nor of
-            # danger; it stays `review`.
+    # Sort key: (no_evidence, precision). No-evidence categories sort last —
+    # collapsing `precision.value is None` into `0.0` would rank "measured
+    # zero, definitely safe to drop" the same as "never measured, unknown"
+    # and this loop skips no-evidence categories anyway, but the key must not
+    # pretend they are the same claim.
+    for p in sorted(
+        remaining,
+        key=lambda x: (x.precision.value is None, x.precision.value or 0.0),
+    ):
+        if p.precision.denominator == 0:
+            # Zero evidence: no row for this category ever entered the
+            # confusion tally (all uncertain, or all malformed
+            # observed=False). Adding it to drop_set would leave `total`/
+            # `wrong` below unchanged from whatever drop_set already
+            # contains, so the "still safe" check would pass trivially and
+            # drop a category on no data at all. Guard on the denominator
+            # that actually measures evidence, not on a raw row count.
             continue
         candidate = drop_set | {p.category}
         # NPV of "predicted negative" when the positive set is everything not
