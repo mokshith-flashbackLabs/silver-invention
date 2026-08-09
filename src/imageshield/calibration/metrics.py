@@ -27,11 +27,11 @@ from decimal import Decimal
 from pydantic import BaseModel, ConfigDict
 
 from imageshield.calibration.models import (
+    TRUE_MATCH_KINDS,
     Band,
     Label,
     LabelKind,
     ScoreDomain,
-    TRUE_MATCH_KINDS,
 )
 
 # 97.5th percentile of the standard normal — the two-sided 95% interval.

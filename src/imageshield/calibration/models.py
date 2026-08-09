@@ -43,7 +43,7 @@ class ScoreDomain(BaseModel):
     """The range or vocabulary a provider's raw values actually occupy, from
     ``providers.score_domain`` (written by migration 0004).
 
-    Hive Web Search reports 0.5–1.0 where **0.5 is the floor**, not a midpoint
+    Hive Web Search reports 0.5-1.0 where **0.5 is the floor**, not a midpoint
     meaning "uncertain". A value below it is impossible — a malformed response
     or a key provisioned against the wrong Hive project — and must not be read
     as "a very low score", which would band it ``drop`` and discard it

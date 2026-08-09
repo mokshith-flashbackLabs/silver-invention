@@ -473,7 +473,7 @@ def test_0007_creates_calibration_tables(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
     with psycopg.connect(throwaway_db) as conn:
-        assert CALIBRATION_TABLES <= _table_names(conn)
+        assert _table_names(conn) >= CALIBRATION_TABLES
 
 
 def test_0007_down_removes_them_and_the_added_columns(throwaway_db: str) -> None:
@@ -512,15 +512,14 @@ def test_0007_eval_item_without_consent_basis_is_rejected(throwaway_db: str) -> 
     run_migrate(throwaway_db, "up")
     with psycopg.connect(throwaway_db) as conn:
         for bad in ("", "   ", "\t\n", chr(11), chr(12)):
-            with pytest.raises(psycopg.errors.CheckViolation):
-                with conn.transaction():
-                    conn.execute(
-                        "INSERT INTO eval_items (eval_set_id, seed_uri, candidate_url,"
-                        " label, label_kind, consent_basis, labelled_by)"
-                        " VALUES ('v1', 's3://seed', 'https://x.test/a',"
-                        " 'true_match', 'same_person', %s, 'tester')",
-                        (bad,),
-                    )
+            with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
+                conn.execute(
+                    "INSERT INTO eval_items (eval_set_id, seed_uri, candidate_url,"
+                    " label, label_kind, consent_basis, labelled_by)"
+                    " VALUES ('v1', 's3://seed', 'https://x.test/a',"
+                    " 'true_match', 'same_person', %s, 'tester')",
+                    (bad,),
+                )
 
 
 def test_0007_consent_basis_regex_accepts_nbsp(throwaway_db: str) -> None:
@@ -582,9 +581,8 @@ def test_0007_label_kind_and_label_must_agree(
             with conn.transaction():
                 conn.execute(stmt, (url, label, label_kind))
         else:
-            with pytest.raises(psycopg.errors.CheckViolation):
-                with conn.transaction():
-                    conn.execute(stmt, (url, label, label_kind))
+            with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
+                conn.execute(stmt, (url, label, label_kind))
 
 
 def test_0007_only_one_active_config_per_provider(throwaway_db: str) -> None:
@@ -597,9 +595,8 @@ def test_0007_only_one_active_config_per_provider(throwaway_db: str) -> None:
         )
         with conn.transaction():
             conn.execute(stmt, ("v1",))
-        with pytest.raises(psycopg.errors.UniqueViolation):
-            with conn.transaction():
-                conn.execute(stmt, ("v2",))
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            conn.execute(stmt, ("v2",))
         # Inactive rows are unconstrained — many may coexist.
         with conn.transaction():
             conn.execute(

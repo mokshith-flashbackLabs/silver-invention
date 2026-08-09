@@ -16,7 +16,6 @@ from imageshield.calibration.metrics import (
     EvalRow,
     composition,
     confusion_at_threshold,
-    confusion_for_categories,
     effective_sample_size,
     metric,
     npv,

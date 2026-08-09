@@ -136,7 +136,7 @@ def test_below_hive_floor_is_review_not_drop() -> None:
     """THE fixture the step-7 done-when asks for.
 
     0.4 is impossible for Hive — its floor is 0.5. Read against an assumed
-    0–1 scale it is merely a low score and bands to `drop`, silently
+    0-1 scale it is merely a low score and bands to `drop`, silently
     discarded and never seen by anyone. Read against score_domain it is a
     malformed response (or a key on the wrong Hive project, which returns
     plausible-looking wrong results rather than an error) and a human looks.
@@ -175,7 +175,7 @@ def test_numeric_boundaries_are_min_inclusive_max_exclusive(
 
 def test_scores_are_never_rescaled() -> None:
     """A 0.72 boundary means 0.72 on Hive's native scale. If anything
-    rescaled the domain onto 0–1, native 0.72 would map to 0.44 and land in
+    rescaled the domain onto 0-1, native 0.72 would map to 0.44 and land in
     `drop` instead of `review`."""
     assert band_hive("0.72")[0] == "review"
 
@@ -322,7 +322,7 @@ def test_half_open_domain_is_also_score_domain_unknown(domain: ScoreDomain) -> N
 
 def _gap_entry() -> PolicyEntry:
     """A deliberately gappy config: drop tops out at 0.72, auto_confirm
-    covers 0.72–0.90, but the domain runs to 1.0. Nothing covers [0.90, 1.0)."""
+    covers 0.72-0.90, but the domain runs to 1.0. Nothing covers [0.90, 1.0)."""
     return PolicyEntry(
         provider_id=HIVE,
         calibrated=True,
@@ -433,8 +433,8 @@ def test_zero_width_band_is_rejected() -> None:
 
 def test_unbounded_domain_min_is_rejected_not_silently_valid() -> None:
     """I3. With domain.min unset, the coverage walk's cursor starts at None
-    and the first band's gap check was silently skipped — bands (0.8–0.9,
-    0.9–inf) against ScoreDomain(min=None, max=1.0) used to report no
+    and the first band's gap check was silently skipped — bands (0.8-0.9,
+    0.9-inf) against ScoreDomain(min=None, max=1.0) used to report no
     problems despite an obvious gap below 0.8."""
     bands = (
         NumericBand(band="review", min=Decimal("0.8"), max=Decimal("0.9")),

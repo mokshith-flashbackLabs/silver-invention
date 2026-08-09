@@ -134,7 +134,10 @@ def band_for_attestation(
 def _in_domain(score: Decimal, domain: ScoreDomain) -> bool:
     if domain.min is not None and score < domain.min:
         return False
-    if domain.max is not None and score > domain.max:
+    # Explicit False/True per boundary reads clearer than `return not (...)`
+    # for a domain check that gates auto_confirm/drop/review; keeps the two
+    # edges visually symmetric.
+    if domain.max is not None and score > domain.max:  # noqa: SIM103
         return False
     return True
 
