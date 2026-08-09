@@ -15,14 +15,19 @@ from __future__ import annotations
 import asyncio
 import selectors
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.config import Config
+from imageshield.db.connection import make_async_pool
 from imageshield.http.app import create_app
+from imageshield.search.store import PostgresSearchStore
+from imageshield.types import ProviderId, UserRef
+from tests.db import run_migrate
 from tests.db import throwaway_db as throwaway_db  # re-exported for fixture discovery
 
 if sys.platform == "win32":
@@ -96,3 +101,70 @@ def config() -> Config:
 def client(config: Config) -> TestClient:
     app = create_app(config=config)
     return TestClient(app)
+
+
+@pytest.fixture
+async def search_fixture(
+    throwaway_db: str,
+) -> AsyncIterator[tuple[PostgresSearchStore, UUID, UserRef]]:
+    """A ``PostgresSearchStore`` against a freshly migrated throwaway
+    database, with one seed and one run already created — the arrangement
+    ``tests/test_search_store.py`` already does per-test, lifted here so
+    ``tests/test_calibration_write_path.py`` doesn't invent a second setup
+    path.
+
+    Yields ``(store, run_id, user_ref)``. The run is attempted against both
+    known providers, matching ``HIVE_DESC``/``GOOGLE_DESC``'s provider ids.
+    """
+    down_result = run_migrate(throwaway_db, "down", "--all")
+    assert down_result.returncode == 0, down_result.stderr
+    up_result = run_migrate(throwaway_db, "up")
+    assert up_result.returncode == 0, up_result.stderr
+
+    pool = make_async_pool(throwaway_db, min_size=1, max_size=2)
+    await pool.open()
+    try:
+        store = PostgresSearchStore(pool)
+        user_ref = UserRef(uuid4())
+        seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
+        run_id = await store.create_run(
+            user_ref, seed_id, (ProviderId("hive"), ProviderId("google"))
+        )
+        yield store, run_id, user_ref
+    finally:
+        await pool.close()
+
+
+@pytest.fixture
+def google_policy() -> Callable[[str], dict[Any, Any]]:
+    """A Google policy mapping every category to one band, for roll-up tests."""
+    from imageshield.calibration.models import (
+        CalibrationConfig,
+        PolicyEntry,
+        ScoreDomain,
+    )
+
+    def _make(band: str) -> dict[Any, Any]:
+        gid = ProviderId("google")
+        return {
+            gid: PolicyEntry(
+                provider_id=gid,
+                calibrated=True,
+                score_domain=ScoreDomain(
+                    categories=("full_match", "partial_match", "page_match")
+                ),
+                config=CalibrationConfig(
+                    config_id=uuid4(),
+                    provider_id=gid,
+                    version="google-cal-v1",
+                    score_kind="categorical",
+                    categorical_bands={
+                        "full_match": band,
+                        "partial_match": band,
+                        "page_match": band,
+                    },
+                ),
+            )
+        }
+
+    return _make

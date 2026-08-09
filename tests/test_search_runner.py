@@ -69,6 +69,7 @@ class FakeStore:
         user_ref: UserRef,
         provider: ProviderDescriptor,
         matches: Sequence[ProviderMatch],
+        policy: Any,
     ) -> int:
         self.matches.append((run_id, provider, matches))
         return len(matches)
@@ -138,7 +139,7 @@ async def test_one_provider_timing_out_still_completes_with_the_others_results()
     store = FakeStore()
     claim = _claim((HIVE, GOOGLE))
 
-    outcome = await execute_run(claim, {HIVE: hive, GOOGLE: google}, store)
+    outcome = await execute_run(claim, {HIVE: hive, GOOGLE: google}, store, {})
 
     assert outcome.providers_succeeded == (HIVE,)
     assert outcome.matches_recorded == 2
@@ -157,7 +158,7 @@ async def test_adapter_raising_becomes_error_result_not_a_failed_run() -> None:
     store = FakeStore()
     claim = _claim((HIVE, GOOGLE))
 
-    outcome = await execute_run(claim, {HIVE: hive, GOOGLE: google}, store)
+    outcome = await execute_run(claim, {HIVE: hive, GOOGLE: google}, store, {})
 
     assert outcome.providers_succeeded == (GOOGLE,)
     hive_calls = [r for _, r in store.calls if r.provider_id == HIVE]
@@ -171,7 +172,7 @@ async def test_attempted_provider_without_adapter_is_visible_error() -> None:
     store = FakeStore()
     claim = _claim((HIVE, GOOGLE))
 
-    outcome = await execute_run(claim, {GOOGLE: google}, store)
+    outcome = await execute_run(claim, {GOOGLE: google}, store, {})
 
     assert outcome.providers_succeeded == (GOOGLE,)
     hive_calls = [r for _, r in store.calls if r.provider_id == HIVE]

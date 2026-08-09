@@ -73,6 +73,14 @@ def _claim(run_id: UUID) -> ClaimedRun:
     )
 
 
+class FakeCalibrationStore:
+    """Empty policy: rule 1 fires and every band is 'review' — this module
+    doesn't exercise banding, only the claim/execute/delete contract."""
+
+    async def load_active_policy(self) -> dict[Any, Any]:
+        return {}
+
+
 def _body(run_id: UUID, event: str = "search.run_requested") -> str:
     return json.dumps({"event": event, "id": str(run_id)})
 
@@ -81,7 +89,7 @@ async def test_valid_message_claims_executes_and_reports_handled() -> None:
     run_id = uuid4()
     store = WorkerFakeStore(_claim(run_id))
 
-    handled = await handle_message(_body(run_id), store, {})
+    handled = await handle_message(_body(run_id), store, {}, FakeCalibrationStore())
 
     assert handled is True
     assert store.claim_requests == [run_id]
@@ -93,7 +101,7 @@ async def test_unclaimable_run_is_handled_without_execution() -> None:
     run_id = uuid4()
     store = WorkerFakeStore(claim=None)
 
-    handled = await handle_message(_body(run_id), store, {})
+    handled = await handle_message(_body(run_id), store, {}, FakeCalibrationStore())
 
     assert handled is True
     assert store.completed == []
@@ -101,9 +109,20 @@ async def test_unclaimable_run_is_handled_without_execution() -> None:
 
 async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
     store = WorkerFakeStore(claim=None)
-    assert await handle_message(_body(uuid4(), event="something.else"), store, {}) is True
-    assert await handle_message("not json at all", store, {}) is True
-    assert await handle_message('{"event": "search.run_requested"}', store, {}) is True
+    calibration_store = FakeCalibrationStore()
+    assert (
+        await handle_message(
+            _body(uuid4(), event="something.else"), store, {}, calibration_store
+        )
+        is True
+    )
+    assert await handle_message("not json at all", store, {}, calibration_store) is True
+    assert (
+        await handle_message(
+            '{"event": "search.run_requested"}', store, {}, calibration_store
+        )
+        is True
+    )
     assert store.claim_requests == []  # never even attempted a claim
 
 
@@ -112,7 +131,7 @@ async def test_execution_failure_keeps_message_for_redelivery() -> None:
     store = WorkerFakeStore(_claim(run_id))
     store.fail_execution = True
 
-    handled = await handle_message(_body(run_id), store, {})
+    handled = await handle_message(_body(run_id), store, {}, FakeCalibrationStore())
 
     assert handled is False  # not deleted -> SQS visibility timeout redelivers
     assert store.completed == []

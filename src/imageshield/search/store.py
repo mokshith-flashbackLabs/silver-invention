@@ -9,9 +9,10 @@ Load-bearing choices:
   queued → running exactly once, completed never re-executes, and a
   'running' claim older than ``_STALE_CLAIM_MINUTES`` is reclaimable (a
   worker died mid-run; SQS redelivered).
-- ``record_infringements`` writes ``band = 'review'`` unconditionally. No
-  calibration exists yet (step 7), and an uncalibrated provider must not be
-  able to tell someone their face was found without a human looking first.
+- ``record_infringements`` bands each attestation through the calibration
+  policy snapshot and rolls the infringement up from its attestations (step
+  7). With no active config, or an uncalibrated provider, every band is still
+  ``review`` — the state the repo ships in.
 - Writes are **upserts, never appends** (step 6). One infringement per
   ``(user_ref, url_hash)``, one attestation per ``(infringement, provider)``,
   and a rescan that finds the same unchanged URL updates counters instead of
@@ -35,6 +36,8 @@ from uuid import UUID
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.calibration.bands import band_for_attestation, roll_up
+from imageshield.calibration.models import BandingPolicy
 from imageshield.outbox import QUEUE_SEARCH_RUNS, OutboxPayload, enqueue
 from imageshield.search.models import (
     AttestationRow,
@@ -141,10 +144,10 @@ _UPSERT_INFRINGEMENT_SQL = """
 _UPSERT_ATTESTATION_SQL = """
     INSERT INTO attestations (infringement_id, provider_id, score_kind,
                               provider_score, provider_category, query_quality,
-                              score_version, last_run_id)
+                              score_version, last_run_id, band, calibration_version)
     VALUES (%(infringement_id)s, %(provider_id)s, %(score_kind)s,
             %(provider_score)s, %(provider_category)s, %(query_quality)s,
-            %(score_version)s, %(run_id)s)
+            %(score_version)s, %(run_id)s, %(band)s, %(calibration_version)s)
     ON CONFLICT (infringement_id, provider_id) DO UPDATE
       SET last_confirmed_at = now(),
           confirm_count = attestations.confirm_count + 1,
@@ -152,7 +155,21 @@ _UPSERT_ATTESTATION_SQL = """
           provider_category = EXCLUDED.provider_category,
           query_quality = EXCLUDED.query_quality,
           score_version = EXCLUDED.score_version,
-          last_run_id = EXCLUDED.last_run_id
+          last_run_id = EXCLUDED.last_run_id,
+          band = EXCLUDED.band,
+          calibration_version = EXCLUDED.calibration_version
+"""
+
+# Every provider's band for this infringement — including ones written
+# earlier in the same run by a different provider — so the roll-up sees the
+# whole picture and not just what this call wrote.
+_ATTESTATION_BANDS_SQL = """
+    SELECT band FROM attestations WHERE infringement_id = %(infringement_id)s
+"""
+
+_SET_INFRINGEMENT_BAND_SQL = """
+    UPDATE infringements SET band = %(band)s, band_reason = %(band_reason)s
+    WHERE infringement_id = %(infringement_id)s
 """
 
 _COMPLETE_RUN_SQL = """
@@ -170,9 +187,10 @@ _COMPLETE_RUN_SQL = """
 _LIST_INFRINGEMENTS_SQL = """
     SELECT i.infringement_id, i.page_url, i.image_url, i.keyed_on,
            i.first_seen_at, i.last_seen_at, i.seen_count, i.band, i.status,
+           i.band_reason,
            a.provider_id, a.score_kind, a.provider_score, a.provider_category,
            a.query_quality, a.score_version, a.first_confirmed_at,
-           a.last_confirmed_at, a.confirm_count
+           a.last_confirmed_at, a.confirm_count, a.band, a.calibration_version
     FROM infringements i
     JOIN attestations a ON a.infringement_id = i.infringement_id
     WHERE i.user_ref = %(user_ref)s
@@ -181,14 +199,14 @@ _LIST_INFRINGEMENTS_SQL = """
 """
 
 
-class _InfringementKey(NamedTuple):
+class InfringementKey(NamedTuple):
     url_hash: UrlHash
     key_url: str
     keyed_on: str  # 'page_url' | 'image_url'
     match: ProviderMatch
 
 
-def _fan_out(matches: Sequence[ProviderMatch]) -> list[_InfringementKey]:
+def fan_out(matches: Sequence[ProviderMatch]) -> list[InfringementKey]:
     """One key per page the image was found on; image_url as the fallback
     when the provider reported no page at all.
 
@@ -201,8 +219,12 @@ def _fan_out(matches: Sequence[ProviderMatch]) -> list[_InfringementKey]:
     tracking params) is one write rather than a self-inflicted double count.
     First occurrence wins: providers return relevance order, and raw_response
     keeps everything regardless.
+
+    Public because ``calibrate observe`` must map provider responses to
+    candidate URLs through exactly this code. An eval measurement made
+    against a reimplementation measures the reimplementation.
     """
-    seen: dict[UrlHash, _InfringementKey] = {}
+    seen: dict[UrlHash, InfringementKey] = {}
     for match in matches:
         targets = (
             [(page, "page_url") for page in match.page_urls]
@@ -212,7 +234,7 @@ def _fan_out(matches: Sequence[ProviderMatch]) -> list[_InfringementKey]:
         for key_url, keyed_on in targets:
             digest = url_hash(key_url)
             if digest not in seen:
-                seen[digest] = _InfringementKey(digest, key_url, keyed_on, match)
+                seen[digest] = InfringementKey(digest, key_url, keyed_on, match)
     return list(seen.values())
 
 
@@ -241,6 +263,7 @@ class SearchStore(Protocol):
         user_ref: UserRef,
         provider: ProviderDescriptor,
         matches: Sequence[ProviderMatch],
+        policy: BandingPolicy,
     ) -> int: ...
 
     async def complete_run(
@@ -370,12 +393,13 @@ class PostgresSearchStore:
         user_ref: UserRef,
         provider: ProviderDescriptor,
         matches: Sequence[ProviderMatch],
+        policy: BandingPolicy,
     ) -> int:
         """Upsert one infringement per page found and one attestation per
         (infringement, provider). Returns the number of infringements touched
         — inserted or updated, since a rescan legitimately touches without
         inserting."""
-        keys = _fan_out(matches)
+        keys = fan_out(matches)
         async with self._pool.connection() as conn, conn.transaction():
             for key in keys:
                 await conn.execute(
@@ -400,10 +424,17 @@ class PostgresSearchStore:
                 )
                 row = await cur.fetchone()
                 assert row is not None
+                infringement_id: UUID = row[0]
+                decision = band_for_attestation(
+                    policy.get(provider.provider_id),
+                    provider.score_kind,
+                    key.match.provider_score,
+                    key.match.provider_category,
+                )
                 await conn.execute(
                     _UPSERT_ATTESTATION_SQL,
                     {
-                        "infringement_id": row[0],
+                        "infringement_id": infringement_id,
                         "provider_id": provider.provider_id,
                         "score_kind": provider.score_kind,
                         "provider_score": key.match.provider_score,
@@ -411,6 +442,24 @@ class PostgresSearchStore:
                         "query_quality": key.match.query_quality,
                         "score_version": provider.score_version,
                         "run_id": run_id,
+                        "band": decision.band,
+                        "calibration_version": decision.calibration_version,
+                    },
+                )
+                # Roll up here rather than at end of run: otherwise, between
+                # provider A's write and provider B's, the stored band
+                # disagrees with the attestations backing it and a reader can
+                # observe that window.
+                bands_cur = await conn.execute(
+                    _ATTESTATION_BANDS_SQL, {"infringement_id": infringement_id}
+                )
+                rolled, reason = roll_up([r[0] for r in await bands_cur.fetchall()])
+                await conn.execute(
+                    _SET_INFRINGEMENT_BAND_SQL,
+                    {
+                        "infringement_id": infringement_id,
+                        "band": rolled,
+                        "band_reason": reason,
                     },
                 )
         return len(keys)
@@ -441,25 +490,65 @@ class PostgresSearchStore:
 
 def _group_infringements(rows: Sequence[tuple[Any, ...]]) -> tuple[InfringementRow, ...]:
     """Collapse the joined (infringement x attestation) rows, preserving the
-    query's ordering."""
+    query's ordering.
+
+    Unpacked by name in ``_LIST_INFRINGEMENTS_SQL``'s column order rather than
+    indexed by position, so a future column added to that SELECT can't
+    silently shift an existing field onto the wrong name.
+    """
     heads: dict[UUID, tuple[Any, ...]] = {}
     attestations: dict[UUID, list[AttestationRow]] = {}
     for row in rows:
-        infringement_id: UUID = row[0]
+        (
+            infringement_id,
+            page_url,
+            image_url,
+            keyed_on,
+            first_seen_at,
+            last_seen_at,
+            seen_count,
+            band,
+            status,
+            band_reason,
+            att_provider_id,
+            att_score_kind,
+            att_provider_score,
+            att_provider_category,
+            att_query_quality,
+            att_score_version,
+            att_first_confirmed_at,
+            att_last_confirmed_at,
+            att_confirm_count,
+            att_band,
+            att_calibration_version,
+        ) = row
         if infringement_id not in heads:
-            heads[infringement_id] = row
+            heads[infringement_id] = (
+                infringement_id,
+                page_url,
+                image_url,
+                keyed_on,
+                first_seen_at,
+                last_seen_at,
+                seen_count,
+                band,
+                status,
+                band_reason,
+            )
             attestations[infringement_id] = []
         attestations[infringement_id].append(
             AttestationRow(
-                provider_id=row[9],
-                score_kind=row[10],
-                provider_score=row[11],
-                provider_category=row[12],
-                query_quality=row[13],
-                score_version=row[14],
-                first_confirmed_at=row[15],
-                last_confirmed_at=row[16],
-                confirm_count=row[17],
+                provider_id=att_provider_id,
+                score_kind=att_score_kind,
+                provider_score=att_provider_score,
+                provider_category=att_provider_category,
+                query_quality=att_query_quality,
+                score_version=att_score_version,
+                first_confirmed_at=att_first_confirmed_at,
+                last_confirmed_at=att_last_confirmed_at,
+                confirm_count=att_confirm_count,
+                band=att_band,
+                calibration_version=att_calibration_version,
             )
         )
     return tuple(
@@ -473,6 +562,7 @@ def _group_infringements(rows: Sequence[tuple[Any, ...]]) -> tuple[InfringementR
             seen_count=head[6],
             band=head[7],
             status=head[8],
+            band_reason=head[9],
             attestations=tuple(attestations[key]),
         )
         for key, head in heads.items()

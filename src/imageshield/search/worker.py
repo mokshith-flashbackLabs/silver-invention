@@ -35,6 +35,7 @@ from typing import Any, Protocol
 import structlog
 from pydantic import ValidationError
 
+from imageshield.calibration.store import PostgresCalibrationStore
 from imageshield.config import Config, ConfigError, load_config
 from imageshield.db.connection import make_async_pool
 from imageshield.http.logging import configure_logging
@@ -92,6 +93,7 @@ async def handle_message(
     body: str,
     store: SearchStore,
     providers: dict[ProviderId, SearchProvider],
+    calibration_store: PostgresCalibrationStore,
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
 ) -> bool:
@@ -119,7 +121,12 @@ async def handle_message(
         return True
 
     try:
-        await execute_run(claim, providers, store)
+        # Snapshotted once per claimed run, not once per process: a config
+        # activated between two runs must apply to the next run immediately,
+        # and a config activated mid-run must not split that run's results
+        # across two rulesets.
+        policy = await calibration_store.load_active_policy()
+        await execute_run(claim, providers, store, policy)
     except Exception as exc:  # broad on purpose: crash = leave for redelivery
         log.error("worker.run_execution_failed", run_id=str(payload.id), error=str(exc))
         return False
@@ -139,6 +146,7 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
     )
     await pool.open()
     store = PostgresSearchStore(pool)
+    calibration_store = PostgresCalibrationStore(pool)
 
     stop_requested = False
 
@@ -161,7 +169,11 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
             )
             for message in response.get("Messages", []):
                 handled = await handle_message(
-                    message.get("Body", ""), store, providers, logger=log
+                    message.get("Body", ""),
+                    store,
+                    providers,
+                    calibration_store,
+                    logger=log,
                 )
                 if handled:
                     await asyncio.to_thread(

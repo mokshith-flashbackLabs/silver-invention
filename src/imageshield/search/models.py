@@ -89,6 +89,8 @@ class AttestationRow(BaseModel):
     first_confirmed_at: datetime
     last_confirmed_at: datetime
     confirm_count: int
+    band: str
+    calibration_version: str | None
 
 
 class InfringementRow(BaseModel):
@@ -106,4 +108,5 @@ class InfringementRow(BaseModel):
     seen_count: int
     band: str
     status: str
+    band_reason: str | None
     attestations: tuple[AttestationRow, ...]

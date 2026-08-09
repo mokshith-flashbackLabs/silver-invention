@@ -17,6 +17,7 @@ from collections.abc import Mapping
 import structlog
 from pydantic import BaseModel, ConfigDict
 
+from imageshield.calibration.models import BandingPolicy
 from imageshield.search.models import ClaimedRun, ProviderDescriptor
 from imageshield.search.provider import ProviderResult, SearchProvider
 from imageshield.search.store import SearchStore
@@ -67,6 +68,7 @@ async def execute_run(
     claim: ClaimedRun,
     providers: Mapping[ProviderId, SearchProvider],
     store: SearchStore,
+    policy: BandingPolicy,
 ) -> RunOutcome:
     tasks = [
         _call_provider(providers[pid], pid, claim.seed_url)
@@ -100,6 +102,7 @@ async def execute_run(
                 score_version=adapter.score_version,
             ),
             result.matches,
+            policy,
         )
 
     await store.complete_run(claim.run_id, succeeded)

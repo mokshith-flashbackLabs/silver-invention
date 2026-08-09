@@ -123,6 +123,8 @@ class AttestationItem(BaseModel):
     first_confirmed_at: datetime
     last_confirmed_at: datetime
     confirm_count: int
+    band: str
+    calibration_version: str | None
 
 
 class InfringementItem(BaseModel):
@@ -135,6 +137,7 @@ class InfringementItem(BaseModel):
     seen_count: int
     band: str
     status: str
+    band_reason: str | None
     # Agreement signal, not a hit count: three independent providers agreeing
     # is meaningfully different from one (CLAUDE.md §7.4).
     provider_count: int

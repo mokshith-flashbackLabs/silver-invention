@@ -90,6 +90,7 @@ class FakeSearchStore:
         user_ref: UserRef,
         provider: ProviderDescriptor,
         matches: Sequence[ProviderMatch],
+        policy: Any,
     ) -> int:
         raise NotImplementedError
 
@@ -265,6 +266,7 @@ def test_infringements_nest_attestations_and_serialise_both_score_shapes() -> No
             seen_count=2,
             band="review",
             status="new",
+            band_reason="unanimous:review(n=2)",
             attestations=(
                 AttestationRow(
                     provider_id="hive",
@@ -276,6 +278,8 @@ def test_infringements_nest_attestations_and_serialise_both_score_shapes() -> No
                     first_confirmed_at=now,
                     last_confirmed_at=now,
                     confirm_count=3,
+                    band="review",
+                    calibration_version=None,
                 ),
                 AttestationRow(
                     provider_id="google",
@@ -287,6 +291,8 @@ def test_infringements_nest_attestations_and_serialise_both_score_shapes() -> No
                     first_confirmed_at=now,
                     last_confirmed_at=now,
                     confirm_count=1,
+                    band="review",
+                    calibration_version=None,
                 ),
             ),
         )

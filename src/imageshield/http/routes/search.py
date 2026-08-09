@@ -147,6 +147,7 @@ async def list_infringements(
                 seen_count=row.seen_count,
                 band=row.band,
                 status=row.status,
+                band_reason=row.band_reason,
                 provider_count=len(row.attestations),
                 attestations=[
                     AttestationItem(
@@ -163,6 +164,8 @@ async def list_infringements(
                         first_confirmed_at=att.first_confirmed_at,
                         last_confirmed_at=att.last_confirmed_at,
                         confirm_count=att.confirm_count,
+                        band=att.band,
+                        calibration_version=att.calibration_version,
                     )
                     for att in row.attestations
                 ],

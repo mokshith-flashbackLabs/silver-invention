@@ -194,6 +194,7 @@ async def test_complete_run_sets_status_succeeded_and_count(
         user_ref,
         HIVE_DESC,
         [_hive_match("https://x/a.jpg"), _hive_match("https://x/b.jpg")],
+        {},
     )
 
     await store.complete_run(run_id, (HIVE,))
@@ -229,9 +230,10 @@ async def test_cross_provider_is_one_infringement_two_attestations(
         user_ref,
         HIVE_DESC,
         [_hive_match("https://cdn.example/img.jpg", pages=[page])],
+        {},
     )
     n_google = await store.record_infringements(
-        run_id, user_ref, GOOGLE_DESC, [_google_match(page, "page_match")]
+        run_id, user_ref, GOOGLE_DESC, [_google_match(page, "page_match")], {}
     )
     assert (n_hive, n_google) == (1, 1)
 
@@ -266,8 +268,8 @@ async def test_cross_user_is_never_dedup(
     _, run_b = await _seeded_run(store, user_b)
     match = _hive_match("https://cdn.example/x.jpg", pages=["https://site.example/p"])
 
-    await store.record_infringements(run_a, user_a, HIVE_DESC, [match])
-    await store.record_infringements(run_b, user_b, HIVE_DESC, [match])
+    await store.record_infringements(run_a, user_a, HIVE_DESC, [match], {})
+    await store.record_infringements(run_b, user_b, HIVE_DESC, [match], {})
 
     rows = _query(
         migrated_db,
@@ -292,6 +294,7 @@ async def test_three_backlinks_are_three_infringements(
         user_ref,
         HIVE_DESC,
         [_hive_match("https://cdn.example/img.jpg", pages=pages)],
+        {},
     )
     assert touched == 3
 
@@ -327,6 +330,7 @@ async def test_same_page_twice_in_one_run_collapses_before_writing(
                 pages=["https://site.example/p?utm_source=share"],
             ),
         ],
+        {},
     )
     assert touched == 1
 
@@ -355,6 +359,7 @@ async def test_image_url_fallback_when_no_backlink(
         user_ref,
         HIVE_DESC,
         [_hive_match("https://cdn.example/only-image.jpg", pages=[])],
+        {},
     )
     assert _query(
         migrated_db,
@@ -387,6 +392,7 @@ async def test_content_urls_carry_canonical_and_version(
                 pages=["https://Site.example/p/?utm_source=x"],
             )
         ],
+        {},
     )
     assert _query(
         migrated_db, "SELECT url, canonical_url, normalisation_version FROM content_urls"
@@ -408,6 +414,7 @@ async def test_rescan_updates_never_inserts_and_moves_the_score(
         user_ref,
         HIVE_DESC,
         [_hive_match("https://cdn.example/i.jpg", "0.8100", pages=[page])],
+        {},
     )
     _, second_run = await _seeded_run(store, user_ref)
     await store.record_infringements(
@@ -415,6 +422,7 @@ async def test_rescan_updates_never_inserts_and_moves_the_score(
         user_ref,
         HIVE_DESC,
         [_hive_match("https://cdn.example/i.jpg", "0.9300", pages=[page])],
+        {},
     )
 
     rows = _query(
@@ -444,15 +452,17 @@ async def test_list_infringements_filters_by_user_and_nests_attestations(
         user_ref,
         HIVE_DESC,
         [_hive_match("https://x/a.jpg", pages=["https://site/a"])],
+        {},
     )
     await store.record_infringements(
-        run_id, user_ref, GOOGLE_DESC, [_google_match("https://site/a", "page_match")]
+        run_id, user_ref, GOOGLE_DESC, [_google_match("https://site/a", "page_match")], {}
     )
     await store.record_infringements(
         other_run,
         other,
         HIVE_DESC,
         [_hive_match("https://x/b.jpg", pages=["https://site/b"])],
+        {},
     )
 
     mine = await store.list_infringements(user_ref, None)
@@ -506,8 +516,8 @@ async def test_52_weekly_rescans_over_static_corpus_add_zero_rows(
     first_week_counts: tuple[int, int, int] | None = None
     for week in range(52):
         run_id = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
-        await store.record_infringements(run_id, user_ref, HIVE_DESC, hive_corpus)
-        await store.record_infringements(run_id, user_ref, GOOGLE_DESC, google_corpus)
+        await store.record_infringements(run_id, user_ref, HIVE_DESC, hive_corpus, {})
+        await store.record_infringements(run_id, user_ref, GOOGLE_DESC, google_corpus, {})
         await store.complete_run(run_id, (HIVE, GOOGLE))
         if week == 0:
             first_week_counts = _counts()
