@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from imageshield.calibration.metrics import EvalRow, sweep_categorical, sweep_numeric
 from imageshield.calibration.models import ScoreDomain
 from imageshield.calibration.report import (
@@ -37,18 +39,39 @@ def test_report_opens_with_composition_before_any_metric() -> None:
     assert text.index("items 2") < text.index("precision")
 
 
-def test_no_figure_appears_without_its_sample_size() -> None:
+@pytest.mark.parametrize(
+    "false_match_score",
+    [
+        # Separable: produces a recommendation. Exercises the table rows and
+        # the header, but never metrics.py's "no threshold reaches ..."
+        # warning — that line renders only when NO boundary can be found at
+        # all, which this fixture alone never triggers.
+        "0.60",
+        # Identical to the true_match score: no threshold can ever separate
+        # them, so this is the fixture that actually renders metrics.py's
+        # precision-target warning — the line this invariant exists to
+        # guard against a regression in.
+        "0.95",
+    ],
+)
+def test_no_figure_appears_without_its_sample_size(false_match_score: str) -> None:
     """Every proportion in the body carries (n/d). A bare 0.975 in this
-    output would be read as a result rather than as two observations."""
+    output would be read as a result rather than as two observations.
+
+    A fixed *target* (e.g. "the required precision target (0.99)") is exempt
+    — 0.99 is a threshold the sweep was asked to clear, not a measurement
+    with a sample size of its own, so it legitimately carries no numerator/
+    denominator and is not what this rule is guarding against.
+    """
     rows = [
         num("true_match", "same_person", "0.95"),
-        num("false_match", "lookalike", "0.60"),
+        num("false_match", "lookalike", false_match_score),
     ]
     text = render_numeric_sweep(
         sweep_numeric(rows, HIVE_DOMAIN), "hive", "v1", uncovered=()
     )
     for line in text.splitlines():
-        if "precision" in line and "n/a" not in line:
+        if "precision" in line and "n/a" not in line and "target" not in line:
             assert "/" in line, line
 
 

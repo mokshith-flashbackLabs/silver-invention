@@ -119,10 +119,25 @@ def render_categorical_sweep(
     for kind, m in sweep.recall_by_kind.items():
         lines.append(f"  {kind:<18} {m.render()}")
     lines.append(_RULE)
-    if not any(b == "auto_confirm" for b in sweep.recommended.values()):
+    # This must agree with propose's refusal condition exactly (every
+    # category stayed review), not with "no auto_confirm" — a drop
+    # assignment is a real, data-supported recommendation on its own, and
+    # printing "the provider stays uncalibrated" while propose goes on to
+    # write that drop band is the report and the recommendation disagreeing
+    # about the same sweep, which is worse than either being wrong alone.
+    non_review = {c: b for c, b in sweep.recommended.items() if b != "review"}
+    if not non_review:
         lines.append(
             "  no category reaches the required 0.99 target — the provider "
             "stays uncalibrated and everything stays review."
         )
+    else:
+        supported = ", ".join(f"{c}={b}" for c, b in sorted(non_review.items()))
+        unsupported = sorted(c for c, b in sweep.recommended.items() if b == "review")
+        lines.append(f"  data supports: {supported}")
+        if unsupported:
+            lines.append(
+                f"  data does not support (stays review): {', '.join(unsupported)}"
+            )
     lines.append(_RULE)
     return "\n".join(lines)

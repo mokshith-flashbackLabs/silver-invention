@@ -257,6 +257,11 @@ async def propose_config(
     """Write an INACTIVE config. Raises ValueError rather than writing
     something the data does not support."""
     meta, rows, _uncovered, sweep = await load_sweep(store, provider_id, eval_set_id)
+    # Whether the caller handed us bands directly, as opposed to letting the
+    # sweep derive them. `measured` below must not attach a figure measured
+    # at the sweep's recommended boundary to a config built from a different,
+    # hand-supplied one.
+    bands_were_supplied = bands_json is not None
 
     if bands_json is None:
         # Narrow on the sweep type, not on meta.score_kind — mypy strict does
@@ -276,19 +281,61 @@ async def propose_config(
                 sweep.recommended_drop_max, sweep.recommended_auto_confirm_min
             )
         else:
+            # Categorical refuses on a DIFFERENTLY-SHAPED condition than
+            # numeric, deliberately: numeric refuses unless BOTH auto_confirm
+            # AND drop are supported, but a drop assignment here is justified
+            # by its own NPV rule independently of whether any category ever
+            # reached auto_confirm — and Task 7's activate floor re-checks
+            # drop NPV from eval_observations regardless. Refusing only when
+            # EVERY category stayed `review` (nothing beyond the no-op
+            # default to propose) is the correct, narrower condition. Do not
+            # "fix" this asymmetry to match the numeric branch.
+            if all(band == "review" for band in sweep.recommended.values()):
+                raise ValueError(
+                    "sweep produced no recommendation on this set — every "
+                    "category stayed review. Report the gap; do not propose "
+                    "a no-op config."
+                )
             bands_json = dict(sweep.recommended)
 
+    # Unconditional, for both score kinds: a bare `meta.score_kind ==
+    # "numeric"` gate here would let a categorical bands_json (or a numeric
+    # one aimed at a categorical provider) through unparsed and unvalidated,
+    # writing a row that is garbage in a shape no reader can recover from
+    # cleanly — `get_config` would only discover it later, at read time.
+    numeric, categorical = parse_bands(meta.score_kind, bands_json)
     if meta.score_kind == "numeric":
-        numeric, _ = parse_bands("numeric", bands_json)
         problems = validate_numeric_bands(numeric, meta.score_domain)
         if problems:
             raise ValueError("; ".join(problems))
+    else:
+        # A mapping for a category the provider cannot emit is dead config,
+        # the same way a zero-width numeric band is: it can never be reached
+        # by a real response.
+        known = set(meta.score_domain.categories or ())
+        unknown = set(categorical) - known
+        if unknown:
+            raise ValueError(
+                f"bands reference categories outside score_domain: "
+                f"{sorted(unknown)} not in {sorted(known)}"
+            )
 
-    measured = {
-        "auto_confirm_precision": _band_precision(sweep, "auto_confirm"),
-        "drop_npv": _band_npv(sweep),
-        "note": "ADVISORY ONLY — activate recomputes from eval_observations",
-    }
+    measured: dict[str, float | str | None]
+    if bands_were_supplied:
+        measured = {
+            "auto_confirm_precision": None,
+            "drop_npv": None,
+            "note": (
+                "ADVISORY ONLY — bands were supplied via --bands, not derived "
+                "from this sweep; activate recomputes from eval_observations"
+            ),
+        }
+    else:
+        measured = {
+            "auto_confirm_precision": _band_precision(sweep, "auto_confirm"),
+            "drop_npv": _band_npv(sweep),
+            "note": "ADVISORY ONLY — activate recomputes from eval_observations",
+        }
     return await store.insert_config(
         provider_id=provider_id,
         version=version,

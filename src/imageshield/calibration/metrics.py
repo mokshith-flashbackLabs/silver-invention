@@ -317,9 +317,9 @@ def sweep_numeric(
     )
     if auto_min is None:
         warnings.append(
-            f"no threshold reaches precision >= {target} — auto_confirm is not "
-            "supportable by this set. The provider stays uncalibrated and "
-            "everything stays review."
+            f"no threshold reaches the required precision target ({target}) — "
+            "auto_confirm is not supportable by this set. The provider stays "
+            "uncalibrated and everything stays review."
         )
     if drop_max is None:
         warnings.append(
