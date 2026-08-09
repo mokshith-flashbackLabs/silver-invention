@@ -35,7 +35,7 @@ from typing import Any, Protocol
 import structlog
 from pydantic import ValidationError
 
-from imageshield.calibration.store import PostgresCalibrationStore
+from imageshield.calibration.store import CalibrationStore, PostgresCalibrationStore
 from imageshield.config import Config, ConfigError, load_config
 from imageshield.db.connection import make_async_pool
 from imageshield.http.logging import configure_logging
@@ -93,7 +93,7 @@ async def handle_message(
     body: str,
     store: SearchStore,
     providers: dict[ProviderId, SearchProvider],
-    calibration_store: PostgresCalibrationStore,
+    calibration_store: CalibrationStore,
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
 ) -> bool:
