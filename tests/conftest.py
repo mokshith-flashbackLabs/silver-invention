@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 
+from imageshield.calibration.store import PostgresCalibrationStore
 from imageshield.config import Config
 from imageshield.db.connection import make_async_pool
 from imageshield.http.app import create_app
@@ -131,6 +132,26 @@ async def search_fixture(
             user_ref, seed_id, (ProviderId("hive"), ProviderId("google"))
         )
         yield store, run_id, user_ref
+    finally:
+        await pool.close()
+
+
+@pytest.fixture
+async def calibration_store(
+    throwaway_db: str,
+) -> AsyncIterator[PostgresCalibrationStore]:
+    """A ``PostgresCalibrationStore`` over a freshly migrated throwaway
+    database — same construction as ``search_fixture`` above, for the eval
+    CRUD (``insert_eval_item``, ``eval_rows``, ...) added in Task 5."""
+    down_result = run_migrate(throwaway_db, "down", "--all")
+    assert down_result.returncode == 0, down_result.stderr
+    up_result = run_migrate(throwaway_db, "up")
+    assert up_result.returncode == 0, up_result.stderr
+
+    pool = make_async_pool(throwaway_db, min_size=1, max_size=2)
+    await pool.open()
+    try:
+        yield PostgresCalibrationStore(pool)
     finally:
         await pool.close()
 

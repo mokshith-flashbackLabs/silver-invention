@@ -36,11 +36,13 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import Any, Protocol
+from uuid import UUID
 
 import structlog
 from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.calibration.metrics import EvalRow
 from imageshield.calibration.models import (
     Band,
     BandingPolicy,
@@ -62,6 +64,80 @@ _LOAD_POLICY_SQL = """
     FROM providers p
     LEFT JOIN calibration_configs c
       ON c.provider_id = p.provider_id AND c.active
+"""
+
+_INSERT_EVAL_ITEM_SQL = """
+    INSERT INTO eval_items (eval_set_id, seed_uri, candidate_url, label,
+                            label_kind, consent_basis, labelled_by)
+    VALUES (%(eval_set_id)s, %(seed_uri)s, %(candidate_url)s, %(label)s,
+            %(label_kind)s, %(consent_basis)s, %(labelled_by)s)
+    RETURNING item_id
+"""
+
+_EVAL_SEEDS_SQL = """
+    SELECT DISTINCT seed_uri FROM eval_items
+    WHERE eval_set_id = %(eval_set_id)s ORDER BY seed_uri
+"""
+
+_EVAL_ITEMS_FOR_SEED_SQL = """
+    SELECT item_id, candidate_url FROM eval_items
+    WHERE eval_set_id = %(eval_set_id)s AND seed_uri = %(seed_uri)s
+"""
+
+# Mirrors the attestations upsert: re-observation UPDATES, never appends.
+_UPSERT_EVAL_OBSERVATION_SQL = """
+    INSERT INTO eval_observations (item_id, provider_id, score_kind,
+                                   provider_score, provider_category,
+                                   query_quality, score_version)
+    VALUES (%(item_id)s, %(provider_id)s, %(score_kind)s, %(provider_score)s,
+            %(provider_category)s, %(query_quality)s, %(score_version)s)
+    ON CONFLICT (item_id, provider_id) DO UPDATE
+      SET score_kind = EXCLUDED.score_kind,
+          provider_score = EXCLUDED.provider_score,
+          provider_category = EXCLUDED.provider_category,
+          query_quality = EXCLUDED.query_quality,
+          score_version = EXCLUDED.score_version,
+          observed_at = now()
+"""
+
+_RECORD_COVERAGE_SQL = """
+    INSERT INTO eval_seed_coverage (eval_set_id, seed_uri, provider_id, status,
+                                    candidates_returned)
+    VALUES (%(eval_set_id)s, %(seed_uri)s, %(provider_id)s, %(status)s,
+            %(candidates_returned)s)
+    ON CONFLICT (eval_set_id, seed_uri, provider_id) DO UPDATE
+      SET status = EXCLUDED.status,
+          candidates_returned = EXCLUDED.candidates_returned,
+          observed_at = now()
+"""
+
+# LEFT JOIN, deliberately: an item with no observation is a provider MISS and
+# must reach the metrics module as observed=False rather than not arriving at
+# all. Computing recall over only what a provider returned guarantees an
+# excellent-looking number.
+_EVAL_ROWS_SQL = """
+    SELECT i.label, i.label_kind, (o.observation_id IS NOT NULL) AS observed,
+           o.provider_score, o.provider_category
+    FROM eval_items i
+    LEFT JOIN eval_observations o
+      ON o.item_id = i.item_id AND o.provider_id = %(provider_id)s
+    WHERE i.eval_set_id = %(eval_set_id)s
+    ORDER BY i.item_id
+"""
+
+# A seed with no ok coverage row was never successfully asked, so its items'
+# absences are not evidence of anything.
+_UNCOVERED_SEEDS_SQL = """
+    SELECT DISTINCT i.seed_uri
+    FROM eval_items i
+    WHERE i.eval_set_id = %(eval_set_id)s
+      AND NOT EXISTS (
+        SELECT 1 FROM eval_seed_coverage c
+        WHERE c.eval_set_id = i.eval_set_id
+          AND c.seed_uri = i.seed_uri
+          AND c.provider_id = %(provider_id)s
+          AND c.status = 'ok')
+    ORDER BY i.seed_uri
 """
 
 
@@ -204,3 +280,122 @@ class PostgresCalibrationStore:
     async def load_active_policy(self) -> BandingPolicy:
         async with self._pool.connection() as conn:
             return await load_active_policy(conn)
+
+    async def insert_eval_item(
+        self,
+        eval_set_id: str,
+        seed_uri: str,
+        candidate_url: str,
+        label: str,
+        label_kind: str,
+        consent_basis: str,
+        labelled_by: str,
+    ) -> UUID:
+        """CheckViolation propagates. A rejected item is a labelling error the
+        operator must see, not something to log and continue past."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _INSERT_EVAL_ITEM_SQL,
+                {
+                    "eval_set_id": eval_set_id,
+                    "seed_uri": seed_uri,
+                    "candidate_url": candidate_url,
+                    "label": label,
+                    "label_kind": label_kind,
+                    "consent_basis": consent_basis,
+                    "labelled_by": labelled_by,
+                },
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        item_id: UUID = row[0]
+        return item_id
+
+    async def eval_seeds(self, eval_set_id: str) -> tuple[str, ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_EVAL_SEEDS_SQL, {"eval_set_id": eval_set_id})
+            return tuple(r[0] for r in await cur.fetchall())
+
+    async def eval_items_for_seed(
+        self, eval_set_id: str, seed_uri: str
+    ) -> tuple[tuple[UUID, str], ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _EVAL_ITEMS_FOR_SEED_SQL,
+                {"eval_set_id": eval_set_id, "seed_uri": seed_uri},
+            )
+            return tuple((r[0], r[1]) for r in await cur.fetchall())
+
+    async def upsert_eval_observation(
+        self,
+        item_id: UUID,
+        provider_id: ProviderId,
+        score_kind: str,
+        provider_score: Decimal | None,
+        provider_category: str | None,
+        query_quality: str | None,
+        score_version: str,
+    ) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                _UPSERT_EVAL_OBSERVATION_SQL,
+                {
+                    "item_id": item_id,
+                    "provider_id": provider_id,
+                    "score_kind": score_kind,
+                    "provider_score": provider_score,
+                    "provider_category": provider_category,
+                    "query_quality": query_quality,
+                    "score_version": score_version,
+                },
+            )
+
+    async def record_seed_coverage(
+        self,
+        eval_set_id: str,
+        seed_uri: str,
+        provider_id: ProviderId,
+        status: str,
+        candidates_returned: int,
+    ) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                _RECORD_COVERAGE_SQL,
+                {
+                    "eval_set_id": eval_set_id,
+                    "seed_uri": seed_uri,
+                    "provider_id": provider_id,
+                    "status": status,
+                    "candidates_returned": candidates_returned,
+                },
+            )
+
+    async def eval_rows(
+        self, eval_set_id: str, provider_id: ProviderId
+    ) -> tuple[EvalRow, ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _EVAL_ROWS_SQL,
+                {"eval_set_id": eval_set_id, "provider_id": provider_id},
+            )
+            rows = await cur.fetchall()
+        return tuple(
+            EvalRow(
+                label=r[0],
+                label_kind=r[1],
+                observed=r[2],
+                provider_score=r[3],
+                provider_category=r[4],
+            )
+            for r in rows
+        )
+
+    async def uncovered_seeds(
+        self, eval_set_id: str, provider_id: ProviderId
+    ) -> tuple[str, ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _UNCOVERED_SEEDS_SQL,
+                {"eval_set_id": eval_set_id, "provider_id": provider_id},
+            )
+            return tuple(r[0] for r in await cur.fetchall())
