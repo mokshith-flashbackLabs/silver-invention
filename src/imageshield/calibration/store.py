@@ -34,6 +34,7 @@ cancellation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
@@ -54,6 +55,7 @@ from imageshield.calibration.models import (
     ScoreDomain,
     ScoreKind,
 )
+from imageshield.search.store import _SET_INFRINGEMENT_BAND_SQL
 from imageshield.types import ProviderId, parse_provider_id
 
 log = structlog.get_logger("imageshield.calibration")
@@ -81,6 +83,43 @@ class StoredConfig(BaseModel):
     config: CalibrationConfig
     eval_set_id: str | None
     active: bool
+
+
+class StoredAttestation(BaseModel):
+    """One attestation as the re-band pass sees it: enough to recompute its
+    band, plus the user_ref needed to answer "how many people does this
+    retune affect" — the number that makes a retune a decision rather than a
+    deploy."""
+
+    model_config = ConfigDict(frozen=True)
+
+    attestation_id: UUID
+    infringement_id: UUID
+    user_ref: UUID
+    score_kind: ScoreKind
+    provider_score: Decimal | None
+    provider_category: str | None
+    band: str
+
+
+class AttestationDecision(BaseModel):
+    """What ``plan_reband`` (devtools/calibrate) computes for one attestation
+    and ``apply_reband`` writes.
+
+    Lives here rather than in the CLI module: ``apply_reband`` needs it in
+    its own method signature, and this production module must not depend on
+    devtools for a type it needs to type itself.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    attestation_id: UUID
+    infringement_id: UUID
+    user_ref: UUID
+    old_band: str
+    band: str
+    calibration_version: str | None
+
 
 _LOAD_POLICY_SQL = """
     SELECT p.provider_id, p.calibrated, p.score_domain,
@@ -181,6 +220,72 @@ _GET_CONFIG_SQL = """
     SELECT config_id, provider_id, version, score_kind, bands, eval_set_id,
            active
     FROM calibration_configs WHERE config_id = %(config_id)s
+"""
+
+_ATTESTATIONS_FOR_PROVIDER_SQL = """
+    SELECT a.attestation_id, a.infringement_id, i.user_ref, a.score_kind,
+           a.provider_score, a.provider_category, a.band
+    FROM attestations a
+    JOIN infringements i ON i.infringement_id = a.infringement_id
+    WHERE a.provider_id = %(provider_id)s
+    ORDER BY a.attestation_id
+"""
+
+_ALL_ATTESTATION_BANDS_SQL = """
+    SELECT infringement_id, attestation_id, band FROM attestations
+    ORDER BY infringement_id, attestation_id
+"""
+
+_SET_ATTESTATION_BAND_SQL = """
+    UPDATE attestations
+    SET band = %(band)s, calibration_version = %(calibration_version)s
+    WHERE attestation_id = %(attestation_id)s
+"""
+
+# Every mutable banding column, in a stable order. `replay` asserts this is
+# unchanged before and after; if replay can move it, replay is not read-only.
+_BAND_CHECKSUM_SQL = """
+    SELECT
+      (SELECT count(*) FROM attestations)::text || '/' ||
+      (SELECT count(*) FROM infringements)::text || ':' ||
+      coalesce((SELECT md5(string_agg(
+          attestation_id::text || '|' || band || '|' ||
+          coalesce(calibration_version, ''), E'\\n' ORDER BY attestation_id))
+        FROM attestations), '') || ':' ||
+      coalesce((SELECT md5(string_agg(
+          infringement_id::text || '|' || band || '|' ||
+          coalesce(band_reason, ''), E'\\n' ORDER BY infringement_id))
+        FROM infringements), '')
+"""
+
+_CONFIG_PROVIDER_SQL = """
+    SELECT provider_id FROM calibration_configs WHERE config_id = %(config_id)s
+"""
+
+_DEACTIVATE_SQL = """
+    UPDATE calibration_configs SET active = false
+    WHERE provider_id = %(provider_id)s AND active
+"""
+
+_ACTIVATE_SQL = """
+    UPDATE calibration_configs
+    SET active = true, activated_at = now(), activated_by = %(activated_by)s
+    WHERE config_id = %(config_id)s
+"""
+
+_ACTIVE_CONFIG_SQL = """
+    SELECT config_id, version, score_kind, bands
+    FROM calibration_configs WHERE provider_id = %(provider_id)s AND active
+"""
+
+_SET_CALIBRATED_SQL = """
+    UPDATE providers SET calibrated = %(calibrated)s
+    WHERE provider_id = %(provider_id)s
+"""
+
+_AUDIT_SQL = """
+    INSERT INTO audit_log (actor_type, action, resource_id, metadata)
+    VALUES ('operator', %(action)s, %(resource_id)s, %(metadata)s)
 """
 
 
@@ -503,3 +608,176 @@ class PostgresCalibrationStore:
             eval_set_id=row[5],
             active=row[6],
         )
+
+    async def active_config(self, provider_id: ProviderId) -> CalibrationConfig | None:
+        """The provider's currently active config, or ``None``. Reuses
+        ``_LOAD_POLICY_SQL``'s parsing (``parse_bands``) rather than a
+        second implementation of it."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_ACTIVE_CONFIG_SQL, {"provider_id": provider_id})
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        numeric, categorical = parse_bands(row[2], row[3])
+        return CalibrationConfig(
+            config_id=row[0],
+            provider_id=provider_id,
+            version=row[1],
+            score_kind=row[2],
+            numeric_bands=numeric,
+            categorical_bands=categorical,
+        )
+
+    async def attestations_for_provider(
+        self, provider_id: ProviderId
+    ) -> tuple[StoredAttestation, ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _ATTESTATIONS_FOR_PROVIDER_SQL, {"provider_id": provider_id}
+            )
+            rows = await cur.fetchall()
+        return tuple(
+            StoredAttestation(
+                attestation_id=r[0],
+                infringement_id=r[1],
+                user_ref=r[2],
+                score_kind=r[3],
+                provider_score=r[4],
+                provider_category=r[5],
+                band=r[6],
+            )
+            for r in rows
+        )
+
+    async def all_attestation_bands(self) -> dict[UUID, list[tuple[UUID, Band]]]:
+        """Every attestation's current band, keyed by infringement_id — the
+        full picture ``plan_reband`` needs so an infringement rolls up
+        correctly when only one provider's attestations are being rebanded
+        and every other provider's attestation must keep its existing band."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_ALL_ATTESTATION_BANDS_SQL)
+            rows = await cur.fetchall()
+        result: dict[UUID, list[tuple[UUID, Band]]] = {}
+        for infringement_id, attestation_id, band in rows:
+            result.setdefault(infringement_id, []).append((attestation_id, band))
+        return result
+
+    async def band_checksum(self) -> str:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_BAND_CHECKSUM_SQL)
+            row = await cur.fetchone()
+        assert row is not None
+        checksum: str = row[0]
+        return checksum
+
+    async def apply_reband(
+        self,
+        provider_id: ProviderId,
+        config_id: UUID | None,
+        activated_by: str | None,
+        decisions: Sequence[AttestationDecision],
+        infringement_bands: Mapping[UUID, tuple[str, str]],
+    ) -> int:
+        """One transaction. Either the config is active and every band under
+        it is written, or neither happened — a half-applied retune would
+        leave rows banded by a config that is not the active one.
+
+        ``config_id=None`` (the ``trust``/``--revoke`` path) skips the
+        activation columns entirely and only rewrites bands: trust never
+        changes which config is active.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            if config_id is not None:
+                await conn.execute(_DEACTIVATE_SQL, {"provider_id": provider_id})
+                await conn.execute(
+                    _ACTIVATE_SQL,
+                    {"config_id": config_id, "activated_by": activated_by},
+                )
+            for d in decisions:
+                await conn.execute(
+                    _SET_ATTESTATION_BAND_SQL,
+                    {
+                        "attestation_id": d.attestation_id,
+                        "band": d.band,
+                        "calibration_version": d.calibration_version,
+                    },
+                )
+            for infringement_id, (band, reason) in infringement_bands.items():
+                await conn.execute(
+                    _SET_INFRINGEMENT_BAND_SQL,
+                    {
+                        "infringement_id": infringement_id,
+                        "band": band,
+                        "band_reason": reason,
+                    },
+                )
+        return len(decisions)
+
+    async def set_active(self, config_id: UUID, activated_by: str) -> None:
+        """Deactivate whatever is active for this config's provider, then
+        activate this one. Own transaction — the standalone primitive for a
+        caller that wants to change the active config without a reband.
+        ``apply_reband`` performs the equivalent write inline, in the SAME
+        transaction as the attestation rewrites it accompanies, rather than
+        calling this."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(_CONFIG_PROVIDER_SQL, {"config_id": config_id})
+            row = await cur.fetchone()
+            if row is None:
+                raise ValueError(f"no config {config_id}")
+            provider_id = parse_provider_id(row[0])
+            await conn.execute(_DEACTIVATE_SQL, {"provider_id": provider_id})
+            await conn.execute(
+                _ACTIVATE_SQL, {"config_id": config_id, "activated_by": activated_by}
+            )
+
+    async def set_calibrated(
+        self, provider_id: ProviderId, value: bool, actor: str, reason: str
+    ) -> None:
+        """Provider row + audit_log row, one transaction — the ONLY writer of
+        ``providers.calibrated``. ``trust``/``--revoke`` is the only caller.
+
+        Inlined rather than composed from :meth:`audit` so both writes share
+        one transaction: a calibrated flag flipped with no audit row (or vice
+        versa) is exactly the kind of half-applied state this whole task
+        exists to prevent elsewhere.
+        """
+        action = "calibration.trusted" if value else "calibration.revoked"
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                _SET_CALIBRATED_SQL, {"provider_id": provider_id, "calibrated": value}
+            )
+            await conn.execute(
+                _AUDIT_SQL,
+                {
+                    "action": action,
+                    "resource_id": None,
+                    "metadata": Jsonb(
+                        {
+                            "actor": actor,
+                            "reason": reason,
+                            "provider_id": provider_id,
+                            "calibrated": value,
+                        }
+                    ),
+                },
+            )
+
+    async def audit(
+        self,
+        action: str,
+        actor: str,
+        resource_id: UUID | None,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """``audit_log`` carries no separate actor column, so ``actor`` is
+        folded into ``metadata`` rather than lost."""
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                _AUDIT_SQL,
+                {
+                    "action": action,
+                    "resource_id": resource_id,
+                    "metadata": Jsonb({**dict(metadata), "actor": actor}),
+                },
+            )

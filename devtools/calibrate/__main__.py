@@ -19,27 +19,37 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID
 
 import httpx
+from pydantic import BaseModel, ConfigDict
 
-from imageshield.calibration.bands import validate_numeric_bands
+from imageshield.calibration.bands import band_for_attestation, roll_up, validate_numeric_bands
 from imageshield.calibration.metrics import (
     CategoricalSweep,
     EvalRow,
+    Metric,
     NumericSweep,
+    composition,
+    confusion_at_threshold,
+    confusion_for_categories,
     effective_sample_size,
+    metric,
+    npv,
+    precision,
     sweep_categorical,
     sweep_numeric,
 )
-from imageshield.calibration.models import Band
+from imageshield.calibration.models import Band, CalibrationConfig, PolicyEntry
 from imageshield.calibration.report import render_categorical_sweep, render_numeric_sweep
 from imageshield.calibration.store import (
+    AttestationDecision,
     PostgresCalibrationStore,
     ProviderMeta,
+    StoredConfig,
     parse_bands,
 )
 from imageshield.config import Config, load_config
@@ -368,6 +378,374 @@ async def run_propose(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── The floor: replay, activate, trust ──────────────────────────────────────
+#
+# Two gates protect the move off `review`, and they defend DIFFERENT
+# failures. `check_floor` lives in code, so loosening the bar is a code
+# change with a review and a git blame — it defends against deadline
+# pressure. `trust` stays a separate human command and is the ONLY writer of
+# `providers.calibrated` — it defends against a bad eval set producing
+# good-looking numbers, which no arithmetic can catch: a sweep with no
+# lookalike hard negatives yields precision 1.0 trivially, because random
+# negatives are easy to reject. The floor cannot tell that set apart from a
+# sound one on the numbers alone (it CAN and does reject the specific,
+# unconditional case of zero lookalikes — see below — but "the lookalikes
+# were not diverse enough" is a judgement, not an arithmetic fact).
+
+# Minimum auto_confirm precision / drop NPV. Matches the target the sweep
+# reports against (metrics.py's own default) rather than inventing a second
+# number for the same concept.
+_FLOOR_TARGET = 0.99
+
+
+class FloorResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    ok: bool
+    problems: tuple[str, ...]
+    auto_confirm_precision: Metric | None
+    drop_npv: Metric | None
+    sample_size: int
+    lookalike_count: int
+
+
+def _precision_of_band(
+    rows: Sequence[EvalRow], config: CalibrationConfig, band: Band
+) -> Metric:
+    """Precision of ``band`` under this EXACT config, recomputed at the
+    config's own boundary.
+
+    Reuses ``confusion_at_threshold``/``confusion_for_categories`` — the same
+    arithmetic ``sweep_numeric``/``sweep_categorical`` already use for every
+    candidate boundary — rather than re-deriving predicted-positive through
+    ``band_for_attestation``. That keeps this working for a boundary
+    hand-typed straight into a config, not only one that happens to equal an
+    observed score or a domain edge (the set ``sweep_numeric`` limits its own
+    candidates to).
+    """
+    if config.score_kind == "numeric":
+        threshold = next(
+            (b.min for b in config.numeric_bands if b.band == band and b.min is not None),
+            None,
+        )
+        if threshold is None:
+            return metric(0, 0)
+        return precision(confusion_at_threshold(rows, threshold))
+    positive = frozenset(c for c, b in config.categorical_bands.items() if b == band)
+    return precision(confusion_for_categories(rows, positive))
+
+
+def _npv_of_band(
+    rows: Sequence[EvalRow], config: CalibrationConfig, band: Band
+) -> Metric:
+    """NPV of ``band`` under this exact config — the mirror of
+    :func:`_precision_of_band`, over what the config would DROP rather than
+    what it would auto_confirm."""
+    if config.score_kind == "numeric":
+        threshold = next(
+            (b.max for b in config.numeric_bands if b.band == band and b.max is not None),
+            None,
+        )
+        if threshold is None:
+            return metric(0, 0)
+        return npv(confusion_at_threshold(rows, threshold))
+    non_drop = frozenset(c for c, b in config.categorical_bands.items() if b != band)
+    return npv(confusion_for_categories(rows, non_drop))
+
+
+async def check_floor(
+    store: PostgresCalibrationStore, stored: StoredConfig, min_items: int
+) -> FloorResult:
+    """The machine half of the two keys, recomputed FRESH from
+    eval_observations joined to eval_items.
+
+    Never reads ``calibration_configs.measured``: a check that trusts a
+    JSONB column an operator can type into is defeated by editing a number.
+
+    A review-only config skips every condition below — it alarms nobody, so
+    there is nothing to gate.
+    """
+    config = stored.config
+    declares_auto = config.declares("auto_confirm")
+    declares_drop = config.declares("drop")
+    if not declares_auto and not declares_drop:
+        return FloorResult(
+            ok=True, problems=(), auto_confirm_precision=None, drop_npv=None,
+            sample_size=0, lookalike_count=0,
+        )
+
+    if stored.eval_set_id is None:
+        return FloorResult(
+            ok=False,
+            problems=("config has no eval_set_id — nothing to measure against",),
+            auto_confirm_precision=None, drop_npv=None,
+            sample_size=0, lookalike_count=0,
+        )
+
+    problems: list[str] = []
+    rows = await store.eval_rows(stored.eval_set_id, config.provider_id)
+    comp = composition(rows)
+    n = effective_sample_size(rows)
+
+    # Unconditional and first in the narrative because it closes the real
+    # failure: a set with no hard negatives yields precision 1.0 trivially,
+    # and no sample size compensates for a figure that cannot be meaningful.
+    if comp.lookalike_count == 0:
+        problems.append(
+            "eval set contains ZERO lookalike items — a set without hard "
+            "negatives cannot produce a meaningful precision figure"
+        )
+    if n < min_items:
+        problems.append(
+            f"effective sample size {n} is below the floor of {min_items} "
+            "(non-uncertain items only)"
+        )
+    uncovered = await store.uncovered_seeds(stored.eval_set_id, config.provider_id)
+    if uncovered:
+        problems.append(
+            f"{len(uncovered)} seed(s) have no successful coverage row — their "
+            "items' absences are not evidence and cannot enter recall"
+        )
+
+    ac_precision = _precision_of_band(rows, config, "auto_confirm") if declares_auto else None
+    drop_npv_metric = _npv_of_band(rows, config, "drop") if declares_drop else None
+    if ac_precision is not None and (
+        ac_precision.value is None or ac_precision.value < _FLOOR_TARGET
+    ):
+        problems.append(f"auto_confirm precision {ac_precision.render()} is below 0.99")
+    if drop_npv_metric is not None and (
+        drop_npv_metric.value is None or drop_npv_metric.value < _FLOOR_TARGET
+    ):
+        problems.append(f"drop NPV {drop_npv_metric.render()} is below 0.99")
+
+    return FloorResult(
+        ok=not problems,
+        problems=tuple(problems),
+        auto_confirm_precision=ac_precision,
+        drop_npv=drop_npv_metric,
+        sample_size=n,
+        lookalike_count=comp.lookalike_count,
+    )
+
+
+class RebandPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    decisions: tuple[AttestationDecision, ...]
+    infringement_bands: Mapping[UUID, tuple[str, str]]
+    attestations_changed: int
+    infringements_changed: int
+    users_affected: int
+    by_direction: Mapping[str, int]
+
+
+async def plan_reband(
+    store: PostgresCalibrationStore, provider_id: ProviderId, entry: PolicyEntry
+) -> RebandPlan:
+    """Compute what a config WOULD do. Writes nothing — ``replay`` is exactly
+    this function plus rendering, and ``activate``/``trust`` are this
+    function plus ``apply_reband``.
+    """
+    stored = await store.attestations_for_provider(provider_id)
+    existing = await store.all_attestation_bands()
+
+    decisions: list[AttestationDecision] = []
+    proposed: dict[UUID, dict[UUID, Band]] = {}
+    for a in stored:
+        decision = band_for_attestation(
+            entry, a.score_kind, a.provider_score, a.provider_category
+        )
+        decisions.append(
+            AttestationDecision(
+                attestation_id=a.attestation_id,
+                infringement_id=a.infringement_id,
+                user_ref=a.user_ref,
+                old_band=a.band,
+                band=decision.band,
+                calibration_version=decision.calibration_version,
+            )
+        )
+        proposed.setdefault(a.infringement_id, {})[a.attestation_id] = decision.band
+
+    infringement_bands: dict[UUID, tuple[str, str]] = {}
+    for infringement_id, current in existing.items():
+        # Other providers' attestations keep their existing bands; only this
+        # provider's move. That is the point of a per-provider config.
+        bands = [
+            proposed.get(infringement_id, {}).get(attestation_id, band)
+            for attestation_id, band in current
+        ]
+        rolled, reason = roll_up(bands)
+        infringement_bands[infringement_id] = (rolled, reason)
+
+    changed = [d for d in decisions if d.band != d.old_band]
+    by_direction: dict[str, int] = {}
+    for d in changed:
+        key = f"{d.old_band}->{d.band}"
+        by_direction[key] = by_direction.get(key, 0) + 1
+    changed_infringement_ids = {d.infringement_id for d in changed}
+    infringements_changed = sum(
+        1 for iid in infringement_bands if iid in changed_infringement_ids
+    )
+
+    return RebandPlan(
+        decisions=tuple(decisions),
+        infringement_bands=infringement_bands,
+        attestations_changed=len(changed),
+        infringements_changed=infringements_changed,
+        users_affected=len({d.user_ref for d in changed}),
+        by_direction=by_direction,
+    )
+
+
+async def run_replay(args: argparse.Namespace) -> int:
+    """Read-only. Builds the calibrated PolicyEntry this config would run
+    under RIGHT NOW (the provider's real ``calibrated`` flag, not a
+    hypothetical one — that hypothetical is `check_floor`'s job, not
+    replay's), reports the delta, and NEVER calls ``apply_reband``."""
+    config = load_config()
+    async with make_async_pool(config.database_url, min_size=1, max_size=2) as pool:
+        store = PostgresCalibrationStore(pool)
+        stored = await store.get_config(args.config)
+        if stored is None:
+            print(f"no config {args.config}")
+            return 1
+        meta = await store.provider_meta(stored.config.provider_id)
+        if meta is None:
+            print(f"unknown provider {stored.config.provider_id!r}")
+            return 1
+        entry = PolicyEntry(
+            provider_id=stored.config.provider_id,
+            calibrated=meta.calibrated,
+            score_domain=meta.score_domain,
+            config=stored.config,
+        )
+        plan = await plan_reband(store, stored.config.provider_id, entry)
+        print(f"config {args.config} ({stored.config.version}):")
+        print(f"  attestations changed: {plan.attestations_changed}")
+        print(f"  infringements changed: {plan.infringements_changed}")
+        print(f"  users affected: {plan.users_affected}")
+        for direction, count in sorted(plan.by_direction.items()):
+            print(f"    {direction}: {count}")
+    return 0
+
+
+async def activate_config(
+    store: PostgresCalibrationStore,
+    config_id: UUID,
+    activated_by: str,
+    min_items: int,
+) -> None:
+    stored = await store.get_config(config_id)
+    if stored is None:
+        raise ValueError(f"no config {config_id}")
+    floor = await check_floor(store, stored, min_items)
+    if not floor.ok:
+        raise ValueError("floor not met: " + "; ".join(floor.problems))
+    meta = await store.provider_meta(stored.config.provider_id)
+    assert meta is not None
+    # Re-band under the provider's REAL calibrated flag, not the floor's
+    # hypothetical one: activation alone must not move anything off review.
+    entry = PolicyEntry(
+        provider_id=stored.config.provider_id,
+        calibrated=meta.calibrated,
+        score_domain=meta.score_domain,
+        config=stored.config,
+    )
+    plan = await plan_reband(store, stored.config.provider_id, entry)
+    await store.apply_reband(
+        stored.config.provider_id, config_id, activated_by,
+        plan.decisions, plan.infringement_bands,
+    )
+    await store.audit(
+        "calibration.activated",
+        actor=activated_by,
+        resource_id=config_id,
+        metadata={
+            "provider_id": stored.config.provider_id,
+            "version": stored.config.version,
+            "eval_set_id": stored.eval_set_id,
+            "sample_size": floor.sample_size,
+            "lookalike_count": floor.lookalike_count,
+            "attestations_rebanded": len(plan.decisions),
+            "users_affected": plan.users_affected,
+        },
+    )
+
+
+async def run_activate(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        print("refusing without --confirm (this rebands live attestations)")
+        return 1
+    config = load_config()
+    async with make_async_pool(config.database_url, min_size=1, max_size=2) as pool:
+        store = PostgresCalibrationStore(pool)
+        try:
+            await activate_config(
+                store, args.config, activated_by=args.by, min_items=args.min_items
+            )
+        except ValueError as exc:
+            print(f"refusing to activate: {exc}")
+            return 1
+        print(f"activated config {args.config}")
+    return 0
+
+
+async def trust_provider(
+    store: PostgresCalibrationStore,
+    provider_id: ProviderId,
+    *,
+    trusted: bool,
+    actor: str,
+    reason: str,
+) -> None:
+    """The second key, and the only writer of ``providers.calibrated``.
+
+    "This config is sound" and "this provider may now alarm people without a
+    human looking" are different claims. The first is arithmetic and the
+    floor checks it. The second is judgement about whether the eval set
+    resembles the real world, and no code can check that.
+    """
+    if not reason.strip():
+        raise ValueError("--reason is required and must not be blank")
+    await store.set_calibrated(provider_id, trusted, actor, reason)
+    # Re-band under the new flag: revoking must actually put everything back
+    # to review, or the flag is decorative.
+    meta = await store.provider_meta(provider_id)
+    assert meta is not None
+    active = await store.active_config(provider_id)
+    entry = PolicyEntry(
+        provider_id=provider_id,
+        calibrated=meta.calibrated,
+        score_domain=meta.score_domain,
+        config=active,
+    )
+    plan = await plan_reband(store, provider_id, entry)
+    await store.apply_reband(
+        provider_id, None, None, plan.decisions, plan.infringement_bands
+    )
+
+
+async def run_trust(args: argparse.Namespace) -> int:
+    if not args.confirm:
+        print("refusing without --confirm (this can alarm or silence real users)")
+        return 1
+    config = load_config()
+    provider_id = parse_provider_id(args.provider)
+    async with make_async_pool(config.database_url, min_size=1, max_size=2) as pool:
+        store = PostgresCalibrationStore(pool)
+        try:
+            await trust_provider(
+                store, provider_id,
+                trusted=not args.revoke, actor=args.by, reason=args.reason,
+            )
+        except ValueError as exc:
+            print(f"refusing to trust: {exc}")
+            return 1
+        print(f"{'revoked' if args.revoke else 'trusted'} provider {provider_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="calibrate")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -400,6 +778,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON bands override; omit to use the sweep's recommendation",
     )
     propose.set_defaults(func=run_propose)
+
+    replay = sub.add_parser(
+        "replay", help="show what activating this config would change; writes nothing"
+    )
+    replay.add_argument("--config", required=True, type=UUID)
+    replay.set_defaults(func=run_replay)
+
+    activate = sub.add_parser(
+        "activate", help="activate a config after it clears the floor"
+    )
+    activate.add_argument("--config", required=True, type=UUID)
+    activate.add_argument("--by", required=True)
+    activate.add_argument("--min-items", type=int, default=200)
+    activate.add_argument(
+        "--confirm", action="store_true", help="required: this rebands live attestations"
+    )
+    activate.set_defaults(func=run_activate)
+
+    trust = sub.add_parser(
+        "trust",
+        help="the second key: allow (or --revoke) a provider auto_confirm/drop",
+    )
+    trust.add_argument("--provider", required=True)
+    trust.add_argument("--by", required=True)
+    trust.add_argument("--reason", required=True)
+    trust.add_argument(
+        "--revoke", action="store_true", help="revoke trust instead of granting it"
+    )
+    trust.add_argument(
+        "--confirm", action="store_true",
+        help="required: this can alarm or silence real users",
+    )
+    trust.set_defaults(func=run_trust)
 
     return parser
 

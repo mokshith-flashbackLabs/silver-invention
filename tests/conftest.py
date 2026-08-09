@@ -16,6 +16,7 @@ import asyncio
 import selectors
 import sys
 from collections.abc import AsyncIterator, Callable, Mapping
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -189,3 +190,282 @@ def google_policy() -> Callable[[str], dict[Any, Any]]:
         }
 
     return _make
+
+
+# ── Task 7 fixtures: eval sets shaped to trip exactly one floor condition ───
+#
+# Everything in test_calibrate_activate.py depends on eval sets shaped this
+# way. One builder plus thin wrappers, so eight hand-written fixtures don't
+# drift apart from each other.
+
+
+async def build_eval_set(
+    store: Any,
+    *,
+    eval_set_id: str = "v1",
+    n_true: int = 150,
+    n_lookalike: int = 100,
+    true_score: str = "0.96",
+    lookalike_score: str = "0.60",
+    cover: bool = True,
+) -> None:
+    """One consenting-style eval set with observations, shaped by parameters.
+
+    Defaults are a SOUND set: 250 non-uncertain items, 100 lookalike hard
+    negatives, and a clean score separation so a 0.72/0.94 config clears both
+    edges. Each unsound fixture below changes exactly one thing, so a failing
+    floor test names its own cause.
+    """
+    hive = ProviderId("hive")
+    seed = "s3://seed-a"
+    for i in range(n_true):
+        item = await store.insert_eval_item(
+            eval_set_id, seed, f"https://x.test/t{i}",
+            "true_match", "same_person", "team member, written consent", "tester",
+        )
+        await store.upsert_eval_observation(
+            item, hive, "numeric", Decimal(true_score), None, None,
+            "hive-web-search-v1",
+        )
+    for i in range(n_lookalike):
+        item = await store.insert_eval_item(
+            eval_set_id, seed, f"https://x.test/l{i}",
+            "false_match", "lookalike", "team member, written consent", "tester",
+        )
+        await store.upsert_eval_observation(
+            item, hive, "numeric", Decimal(lookalike_score), None, None,
+            "hive-web-search-v1",
+        )
+    if cover:
+        await store.record_seed_coverage(
+            eval_set_id, seed, hive, "ok", n_true + n_lookalike
+        )
+
+
+HIVE_BANDS_JSON = [
+    {"band": "drop", "max": "0.72"},
+    {"band": "review", "min": "0.72", "max": "0.94"},
+    {"band": "auto_confirm", "min": "0.94"},
+]
+
+
+async def make_calibration_config(store: Any, **kwargs: Any) -> UUID:
+    """Insert an inactive Hive config with the standard three bands.
+
+    Named ``make_calibration_config`` rather than ``make_config``: this file
+    already has a ``make_config() -> Config`` above, building an entirely
+    different thing (the app's boot-time settings object). Same name would
+    have silently shadowed it.
+    """
+    defaults: dict[str, Any] = {
+        "provider_id": ProviderId("hive"),
+        "version": "hive-cal-v1",
+        "score_kind": "numeric",
+        "bands": HIVE_BANDS_JSON,
+        "eval_set_id": "v1",
+        "eval_sample_size": 250,
+        "measured": None,
+    }
+    return await store.insert_config(**{**defaults, **kwargs})
+
+
+@pytest.fixture
+async def sound_eval_set(calibration_store: Any) -> tuple[Any, Any]:
+    await build_eval_set(calibration_store)
+    return calibration_store, await make_calibration_config(calibration_store)
+
+
+@pytest.fixture
+async def weak_precision_eval_set(calibration_store: Any) -> tuple[Any, Any]:
+    """Lookalikes score as high as true matches — nothing separates them."""
+    await build_eval_set(calibration_store, lookalike_score="0.96")
+    return calibration_store, await make_calibration_config(calibration_store)
+
+
+@pytest.fixture
+async def weak_npv_eval_set(calibration_store: Any) -> tuple[Any, Any]:
+    """True matches sit below the drop boundary, so dropping loses them."""
+    await build_eval_set(calibration_store, true_score="0.60")
+    return calibration_store, await make_calibration_config(calibration_store)
+
+
+@pytest.fixture
+async def small_eval_set(calibration_store: Any) -> tuple[Any, Any]:
+    await build_eval_set(calibration_store, n_true=20, n_lookalike=15)
+    return calibration_store, await make_calibration_config(
+        calibration_store, eval_sample_size=35
+    )
+
+
+@pytest.fixture
+async def no_lookalike_eval_set(calibration_store: Any) -> tuple[Any, Any]:
+    """250 items, clean separation, precision 1.0 — and meaningless, because
+    every negative is an easy one. This is the set the floor must refuse."""
+    hive = ProviderId("hive")
+    await build_eval_set(calibration_store, n_lookalike=0)
+    for i in range(100):
+        item = await calibration_store.insert_eval_item(
+            "v1", "s3://seed-a", f"https://x.test/u{i}",
+            "false_match", "unrelated", "public domain", "tester",
+        )
+        await calibration_store.upsert_eval_observation(
+            item, hive, "numeric", Decimal("0.55"), None, None, "hive-web-search-v1"
+        )
+    return calibration_store, await make_calibration_config(calibration_store)
+
+
+@pytest.fixture
+async def orphan_config(calibration_store: Any) -> tuple[Any, Any]:
+    await build_eval_set(calibration_store)
+    return calibration_store, await make_calibration_config(
+        calibration_store, eval_set_id=None
+    )
+
+
+@pytest.fixture
+async def uncovered_eval_set(calibration_store: Any) -> tuple[Any, Any]:
+    await build_eval_set(calibration_store, cover=False)
+    return calibration_store, await make_calibration_config(calibration_store)
+
+
+@pytest.fixture
+async def tampered_measured(calibration_store: Any) -> tuple[Any, Any]:
+    """measured claims a perfect result; eval_observations disagree. The floor
+    must derive from the data, so the claim changes nothing."""
+    await build_eval_set(calibration_store, lookalike_score="0.96")
+    return calibration_store, await make_calibration_config(
+        calibration_store,
+        measured={"auto_confirm_precision": 1.0, "drop_npv": 1.0},
+    )
+
+
+@pytest.fixture
+async def review_only_config(calibration_store: Any) -> tuple[Any, Any]:
+    await build_eval_set(calibration_store, n_true=1, n_lookalike=0)
+    return calibration_store, await make_calibration_config(
+        calibration_store,
+        version="hive-review-only",
+        bands=[{"band": "review"}],
+    )
+
+
+@pytest.fixture
+async def no_drop_band_config(calibration_store: Any) -> tuple[Any, Any]:
+    await build_eval_set(calibration_store)
+    return calibration_store, await make_calibration_config(
+        calibration_store,
+        version="hive-no-drop",
+        bands=[
+            {"band": "review", "max": "0.94"},
+            {"band": "auto_confirm", "min": "0.94"},
+        ],
+    )
+
+
+@pytest.fixture
+async def two_sound_configs(calibration_store: Any) -> tuple[Any, Any, Any]:
+    await build_eval_set(calibration_store)
+    first = await make_calibration_config(calibration_store, version="hive-cal-v1")
+    second = await make_calibration_config(calibration_store, version="hive-cal-v2")
+    return calibration_store, first, second
+
+
+class BandedFixture:
+    """Real infringements with Hive attestations spanning three scores, all
+    currently 'review'. Under a 0.72/0.94 config they move in BOTH directions
+    (0.60 -> drop, 0.99 -> auto_confirm, 0.80 stays review), so a replay delta
+    is non-trivial and by_direction has more than one key."""
+
+    def __init__(self, store: Any, pool: Any) -> None:
+        self._store = store
+        self._pool = pool
+
+    def entry(self) -> Any:
+        from imageshield.calibration.models import (
+            CalibrationConfig,
+            NumericBand,
+            PolicyEntry,
+            ScoreDomain,
+        )
+
+        hive = ProviderId("hive")
+        return PolicyEntry(
+            provider_id=hive,
+            calibrated=True,
+            score_domain=ScoreDomain(min=Decimal("0.5"), max=Decimal("1.0")),
+            config=CalibrationConfig(
+                config_id=uuid4(),
+                provider_id=hive,
+                version="hive-cal-v1",
+                score_kind="numeric",
+                numeric_bands=(
+                    NumericBand(band="drop", max=Decimal("0.72")),
+                    NumericBand(band="review", min=Decimal("0.72"), max=Decimal("0.94")),
+                    NumericBand(band="auto_confirm", min=Decimal("0.94")),
+                ),
+            ),
+        )
+
+    async def counts(self) -> tuple[int, int]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT (SELECT count(*) FROM attestations),"
+                "       (SELECT count(*) FROM infringements)"
+            )
+            row = await cur.fetchone()
+        return (row[0], row[1])
+
+
+@pytest.fixture
+async def banded_infringements(calibration_store: Any) -> BandedFixture:
+    """Deliberately does NOT depend on the ``search_fixture`` fixture: that
+    fixture runs its own ``migrate down --all`` + ``up`` against the same
+    session-scoped ``throwaway_db``, and pairing it with ``calibration_store``
+    in one test (as ``sound_eval_set`` + this fixture are, throughout the
+    activate/trust tests) would re-migrate the schema out from under whatever
+    ``sound_eval_set`` already inserted — a config row created, then wiped,
+    before the test body ever runs. Building the seed/run directly off
+    ``calibration_store``'s own (already-migrated) pool avoids the second
+    reset entirely.
+    """
+    from imageshield.search.models import ProviderDescriptor
+    from imageshield.search.provider import ProviderMatch
+    from imageshield.search.store import PostgresSearchStore
+
+    store = PostgresSearchStore(calibration_store._pool)
+    user_ref = UserRef(uuid4())
+    seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
+    run_id = await store.create_run(
+        user_ref, seed_id, (ProviderId("hive"), ProviderId("google"))
+    )
+    hive = ProviderId("hive")
+    desc = ProviderDescriptor(
+        provider_id=hive, score_kind="numeric", score_version="hive-web-search-v1"
+    )
+    # Two users, because "how many people does this retune affect" is the
+    # number replay exists to report and a single-user fixture cannot prove it.
+    second_user = UserRef(uuid4())
+    for owner, scores in (
+        (user_ref, ("0.60", "0.80", "0.99")),
+        (second_user, ("0.65", "0.97")),
+    ):
+        for i, score in enumerate(scores):
+            url = f"https://x.test/{owner}/{i}"
+            # Empty policy: every row starts at 'review', exactly as the
+            # shipped system produces them.
+            await store.record_infringements(
+                run_id,
+                owner,
+                desc,
+                [
+                    ProviderMatch(
+                        image_url=f"{url}/img.jpg",
+                        page_urls=[url],
+                        provider_score=Decimal(score),
+                        provider_category=None,
+                        query_quality=None,
+                    )
+                ],
+                {},
+            )
+    return BandedFixture(calibration_store, calibration_store._pool)
