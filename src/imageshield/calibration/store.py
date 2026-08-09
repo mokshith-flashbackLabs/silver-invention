@@ -40,7 +40,9 @@ from uuid import UUID
 
 import structlog
 from psycopg import AsyncConnection
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
+from pydantic import BaseModel, ConfigDict
 
 from imageshield.calibration.metrics import EvalRow
 from imageshield.calibration.models import (
@@ -57,6 +59,28 @@ from imageshield.types import ProviderId, parse_provider_id
 log = structlog.get_logger("imageshield.calibration")
 
 _VALID_BANDS: frozenset[str] = frozenset({"drop", "review", "auto_confirm"})
+
+
+class ProviderMeta(BaseModel):
+    """What ``sweep``/``propose`` need to know about a provider before they
+    can interpret its raw values at all."""
+
+    model_config = ConfigDict(frozen=True)
+
+    score_kind: ScoreKind
+    score_domain: ScoreDomain
+    calibrated: bool
+
+
+class StoredConfig(BaseModel):
+    """A config row plus the provenance the activate floor needs. Distinct
+    from CalibrationConfig, which is only what banding needs."""
+
+    model_config = ConfigDict(frozen=True)
+
+    config: CalibrationConfig
+    eval_set_id: str | None
+    active: bool
 
 _LOAD_POLICY_SQL = """
     SELECT p.provider_id, p.calibrated, p.score_domain,
@@ -138,6 +162,25 @@ _UNCOVERED_SEEDS_SQL = """
           AND c.provider_id = %(provider_id)s
           AND c.status = 'ok')
     ORDER BY i.seed_uri
+"""
+
+_PROVIDER_META_SQL = """
+    SELECT score_kind, score_domain, calibrated FROM providers
+    WHERE provider_id = %(provider_id)s
+"""
+
+_INSERT_CONFIG_SQL = """
+    INSERT INTO calibration_configs (provider_id, version, score_kind, bands,
+                                     eval_set_id, eval_sample_size, measured)
+    VALUES (%(provider_id)s, %(version)s, %(score_kind)s, %(bands)s,
+            %(eval_set_id)s, %(eval_sample_size)s, %(measured)s)
+    RETURNING config_id
+"""
+
+_GET_CONFIG_SQL = """
+    SELECT config_id, provider_id, version, score_kind, bands, eval_set_id,
+           active
+    FROM calibration_configs WHERE config_id = %(config_id)s
 """
 
 
@@ -399,3 +442,64 @@ class PostgresCalibrationStore:
                 {"eval_set_id": eval_set_id, "provider_id": provider_id},
             )
             return tuple(r[0] for r in await cur.fetchall())
+
+    async def provider_meta(self, provider_id: ProviderId) -> ProviderMeta | None:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_PROVIDER_META_SQL, {"provider_id": provider_id})
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return ProviderMeta(
+            score_kind=row[0],
+            score_domain=parse_score_domain(row[1]),
+            calibrated=row[2],
+        )
+
+    async def insert_config(
+        self,
+        provider_id: ProviderId,
+        version: str,
+        score_kind: ScoreKind,
+        bands: Any,
+        eval_set_id: str | None,
+        eval_sample_size: int | None,
+        measured: dict[str, Any] | None,
+    ) -> UUID:
+        """Always INACTIVE. Activation is a separate, gated command."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _INSERT_CONFIG_SQL,
+                {
+                    "provider_id": provider_id,
+                    "version": version,
+                    "score_kind": score_kind,
+                    "bands": Jsonb(bands),
+                    "eval_set_id": eval_set_id,
+                    "eval_sample_size": eval_sample_size,
+                    "measured": Jsonb(measured) if measured is not None else None,
+                },
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        config_id: UUID = row[0]
+        return config_id
+
+    async def get_config(self, config_id: UUID) -> StoredConfig | None:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_GET_CONFIG_SQL, {"config_id": config_id})
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        numeric, categorical = parse_bands(row[3], row[4])
+        return StoredConfig(
+            config=CalibrationConfig(
+                config_id=row[0],
+                provider_id=parse_provider_id(row[1]),
+                version=row[2],
+                score_kind=row[3],
+                numeric_bands=numeric,
+                categorical_bands=categorical,
+            ),
+            eval_set_id=row[5],
+            active=row[6],
+        )

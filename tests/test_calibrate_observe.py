@@ -127,3 +127,34 @@ async def test_a_failed_provider_call_records_coverage_as_not_ok(
     assert await calibration_store.uncovered_seeds("v1", HIVE) == (
         "https://seed.test/a.jpg",
     )
+    # uncovered_seeds alone only proves the seed isn't marked 'ok' — it would
+    # read identically if record_seed_coverage were deleted outright and the
+    # row never existed at all. Assert the row itself carries the real
+    # failing status, not just its absence from the 'ok' set.
+    async with calibration_store._pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT status, candidates_returned FROM eval_seed_coverage "
+            "WHERE eval_set_id = %s AND seed_uri = %s AND provider_id = %s",
+            ("v1", "https://seed.test/a.jpg", HIVE),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == "timeout"
+    assert row[1] == 0
+
+
+async def test_observe_does_not_match_across_path_case(calibration_store) -> None:
+    """URL normalisation lowercases the host but PRESERVES path case (v1
+    rule 6 — paths are case-sensitive, hosts are not). A labelled URL and a
+    returned URL that differ ONLY by path case must therefore NOT be treated
+    as the same page: matching on a looser key than production's dedup key
+    would measure a system that isn't the one actually running."""
+    await calibration_store.insert_eval_item(
+        "v1", "https://seed.test/a.jpg", "https://x.test/found",
+        "true_match", "same_person", "team member, written consent", "tester",
+    )
+    provider = FakeProvider(result("https://x.test/Found"))
+    written = await observe_seed(
+        calibration_store, provider, "v1", "https://seed.test/a.jpg"
+    )
+    assert written == 0
