@@ -225,8 +225,25 @@ results when a provider retunes.
 
 ### 7.3 Uncalibrated providers reach `review` band only
 
-Never `auto_confirm`. A provider we haven't measured against a labelled set must not be able to tell
-someone their face is in porn without a human looking first.
+Never `auto_confirm`, and never `drop` either — a real infringement in `drop` is invisible to the
+user forever, which is the worse of the two edges. A provider we haven't measured against a labelled
+set must not be able to tell someone their face is in porn without a human looking first.
+
+Two keys move a provider off review-only, and they defend different failures.
+
+`calibrate activate` enforces a floor **recomputed from `eval_observations`**, never from the stored
+`measured` column — a check that trusts a JSONB column an operator can type into is defeated by
+editing a number. It refuses unless: precision ≥ 0.99 on any declared `auto_confirm` band, NPV ≥ 0.99
+on any declared `drop` band, effective sample size (non-`uncertain` items) ≥
+`CALIBRATION_MIN_EVAL_ITEMS`, at least one `lookalike` item, a non-null `eval_set_id`, and every seed
+covered by a successful provider run. A review-only config skips the floor — it alarms nobody. The
+floor lives in code so loosening it costs a code change, a review, and a `git blame`.
+
+`calibrate trust` is separate, human, and the only writer of `providers.calibrated`. *This config is
+sound* and *this provider may alarm people unreviewed* are different claims. The first is arithmetic
+and the floor checks it. The second is judgement about whether the eval set resembles the real world
+— a sweep over 40 items with no hard negatives yields precision 1.0 trivially, because random
+negatives are easy to reject. No code can check that.
 
 ### 7.4 One infringement, many attestations
 

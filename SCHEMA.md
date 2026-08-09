@@ -316,6 +316,13 @@ CREATE TABLE attestations (
   last_confirmed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   confirm_count      INT NOT NULL DEFAULT 1,
   last_run_id        UUID REFERENCES search_runs(run_id),
+  -- Added by 0007. `band` is this ONE provider's verdict; the infringement's
+  -- band is the roll-up of every attestation on it.
+  band               TEXT NOT NULL DEFAULT 'review'
+                     CHECK (band IN ('drop','review','auto_confirm')),
+  -- Which config produced that band. Without it a retune makes every
+  -- historical band uninterpretable.
+  calibration_version TEXT,
   UNIQUE (infringement_id, provider_id),
   CONSTRAINT attestation_score_shape CHECK (
     (score_kind = 'numeric'     AND provider_score    IS NOT NULL) OR
@@ -328,10 +335,112 @@ CREATE INDEX attestations_run_idx ON attestations (last_run_id);
 ```
 
 `provider_score` is **raw and provider-native**. Provider A's 0.92 and Provider B's 0.92 are
-different quantities; calibration is a separate, versioned step (step 7) and `band` stays `'review'`
-until it lands. The `attestation_score_shape` CHECK is what lets one table hold both a numeric
-provider (Hive Web Search, 0.5–1.0) and a categorical one (Google Web Detection, which returns
-`score: null`) without an adapter inventing a number.
+different quantities; calibration is a separate, versioned step and nothing rescales or combines
+them. The `attestation_score_shape` CHECK is what lets one table hold both a numeric provider (Hive
+Web Search, 0.5–1.0) and a categorical one (Google Web Detection, which returns `score: null`)
+without an adapter inventing a number.
+
+### Calibration and the evaluation set — **built** (step 7, migration 0007)
+
+`infringements.band` moved off the hardcoded `'review'` in step 7. Four tables make that possible.
+
+```sql
+CREATE TABLE calibration_configs (
+  config_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider_id      TEXT NOT NULL REFERENCES providers(provider_id),
+  version          TEXT NOT NULL,
+  score_kind       TEXT NOT NULL CHECK (score_kind IN ('numeric','categorical')),
+  -- In the provider's NATIVE units, validated against providers.score_domain.
+  --   numeric:     [{"band":"drop","max":0.72}, …]
+  --   categorical: {"full_match":"auto_confirm", …}
+  bands            JSONB NOT NULL,
+  eval_set_id      TEXT,
+  eval_sample_size INT,
+  -- ADVISORY ONLY. `activate` recomputes from eval_observations and never
+  -- reads this: a check that trusts a column an operator can edit is not a
+  -- check.
+  measured         JSONB,
+  active           BOOLEAN NOT NULL DEFAULT false,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  activated_at     TIMESTAMPTZ,
+  activated_by     TEXT,
+  UNIQUE (provider_id, version)
+);
+
+CREATE UNIQUE INDEX calibration_one_active
+  ON calibration_configs (provider_id) WHERE active;
+
+-- `label` answers "is this the user's likeness, and should they be told?" —
+-- NOT "is this an authentic photograph of them". That distinction is why a
+-- derived_edit is a POSITIVE.
+CREATE TABLE eval_items (
+  item_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  eval_set_id    TEXT NOT NULL,
+  seed_uri       TEXT NOT NULL,
+  candidate_url  TEXT NOT NULL,
+  label          TEXT NOT NULL CHECK (label IN ('true_match','false_match','uncertain')),
+  label_kind     TEXT NOT NULL CHECK (label_kind IN ('same_person','derived_edit',
+                                       'novel_generation','lookalike','unrelated')),
+  -- NOT NULL alone permits ''. The regex is what actually rejects an item
+  -- with no traceable consent basis.
+  consent_basis  TEXT NOT NULL CHECK (consent_basis ~ '\S'),
+  labelled_by    TEXT NOT NULL,
+  labelled_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT eval_label_kind_agrees CHECK (
+    (label_kind IN ('same_person','derived_edit','novel_generation')
+       AND label IN ('true_match','uncertain'))
+    OR
+    (label_kind IN ('lookalike','unrelated')
+       AND label IN ('false_match','uncertain'))
+  ),
+  UNIQUE (eval_set_id, seed_uri, candidate_url)
+);
+
+-- What a provider actually said about a labelled item. Mirrors attestations:
+-- one item, many providers, re-observation UPDATES rather than appends. Kept
+-- out of infringements/attestations so nothing serving real users carries
+-- test rows.
+CREATE TABLE eval_observations (
+  observation_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  item_id           UUID NOT NULL REFERENCES eval_items(item_id) ON DELETE CASCADE,
+  provider_id       TEXT NOT NULL REFERENCES providers(provider_id),
+  score_kind        TEXT NOT NULL,
+  provider_score    NUMERIC(6,4),
+  provider_category TEXT,
+  query_quality     TEXT,
+  score_version     TEXT NOT NULL,
+  observed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (item_id, provider_id),
+  CONSTRAINT eval_observation_score_shape CHECK (
+    (score_kind = 'numeric'     AND provider_score    IS NOT NULL) OR
+    (score_kind = 'categorical' AND provider_category IS NOT NULL)
+  )
+);
+
+-- Recall depends on counting the true_matches a provider FAILED to return.
+-- An absent eval_observation is ambiguous alone: either "asked and did not
+-- return it" (a miss, and data) or "never asked" (not data). Only coverage
+-- separates them, which is also what makes the activate floor's coverage
+-- condition checkable without rejecting every honest set.
+CREATE TABLE eval_seed_coverage (
+  coverage_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  eval_set_id         TEXT NOT NULL,
+  seed_uri            TEXT NOT NULL,
+  provider_id         TEXT NOT NULL REFERENCES providers(provider_id),
+  status              TEXT NOT NULL,   -- ok | error | timeout | rate_limited
+  candidates_returned INT NOT NULL,
+  observed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (eval_set_id, seed_uri, provider_id)
+);
+```
+
+`infringements` also gained `band_reason TEXT` and a CHECK pinning `band` to the same three values.
+
+**Sourcing is a hard constraint, not a preference.** Eval imagery comes from consenting
+participants, public-domain, or synthetic sources only — never real victim content, never scraped
+material. `novel_generation` items are non-sexual synthetic portraits: the question being measured is
+whether image search can find a novel generation of a face, and the answer does not depend on what
+the image depicts.
 
 ### Dedup rules
 

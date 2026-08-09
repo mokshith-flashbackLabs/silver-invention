@@ -221,9 +221,10 @@ interface SearchProvider {
     externalUserId: string;
   }): Promise<RawProviderResult[]>;
 
-  /** Map this provider's native score onto the common 0-100 scale.
-   *  Derived empirically from a labelled set — NOT a guess. */
-  calibrate(rawScore: number): number;
+  /** NO calibrate() method. Adapters return raw scores and stop (§7.2).
+   *  Banding is a separate, versioned, config-driven step: an adapter that
+   *  normalises makes recalibration impossible without a redeploy, and a
+   *  "common scale" across providers is a number with no meaning. */
 }
 
 interface RawProviderResult {
@@ -260,7 +261,7 @@ CREATE TABLE search_hits (
   url_hash         TEXT NOT NULL,
   source_url       TEXT NOT NULL,
   source_domain    TEXT NOT NULL,
-  best_score       NUMERIC(5,2) NOT NULL,   -- highest calibrated score
+  -- NO best_score. There is no cross-provider scale to take a "highest" on.
   provider_count   INT NOT NULL,            -- agreement signal
   first_seen_at    TIMESTAMPTZ NOT NULL,
   last_seen_at     TIMESTAMPTZ NOT NULL,
@@ -274,8 +275,9 @@ CREATE TABLE search_attestations (
   attestation_id  UUID PRIMARY KEY,
   hit_id          UUID NOT NULL REFERENCES search_hits(hit_id),
   provider_id     TEXT NOT NULL,
-  raw_score       NUMERIC,
-  calibrated_score NUMERIC(5,2),
+  raw_score       NUMERIC,                 -- RAW and provider-native. Never rescaled.
+  band            TEXT NOT NULL,           -- drop|review|auto_confirm
+  calibration_version TEXT,                -- which config produced that band
   raw_payload     JSONB NOT NULL,
   observed_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -299,12 +301,31 @@ like "no infringements found."
 
 ## 2.3 Calibration
 
-**Do not merge raw scores.** Build a small labelled set — known-positive URLs for consenting test
-identities, plus known-negatives — and derive each provider's mapping onto the common scale. Store
-`calibration_version` per run so scores stay interpretable when you retune.
+**Do not merge raw scores, and do not map them onto a common scale.** Provider A's 0.92 and Provider
+B's 0.92 are different quantities with different distributions; a shared 0–100 scale makes them look
+comparable when they are not. Each provider gets its own band boundaries in its own **native units**,
+from its own labelled measurements. Nothing is rescaled and nothing is combined across providers —
+`tests/test_boundaries.py` enforces that with a grep that has no allowlist.
 
-Until a provider is calibrated, its results go into `review` band only. Never `auto_confirm`.
-A provider that hasn't earned auto-confirm shouldn't be able to alarm a user unreviewed.
+> This section previously specified a `calibrate(rawScore): number` adapter method and a
+> `calibrated_score` column mapping every provider onto a common scale. That is exactly the
+> cross-provider comparison `CLAUDE.md` §7.2 forbids, and it is not built. Corrected here so the
+> next reader doesn't implement the thing the test now blocks.
+
+Build a small labelled set — consenting participants, public-domain, or synthetic imagery only,
+never real victim content, never scraped material — and record a `consent_basis` per item or the item
+does not go in the set. It must contain `lookalike` hard negatives: random negatives are easy for any
+provider to reject and will make a bad threshold look excellent.
+
+Bands are `drop | review | auto_confirm`. An infringement's band is the roll-up of its attestations:
+any disagreement resolves to `review`, and agreement never promotes — two providers at `review` stay
+`review`, because concurrence between two image-search providers indexing overlapping corpora is not
+two independent observations. `attestations.calibration_version` records which config produced each
+band, so a retune leaves history interpretable.
+
+Until a provider is calibrated its results go into `review` band only — never `auto_confirm`, and
+never `drop`. See `CLAUDE.md` §7.3 for the two keys, and
+`docs/superpowers/specs/2026-08-07-step-7-calibration-banding-design.md` for the full design.
 
 ## 2.4 Cost and failure isolation
 

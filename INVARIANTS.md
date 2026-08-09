@@ -131,7 +131,33 @@ Enforced with distinct Postgres roles and network policy. Not convention, not co
 
 **15. Threshold bands are read from config and recorded per search run.**
 `search_runs.threshold_config` stores the exact bands used. Retuning must not make historical scores
-uninterpretable.
+uninterpretable. As of step 7 the per-row record is finer-grained still:
+`attestations.calibration_version` names the exact config that produced each band.
+
+**15b. An uncalibrated provider produces `review` and nothing else — enforced in code, not by
+discipline.**
+Not `auto_confirm`, and not `drop` either: a real infringement in `drop` is invisible to the user
+forever, so it is the worse of the two edges. Enforcement points, all of which have permanent tests:
+
+- `calibration/bands.py` rule 2 returns `review`/`provider_uncalibrated` before any score is
+  examined. Every other failure mode in that module — no active config, score-kind mismatch, a score
+  outside `providers.score_domain`, a non-finite score, an unbounded domain, an unknown category —
+  also returns `review`. **Nothing in that module raises**, because banding runs inside a scan's
+  write path and a crash there would fail a whole run over one malformed provider row.
+- `calibrate activate` refuses on six conditions, each recomputed fresh from `eval_observations`
+  joined to `eval_items` and never from the stored `measured` column. The zero-`lookalike` refusal is
+  unconditional: a set without hard negatives yields precision 1.0 trivially, and no sample size
+  compensates for a measurement that means nothing.
+- `calibrate trust` is the **only** writer of `providers.calibrated`, and `activate` never touches
+  it. Two keys, because they defend different failures — see `CLAUDE.md` §7.3.
+
+**15c. No code path combines scores across providers.**
+Provider A's 0.92 and Provider B's 0.92 are different quantities on different scales; combining them
+produces a plausible-looking number with no meaning. An infringement's band is the roll-up of its
+attestations' *bands*, never of their scores: any disagreement resolves to `review`, and agreement
+never promotes. `tests/test_boundaries.py` greps `src/imageshield/calibration/` and
+`src/imageshield/search/` for the arithmetic vocabulary, with **no allowlist** — if a legitimate use
+ever needs to exist, adding it should cost a code review.
 
 **16. `FaceMatchThreshold` is set explicitly on every Rekognition call.**
 The 80% default is far too loose for this product. Auto-confirm requires 95+. Never rely on the
