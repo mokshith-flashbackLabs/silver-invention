@@ -70,9 +70,20 @@ def test_no_figure_appears_without_its_sample_size(false_match_score: str) -> No
     text = render_numeric_sweep(
         sweep_numeric(rows, HIVE_DOMAIN), "hive", "v1", uncovered=()
     )
+    # Exempt the SPECIFIC target-statement phrasings, not the word "target".
+    # A substring carve-out on the word widens silently the day someone writes
+    # "precision at the target boundary 0.975" — a real measurement that would
+    # then escape the check this test exists to enforce.
+    target_statements = (
+        "reaches the required 0.99 target",
+        "reaches the required precision target",
+    )
     for line in text.splitlines():
-        if "precision" in line and "n/a" not in line and "target" not in line:
-            assert "/" in line, line
+        if "precision" not in line or "n/a" in line:
+            continue
+        if any(phrase in line for phrase in target_statements):
+            continue
+        assert "/" in line, line
 
 
 def test_zero_lookalikes_is_shouted_not_footnoted() -> None:

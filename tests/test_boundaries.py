@@ -54,9 +54,15 @@ FORBIDDEN_CROSS_PROVIDER_MATHS = re.compile(
     rf"|(?i:\b{_MATHS_TOKEN})(?=[A-Z])"  # camelCase:       avgScore
 )
 
-# Only the two directories that hold scores. The schema lint elsewhere in src/
+# Only the directories that hold scores. The schema lint elsewhere in src/
 # legitimately says "the two words that mean 'we kept pixels around'".
 SCORE_DIRS = ("search", "calibration")
+
+# devtools/calibrate/ is scanned too: it is the harness that produces the
+# numbers a human reads before trusting a provider, so "just average the
+# providers" is at least as likely to be written there as in bands.py.
+# devtools/harness/web/dist/ is vendored JS and is NOT scanned.
+CALIBRATE_CLI = Path(__file__).resolve().parents[1] / "devtools" / "calibrate"
 
 
 def _source_files() -> list[Path]:
@@ -67,7 +73,8 @@ def _source_files() -> list[Path]:
 
 def _scored_source_files() -> list[Path]:
     files = [p for d in SCORE_DIRS for p in sorted((SRC / "imageshield" / d).rglob("*.py"))]
-    assert files, "search/ and calibration/ scan found nothing — paths wrong?"
+    files += sorted(CALIBRATE_CLI.rglob("*.py"))
+    assert files, "search/, calibration/ and devtools/calibrate/ scan found nothing?"
     return files
 
 

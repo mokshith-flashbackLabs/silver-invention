@@ -7,7 +7,9 @@ loosening it is a code change with a review and a git blame.
 from __future__ import annotations
 
 import argparse
+from uuid import uuid4
 
+import pytest
 from devtools.calibrate.__main__ import activate_config, build_parser, check_floor
 
 from imageshield.types import ProviderId
@@ -16,18 +18,46 @@ HIVE = ProviderId("hive")
 MIN_ITEMS = 200
 
 
-async def run_activate_with_store(store, args: argparse.Namespace) -> int:
-    """The same code path as `run_activate`, against the fixture's store
-    rather than building its own pool."""
+async def run_activate_with_store(
+    store, args: argparse.Namespace, min_items: int = MIN_ITEMS
+) -> int:
+    """Mirrors `run_activate` against the fixture's store rather than building
+    its own pool.
+
+    ``min_items`` is a parameter here for the same reason it is NOT a CLI flag
+    in `run_activate`: the real command sources the floor from
+    ``Config.calibration_min_eval_items`` and offers no way to lower it from
+    the command line. A `--min-items` flag used to exist and could carry a
+    20-item eval set to `auto_confirm` on a trusted provider, which defeated
+    the whole point of the floor living in code. If this helper ever starts
+    reading the floor off `args` again, that flag has come back.
+    """
     if not args.confirm:
         return 1
     try:
         await activate_config(
-            store, args.config, activated_by=args.by, min_items=args.min_items
+            store, args.config, activated_by=args.by, min_items=min_items
         )
     except ValueError:
         return 1
     return 0
+
+
+def test_activate_has_no_flag_that_lowers_the_floor() -> None:
+    """Permanent. The floor is the defence against a small or hard-negative-free
+    eval set, and a command-line override turns "a code change with a review and
+    a git blame" into a keystroke."""
+    config_id = str(uuid4())
+    base = ["activate", "--config", config_id, "--by", "tester", "--confirm"]
+
+    args = build_parser().parse_args(base)
+    assert not hasattr(args, "min_items")
+
+    # argparse exits non-zero on an unrecognised option, which is the
+    # behaviour that matters: there is no way to hand this command a lower
+    # floor.
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([*base, "--min-items", "1"])
 
 
 async def test_a_sound_config_passes_the_floor(sound_eval_set) -> None:

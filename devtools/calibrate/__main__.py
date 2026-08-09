@@ -130,8 +130,8 @@ async def observe_seed(
         )
         written += 1
     # The 'ok' coverage row is written only after the loop completes, not
-    # before it. Writing it up front would mean a crash partway through the
-    # loop leaves status='ok' with some observations missing — and a missing
+    # before it. Written up front, a crash partway through the loop would
+    # leave status='ok' with some observations missing — and a missing
     # observation under an 'ok' coverage row reads as a provider MISS
     # forever, deflating recall in exactly the direction this table exists
     # to prevent.
@@ -681,8 +681,18 @@ async def run_activate(args: argparse.Namespace) -> int:
     async with make_async_pool(config.database_url, min_size=1, max_size=2) as pool:
         store = PostgresCalibrationStore(pool)
         try:
+            # The floor comes from config, NEVER from the command line. It is
+            # the defence against the spec's own worked example — a sweep over
+            # 40 items with no hard negatives scores precision 1.0 trivially —
+            # and a flag that lowers it turns "a code change with a review and
+            # a git blame" into a keystroke. Tightening it is an ops change
+            # (raise CALIBRATION_MIN_EVAL_ITEMS); loosening it is not
+            # available here at all.
             await activate_config(
-                store, args.config, activated_by=args.by, min_items=args.min_items
+                store,
+                args.config,
+                activated_by=args.by,
+                min_items=config.calibration_min_eval_items,
             )
         except ValueError as exc:
             print(f"refusing to activate: {exc}")
@@ -790,7 +800,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     activate.add_argument("--config", required=True, type=UUID)
     activate.add_argument("--by", required=True)
-    activate.add_argument("--min-items", type=int, default=200)
     activate.add_argument(
         "--confirm", action="store_true", help="required: this rebands live attestations"
     )
