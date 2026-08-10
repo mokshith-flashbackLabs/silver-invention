@@ -7,6 +7,7 @@ fails BEFORE a PR exists. Permanent — never delete.
 from __future__ import annotations
 
 import re
+import tokenize
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -76,6 +77,67 @@ def _scored_source_files() -> list[Path]:
     files += sorted(CALIBRATE_CLI.rglob("*.py"))
     assert files, "search/, calibration/ and devtools/calibrate/ scan found nothing?"
     return files
+
+
+# INVARIANTS #8 / #1b, tightened by step 8. Both age floors come from config:
+# MIN_ENROLMENT_AGE (13) and MIN_DISCOVERY_AGE (18). An inline 18 is the exact
+# shape the v2 change would silently miss — the config value lowered while some
+# literal still gates on the old one, failing in the direction that scans a
+# minor.
+#
+# Two deliberate narrowings of the step-8 brief's `grep -rn "\b18\b" src/`:
+#
+# 1. Only the directories where an age could plausibly be compared.
+#    calibration/report.py uses 18 as a column width in format specifiers and
+#    redaction.py uses it as a phone-length bound. Neither is an age, and
+#    rewriting them to satisfy a grep would be the grep changing the code.
+#
+# 2. **Executable code only** — comments and string literals are stripped with
+#    `tokenize` before matching. This is the opposite choice from
+#    FORBIDDEN_CROSS_PROVIDER_MATHS above, and for a reason: there, the risk was
+#    arithmetic, which a comment about averaging is indistinguishable from to a
+#    grep. Here the risk is a *comparison*, which cannot live in a comment, while
+#    the prose explaining why v1 ships at 18 is exactly what a future reader
+#    needs. Flagging it would push authors toward deleting the explanation.
+AGE_TOKEN = re.compile(r"\b18\b")
+AGE_SCAN_DIRS = ("subjects", "http")
+
+
+def _age_scannable_files() -> list[Path]:
+    files = [p for d in AGE_SCAN_DIRS for p in sorted((SRC / "imageshield" / d).rglob("*.py"))]
+    files.append(SRC / "imageshield" / "config.py")
+    assert files, "subjects/, http/ and config.py scan found nothing?"
+    return files
+
+
+def _code_tokens(path: Path) -> list[tuple[int, str]]:
+    """(line number, token text) for everything that is not a comment or a
+    string literal — i.e. the part of the file that can actually compare an age.
+    """
+    with path.open("rb") as handle:
+        return [
+            (token.start[0], token.string)
+            for token in tokenize.tokenize(handle.readline)
+            if token.type not in (tokenize.COMMENT, tokenize.STRING)
+        ]
+
+
+def test_no_inline_age_literal_where_ages_are_decided() -> None:
+    """Permanent. Both ages are read from config at request time (INVARIANTS #8),
+    so v2 lowering MIN_DISCOVERY_AGE is a config change plus the minor-handling
+    code — never a hunt for literals.
+
+    Verified to actually fire: inserting `if age >= 18:` into
+    subjects/eligibility.py makes this fail. A tripwire nobody has seen trip is
+    not known to work.
+    """
+    offenders = [
+        f"{path}:{line}: {text}"
+        for path in _age_scannable_files()
+        for line, text in _code_tokens(path)
+        if AGE_TOKEN.search(text)
+    ]
+    assert offenders == []
 
 
 def test_no_face_search_anywhere_in_src() -> None:

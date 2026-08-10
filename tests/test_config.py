@@ -190,3 +190,90 @@ def test_calibration_min_eval_items_must_be_positive() -> None:
 
     with pytest.raises(ValidationError):
         make_config(calibration_min_eval_items=0)
+
+
+# ── Step 8: two ages, not one ─────────────────────────────────────────────
+
+
+def test_both_ages_are_required_from_the_environment(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """Neither has a default. An age floor that ships with one is an age floor
+    somebody can forget to set."""
+    clean_env.delenv("MIN_DISCOVERY_AGE", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        load_config()
+    assert "MIN_DISCOVERY_AGE" in str(exc.value)
+
+
+def test_the_v1_split_is_13_to_enrol_and_18_to_be_searched(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    clean_env.setenv("MIN_ENROLMENT_AGE", "13")
+    clean_env.setenv("MIN_DISCOVERY_AGE", "18")
+    cfg = load_config()
+    assert (cfg.min_enrolment_age, cfg.min_discovery_age) == (13, 18)
+
+
+def test_a_discovery_age_below_the_enrolment_age_refuses_to_boot() -> None:
+    """It would gate nobody: everyone who got through enrolment is already past
+    it. Equal is legitimate — that is the pre-step-8 world, 18/18."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(min_enrolment_age=18, min_discovery_age=13)
+    assert make_config(min_enrolment_age=18, min_discovery_age=18).min_discovery_age == 18
+
+
+# ── Step 8: the provider control knobs ────────────────────────────────────
+
+
+def test_step_8_defaults() -> None:
+    cfg = make_config()
+    assert cfg.provider_failure_threshold == 5
+    assert cfg.breaker_cooldown_seconds == 300
+    assert cfg.breaker_cooldown_max_seconds == 3600
+    assert cfg.provider_max_retries == 3
+    assert cfg.provider_config_cache_seconds == 30.0
+    assert cfg.scan_relaxed_after_empty == 8
+    assert cfg.scan_dormant_after_empty == 20
+    assert cfg.provider_spend_alarm_fraction == 0.80
+
+
+def test_the_provider_cache_ttl_is_capped_at_30_seconds() -> None:
+    """A kill switch that takes a minute to bite is not a kill switch, and the
+    only way to be sure is to refuse to boot with a longer TTL. The cap lives in
+    code, so raising it costs a review."""
+    from pydantic import ValidationError
+
+    assert make_config(provider_config_cache_seconds=30.0)
+    assert make_config(provider_config_cache_seconds=5.0)
+    with pytest.raises(ValidationError):
+        make_config(provider_config_cache_seconds=31.0)
+
+
+def test_a_cooldown_cap_below_the_base_cooldown_refuses_to_boot() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(breaker_cooldown_seconds=600, breaker_cooldown_max_seconds=300)
+
+
+def test_cadence_thresholds_must_be_ordered() -> None:
+    """A seed with a recent hit must never be demoted sooner than one that never
+    had one — otherwise a hit makes a user's cadence WORSE."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(scan_relaxed_after_empty=20, scan_dormant_after_empty=8)
+    with pytest.raises(ValidationError):
+        make_config(scan_relaxed_after_empty=8, scan_priority_release_after_empty=4)
+
+
+def test_the_retry_jitter_fraction_must_be_a_fraction() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(provider_retry_jitter_fraction=1.5)
+    with pytest.raises(ValidationError):
+        make_config(provider_retry_jitter_fraction=-0.1)

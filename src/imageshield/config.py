@@ -29,6 +29,10 @@ SENTINEL_VALUES = {"changeme", "change-me", "replace-me", "test"}
 _AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
 _POSTGRES_URL_RE = re.compile(r"^postgres(ql)?://.+")
 
+# Hard ceiling on PROVIDER_CONFIG_CACHE_SECONDS. In code, not config: the
+# whole value of the cap is that raising it costs a code change and a review.
+_PROVIDER_CACHE_TTL_CAP_SECONDS = 30.0
+
 
 class ConfigError(RuntimeError):
     """Raised when required environment configuration is missing or malformed."""
@@ -52,7 +56,29 @@ class Config(BaseSettings):
 
     liveness_min_confidence: float
     face_match_threshold: float
+    # Two ages, not one, and the split is load-bearing (step 8).
+    #
+    # MIN_ENROLMENT_AGE is who may enrol — consent, guardianship and household
+    # seats all work for minors. MIN_DISCOVERY_AGE is who may be SEARCHED. They
+    # were one number until step 8, which is why minors were blocked from
+    # enrolling at all. Neither carries a default: an age floor that ships with
+    # one is an age floor somebody can forget to set. The v1 values live in
+    # .env.example and INVARIANTS #8, deliberately not repeated here — a number
+    # quoted in a comment beside a required env var is a number that can drift.
+    #
+    # Discovery finds images resembling the seed and nudify sites alter real
+    # photos, so for an enrolled minor a *successful* result is CSAM inside
+    # this pipeline. CSAM screening and reporting are deferred until the
+    # partner corpus connects; until they exist the correct behaviour is that
+    # nothing looks.
+    #
+    # MIN_DISCOVERY_AGE drops in v2, and lowering it here does NOT enable
+    # minor discovery on its own: the proxy sends a boolean and
+    # ``imageshield.subjects.eligibility`` maps minor -> ineligible
+    # unconditionally. That is deliberate — the change must cost a code review
+    # alongside the config change, never config alone.
     min_enrolment_age: int
+    min_discovery_age: int
     liveness_session_ttl_seconds: int
     liveness_max_attempts_24h: int
     # Measured, not guessed: ≈$0.015 per completed Face Liveness check
@@ -90,6 +116,65 @@ class Config(BaseSettings):
     # constant so tightening it is an ops change, but note that LOOSENING it
     # still cannot bypass the zero-lookalike refusal, which is unconditional.
     calibration_min_eval_items: int = 200
+
+    # ── Step 8: circuit breaker ───────────────────────────────────────────
+    # Consecutive failures that open a provider's breaker. Failure means
+    # timeout, 5xx, connection error, or a malformed response. It does NOT
+    # mean 429 (that is rate limiting, retried within bounds) and it does not
+    # mean a 200 with zero matches — conflating "no matches" with failure
+    # would open the breaker on the single most ordinary result this system
+    # produces.
+    provider_failure_threshold: int = 5
+    # How long an open breaker waits before allowing ONE half-open probe.
+    breaker_cooldown_seconds: int = 300
+    # The doubling cap. Without it a provider down for a weekend ends up with
+    # a cooldown longer than the outage, so recovery is never noticed.
+    breaker_cooldown_max_seconds: int = 3600
+
+    # ── Step 8: rate limiting ─────────────────────────────────────────────
+    # Bounded retries on 429, honouring `retry-after`, with jitter. The old
+    # lambda recursed on 429 with no attempt counter
+    # (weeklyInfringementScanner.js:1148), so a persistently limited provider
+    # recursed until the Lambda timed out. This is the counter.
+    provider_max_retries: int = 3
+    # Jitter as a fraction of the computed wait, so N workers retrying the
+    # same rate-limited provider don't re-collide in lockstep.
+    provider_retry_jitter_fraction: float = 0.25
+    # Ceiling on any single 429 back-off, so a provider answering
+    # `retry-after: 86400` cannot pin a worker for a day.
+    provider_retry_max_wait_seconds: float = 30.0
+
+    # ── Step 8: kill switches ─────────────────────────────────────────────
+    # Provider rows (enabled, budgets, breaker state) are re-read at least
+    # this often. Capped at 30s in the validator: a kill switch has to take
+    # effect in seconds during an incident, and a cache is the one thing that
+    # can silently make "disabled" mean "disabled in a while".
+    provider_config_cache_seconds: float = 30.0
+
+    # ── Step 8: adaptive cadence ──────────────────────────────────────────
+    # The 4-10x lever. A user with no hits in six months does not need weekly
+    # scans. Every number here is a cost/safety trade-off, so all of them are
+    # config — cadence is a safety decision, not a growth lever (CLAUDE.md §1).
+    scan_interval_standard_days: int = 7
+    scan_interval_relaxed_days: int = 14
+    scan_interval_dormant_days: int = 30
+    # 'new' holds weekly for this many weeks after enrolment, then becomes
+    # 'standard'. Same interval; the tier exists so the first month is never
+    # relaxed by an empty-scan counter that has barely started.
+    scan_new_tier_weeks: int = 4
+    scan_relaxed_after_empty: int = 8
+    scan_dormant_after_empty: int = 20
+    # 'priority' is never demoted by the empty counter while a recent hit
+    # stands. Adjudication is out of scope (CLAUDE.md §6), so v1 approximates
+    # "any confirmed infringement in 90 days" as 13 consecutive empty weekly
+    # scans (~91 days) since the last non-empty one. Replace with a query
+    # against confirmed infringements when the review queue lands.
+    scan_priority_release_after_empty: int = 13
+
+    # ── Step 8: observability thresholds ──────────────────────────────────
+    provider_spend_alarm_fraction: float = 0.80
+    provider_success_rate_alarm: float = 0.90
+    provider_alarm_window_hours: int = 1
 
     sqs_identity_index_url: str
     sqs_search_runs_url: str
@@ -162,7 +247,7 @@ class Config(BaseSettings):
             raise ValueError("must be between 0 and 100")
         return value
 
-    @field_validator("min_enrolment_age")
+    @field_validator("min_enrolment_age", "min_discovery_age")
     @classmethod
     def _age(cls, value: int) -> int:
         if not 0 <= value <= 130:
@@ -176,6 +261,18 @@ class Config(BaseSettings):
         "outbox_max_attempts",
         "raw_response_retention_days",
         "calibration_min_eval_items",
+        "provider_failure_threshold",
+        "breaker_cooldown_seconds",
+        "breaker_cooldown_max_seconds",
+        "provider_max_retries",
+        "scan_interval_standard_days",
+        "scan_interval_relaxed_days",
+        "scan_interval_dormant_days",
+        "scan_new_tier_weeks",
+        "scan_relaxed_after_empty",
+        "scan_dormant_after_empty",
+        "scan_priority_release_after_empty",
+        "provider_alarm_window_hours",
     )
     @classmethod
     def _positive(cls, value: int) -> int:
@@ -187,6 +284,8 @@ class Config(BaseSettings):
         "outbox_poll_interval_seconds",
         "liveness_cost_per_check_usd",
         "provider_timeout_seconds",
+        "provider_retry_max_wait_seconds",
+        "provider_config_cache_seconds",
     )
     @classmethod
     def _positive_float(cls, value: float) -> float:
@@ -194,11 +293,76 @@ class Config(BaseSettings):
             raise ValueError("must be a positive number")
         return value
 
+    @field_validator("provider_retry_jitter_fraction")
+    @classmethod
+    def _fraction(cls, value: float) -> float:
+        if not 0 <= value <= 1:
+            raise ValueError("must be a fraction between 0 and 1")
+        return value
+
+    @field_validator("provider_spend_alarm_fraction", "provider_success_rate_alarm")
+    @classmethod
+    def _alarm_fraction(cls, value: float) -> float:
+        if not 0 < value <= 1:
+            raise ValueError("must be a fraction greater than 0 and at most 1")
+        return value
+
+    @field_validator("provider_config_cache_seconds")
+    @classmethod
+    def _cache_ttl_capped(cls, value: float) -> float:
+        # "Never cache the enabled flag beyond 30s" (step-8 brief). A kill
+        # switch that takes a minute to bite is not a kill switch, and the
+        # only way to be sure of that is to refuse to boot with a longer TTL.
+        if value > _PROVIDER_CACHE_TTL_CAP_SECONDS:
+            raise ValueError(
+                f"must not exceed {_PROVIDER_CACHE_TTL_CAP_SECONDS:g}s — a provider"
+                " kill switch has to take effect within seconds"
+            )
+        return value
+
     @model_validator(mode="after")
     def _tokens_distinct(self) -> Config:
         if self.service_token == self.admin_service_token:
             raise ValueError(
                 "SERVICE_TOKEN and ADMIN_SERVICE_TOKEN must differ — refusing to start"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _ages_ordered(self) -> Config:
+        # A discovery age BELOW the enrolment age would mean the search gate is
+        # looser than the gate that let the person in — i.e. it gates nobody.
+        # Equal is legitimate: it is the pre-step-8 world, where one number did
+        # both jobs.
+        if self.min_discovery_age < self.min_enrolment_age:
+            raise ValueError(
+                "MIN_DISCOVERY_AGE must be >= MIN_ENROLMENT_AGE — a discovery age"
+                " below the enrolment age gates nobody"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _breaker_cooldown_ordered(self) -> Config:
+        if self.breaker_cooldown_max_seconds < self.breaker_cooldown_seconds:
+            raise ValueError(
+                "BREAKER_COOLDOWN_MAX_SECONDS must be >= BREAKER_COOLDOWN_SECONDS"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _scan_thresholds_ordered(self) -> Config:
+        # relaxed before dormant, and priority released no sooner than a seed
+        # would have been relaxed — otherwise a hit makes a seed's cadence
+        # WORSE than never having had one, which is backwards.
+        if self.scan_dormant_after_empty <= self.scan_relaxed_after_empty:
+            raise ValueError(
+                "SCAN_DORMANT_AFTER_EMPTY must be > SCAN_RELAXED_AFTER_EMPTY"
+            )
+        if self.scan_priority_release_after_empty < self.scan_relaxed_after_empty:
+            raise ValueError(
+                "SCAN_PRIORITY_RELEASE_AFTER_EMPTY must be >= SCAN_RELAXED_AFTER_EMPTY"
+                " — a seed with a recent hit must never be demoted sooner than one"
+                " that never had one"
             )
         return self
 
