@@ -18,8 +18,9 @@ from uuid import UUID
 import structlog
 from fastapi import APIRouter, Depends, Query
 
+from imageshield.config import Config
 from imageshield.http.auth import require_service_token
-from imageshield.http.deps import get_search_store
+from imageshield.http.deps import get_config, get_search_store, get_subject_store
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
     AttestationItem,
@@ -31,7 +32,8 @@ from imageshield.http.models import (
     SeedCreateRequest,
     SeedCreateResponse,
 )
-from imageshield.search.store import SearchStore
+from imageshield.search.store import SearchStore, UnknownSubject
+from imageshield.subjects.store import SubjectStore
 from imageshield.types import ProviderId, UserRef, parse_provider_id
 
 log = structlog.get_logger("imageshield.search")
@@ -44,7 +46,25 @@ async def create_seed(
     body: SeedCreateRequest,
     store: SearchStore = Depends(get_search_store),
 ) -> SeedCreateResponse:
-    seed_id = await store.create_seed(body.user_ref, body.seed_kind, body.source_object_uri)
+    # No eligibility check here, deliberately — only an existence one, enforced
+    # by migration 0008's FK and surfaced as UnknownSubject. A minor may hold
+    # seeds: they enrol, and consent/guardianship/household seats all work. What
+    # a minor may not have is a *search*, and that refusal lives on
+    # POST /v1/search where the searching happens. Refusing the seed as well
+    # would be a second gate on the wrong thing, and would make the enrolment
+    # flow fail for a user we deliberately support.
+    try:
+        seed_id = await store.create_seed(
+            body.user_ref, body.seed_kind, body.source_object_uri
+        )
+    except UnknownSubject as exc:
+        raise ServiceError(
+            409,
+            "subject_unknown",
+            "No subject record for this user_ref. Enrolment creates it; a seed"
+            " cannot be parented to a subject that does not exist.",
+            retryable=False,
+        ) from exc
     log.info("search.seed_created", seed_id=str(seed_id), seed_kind=body.seed_kind)
     return SeedCreateResponse(seed_id=seed_id)
 
@@ -52,8 +72,16 @@ async def create_seed(
 @router.post("/search", status_code=202)
 async def create_search(
     body: SearchCreateRequest,
+    cfg: Config = Depends(get_config),
     store: SearchStore = Depends(get_search_store),
+    subjects: SubjectStore = Depends(get_subject_store),
 ) -> SearchCreateResponse:
+    # ── Guard chain step 1: ELIGIBILITY ──────────────────────────────────
+    # First, before anything else, and before any row exists. An eligibility
+    # refusal must consume no budget and touch no breaker, which it cannot do
+    # if it happens after them.
+    await _require_discovery_eligible(body.user_ref, cfg, subjects)
+
     seed = await store.get_seed(body.seed_id)
     if seed is None or seed.user_ref != body.user_ref:
         raise ServiceError(
@@ -81,6 +109,64 @@ async def create_search(
         providers=[str(p) for p in selected],
     )
     return SearchCreateResponse(run_id=run_id)
+
+
+async def _require_discovery_eligible(
+    user_ref: UserRef, cfg: Config, subjects: SubjectStore
+) -> None:
+    """Refuse the whole request when discovery must not run for this subject.
+
+    Writes exactly one ``audit_log`` row and **nothing else**: no
+    ``search_runs`` row, no ``provider_calls`` row, no provider client touched.
+    A ``search_runs`` row with zero results reads as "we looked and found
+    nothing", which for a subject nobody searched is a false reassurance — and
+    for a minor it would be a false reassurance about the exact thing the
+    refusal exists to prevent.
+
+    Two distinct outcomes, deliberately different status codes:
+
+    - **409 subject_unknown** — no subject row. The proxy has a user we have
+      never enrolled, which is a state it can fix (enrol them) and therefore a
+      conflict, not a permission problem.
+    - **403 discovery_not_available** — the subject is a minor. Nothing the
+      proxy can do changes this until v2, so it is a refusal.
+    """
+    subject = await subjects.get_subject(user_ref)
+    ages = {
+        "min_enrolment_age": cfg.min_enrolment_age,
+        "min_discovery_age": cfg.min_discovery_age,
+    }
+    if subject is None:
+        await subjects.record_discovery_refusal(
+            user_ref, outcome="subject_unknown", metadata=ages
+        )
+        log.warning("search.refused", user_ref=str(user_ref), outcome="subject_unknown")
+        raise ServiceError(
+            409,
+            "subject_unknown",
+            "No subject record for this user_ref. Discovery eligibility is"
+            " asserted once at enrolment and cannot be inferred per request.",
+            retryable=False,
+        )
+    if not subject.discovery_eligible:
+        await subjects.record_discovery_refusal(
+            user_ref,
+            outcome="discovery_not_available",
+            metadata={"eligibility_reason": subject.eligibility_reason, **ages},
+        )
+        log.warning(
+            "search.refused",
+            user_ref=str(user_ref),
+            outcome="discovery_not_available",
+            eligibility_reason=subject.eligibility_reason,
+        )
+        raise ServiceError(
+            403,
+            "discovery_not_available",
+            "Discovery is not available for this subject"
+            f" ({subject.eligibility_reason}). No search was run.",
+            retryable=False,
+        )
 
 
 def _select_providers(
@@ -119,6 +205,8 @@ async def get_search_run(
         providers_attempted=list(run.providers_attempted),
         providers_succeeded=list(run.providers_succeeded),
         matches_found=run.matches_found,
+        scan_tier=run.scan_tier,
+        next_scan_after=run.next_scan_after,
     )
 
 

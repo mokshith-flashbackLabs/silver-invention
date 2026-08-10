@@ -1,180 +1,277 @@
-"""execute_run over fake adapters and a fake store — the spec's done-when in
-miniature: one provider timing out still completes the run with the other's
-results, and providers_succeeded reflects only the one that worked."""
+"""``execute_run`` over fake adapters, a fake store and a fake control plane.
+
+Two specs in miniature:
+
+- **step 5** — one provider timing out still completes the run with the other's
+  results, and ``providers_succeeded`` reflects only what worked.
+- **step 8** — the dispatch guard chain runs BEFORE any adapter is touched, so a
+  disabled / breaker-open / budget-exhausted provider is never called at all.
+  Every assertion about that is an assertion about ``RecordingProvider.calls``,
+  not about cost inspected after the fact.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from decimal import Decimal
-from typing import Any, Literal
-from uuid import UUID, uuid4
+from datetime import UTC, datetime, timedelta
 
-from imageshield.search.models import ClaimedRun, ProviderDescriptor
-from imageshield.search.provider import ProviderMatch, ProviderResult
 from imageshield.search.runner import execute_run
-from imageshield.types import ProviderId, UserRef
+from tests.providers_fakes import (
+    CADENCE,
+    GOOGLE,
+    HIVE,
+    FakeControlStore,
+    FakeSeedStore,
+    RecordingProvider,
+    make_claim,
+    make_seed,
+    ok_result,
+    runtime,
+    timeout_result,
+)
 
-HIVE = ProviderId("hive")
-GOOGLE = ProviderId("google")
-
-
-def _match(url: str) -> ProviderMatch:
-    return ProviderMatch(
-        image_url=url,
-        page_urls=[],
-        provider_score=Decimal("0.9"),
-        provider_category=None,
-        query_quality=None,
-    )
-
-
-class FakeProvider:
-    kind: Literal["image_search", "face_search", "classifier"] = "image_search"
-    score_kind: Literal["numeric", "categorical"] = "numeric"
-    score_version = "fake-v1"
-
-    def __init__(
-        self,
-        provider_id: ProviderId,
-        result: ProviderResult | None = None,
-        error: Exception | None = None,
-    ) -> None:
-        self.id = provider_id
-        self._result = result
-        self._error = error
-        self.calls: list[str] = []
-
-    async def search(
-        self, seed_url: str, max_results: int | None = None
-    ) -> ProviderResult:
-        self.calls.append(seed_url)
-        if self._error is not None:
-            raise self._error
-        assert self._result is not None
-        return self._result
+BOTH = {HIVE: runtime(HIVE), GOOGLE: runtime(GOOGLE)}
 
 
-class FakeStore:
-    def __init__(self) -> None:
-        self.calls: list[tuple[UUID, ProviderResult]] = []
-        self.matches: list[tuple[UUID, ProviderDescriptor, Sequence[ProviderMatch]]] = []
-        self.completed: list[tuple[UUID, tuple[ProviderId, ...]]] = []
+class _Any:
+    """Matches any value in an equality assertion. Used where the exact prose of
+    a reason string is not the thing under test."""
 
-    async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None:
-        self.calls.append((run_id, result))
+    def __eq__(self, other: object) -> bool:
+        return True
 
-    async def record_infringements(
-        self,
-        run_id: UUID,
-        user_ref: UserRef,
-        provider: ProviderDescriptor,
-        matches: Sequence[ProviderMatch],
-        policy: Any,
-    ) -> int:
-        self.matches.append((run_id, provider, matches))
-        return len(matches)
+    def __hash__(self) -> int:
+        return 0
 
-    async def complete_run(
-        self, run_id: UUID, providers_succeeded: Sequence[ProviderId]
-    ) -> None:
-        self.completed.append((run_id, tuple(providers_succeeded)))
-
-    # unused SearchStore surface, present so the fake satisfies the Protocol
-    async def create_seed(self, *a: Any, **k: Any) -> UUID:
-        raise NotImplementedError
-
-    async def get_seed(self, *a: Any, **k: Any) -> Any:
-        raise NotImplementedError
-
-    async def create_run(self, *a: Any, **k: Any) -> UUID:
-        raise NotImplementedError
-
-    async def get_run(self, *a: Any, **k: Any) -> Any:
-        raise NotImplementedError
-
-    async def claim_run(self, *a: Any, **k: Any) -> Any:
-        raise NotImplementedError
-
-    async def enabled_provider_ids(self) -> tuple[ProviderId, ...]:
-        raise NotImplementedError
-
-    async def list_infringements(self, *a: Any, **k: Any) -> Any:
-        raise NotImplementedError
+    def __repr__(self) -> str:
+        return "<any>"
 
 
-def _claim(providers: tuple[ProviderId, ...]) -> ClaimedRun:
-    return ClaimedRun(
-        run_id=uuid4(),
-        user_ref=UserRef(uuid4()),
-        seed_url="https://s3/seed.jpg",
-        providers_attempted=providers,
-    )
+ANY_REASON = _Any()
 
 
-def _ok(provider_id: ProviderId, urls: list[str]) -> ProviderResult:
-    return ProviderResult(
-        provider_id=provider_id,
-        status="ok",
-        matches=[_match(u) for u in urls],
-        raw_response={"matches": urls},
-        http_status=200,
-        latency_ms=5,
-    )
+async def test_a_subject_who_became_ineligible_is_refused_at_dispatch() -> None:
+    """The route's 403 only covers the instant of the request.
 
+    `POST /v1/search` is 202-and-enqueue-only, and `subjects.discovery_eligible`
+    is deliberately mutable — a DOB correction at re-enrolment writes it. A queued
+    backlog, or a dead worker whose claim goes stale for _STALE_CLAIM_MINUTES,
+    puts minutes between the check and the dispatch. Without re-reading the flag
+    on the claim, a run enqueued while the subject was eligible would dispatch
+    against a minor, write infringements, and complete — which is the exact
+    outcome INVARIANTS #8b exists to make impossible.
 
-def _timeout(provider_id: ProviderId) -> ProviderResult:
-    return ProviderResult(
-        provider_id=provider_id,
-        status="timeout",
-        matches=[],
-        raw_response={"exception": "read timeout"},
-        http_status=None,
-        latency_ms=5000,
-    )
+    The run is marked 'refused', NOT 'completed': a completed run with zero
+    results says "we looked and found nothing" about a search that never ran.
+    """
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, ["https://x/a"]))
+    store, control = FakeSeedStore(), FakeControlStore(BOTH)
+    claim = make_claim((HIVE, GOOGLE), store.seed, discovery_eligible=False)
+
+    outcome = await execute_run(claim, {HIVE: hive}, store, {}, control, CADENCE)
+
+    assert hive.calls == []  # no provider client invoked
+    assert outcome.providers_succeeded == ()
+    assert outcome.matches_recorded == 0
+    assert store.refusals == [(claim.run_id, claim.user_ref, ANY_REASON)]
+    # Nothing that could reassure a reader, and nothing consumed:
+    assert store.completed == []  # not completed
+    assert store.matches == []  # no infringements
+    assert store.cadence_updates == []  # cadence untouched
+    assert control.outcomes == []  # no spend
+    assert control.skips == []  # not even a per-provider skip row
+    assert control.half_open_claims == []  # no breaker state consumed
 
 
 async def test_one_provider_timing_out_still_completes_with_the_others_results() -> None:
-    hive = FakeProvider(HIVE, result=_ok(HIVE, ["https://x/a.jpg", "https://x/b.jpg"]))
-    google = FakeProvider(GOOGLE, result=_timeout(GOOGLE))
-    store = FakeStore()
-    claim = _claim((HIVE, GOOGLE))
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, ["https://x/a", "https://x/b"]))
+    google = RecordingProvider(GOOGLE, result=timeout_result(GOOGLE))
+    store, control = FakeSeedStore(), FakeControlStore(BOTH)
+    claim = make_claim((HIVE, GOOGLE), store.seed)
 
-    outcome = await execute_run(claim, {HIVE: hive, GOOGLE: google}, store, {})
+    outcome = await execute_run(
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE
+    )
 
     assert outcome.providers_succeeded == (HIVE,)
     assert outcome.matches_recorded == 2
-    assert hive.calls == ["https://s3/seed.jpg"]
-    assert google.calls == ["https://s3/seed.jpg"]
-    # both calls recorded — a timeout is a provider_calls row, never silence
-    assert {r.status for _, r in store.calls} == {"ok", "timeout"}
-    # matches recorded only for the ok provider
+    assert hive.calls == [store.seed.source_object_uri]
+    assert google.calls == [store.seed.source_object_uri]
+    # Both calls recorded — a timeout is a provider_calls row, never silence.
+    assert {r.status for _, r, _ in control.outcomes} == {"ok", "timeout"}
     assert [p.provider_id for _, p, _ in store.matches] == [HIVE]
     assert store.completed == [(claim.run_id, (HIVE,))]
 
 
 async def test_adapter_raising_becomes_error_result_not_a_failed_run() -> None:
-    hive = FakeProvider(HIVE, error=RuntimeError("connection pool exploded"))
-    google = FakeProvider(GOOGLE, result=_ok(GOOGLE, ["https://x/c.jpg"]))
-    store = FakeStore()
-    claim = _claim((HIVE, GOOGLE))
+    hive = RecordingProvider(HIVE, error=RuntimeError("connection pool exploded"))
+    google = RecordingProvider(GOOGLE, result=ok_result(GOOGLE, ["https://x/c"]))
+    store, control = FakeSeedStore(), FakeControlStore(BOTH)
+    claim = make_claim((HIVE, GOOGLE), store.seed)
 
-    outcome = await execute_run(claim, {HIVE: hive, GOOGLE: google}, store, {})
+    outcome = await execute_run(
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE
+    )
 
     assert outcome.providers_succeeded == (GOOGLE,)
-    hive_calls = [r for _, r in store.calls if r.provider_id == HIVE]
-    assert hive_calls[0].status == "error"
-    assert "connection pool exploded" in str(hive_calls[0].raw_response)
+    [hive_result] = [r for _, r, _ in control.outcomes if r.provider_id == HIVE]
+    assert hive_result.status == "error"
+    assert "connection pool exploded" in str(hive_result.raw_response)
     assert store.completed == [(claim.run_id, (GOOGLE,))]
 
 
 async def test_attempted_provider_without_adapter_is_visible_error() -> None:
-    google = FakeProvider(GOOGLE, result=_ok(GOOGLE, []))
-    store = FakeStore()
-    claim = _claim((HIVE, GOOGLE))
+    google = RecordingProvider(GOOGLE, result=ok_result(GOOGLE, []))
+    store, control = FakeSeedStore(), FakeControlStore(BOTH)
+    claim = make_claim((HIVE, GOOGLE), store.seed)
 
-    outcome = await execute_run(claim, {GOOGLE: google}, store, {})
+    outcome = await execute_run(claim, {GOOGLE: google}, store, {}, control, CADENCE)
 
     assert outcome.providers_succeeded == (GOOGLE,)
-    hive_calls = [r for _, r in store.calls if r.provider_id == HIVE]
-    assert len(hive_calls) == 1
-    assert hive_calls[0].status == "error"  # visible, never silently skipped
+    [hive_result] = [r for _, r, _ in control.outcomes if r.provider_id == HIVE]
+    assert hive_result.status == "error"  # visible, never silently skipped
+
+
+# ── Step 8: the guard chain runs before dispatch ──────────────────────────
+
+
+async def test_disabled_provider_is_never_called_and_the_run_still_completes() -> None:
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, ["https://x/a"]))
+    google = RecordingProvider(GOOGLE, result=ok_result(GOOGLE, ["https://x/b"]))
+    store = FakeSeedStore()
+    control = FakeControlStore({HIVE: runtime(HIVE), GOOGLE: runtime(GOOGLE, enabled=False)})
+    claim = make_claim((HIVE, GOOGLE), store.seed)
+
+    outcome = await execute_run(
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE
+    )
+
+    assert google.calls == []  # the whole point: no API call
+    assert hive.calls == [store.seed.source_object_uri]
+    assert outcome.providers_succeeded == (HIVE,)
+    assert outcome.providers_skipped == (GOOGLE,)
+    assert [(pid, reason) for _, pid, reason, _ in control.skips] == [
+        (GOOGLE, "provider_disabled")
+    ]
+    # Attempted-but-not-succeeded: partial coverage stays visible.
+    assert claim.providers_attempted == (HIVE, GOOGLE)
+    assert store.completed == [(claim.run_id, (HIVE,))]
+
+
+async def test_budget_exceeded_makes_no_api_call() -> None:
+    """Step-8 done-when, asserted on invocations rather than on cost after the
+    fact: exceeding daily_budget_usd makes NO API call."""
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, ["https://x/a"]))
+    store = FakeSeedStore()
+    control = FakeControlStore(
+        {HIVE: runtime(HIVE, cost="1.00", daily_budget="10.00")},
+        spend={HIVE: "10.00"},
+    )
+    claim = make_claim((HIVE,), store.seed)
+
+    outcome = await execute_run(claim, {HIVE: hive}, store, {}, control, CADENCE)
+
+    assert hive.calls == []
+    assert control.outcomes == []  # no call row from record_outcome: nothing ran
+    assert [(pid, reason) for _, pid, reason, _ in control.skips] == [
+        (HIVE, "budget_exceeded")
+    ]
+    assert outcome.providers_succeeded == ()
+    assert outcome.providers_skipped == (HIVE,)
+
+
+async def test_open_breaker_within_cooldown_is_never_called() -> None:
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, ["https://x/a"]))
+    store = FakeSeedStore()
+    control = FakeControlStore(
+        {
+            HIVE: runtime(
+                HIVE,
+                breaker_state="open",
+                breaker_opened_at=datetime.now(UTC),
+                failures=5,
+                cooldown=300,
+            )
+        },
+        half_open_grants=set(),  # the DB claim refuses: still cooling down
+    )
+    claim = make_claim((HIVE,), store.seed)
+
+    await execute_run(claim, {HIVE: hive}, store, {}, control, CADENCE)
+
+    assert hive.calls == []
+    assert control.half_open_claims == [HIVE]  # it did try to claim a probe
+    assert [reason for _, _, reason, _ in control.skips] == ["breaker_open"]
+
+
+async def test_half_open_probe_is_dispatched_when_the_claim_is_won() -> None:
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, ["https://x/a"]))
+    store = FakeSeedStore()
+    control = FakeControlStore(
+        {
+            HIVE: runtime(
+                HIVE,
+                breaker_state="open",
+                breaker_opened_at=datetime.now(UTC) - timedelta(seconds=600),
+                failures=5,
+                cooldown=300,
+            )
+        },
+        half_open_grants={HIVE},
+    )
+    claim = make_claim((HIVE,), store.seed)
+
+    outcome = await execute_run(claim, {HIVE: hive}, store, {}, control, CADENCE)
+
+    assert hive.calls == [store.seed.source_object_uri]  # exactly one probe
+    assert outcome.providers_succeeded == (HIVE,)
+    assert control.skips == []
+
+
+# ── Step 8: cadence ──────────────────────────────────────────────────────
+
+
+async def test_a_non_empty_scan_promotes_to_priority_and_resets_the_counter() -> None:
+    seed = make_seed(scan_tier="relaxed", consecutive_empty_scans=9)
+    store = FakeSeedStore(seed)
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, ["https://x/a"]))
+    control = FakeControlStore({HIVE: runtime(HIVE)})
+
+    await execute_run(
+        make_claim((HIVE,), seed), {HIVE: hive}, store, {}, control, CADENCE
+    )
+
+    [(seed_id, update)] = store.cadence_updates
+    assert seed_id == seed.seed_id
+    assert update.scan_tier == "priority"
+    assert update.consecutive_empty_scans == 0
+
+
+async def test_an_empty_scan_increments_and_demotes_at_the_threshold() -> None:
+    seed = make_seed(scan_tier="standard", consecutive_empty_scans=7)
+    store = FakeSeedStore(seed)
+    hive = RecordingProvider(HIVE, result=ok_result(HIVE, []))
+    control = FakeControlStore({HIVE: runtime(HIVE)})
+
+    await execute_run(
+        make_claim((HIVE,), seed), {HIVE: hive}, store, {}, control, CADENCE
+    )
+
+    [(_, update)] = store.cadence_updates
+    assert update.consecutive_empty_scans == 8
+    assert update.scan_tier == "relaxed"
+
+
+async def test_a_run_where_nothing_succeeded_does_not_change_the_tier() -> None:
+    """A run where every provider was skipped or timed out produced no evidence.
+    Counting it as an empty scan would relax a user's cadence *because* our own
+    provider integration was down."""
+    seed = make_seed(scan_tier="standard", consecutive_empty_scans=7)
+    store = FakeSeedStore(seed)
+    hive = RecordingProvider(HIVE, result=timeout_result(HIVE))
+    control = FakeControlStore({HIVE: runtime(HIVE)})
+
+    await execute_run(
+        make_claim((HIVE,), seed), {HIVE: hive}, store, {}, control, CADENCE
+    )
+
+    assert store.cadence_updates == []

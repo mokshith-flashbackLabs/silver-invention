@@ -29,12 +29,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from imageshield.db.connection import make_async_pool
 from imageshield.env import load_dotenv_local
+from imageshield.providers.ratelimit import RetryPolicy
+from imageshield.providers.store import PostgresProviderControlStore
+from imageshield.search.cadence import CadencePolicy
 from imageshield.search.google import GoogleWebDetectionProvider
 from imageshield.search.hive import HiveWebSearchProvider
 from imageshield.search.provider import SearchProvider
 from imageshield.search.runner import execute_run
 from imageshield.search.store import PostgresSearchStore
+from imageshield.subjects.eligibility import eligibility_for
+from imageshield.subjects.store import PostgresSubjectStore
 from imageshield.types import ProviderId, UserRef
+
+# This script builds its config from bare env vars rather than Config (it
+# predates several required keys), so the step-8 policies are spelled out here
+# with the same defaults config.py carries.
+E2E_RETRY = RetryPolicy(max_retries=3, max_wait_seconds=30.0, jitter_fraction=0.25)
+E2E_CADENCE = CadencePolicy(
+    standard_days=7,
+    relaxed_days=14,
+    dormant_days=30,
+    new_tier_weeks=4,
+    relaxed_after_empty=8,
+    dormant_after_empty=20,
+    priority_release_after_empty=13,
+)
 
 DEFAULT_SEED_URL = (
     "https://upload.wikimedia.org/wikipedia/commons/8/8d/President_Barack_Obama.jpg"
@@ -57,11 +76,13 @@ async def main() -> int:
             base_url=os.environ.get("HIVE_BASE_URL", "https://api.thehive.ai"),
             api_key=hive_key,
             timeout_seconds=120.0,
+            retry_policy=E2E_RETRY,
         ),
         ProviderId("google"): GoogleWebDetectionProvider(
             endpoint="https://vision.googleapis.com/v1/images:annotate",
             api_key=google_key,
             timeout_seconds=60.0,
+            retry_policy=E2E_RETRY,
         ),
     }
 
@@ -69,15 +90,30 @@ async def main() -> int:
     await pool.open()
     try:
         store = PostgresSearchStore(pool)
+        control = PostgresProviderControlStore(
+            pool,
+            cache_seconds=30.0,
+            failure_threshold=5,
+            default_cooldown_seconds=300,
+            max_cooldown_seconds=3600,
+        )
         user_ref = UserRef(uuid4())
 
+        # Step 8: search_seeds now FKs to subjects, so the seed cannot exist
+        # without one. Enrolment normally writes this row; this script has no
+        # liveness session, so it asserts eligibility directly.
+        await PostgresSubjectStore(pool).upsert_subject(
+            user_ref, eligibility_for(True)
+        )
         seed_id = await store.create_seed(user_ref, "user_supplied", seed_url)
         run_id = await store.create_run(user_ref, seed_id, tuple(providers))
         print(f"seed {seed_id}\nrun  {run_id}\nseed_url {seed_url}\n")
 
         claim = await store.claim_run(run_id)
         assert claim is not None, "fresh run must be claimable"
-        outcome = await execute_run(claim, providers, store)
+        outcome = await execute_run(
+            claim, providers, store, {}, control, E2E_CADENCE
+        )
 
         run = await store.get_run(run_id)
         assert run is not None
@@ -85,6 +121,9 @@ async def main() -> int:
         print(f"providers_attempted     {list(run.providers_attempted)}")
         print(f"providers_succeeded     {list(run.providers_succeeded)}")
         print(f"matches_found           {run.matches_found}")
+        print(f"providers_skipped       {list(outcome.providers_skipped)}")
+        print(f"scan_tier               {run.scan_tier}")
+        print(f"next_scan_after         {run.next_scan_after}")
 
         infringements = await store.list_infringements(user_ref, None)
         print(f"infringements           {len(infringements)}")

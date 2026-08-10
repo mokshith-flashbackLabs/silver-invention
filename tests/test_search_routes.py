@@ -33,7 +33,10 @@ from imageshield.search.models import (
     RunRow,
     SeedRow,
 )
-from imageshield.search.provider import ProviderMatch, ProviderResult
+from imageshield.search.provider import ProviderMatch
+from imageshield.search.store import UnknownSubject
+from imageshield.subjects.eligibility import eligibility_for
+from imageshield.subjects.models import Eligibility, SubjectRow
 from imageshield.types import ProviderId, UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
 
@@ -47,10 +50,17 @@ class FakeSearchStore:
         self.infringements: list[InfringementRow] = []
         self.created_runs: list[tuple[UserRef, UUID, tuple[ProviderId, ...]]] = []
         self.enabled: tuple[ProviderId, ...] = (ProviderId("google"), ProviderId("hive"))
+        # Models migration 0008's search_seeds_subject_fk. Without this the fake
+        # accepted a seed for an unparented user_ref and returned 201, while the
+        # real Postgres raised ForeignKeyViolation and the route answered a bare
+        # 500 — a divergence that hid the defect from the whole route suite.
+        self.known_subjects: set[UserRef] = set()
 
     async def create_seed(
         self, user_ref: UserRef, seed_kind: str, source_object_uri: str
     ) -> UUID:
+        if self.known_subjects and user_ref not in self.known_subjects:
+            raise UnknownSubject("no subjects row for this user_ref")
         seed_id = uuid4()
         self.seeds[seed_id] = SeedRow(
             seed_id=seed_id,
@@ -81,7 +91,7 @@ class FakeSearchStore:
     async def enabled_provider_ids(self) -> tuple[ProviderId, ...]:
         return self.enabled
 
-    async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None:
+    async def update_cadence(self, seed_id: UUID, update: Any) -> None:
         raise NotImplementedError
 
     async def record_infringements(
@@ -105,11 +115,47 @@ class FakeSearchStore:
         return tuple(self.infringements)
 
 
-def make_client() -> tuple[TestClient, FakeSearchStore]:
+class FakeSubjectStore:
+    """Records every refusal, so "exactly one audit row and nothing else" is
+    assertable without a database."""
+
+    def __init__(self) -> None:
+        self.subjects: dict[UserRef, Eligibility] = {}
+        self.refusals: list[tuple[UserRef, str, dict[str, Any]]] = []
+
+    async def get_subject(self, user_ref: UserRef) -> SubjectRow | None:
+        eligibility = self.subjects.get(user_ref)
+        if eligibility is None:
+            return None
+        now = datetime.now(UTC)
+        return SubjectRow(
+            user_ref=user_ref,
+            discovery_eligible=eligibility.discovery_eligible,
+            eligibility_reason=eligibility.eligibility_reason,
+            created_at=now,
+            updated_at=now,
+        )
+
+    async def upsert_subject(self, user_ref: UserRef, eligibility: Eligibility) -> None:
+        self.subjects[user_ref] = eligibility
+
+    async def record_discovery_refusal(
+        self, user_ref: UserRef, *, outcome: str, metadata: Any
+    ) -> None:
+        self.refusals.append((user_ref, outcome, dict(metadata)))
+
+
+def make_client() -> tuple[TestClient, FakeSearchStore, FakeSubjectStore]:
     app = create_app(config=make_config())
     store = FakeSearchStore()
+    subjects = FakeSubjectStore()
     app.state.search_store = store
-    return TestClient(app), store
+    app.state.subject_store = subjects
+    return TestClient(app), store, subjects
+
+
+def _enrolled_adult(subjects: FakeSubjectStore, user_ref: UUID) -> None:
+    subjects.subjects[UserRef(user_ref)] = eligibility_for(True)
 
 
 def _seed_body(user_ref: UUID) -> dict[str, Any]:
@@ -121,7 +167,7 @@ def _seed_body(user_ref: UUID) -> dict[str, Any]:
 
 
 def test_all_routes_require_service_token() -> None:
-    client, _ = make_client()
+    client, _, _subjects = make_client()
     assert client.post("/v1/seeds", json={}).status_code == 401
     assert client.post("/v1/search", json={}).status_code == 401
     assert client.get(f"/v1/search/runs/{uuid4()}").status_code == 401
@@ -129,7 +175,7 @@ def test_all_routes_require_service_token() -> None:
 
 
 def test_create_seed_201() -> None:
-    client, store = make_client()
+    client, store, _subjects = make_client()
     user_ref = uuid4()
 
     response = client.post("/v1/seeds", json=_seed_body(user_ref), headers=AUTH)
@@ -141,7 +187,7 @@ def test_create_seed_201() -> None:
 
 
 def test_create_seed_rejects_non_http_uri_and_bad_kind() -> None:
-    client, _ = make_client()
+    client, _, _subjects = make_client()
     body = _seed_body(uuid4())
     body["source_object_uri"] = "s3://bucket/key.jpg"  # we hold no S3 creds
     assert client.post("/v1/seeds", json=body, headers=AUTH).status_code == 422
@@ -152,8 +198,9 @@ def test_create_seed_rejects_non_http_uri_and_bad_kind() -> None:
 
 
 def test_create_search_202_defaults_to_all_enabled_providers() -> None:
-    client, store = make_client()
+    client, store, subjects = make_client()
     user_ref = uuid4()
+    _enrolled_adult(subjects, user_ref)
     seed = client.post("/v1/seeds", json=_seed_body(user_ref), headers=AUTH).json()
 
     response = client.post(
@@ -171,8 +218,9 @@ def test_create_search_202_defaults_to_all_enabled_providers() -> None:
 
 
 def test_create_search_subset_and_unknown_provider() -> None:
-    client, store = make_client()
+    client, store, subjects = make_client()
     user_ref = uuid4()
+    _enrolled_adult(subjects, user_ref)
     seed = client.post("/v1/seeds", json=_seed_body(user_ref), headers=AUTH).json()
 
     ok = client.post(
@@ -198,8 +246,10 @@ def test_create_search_subset_and_unknown_provider() -> None:
 
 
 def test_create_search_wrong_user_or_missing_seed_is_404() -> None:
-    client, store = make_client()
+    client, store, subjects = make_client()
     owner, intruder = uuid4(), uuid4()
+    _enrolled_adult(subjects, owner)
+    _enrolled_adult(subjects, intruder)
     seed = client.post("/v1/seeds", json=_seed_body(owner), headers=AUTH).json()
 
     stolen = client.post(
@@ -221,7 +271,7 @@ def test_create_search_wrong_user_or_missing_seed_is_404() -> None:
 
 
 def test_run_status_keeps_attempted_and_succeeded_distinct() -> None:
-    client, store = make_client()
+    client, store, _subjects = make_client()
     run_id = uuid4()
     store.runs[run_id] = RunRow(
         run_id=run_id,
@@ -233,6 +283,8 @@ def test_run_status_keeps_attempted_and_succeeded_distinct() -> None:
         matches_found=3,
         started_at=datetime.now(UTC),
         completed_at=datetime.now(UTC),
+        scan_tier="relaxed",
+        next_scan_after=datetime(2026, 8, 23, tzinfo=UTC),
     )
 
     response = client.get(f"/v1/search/runs/{run_id}", headers=AUTH)
@@ -244,15 +296,165 @@ def test_run_status_keeps_attempted_and_succeeded_distinct() -> None:
         "providers_attempted": ["hive", "google"],
         "providers_succeeded": ["hive"],
         "matches_found": 3,
+        # Tiering must never be silent: the proxy reads the real cadence off
+        # this response so it can tell the user the truth about it.
+        "scan_tier": "relaxed",
+        "next_scan_after": "2026-08-23T00:00:00Z",
     }
 
     assert client.get(f"/v1/search/runs/{uuid4()}", headers=AUTH).status_code == 404
 
 
+# ── Step 8: the eligibility guard ─────────────────────────────────────────
+
+
+def test_a_seed_for_an_unenrolled_subject_is_409_not_a_bare_500() -> None:
+    """Migration 0008's FK made this request fail for the first time, and the
+    unhandled psycopg exception came out as a plain-text 500 with none of the
+    error envelope — no `code`, no `retryable`, no `request_id`.
+
+    A 5xx reads as transient, so the proxy would retry a request that can never
+    succeed, and no client-facing copy could be selected. 409 with the same
+    `subject_unknown` code POST /v1/search already returns for the identical
+    condition is the terminal, machine-readable answer.
+    """
+    client, store, _ = make_client()
+    store.known_subjects = {UserRef(uuid4())}  # somebody else
+    stranger = uuid4()
+
+    response = client.post("/v1/seeds", json=_seed_body(stranger), headers=AUTH)
+
+    assert response.status_code == 409
+    body = response.json()["error"]
+    assert body["code"] == "subject_unknown"
+    assert body["retryable"] is False
+    assert store.seeds == {}
+
+
+def test_a_minor_may_still_hold_a_seed() -> None:
+    """Only discovery is refused for a minor, not enrolment or seed-holding.
+
+    Gating /v1/seeds on eligibility as well would break the enrolment flow for a
+    user group v1 deliberately supports — consent, guardianship and household
+    seats all work. The refusal belongs where the searching happens.
+    """
+    client, store, subjects = make_client()
+    minor = uuid4()
+    store.known_subjects = {UserRef(minor)}
+    subjects.subjects[UserRef(minor)] = eligibility_for(False)
+
+    response = client.post("/v1/seeds", json=_seed_body(minor), headers=AUTH)
+
+    assert response.status_code == 201
+    assert len(store.seeds) == 1
+
+
+def test_an_ineligible_subject_gets_403_and_no_run_is_created() -> None:
+    """Step-8 done-when. Every assertion here is about absence: no search_runs
+    row, no provider client invoked, exactly one audit record.
+
+    A search_runs row with zero results reads as "we looked and found nothing",
+    which for a minor is a false reassurance about the exact thing the refusal
+    exists to prevent.
+    """
+    client, store, subjects = make_client()
+    user_ref = uuid4()
+    subjects.subjects[UserRef(user_ref)] = eligibility_for(False)
+    # The seed genuinely EXISTS and is genuinely theirs — a minor can enrol and
+    # hold seeds; discovery is what must not run. One seed_id threaded through
+    # all three places, so the refusal is proven to come from the eligibility
+    # guard and not from an incidental 404 on a seed that was never found.
+    seed_id = uuid4()
+    store.seeds[seed_id] = SeedRow(
+        seed_id=seed_id,
+        user_ref=UserRef(user_ref),
+        seed_kind="enrolment",
+        source_object_uri="https://s3/x.jpg",
+        status="active",
+        created_at=datetime.now(UTC),
+    )
+
+    response = client.post(
+        "/v1/search",
+        json={"user_ref": str(user_ref), "seed_id": str(seed_id)},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "discovery_not_available"
+    assert store.created_runs == []
+    [(refused_ref, outcome, metadata)] = subjects.refusals
+    assert refused_ref == user_ref
+    assert outcome == "discovery_not_available"
+    assert metadata["eligibility_reason"] == "minor_discovery_deferred"
+    # The thresholds in force are recorded, so a decision stays interpretable
+    # after MIN_DISCOVERY_AGE changes.
+    assert metadata["min_discovery_age"] == 18
+    assert metadata["min_enrolment_age"] == 13
+
+
+def test_an_unknown_subject_gets_409_not_403() -> None:
+    """Different codes for different situations. 409: the proxy has a user we
+    have never enrolled, which it can fix. 403: a minor, which it cannot."""
+    client, store, subjects = make_client()
+    user_ref = uuid4()
+
+    response = client.post(
+        "/v1/search",
+        json={"user_ref": str(user_ref), "seed_id": str(uuid4())},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "subject_unknown"
+    assert store.created_runs == []
+    assert [outcome for _, outcome, _ in subjects.refusals] == ["subject_unknown"]
+
+
+def test_the_eligibility_check_runs_before_the_seed_lookup() -> None:
+    """Guard-chain ordering. An ineligible subject with a seed belonging to
+    someone else must report the refusal, not the 404: the cheapest and most
+    absolute check comes first, and it must not be reachable around."""
+    client, store, subjects = make_client()
+    owner, minor = uuid4(), uuid4()
+    _enrolled_adult(subjects, owner)
+    subjects.subjects[UserRef(minor)] = eligibility_for(False)
+    seed = client.post("/v1/seeds", json=_seed_body(owner), headers=AUTH).json()
+
+    response = client.post(
+        "/v1/search",
+        json={"user_ref": str(minor), "seed_id": seed["seed_id"]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 403
+    assert store.created_runs == []
+
+
+def test_get_subject_reports_eligibility_and_404s_for_a_stranger() -> None:
+    client, _, subjects = make_client()
+    adult, minor = uuid4(), uuid4()
+    _enrolled_adult(subjects, adult)
+    subjects.subjects[UserRef(minor)] = eligibility_for(False)
+
+    assert client.get(f"/v1/subjects/{adult}", headers=AUTH).json() == {
+        "discovery_eligible": True,
+        "eligibility_reason": "adult",
+    }
+    assert client.get(f"/v1/subjects/{minor}", headers=AUTH).json() == {
+        "discovery_eligible": False,
+        "eligibility_reason": "minor_discovery_deferred",
+    }
+    stranger = client.get(f"/v1/subjects/{uuid4()}", headers=AUTH)
+    assert stranger.status_code == 404
+    assert stranger.json()["error"]["code"] == "subject_unknown"
+    assert client.get(f"/v1/subjects/{adult}").status_code == 401
+
+
 def test_infringements_nest_attestations_and_serialise_both_score_shapes() -> None:
     """One page found by two providers is ONE entry with TWO attestations,
     and provider_count is the agreement signal the report surface reads."""
-    client, store = make_client()
+    client, store, _subjects = make_client()
     user_ref = uuid4()
     now = datetime.now(UTC)
     store.infringements = [

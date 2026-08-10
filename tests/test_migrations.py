@@ -479,7 +479,10 @@ def test_0007_creates_calibration_tables(throwaway_db: str) -> None:
 def test_0007_down_removes_them_and_the_added_columns(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "1")
+    # Three steps back: 0009 (cost/cadence), 0008 (subjects), then 0007. This
+    # number has to move whenever a migration is added, which is the point —
+    # a silently-wrong count would revert the wrong migration and pass.
+    run_migrate(throwaway_db, "down", "--steps", "3")
     with psycopg.connect(throwaway_db) as conn:
         assert CALIBRATION_TABLES & _table_names(conn) == set()
         cols = {
@@ -604,3 +607,186 @@ def test_0007_only_one_active_config_per_provider(throwaway_db: str) -> None:
                 " VALUES ('hive', 'v3', 'numeric', '[]'::jsonb),"
                 "        ('hive', 'v4', 'numeric', '[]'::jsonb)"
             )
+
+
+# ── 0008: subjects and the seed FK ────────────────────────────────────────
+
+
+def _columns(conn: psycopg.Connection[tuple[str]], table: str) -> set[str]:
+    rows = conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+        (table,),
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def _constraints(conn: psycopg.Connection[tuple[str]], table: str) -> set[str]:
+    rows = conn.execute(
+        "SELECT conname FROM pg_constraint WHERE conrelid = %s::regclass", (table,)
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def test_0008_creates_subjects_and_the_seed_fk(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        assert "subjects" in _table_names(conn)
+        assert "search_seeds_subject_fk" in _constraints(conn, "search_seeds")
+
+
+def test_0008_backfills_existing_enrolments_and_seeds_as_adult(throwaway_db: str) -> None:
+    """Everything enrolled before step 8 predates minor support: MIN_ENROLMENT_AGE
+    was 18 and enrolment refused anyone younger, so every existing subject is an
+    adult by construction. That is a statement about the old gate, not an
+    assumption about the population.
+
+    Exercised by rolling forward, back to 0007, inserting pre-step-8 rows, then
+    running 0008 — the real upgrade path rather than a simulation of it.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "2")  # back to 0007
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        session = conn.execute(
+            "INSERT INTO liveness_sessions (user_ref, provider_session_id, status,"
+            " attempt_number, expires_at, consumed_at, completed_at)"
+            " VALUES (gen_random_uuid(), 'ps-1', 'consumed', 1,"
+            "         now() + interval '10 minutes', now(), now())"
+            " RETURNING session_id, user_ref"
+        ).fetchone()
+        assert session is not None
+        session_id, enrolled_ref = session
+        conn.execute(
+            "INSERT INTO enrolments (session_id, session_status, user_ref, collection_id,"
+            " external_face_id, model_id, source_object_uri)"
+            " VALUES (%s, 'consumed', %s, 'identity-v1', 'face-1', 'rekognition:7.0',"
+            "         'https://s3/ref.jpg')",
+            (session_id, enrolled_ref),
+        )
+        seeded = conn.execute(
+            "INSERT INTO search_seeds (user_ref, seed_kind, source_object_uri)"
+            " VALUES (gen_random_uuid(), 'user_supplied', 'https://s3/seed.jpg')"
+            " RETURNING user_ref"
+        ).fetchone()
+        assert seeded is not None
+
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db) as conn:
+        rows = conn.execute(
+            "SELECT user_ref, discovery_eligible, eligibility_reason FROM subjects"
+        ).fetchall()
+    assert {(row[1], row[2]) for row in rows} == {(True, "adult")}
+    assert {row[0] for row in rows} == {enrolled_ref, seeded[0]}
+
+
+def test_0008_down_drops_the_table_and_the_constraint(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "2")  # 0009 then 0008
+    with psycopg.connect(throwaway_db) as conn:
+        assert "subjects" not in _table_names(conn)
+        assert "search_seeds_subject_fk" not in _constraints(conn, "search_seeds")
+
+
+# ── 0009: cost, breakers, cadence ─────────────────────────────────────────
+
+PROVIDER_STEP_8_COLUMNS = {
+    "cost_per_call_usd",
+    "monthly_budget_usd",
+    "rate_limit_per_min",
+    "breaker_state",
+    "breaker_opened_at",
+    "breaker_reason",
+    "breaker_consecutive_failures",
+    "breaker_cooldown_seconds",
+}
+SEED_STEP_8_COLUMNS = {"scan_tier", "next_scan_after", "consecutive_empty_scans"}
+
+
+def test_0009_adds_the_cost_and_cadence_columns(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        assert "provider_spend" in _table_names(conn)
+        assert _columns(conn, "providers") >= PROVIDER_STEP_8_COLUMNS
+        assert _columns(conn, "search_seeds") >= SEED_STEP_8_COLUMNS
+        # daily_budget_usd belongs to 0001; 0009 deliberately does not re-add it.
+        assert "daily_budget_usd" in _columns(conn, "providers")
+
+
+def test_0009_writes_the_real_google_cost_and_leaves_hive_null(throwaway_db: str) -> None:
+    """Google Cloud Vision Web Detection is published list price. Hive Web Search
+    is contract-priced and no measured figure exists anywhere in this repo, so
+    the column stays NULL rather than holding a plausible-looking guess — a
+    budget enforced against an unsourced number is worse than no budget, because
+    the error only surfaces on an invoice."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        costs = dict(
+            conn.execute("SELECT provider_id, cost_per_call_usd FROM providers").fetchall()
+        )
+    assert costs["google"] == Decimal("0.003500")
+    assert costs["hive"] is None
+
+
+def test_0009_rejects_an_unknown_breaker_state(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with (
+        psycopg.connect(throwaway_db) as conn,
+        pytest.raises(psycopg.errors.CheckViolation),
+        conn.transaction(),
+    ):
+        conn.execute("UPDATE providers SET breaker_state = 'tripped'")
+
+
+def test_0009_rejects_an_unknown_scan_tier(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO subjects (user_ref, discovery_eligible, eligibility_reason)"
+                " VALUES ('11111111-1111-1111-1111-111111111111', true, 'adult')"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
+            conn.execute(
+                "INSERT INTO search_seeds (user_ref, seed_kind, source_object_uri, scan_tier)"
+                " VALUES ('11111111-1111-1111-1111-111111111111', 'user_supplied',"
+                "         'https://s3/x.jpg', 'hourly')"
+            )
+
+
+def test_0009_rejects_an_unknown_provider_call_status(throwaway_db: str) -> None:
+    """providers_succeeded is derived from this column, so a typo'd status
+    silently becomes a not-ok row — which reads downstream as a provider
+    outage, i.e. as coverage we did not have."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with (
+        psycopg.connect(throwaway_db) as conn,
+        pytest.raises(psycopg.errors.CheckViolation),
+        conn.transaction(),
+    ):
+        conn.execute(
+            "INSERT INTO provider_calls (provider_id, status, raw_response)"
+            " VALUES ('hive', 'sort_of_ok', '{}'::jsonb)"
+        )
+
+
+def test_0009_down_removes_them_and_keeps_daily_budget(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "1")
+    with psycopg.connect(throwaway_db) as conn:
+        assert "provider_spend" not in _table_names(conn)
+        assert _columns(conn, "providers") & PROVIDER_STEP_8_COLUMNS == set()
+        assert _columns(conn, "search_seeds") & SEED_STEP_8_COLUMNS == set()
+        # 0001's column survives: dropping it here would make this migration
+        # destructive to something it never created.
+        assert "daily_budget_usd" in _columns(conn, "providers")

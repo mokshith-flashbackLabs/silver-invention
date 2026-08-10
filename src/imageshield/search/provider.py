@@ -30,9 +30,20 @@ from pydantic import BaseModel, ConfigDict
 
 from imageshield.types import ProviderId
 
-ProviderStatus = Literal["ok", "error", "rate_limited", "timeout", "budget_exceeded"]
-# 'budget_exceeded' is unused until step 8 (cost tracking); it exists now so
-# the status vocabulary doesn't change shape when budgets arrive.
+ProviderStatus = Literal[
+    "ok",
+    "error",
+    "rate_limited",
+    "timeout",
+    # The three step-8 skip statuses. No adapter ever produces them: they are
+    # written by the dispatch guard (imageshield/providers/gate.py) for a
+    # provider that was NOT called, and they are recorded rather than silent
+    # because a skipped provider must be distinguishable from one that ran and
+    # found nothing (CLAUDE.md §7.5).
+    "budget_exceeded",
+    "breaker_open",
+    "provider_disabled",
+]
 
 
 class ProviderMatch(BaseModel):
@@ -59,6 +70,15 @@ class ProviderResult(BaseModel):
     raw_response: dict[str, Any]    # VERBATIM, always, even on error
     http_status: int | None
     latency_ms: int
+    # How many HTTP attempts this result cost, counting the first. >1 means the
+    # provider rate-limited us and the bounded retry (providers/ratelimit.py)
+    # ran. Recorded on provider_calls.attempt so "we are being throttled" is
+    # visible before it becomes "we are being throttled and gave up".
+    attempts: int = 1
+    # Short, stable failure summary for provider_calls.error_detail. The verbatim
+    # body stays in raw_response, which the retention job nulls after
+    # RAW_RESPONSE_RETENTION_DAYS; this outlives it.
+    error_detail: str | None = None
 
 
 class SearchProvider(Protocol):

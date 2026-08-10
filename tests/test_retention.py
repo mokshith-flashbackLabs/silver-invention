@@ -8,6 +8,7 @@ payloads, not all of them — so the payload expires and the row does not.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -15,11 +16,12 @@ import psycopg
 import pytest
 
 from imageshield.db.connection import make_async_pool
+from imageshield.providers.store import PostgresProviderControlStore
 from imageshield.search.provider import ProviderResult
 from imageshield.search.retention import null_expired_raw_responses
 from imageshield.search.store import PostgresSearchStore
 from imageshield.types import ProviderId, UserRef
-from tests.db import run_migrate
+from tests.db import ensure_subject, run_migrate
 
 HIVE = ProviderId("hive")
 
@@ -45,10 +47,20 @@ async def test_nulls_only_rows_past_the_window_and_is_idempotent(
     try:
         store = PostgresSearchStore(pool)
         user_ref = UserRef(uuid4())
+        await ensure_subject(pool, user_ref)
         seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/i.jpg")
         run_id = await store.create_run(user_ref, seed_id, (HIVE,))
+        # provider_calls is written by the control store from step 8 onward, so
+        # it shares a transaction with the spend upsert and the breaker.
+        control = PostgresProviderControlStore(
+            pool,
+            cache_seconds=0.0,
+            failure_threshold=100,
+            default_cooldown_seconds=300,
+            max_cooldown_seconds=1200,
+        )
         for _ in range(2):
-            await store.record_provider_call(
+            await control.record_outcome(
                 run_id,
                 ProviderResult(
                     provider_id=HIVE,
@@ -58,6 +70,8 @@ async def test_nulls_only_rows_past_the_window_and_is_idempotent(
                     http_status=200,
                     latency_ms=5,
                 ),
+                cost_usd=None,
+                spend_date=datetime.now(UTC).date(),
             )
 
         # Age ONE of the two rows past the window.

@@ -19,6 +19,10 @@ Load-bearing choices:
   inserting. Row count grows with content, not with time.
 - The url_hash is normalisation v1 (``search/urlhash.py``), computed over the
   **page** where a provider reports one — the page is what a user acts on.
+- ``provider_calls`` is deliberately **not** written here. Step 8 moved that
+  insert into ``providers/store.py``, where it shares one transaction with the
+  ``provider_spend`` upsert and the breaker transition. A call row written
+  independently of its spend row is money with no provenance.
 
 Two counters that are easy to confuse: ``seen_count`` counts provider
 observations of an infringement (two providers in one run bump it twice), so
@@ -33,12 +37,14 @@ from datetime import datetime
 from typing import Any, NamedTuple, Protocol
 from uuid import UUID
 
+from psycopg.errors import ForeignKeyViolation
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.calibration.bands import band_for_attestation, roll_up
 from imageshield.calibration.models import BandingPolicy
 from imageshield.outbox import QUEUE_SEARCH_RUNS, OutboxPayload, enqueue
+from imageshield.search.cadence import CadenceInput, CadenceUpdate, update_for
 from imageshield.search.models import (
     AttestationRow,
     ClaimedRun,
@@ -47,13 +53,14 @@ from imageshield.search.models import (
     RunRow,
     SeedRow,
 )
-from imageshield.search.provider import ProviderMatch, ProviderResult
+from imageshield.search.provider import ProviderMatch
 from imageshield.search.urlhash import (
     NORMALISATION_VERSION,
     canonicalise,
     source_domain,
     url_hash,
 )
+from imageshield.subjects.store import DISCOVERY_REFUSED_ACTION
 from imageshield.types import (
     ProviderId,
     UrlHash,
@@ -74,15 +81,46 @@ _STALE_CLAIM_MINUTES = 15
 # 'review' so historical rows stay interpretable when step 7 changes this.
 _THRESHOLD_CONFIG_V1 = {"band": "review", "reason": "uncalibrated_v1"}
 
+# scan_tier is set explicitly to 'new' rather than left to the column default
+# ('standard'). The default is the safe fallback for a row nobody tiered; a seed
+# created HERE is genuinely new, and only this write can say so. Leaving it to
+# the default made the whole 'new' branch of search/cadence.py unreachable and
+# SCAN_NEW_TIER_WEEKS a knob with no effect at any value.
 _CREATE_SEED_SQL = """
-    INSERT INTO search_seeds (user_ref, seed_kind, source_object_uri)
-    VALUES (%(user_ref)s, %(seed_kind)s, %(source_object_uri)s)
+    INSERT INTO search_seeds (user_ref, seed_kind, source_object_uri, scan_tier)
+    VALUES (%(user_ref)s, %(seed_kind)s, %(source_object_uri)s, 'new')
     RETURNING seed_id
 """
 
 _GET_SEED_SQL = """
-    SELECT seed_id, user_ref, seed_kind, source_object_uri, status, created_at
+    SELECT seed_id, user_ref, seed_kind, source_object_uri, status, created_at,
+           scan_tier, next_scan_after, consecutive_empty_scans
     FROM search_seeds WHERE seed_id = %(seed_id)s
+"""
+
+# Written once per completed run that actually looked (search/cadence.py).
+# All three columns move together: a tier without its next_scan_after would
+# leave the proxy stating a cadence the scheduler is not going to honour.
+_UPDATE_CADENCE_SQL = """
+    UPDATE search_seeds
+    SET scan_tier = %(scan_tier)s,
+        consecutive_empty_scans = %(consecutive_empty_scans)s,
+        next_scan_after = %(next_scan_after)s
+    WHERE seed_id = %(seed_id)s
+"""
+
+# FOR UPDATE, and it is load-bearing. The cadence update is a read-modify-write
+# on consecutive_empty_scans, and two runs can legitimately be in flight for one
+# seed — POST /v1/search does not serialise per seed, and _CLAIM_RUN_SQL locks
+# search_runs, not the joined seed row. Without the lock both runs read the same
+# counter, both write count+1, and one empty scan vanishes: at the boundary that
+# is the difference between demoting a user to fortnightly and leaving them
+# weekly, decided by a race.
+_LOCK_SEED_FOR_CADENCE_SQL = """
+    SELECT scan_tier, consecutive_empty_scans, created_at
+    FROM search_seeds
+    WHERE seed_id = %(seed_id)s
+    FOR UPDATE
 """
 
 _CREATE_RUN_SQL = """
@@ -91,32 +129,62 @@ _CREATE_RUN_SQL = """
     RETURNING run_id
 """
 
+# Joined to search_seeds for the cadence fields: the proxy reads a run's status
+# and has to be able to tell the user their real scan cadence off the same
+# response, without a second round trip that it might skip.
 _GET_RUN_SQL = """
-    SELECT run_id, seed_id, user_ref, status, providers_attempted,
-           providers_succeeded, matches_found, started_at, completed_at
-    FROM search_runs WHERE run_id = %(run_id)s
+    SELECT r.run_id, r.seed_id, r.user_ref, r.status, r.providers_attempted,
+           r.providers_succeeded, r.matches_found, r.started_at, r.completed_at,
+           s.scan_tier, s.next_scan_after
+    FROM search_runs r
+    JOIN search_seeds s ON s.seed_id = r.seed_id
+    WHERE r.run_id = %(run_id)s
 """
 
+# The eligibility flag comes back on the claim so the worker can refuse a run
+# that was enqueued while the subject was eligible and dispatched after they
+# stopped being. That window is real and not small: a queued backlog, or a dead
+# worker whose claim goes stale for _STALE_CLAIM_MINUTES, both stretch it, and
+# `subjects.discovery_eligible` is deliberately mutable (a DOB correction at
+# re-enrolment writes it). Without this the route's 403 guarantee holds only at
+# the instant of the request, and INVARIANTS #8b promises more than that.
+#
+# LEFT JOIN with a COALESCE to false: a subject row deleted between run creation
+# and dispatch must read as INELIGIBLE, not as a missing column. An inner join
+# would instead return no row at all, which claim_run reports as "not claimable"
+# — indistinguishable from a duplicate delivery, so the run would sit queued and
+# be silently retried forever rather than refused once.
 _CLAIM_RUN_SQL = f"""
     UPDATE search_runs r
     SET status = 'running', claimed_at = now()
     FROM search_seeds s
+    LEFT JOIN subjects sub ON sub.user_ref = s.user_ref
     WHERE r.run_id = %(run_id)s
       AND s.seed_id = r.seed_id
       AND (r.status = 'queued'
            OR (r.status = 'running'
                AND r.claimed_at < now() - interval '{_STALE_CLAIM_MINUTES} minutes'))
-    RETURNING r.run_id, r.user_ref, s.source_object_uri, r.providers_attempted
+    RETURNING r.run_id, r.seed_id, r.user_ref, s.source_object_uri,
+              r.providers_attempted, COALESCE(sub.discovery_eligible, false)
+"""
+
+# A run refused at dispatch. Deliberately NOT 'completed': a completed run with
+# zero results reads as "we looked and found nothing", which for a subject
+# nobody searched is a false reassurance — the same reasoning that keeps the
+# route from creating a run row at all (INVARIANTS #8b). 'refused' is a distinct
+# status the proxy can render honestly.
+_REFUSE_RUN_SQL = """
+    UPDATE search_runs
+    SET status = 'refused', completed_at = now()
+    WHERE run_id = %(run_id)s
+"""
+
+_REFUSAL_AUDIT_SQL = """
+    INSERT INTO audit_log (actor_type, action, subject_ref, resource_id, metadata)
+    VALUES ('service', %(action)s, %(subject_ref)s, %(run_id)s, %(metadata)s)
 """
 
 _ENABLED_PROVIDERS_SQL = "SELECT provider_id FROM providers WHERE enabled ORDER BY provider_id"
-
-_RECORD_CALL_SQL = """
-    INSERT INTO provider_calls (run_id, provider_id, status, http_status,
-                                latency_ms, raw_response)
-    VALUES (%(run_id)s, %(provider_id)s, %(status)s, %(http_status)s,
-            %(latency_ms)s, %(raw_response)s)
-"""
 
 _UPSERT_URL_SQL = """
     INSERT INTO content_urls (url_hash, url, source_domain, canonical_url,
@@ -199,6 +267,18 @@ _LIST_INFRINGEMENTS_SQL = """
 """
 
 
+class UnknownSubject(LookupError):
+    """A write referenced a ``user_ref`` with no ``subjects`` row.
+
+    A domain error rather than a leaked ``psycopg`` exception: the route layer
+    maps it to ``409 subject_unknown``, matching what ``POST /v1/search`` already
+    returns for the identical condition. Letting the driver exception escape gave
+    a bare ``500`` with none of the error envelope — no ``code``, no
+    ``retryable`` — which reads to the proxy as a transient server fault and
+    invites it to retry a request that can never succeed.
+    """
+
+
 class InfringementKey(NamedTuple):
     url_hash: UrlHash
     key_url: str
@@ -255,7 +335,9 @@ class SearchStore(Protocol):
 
     async def enabled_provider_ids(self) -> tuple[ProviderId, ...]: ...
 
-    async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None: ...
+    async def refuse_run(
+        self, run_id: UUID, user_ref: UserRef, *, reason: str
+    ) -> None: ...
 
     async def record_infringements(
         self,
@@ -267,8 +349,13 @@ class SearchStore(Protocol):
     ) -> int: ...
 
     async def complete_run(
-        self, run_id: UUID, providers_succeeded: Sequence[ProviderId]
-    ) -> None: ...
+        self,
+        run_id: UUID,
+        seed_id: UUID,
+        providers_succeeded: Sequence[ProviderId],
+        *,
+        retier: CadenceInput | None,
+    ) -> CadenceUpdate | None: ...
 
     async def list_infringements(
         self, user_ref: UserRef, since: datetime | None
@@ -282,16 +369,29 @@ class PostgresSearchStore:
     async def create_seed(
         self, user_ref: UserRef, seed_kind: str, source_object_uri: str
     ) -> UUID:
-        async with self._pool.connection() as conn:
-            cur = await conn.execute(
-                _CREATE_SEED_SQL,
-                {
-                    "user_ref": user_ref,
-                    "seed_kind": seed_kind,
-                    "source_object_uri": source_object_uri,
-                },
-            )
-            row = await cur.fetchone()
+        """Raises :class:`UnknownSubject` when no ``subjects`` row exists.
+
+        Migration 0008's ``search_seeds_subject_fk`` is what actually refuses
+        this, and translating it here rather than pre-checking is deliberate:
+        a ``SELECT`` then ``INSERT`` has a race the constraint does not, and the
+        constraint is the thing that holds even if a future caller forgets the
+        check.
+        """
+        try:
+            async with self._pool.connection() as conn:
+                cur = await conn.execute(
+                    _CREATE_SEED_SQL,
+                    {
+                        "user_ref": user_ref,
+                        "seed_kind": seed_kind,
+                        "source_object_uri": source_object_uri,
+                    },
+                )
+                row = await cur.fetchone()
+        except ForeignKeyViolation as exc:
+            raise UnknownSubject(
+                "no subjects row for this user_ref — enrol before creating a seed"
+            ) from exc
         assert row is not None
         seed_id: UUID = row[0]
         return seed_id
@@ -309,6 +409,9 @@ class PostgresSearchStore:
             source_object_uri=row[3],
             status=row[4],
             created_at=row[5],
+            scan_tier=row[6],
+            next_scan_after=row[7],
+            consecutive_empty_scans=row[8],
         )
 
     async def create_run(
@@ -352,6 +455,8 @@ class PostgresSearchStore:
             matches_found=row[6],
             started_at=row[7],
             completed_at=row[8],
+            scan_tier=row[9],
+            next_scan_after=row[10],
         )
 
     async def claim_run(self, run_id: UUID) -> ClaimedRun | None:
@@ -362,9 +467,11 @@ class PostgresSearchStore:
             return None
         return ClaimedRun(
             run_id=row[0],
-            user_ref=parse_user_ref(row[1]),
-            seed_url=row[2],
-            providers_attempted=tuple(parse_provider_id(p) for p in row[3]),
+            seed_id=row[1],
+            user_ref=parse_user_ref(row[2]),
+            seed_url=row[3],
+            providers_attempted=tuple(parse_provider_id(p) for p in row[4]),
+            discovery_eligible=row[5],
         )
 
     async def enabled_provider_ids(self) -> tuple[ProviderId, ...]:
@@ -373,17 +480,29 @@ class PostgresSearchStore:
             rows = await cur.fetchall()
         return tuple(parse_provider_id(row[0]) for row in rows)
 
-    async def record_provider_call(self, run_id: UUID, result: ProviderResult) -> None:
-        async with self._pool.connection() as conn:
+    async def refuse_run(
+        self, run_id: UUID, user_ref: UserRef, *, reason: str
+    ) -> None:
+        """Mark a claimed run refused and audit it — one transaction.
+
+        For the subject who became ineligible between enqueue and dispatch. The
+        run row already exists (it was created while they were eligible), so it
+        cannot be made to disappear; what it must not do is read as 'completed',
+        because a completed run with zero results says "we looked and found
+        nothing" about a search that never ran.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(_REFUSE_RUN_SQL, {"run_id": run_id})
             await conn.execute(
-                _RECORD_CALL_SQL,
+                _REFUSAL_AUDIT_SQL,
                 {
+                    "action": DISCOVERY_REFUSED_ACTION,
+                    "subject_ref": user_ref,
                     "run_id": run_id,
-                    "provider_id": result.provider_id,
-                    "status": result.status,
-                    "http_status": result.http_status,
-                    "latency_ms": result.latency_ms,
-                    "raw_response": Jsonb(result.raw_response),
+                    "metadata": Jsonb(
+                        {"outcome": "discovery_not_available", "refused_at": "dispatch",
+                         "reason": reason}
+                    ),
                 },
             )
 
@@ -465,13 +584,63 @@ class PostgresSearchStore:
         return len(keys)
 
     async def complete_run(
-        self, run_id: UUID, providers_succeeded: Sequence[ProviderId]
-    ) -> None:
-        async with self._pool.connection() as conn:
+        self,
+        run_id: UUID,
+        seed_id: UUID,
+        providers_succeeded: Sequence[ProviderId],
+        *,
+        retier: CadenceInput | None,
+    ) -> CadenceUpdate | None:
+        """Complete the run and re-tier its seed in ONE transaction.
+
+        Two separate transactions was wrong in both directions:
+
+        - **Lost update.** The cadence write is a read-modify-write on
+          ``consecutive_empty_scans``, and two runs for one seed can overlap.
+          Both would read the same counter and both write ``count + 1``, losing
+          an empty scan — at the threshold, that is the difference between
+          demoting a user to fortnightly and leaving them weekly, decided by a
+          race. ``_LOCK_SEED_FOR_CADENCE_SQL`` takes ``FOR UPDATE`` first.
+
+        - **Lost tier change.** Completing the run makes it unclaimable, so a
+          crash after that commit and before the cadence commit dropped the tier
+          change permanently, with no retry path: SQS would redeliver, and
+          ``claim_run`` would correctly decline a completed run.
+
+        ``retier=None`` means this run is not evidence about the seed — no
+        provider succeeded — so the run completes and the tier is left alone.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            update: CadenceUpdate | None = None
+            if retier is not None:
+                cur = await conn.execute(
+                    _LOCK_SEED_FOR_CADENCE_SQL, {"seed_id": seed_id}
+                )
+                seed = await cur.fetchone()
+                if seed is not None:
+                    update = update_for(
+                        current=seed[0],
+                        consecutive_empty_scans=seed[1],
+                        found_matches=retier.found_matches,
+                        seed_age_days=(retier.now - seed[2]).days,
+                        now=retier.now,
+                        policy=retier.policy,
+                    )
             await conn.execute(
                 _COMPLETE_RUN_SQL,
                 {"run_id": run_id, "providers_succeeded": list(providers_succeeded)},
             )
+            if update is not None:
+                await conn.execute(
+                    _UPDATE_CADENCE_SQL,
+                    {
+                        "seed_id": seed_id,
+                        "scan_tier": update.scan_tier,
+                        "consecutive_empty_scans": update.consecutive_empty_scans,
+                        "next_scan_after": update.next_scan_after,
+                    },
+                )
+        return update
 
     async def list_infringements(
         self, user_ref: UserRef, since: datetime | None

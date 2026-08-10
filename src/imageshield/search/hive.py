@@ -16,7 +16,9 @@ defects are deliberately absent here:
 - rescaling ``similarity_score`` into a percentage (js:1129). Scores here
   stay raw ``Decimal`` in Hive's native 0.5-1.0 domain, where 0.5 is the
   floor (the lowest score Hive reports), not a midpoint.
-- unbounded recursive retry on 429 (js:1148). Here: one bounded retry.
+- unbounded recursive retry on 429 (js:1148). Here: ``PROVIDER_MAX_RETRIES``
+  bounded, jittered attempts through the one shared driver
+  (``providers/ratelimit.py``), then ``rate_limited`` and stop.
 - unnormalised URL hashing — not this module's business at all.
 
 The seed is passed as the ``url`` form field (a presigned GET minted by the
@@ -25,19 +27,15 @@ proxy) so no image bytes pass through this service.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 import httpx
 
+from imageshield.providers.ratelimit import RetryPolicy, send_with_retry
 from imageshield.search.provider import ProviderMatch, ProviderResult, ProviderStatus
 from imageshield.types import ProviderId
-
-_MAX_RATE_LIMIT_RETRIES = 1
-_RATE_LIMIT_WAIT_CAP_SECONDS = 30.0
-_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 60.0  # capped to the line above
 
 # INFERRED: the harness observed "a query quality signal" in Web Search
 # responses (devtools/harness/README.md) but no saved payload pins the exact
@@ -72,11 +70,13 @@ class HiveWebSearchProvider:
         base_url: str,
         api_key: str,
         timeout_seconds: float,
+        retry_policy: RetryPolicy,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._endpoint = f"{base_url.rstrip('/')}/api/v2/task/sync"
         self._api_key = api_key
         self._timeout = timeout_seconds
+        self._retry_policy = retry_policy
         self._client = client if client is not None else httpx.AsyncClient()
 
     async def search(
@@ -93,6 +93,8 @@ class HiveWebSearchProvider:
             matches: list[ProviderMatch] | None = None,
             raw: dict[str, Any],
             http_status: int | None,
+            attempts: int = 1,
+            error_detail: str | None = None,
         ) -> ProviderResult:
             return ProviderResult(
                 provider_id=self.id,
@@ -101,40 +103,66 @@ class HiveWebSearchProvider:
                 raw_response=raw,
                 http_status=http_status,
                 latency_ms=_elapsed_ms(),
+                attempts=attempts,
+                error_detail=error_detail,
             )
 
-        response: httpx.Response | None = None
-        for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                response = await self._client.post(
-                    self._endpoint,
-                    headers={"authorization": f"token {self._api_key}"},
-                    data={"url": seed_url},
-                    timeout=self._timeout,
-                )
-            except httpx.TimeoutException as exc:
-                return _result("timeout", raw={"exception": str(exc)}, http_status=None)
-            except httpx.HTTPError as exc:
-                return _result("error", raw={"exception": str(exc)}, http_status=None)
+        async def _send() -> httpx.Response:
+            return await self._client.post(
+                self._endpoint,
+                headers={"authorization": f"token {self._api_key}"},
+                data={"url": seed_url},
+                timeout=self._timeout,
+            )
 
-            if response.status_code != 429:
-                break
-            if attempt < _MAX_RATE_LIMIT_RETRIES:
-                await asyncio.sleep(_retry_after_seconds(response))
+        try:
+            response, attempts = await send_with_retry(_send, self._retry_policy)
+        except httpx.TimeoutException as exc:
+            return _result(
+                "timeout",
+                raw={"exception": str(exc)},
+                http_status=None,
+                error_detail="request timed out",
+            )
+        except httpx.HTTPError as exc:
+            return _result(
+                "error",
+                raw={"exception": str(exc)},
+                http_status=None,
+                error_detail=f"transport error: {type(exc).__name__}",
+            )
 
-        assert response is not None
         raw = _decode_body(response)
 
         if response.status_code == 429:
-            return _result("rate_limited", raw=raw, http_status=429)
+            return _result(
+                "rate_limited",
+                raw=raw,
+                http_status=429,
+                attempts=attempts,
+                error_detail=f"rate limited after {attempts} attempt(s)",
+            )
         if response.status_code != 200:
-            return _result("error", raw=raw, http_status=response.status_code)
+            return _result(
+                "error",
+                raw=raw,
+                http_status=response.status_code,
+                attempts=attempts,
+                error_detail=f"http {response.status_code}",
+            )
 
         parsed = _parse_output(raw)
         if parsed is None:
             # Wrong-project tripwire: a 200 without the Web Search matches
             # path must not read as "nothing found".
-            return _result("error", raw=raw, http_status=200)
+            return _result(
+                "error",
+                raw=raw,
+                http_status=200,
+                attempts=attempts,
+                error_detail="200 without the Web Search matches path"
+                " — check the Hive project the key belongs to",
+            )
 
         matches, query_quality = parsed
         if max_results is not None:
@@ -145,16 +173,8 @@ class HiveWebSearchProvider:
                      if _raw_score(entry) is not None],
             raw=raw,
             http_status=200,
+            attempts=attempts,
         )
-
-
-def _retry_after_seconds(response: httpx.Response) -> float:
-    header = response.headers.get("retry-after")
-    try:
-        wait = float(header) if header is not None else _RATE_LIMIT_DEFAULT_WAIT_SECONDS
-    except ValueError:
-        wait = _RATE_LIMIT_DEFAULT_WAIT_SECONDS
-    return min(max(wait, 0.0), _RATE_LIMIT_WAIT_CAP_SECONDS)
 
 
 def _parse_output(

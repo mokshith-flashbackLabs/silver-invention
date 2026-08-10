@@ -3,6 +3,7 @@ tests/test_enrolment_store.py: own down --all + up arrange step)."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -13,11 +14,13 @@ import psycopg
 import pytest
 
 from imageshield.db.connection import make_async_pool
+from imageshield.search.cadence import CadenceInput
 from imageshield.search.models import ProviderDescriptor
-from imageshield.search.provider import ProviderMatch, ProviderResult
-from imageshield.search.store import PostgresSearchStore
+from imageshield.search.provider import ProviderMatch
+from imageshield.search.store import PostgresSearchStore, UnknownSubject
 from imageshield.types import ProviderId, UserRef
-from tests.db import run_migrate
+from tests.db import ensure_subject, run_migrate
+from tests.providers_fakes import CADENCE
 
 HIVE = ProviderId("hive")
 GOOGLE = ProviderId("google")
@@ -76,6 +79,8 @@ def _google_match(url: str, category: str = "full_match") -> ProviderMatch:
 async def _seeded_run(
     store: PostgresSearchStore, user_ref: UserRef
 ) -> tuple[UUID, UUID]:
+    # Step 8: search_seeds FKs to subjects, so the subject row comes first.
+    await ensure_subject(store._pool, user_ref)
     seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
     run_id = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
     return seed_id, run_id
@@ -88,13 +93,44 @@ def _query(db_url: str, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[An
 
 async def test_seed_roundtrip(store: PostgresSearchStore) -> None:
     user_ref = _user()
+    await ensure_subject(store._pool, user_ref)
     seed_id = await store.create_seed(user_ref, "enrolment", "https://s3/ref.jpg")
     seed = await store.get_seed(seed_id)
     assert seed is not None
     assert seed.user_ref == user_ref
     assert seed.seed_kind == "enrolment"
     assert seed.source_object_uri == "https://s3/ref.jpg"
+    # Step-8 cadence: a seed created here IS new, and create_seed says so
+    # explicitly rather than leaving the column default ("standard") to speak
+    # for it — the default is the fallback for a row nobody tiered. Same
+    # weekly interval as standard; the tier differs in how it TRANSITIONS.
+    assert seed.scan_tier == "new"
+    assert seed.consecutive_empty_scans == 0
+    assert seed.next_scan_after is None
     assert await store.get_seed(uuid4()) is None
+
+
+async def test_seed_for_unknown_subject_fails_at_the_database(
+    store: PostgresSearchStore,
+) -> None:
+    """Step-8 done-when: inserting a search_seeds row for an unknown subject
+    fails at the DATABASE, not in the application.
+
+    The route guard can be edited or bypassed; this constraint cannot be, which
+    is why the eligibility story does not rest on the route alone.
+
+    What escapes is :class:`UnknownSubject` — the route needs a domain error to
+    map to 409, because letting psycopg's exception through produced a bare 500
+    with none of the error envelope. The `__cause__` assertion is the part that
+    matters here: it proves the refusal still originates in the FK and that this
+    is a translation, not an application-level pre-check that could drift out of
+    agreement with the constraint (or race it).
+    """
+    with pytest.raises(UnknownSubject) as raised:
+        await store.create_seed(_user(), "user_supplied", "https://s3/img.jpg")
+
+    assert isinstance(raised.value.__cause__, psycopg.errors.ForeignKeyViolation)
+    assert "search_seeds_subject_fk" in str(raised.value.__cause__)
 
 
 async def test_create_run_writes_outbox_row_in_same_transaction(
@@ -137,9 +173,9 @@ async def test_claim_run_transitions_queued_to_running_once(
 
 async def test_claim_run_skips_completed(store: PostgresSearchStore) -> None:
     user_ref = _user()
-    _, run_id = await _seeded_run(store, user_ref)
+    seed_id, run_id = await _seeded_run(store, user_ref)
     assert await store.claim_run(run_id) is not None
-    await store.complete_run(run_id, (HIVE,))
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=None)
     assert await store.claim_run(run_id) is None
 
 
@@ -159,36 +195,175 @@ async def test_stale_running_claim_is_reclaimable(
     assert await store.claim_run(run_id) is not None
 
 
-async def test_record_provider_call_keeps_raw_response_verbatim_on_failure(
+# The provider_calls write moved to PostgresProviderControlStore in step 8, so
+# it shares one transaction with the provider_spend upsert and the breaker
+# transition. Its tests moved with it, to tests/test_provider_control_store.py —
+# including the raw_response-verbatim-on-failure case that lived here.
+
+
+def _retier(found: bool, *, now: datetime | None = None) -> CadenceInput:
+    return CadenceInput(
+        found_matches=found, now=now or datetime.now(UTC), policy=CADENCE
+    )
+
+
+async def test_completion_and_cadence_are_one_transaction(
     store: PostgresSearchStore, migrated_db: str
 ) -> None:
+    """They were two, and both orderings lost data.
+
+    Completing first makes the run unclaimable, so a crash before the cadence
+    write dropped the tier change permanently — SQS would redeliver and claim_run
+    would correctly decline a completed run. There is no retry path for a
+    half-applied re-tier, so the only fix is that there is no half-applied state.
+    """
+    user_ref = _user()
+    seed_id, run_id = await _seeded_run(store, user_ref)
+
+    update = await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(False))
+
+    assert update is not None
+    seed = await store.get_seed(seed_id)
+    run = await store.get_run(run_id)
+    assert seed is not None and run is not None
+    # Both halves landed, from one call.
+    assert run.status == "completed"
+    assert seed.consecutive_empty_scans == 1
+    assert seed.next_scan_after is not None
+    # A tier without its due date would leave the proxy quoting a cadence the
+    # scheduler is not going to honour, so all three columns move as one write.
+    assert abs((seed.next_scan_after - update.next_scan_after).total_seconds()) < 1
+
+
+async def test_a_run_with_no_successful_provider_leaves_the_tier_alone(
+    store: PostgresSearchStore,
+) -> None:
+    """retier=None is how the runner says "this run is not evidence". The run
+    still completes; the seed's counter must not move, because demoting a user's
+    cadence for our own provider outage takes the saving from the wrong place."""
+    user_ref = _user()
+    seed_id, run_id = await _seeded_run(store, user_ref)
+    before = await store.get_seed(seed_id)
+    assert before is not None
+
+    assert await store.complete_run(run_id, seed_id, (), retier=None) is None
+
+    after = await store.get_seed(seed_id)
+    run = await store.get_run(run_id)
+    assert after is not None and run is not None
+    assert run.status == "completed"
+    assert after.consecutive_empty_scans == before.consecutive_empty_scans
+    assert after.scan_tier == before.scan_tier
+    assert after.next_scan_after is None
+
+
+async def test_concurrent_completions_on_one_seed_lose_no_empty_scan(
+    store: PostgresSearchStore,
+) -> None:
+    """The lost-update race the FOR UPDATE exists for.
+
+    POST /v1/search does not serialise per seed, and _CLAIM_RUN_SQL row-locks
+    search_runs, not the joined seed row. Without the lock both runs read the same
+    counter and both write count+1, so one empty scan vanishes — at the threshold
+    that is the difference between demoting a user to fortnightly and leaving them
+    weekly, decided by a race.
+    """
+    user_ref = _user()
+    seed_id, first = await _seeded_run(store, user_ref)
+    second = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
+
+    await asyncio.gather(
+        store.complete_run(first, seed_id, (HIVE,), retier=_retier(False)),
+        store.complete_run(second, seed_id, (HIVE,), retier=_retier(False)),
+    )
+
+    seed = await store.get_seed(seed_id)
+    assert seed is not None
+    assert seed.consecutive_empty_scans == 2  # not 1
+
+
+async def test_a_non_empty_scan_promotes_to_priority_through_the_store(
+    store: PostgresSearchStore,
+) -> None:
+    user_ref = _user()
+    seed_id, run_id = await _seeded_run(store, user_ref)
+
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True))
+
+    seed = await store.get_seed(seed_id)
+    assert seed is not None
+    assert seed.scan_tier == "priority"
+    assert seed.consecutive_empty_scans == 0
+
+
+async def test_a_new_seed_starts_on_the_new_tier(
+    store: PostgresSearchStore,
+) -> None:
+    """The 'new' tier has to be written by create_seed. Left to the column
+    default ('standard') the whole `new` branch of search/cadence.py was
+    unreachable and SCAN_NEW_TIER_WEEKS had no effect at any value, while
+    PROXY_INTEGRATION.md advertised a tier the API could never return."""
+    user_ref = _user()
+    await ensure_subject(store._pool, user_ref)
+    seed_id = await store.create_seed(user_ref, "enrolment", "https://s3/img.jpg")
+
+    seed = await store.get_seed(seed_id)
+    assert seed is not None
+    assert seed.scan_tier == "new"
+
+
+async def test_run_status_carries_the_seeds_cadence(
+    store: PostgresSearchStore,
+) -> None:
+    """Tiering must never be silent: GET /v1/search/runs reads these off the
+    run row, so the join has to bring them through."""
+    user_ref = _user()
+    seed_id, run_id = await _seeded_run(store, user_ref)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True))
+
+    run = await store.get_run(run_id)
+    assert run is not None
+    assert run.scan_tier == "priority"
+    assert run.next_scan_after is not None
+
+
+async def test_a_refused_run_is_not_completed_and_audits_once(
+    store: PostgresSearchStore, migrated_db: str
+) -> None:
+    """A subject who stopped being eligible between enqueue and dispatch.
+
+    The run row already exists, so it cannot be made to disappear; what it must
+    not do is read as 'completed', because a completed run with zero results says
+    "we looked and found nothing" about a search that never ran (INVARIANTS #8b).
+    """
     user_ref = _user()
     _, run_id = await _seeded_run(store, user_ref)
-    result = ProviderResult(
-        provider_id=HIVE,
-        status="rate_limited",
-        matches=[],
-        raw_response={"why": "slow down", "nested": {"retry": 60}},
-        http_status=429,
-        latency_ms=812,
-    )
 
-    await store.record_provider_call(run_id, result)
+    await store.refuse_run(run_id, user_ref, reason="became ineligible")
 
-    rows = _query(
+    run = await store.get_run(run_id)
+    assert run is not None
+    assert run.status == "refused"
+    assert run.providers_succeeded == ()
+    assert run.matches_found == 0
+
+    audit = _query(
         migrated_db,
-        "SELECT status, http_status, latency_ms, raw_response FROM provider_calls"
-        " WHERE run_id = %s",
+        "SELECT action, subject_ref, resource_id, metadata FROM audit_log"
+        " WHERE resource_id = %s",
         (run_id,),
     )
-    assert rows == [("rate_limited", 429, 812, {"why": "slow down", "nested": {"retry": 60}})]
+    assert len(audit) == 1
+    assert audit[0][0] == "discovery.refused"
+    assert audit[0][1] == user_ref
+    assert audit[0][3]["refused_at"] == "dispatch"
 
 
 async def test_complete_run_sets_status_succeeded_and_count(
     store: PostgresSearchStore,
 ) -> None:
     user_ref = _user()
-    _, run_id = await _seeded_run(store, user_ref)
+    seed_id, run_id = await _seeded_run(store, user_ref)
     await store.record_infringements(
         run_id,
         user_ref,
@@ -197,7 +372,7 @@ async def test_complete_run_sets_status_succeeded_and_count(
         {},
     )
 
-    await store.complete_run(run_id, (HIVE,))
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True))
 
     run = await store.get_run(run_id)
     assert run is not None
@@ -495,6 +670,7 @@ async def test_52_weekly_rescans_over_static_corpus_add_zero_rows(
     DO NOT DELETE OR WEAKEN THIS TEST — step-6 spec, "Done when".
     """
     user_ref = _user()
+    await ensure_subject(store._pool, user_ref)
     seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
     # Three pages, each found by Hive (via a backlink) and by Google (as a
     # page match) — the cross-provider case, rescanned.
@@ -518,7 +694,7 @@ async def test_52_weekly_rescans_over_static_corpus_add_zero_rows(
         run_id = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
         await store.record_infringements(run_id, user_ref, HIVE_DESC, hive_corpus, {})
         await store.record_infringements(run_id, user_ref, GOOGLE_DESC, google_corpus, {})
-        await store.complete_run(run_id, (HIVE, GOOGLE))
+        await store.complete_run(run_id, seed_id, (HIVE, GOOGLE), retier=None)
         if week == 0:
             first_week_counts = _counts()
 

@@ -54,6 +54,7 @@ from imageshield.calibration.store import (
 )
 from imageshield.config import Config, load_config
 from imageshield.db.connection import make_async_pool
+from imageshield.providers.ratelimit import policy_from_config as retry_policy_from_config
 from imageshield.search.google import GoogleWebDetectionProvider
 from imageshield.search.hive import HiveWebSearchProvider
 from imageshield.search.provider import SearchProvider
@@ -68,11 +69,13 @@ def build_provider(
     """The same adapters the worker constructs (``search/worker.py``'s
     ``build_providers``). Adding a provider here without adding it there
     would calibrate something we do not run."""
+    retry = retry_policy_from_config(config)
     if provider_id == "hive":
         return HiveWebSearchProvider(
             base_url=config.hive_base_url,
             api_key=config.hive_api_key,
             timeout_seconds=config.provider_timeout_seconds,
+            retry_policy=retry,
             client=client,
         )
     if provider_id == "google":
@@ -80,6 +83,7 @@ def build_provider(
             endpoint=config.google_vision_endpoint,
             api_key=config.google_vision_api_key,
             timeout_seconds=config.provider_timeout_seconds,
+            retry_policy=retry,
             client=client,
         )
     raise SystemExit(f"no adapter for provider {provider_id!r}")

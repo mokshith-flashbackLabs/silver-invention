@@ -14,9 +14,15 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
+from imageshield.search.cadence import ScanTier
 from imageshield.types import ProviderId, UserRef
 
-RunStatus = Literal["queued", "running", "completed"]
+# 'refused' is a dispatch-time eligibility refusal (step 8): the subject was
+# eligible when the run was created and had stopped being by the time a worker
+# claimed it. Distinct from 'completed' on purpose — a completed run with zero
+# results reads as "we looked and found nothing", which about a search that never
+# ran is a false reassurance (INVARIANTS #8b).
+RunStatus = Literal["queued", "running", "completed", "refused"]
 ScoreKind = Literal["numeric", "categorical"]
 # Which URL the infringement's url_hash was computed over: the page a
 # provider reported, or the image itself when it reported no page.
@@ -34,6 +40,12 @@ class SeedRow(BaseModel):
     source_object_uri: str
     status: str
     created_at: datetime
+    # Step 8 cadence state. Defaulted to the migration's own defaults so a
+    # caller constructing a SeedRow in a test doesn't have to know about
+    # cadence to talk about a seed.
+    scan_tier: ScanTier = "standard"
+    next_scan_after: datetime | None = None
+    consecutive_empty_scans: int = 0
 
 
 class RunRow(BaseModel):
@@ -48,6 +60,12 @@ class RunRow(BaseModel):
     matches_found: int
     started_at: datetime
     completed_at: datetime | None
+    # Carried on the run so `GET /v1/search/runs/{run_id}` can state the seed's
+    # real monitoring cadence. Tiering must never be silent: someone on
+    # 'dormant' who believes they are scanned weekly is being misled about a
+    # safety product.
+    scan_tier: ScanTier = "standard"
+    next_scan_after: datetime | None = None
 
 
 class ClaimedRun(BaseModel):
@@ -57,9 +75,16 @@ class ClaimedRun(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     run_id: UUID
+    seed_id: UUID
     user_ref: UserRef
     seed_url: str
     providers_attempted: tuple[ProviderId, ...]
+    # Re-read at claim time, not trusted from run creation. The route checked it
+    # before creating the run, but `subjects.discovery_eligible` is mutable (a
+    # DOB correction at re-enrolment writes it) and a queued backlog or a stale
+    # claim can put minutes between the two. False here refuses the run rather
+    # than dispatching against a subject who may no longer be searched.
+    discovery_eligible: bool
 
 
 class ProviderDescriptor(BaseModel):

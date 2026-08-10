@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from imageshield.providers.ratelimit import RetryPolicy
 from imageshield.search.google import GoogleWebDetectionProvider
 
 ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
@@ -21,11 +22,15 @@ def _body(web_detection: dict[str, Any]) -> dict[str, Any]:
     return {"responses": [{"webDetection": web_detection}]}
 
 
+RETRY = RetryPolicy(max_retries=2, max_wait_seconds=1.0, jitter_fraction=0.0)
+
+
 def _adapter(handler: Any) -> GoogleWebDetectionProvider:
     return GoogleWebDetectionProvider(
         endpoint=ENDPOINT,
         api_key="g-test",
         timeout_seconds=5.0,
+        retry_policy=RETRY,
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
@@ -138,3 +143,36 @@ async def test_timeout_and_http_error() -> None:
     assert result.status == "error"
     assert result.http_status == 403
     assert result.raw_response == {"error": {"message": "key invalid"}}
+
+
+async def test_a_429_is_retried_within_bounds_then_reported(  # step 8
+) -> None:
+    """Google had NO 429 retry before step 8 — Hive had one and Google had none,
+    which is precisely the drift the shared driver
+    (providers/ratelimit.py) exists to prevent."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(429, headers={"retry-after": "0"}, json={"why": "quota"})
+
+    result = await _adapter(handler).search("https://seed/s.jpg")
+
+    assert len(calls) == 1 + RETRY.max_retries
+    assert result.status == "rate_limited"
+    assert result.attempts == 1 + RETRY.max_retries
+
+
+async def test_a_429_then_success_recovers() -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"retry-after": "0"}, json={})
+        return httpx.Response(200, json=FIXTURE)
+
+    result = await _adapter(handler).search("https://seed/s.jpg")
+
+    assert result.status == "ok"
+    assert result.attempts == 2

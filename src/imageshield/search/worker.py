@@ -33,6 +33,7 @@ import sys
 from typing import Any, Protocol
 
 import structlog
+from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
 
 from imageshield.calibration.store import CalibrationStore, PostgresCalibrationStore
@@ -40,7 +41,14 @@ from imageshield.config import Config, ConfigError, load_config
 from imageshield.db.connection import make_async_pool
 from imageshield.http.logging import configure_logging
 from imageshield.outbox import OutboxPayload
+from imageshield.providers.ratelimit import policy_from_config as retry_policy_from_config
+from imageshield.providers.store import (
+    PostgresProviderControlStore,
+    ProviderControlStore,
+)
 from imageshield.relay import _localstack_endpoint_url
+from imageshield.search.cadence import CadencePolicy
+from imageshield.search.cadence import policy_from_config as cadence_policy_from_config
 from imageshield.search.google import GoogleWebDetectionProvider
 from imageshield.search.hive import HiveWebSearchProvider
 from imageshield.search.provider import SearchProvider
@@ -75,18 +83,33 @@ def build_sqs_consumer(config: Config) -> SqsConsumer:
 
 
 def build_providers(config: Config) -> dict[ProviderId, SearchProvider]:
+    retry = retry_policy_from_config(config)
     return {
         ProviderId("hive"): HiveWebSearchProvider(
             base_url=config.hive_base_url,
             api_key=config.hive_api_key,
             timeout_seconds=config.provider_timeout_seconds,
+            retry_policy=retry,
         ),
         ProviderId("google"): GoogleWebDetectionProvider(
             endpoint=config.google_vision_endpoint,
             api_key=config.google_vision_api_key,
             timeout_seconds=config.provider_timeout_seconds,
+            retry_policy=retry,
         ),
     }
+
+
+def build_control_store(
+    config: Config, pool: AsyncConnectionPool
+) -> PostgresProviderControlStore:
+    return PostgresProviderControlStore(
+        pool,
+        cache_seconds=config.provider_config_cache_seconds,
+        failure_threshold=config.provider_failure_threshold,
+        default_cooldown_seconds=config.breaker_cooldown_seconds,
+        max_cooldown_seconds=config.breaker_cooldown_max_seconds,
+    )
 
 
 async def handle_message(
@@ -94,6 +117,8 @@ async def handle_message(
     store: SearchStore,
     providers: dict[ProviderId, SearchProvider],
     calibration_store: CalibrationStore,
+    control: ProviderControlStore,
+    cadence: CadencePolicy,
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
 ) -> bool:
@@ -126,7 +151,7 @@ async def handle_message(
         # and a config activated mid-run must not split that run's results
         # across two rulesets.
         policy = await calibration_store.load_active_policy()
-        await execute_run(claim, providers, store, policy)
+        await execute_run(claim, providers, store, policy, control, cadence)
     except Exception as exc:  # broad on purpose: crash = leave for redelivery
         log.error("worker.run_execution_failed", run_id=str(payload.id), error=str(exc))
         return False
@@ -147,6 +172,8 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
     await pool.open()
     store = PostgresSearchStore(pool)
     calibration_store = PostgresCalibrationStore(pool)
+    control = build_control_store(config, pool)
+    cadence = cadence_policy_from_config(config)
 
     stop_requested = False
 
@@ -173,6 +200,8 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
                     store,
                     providers,
                     calibration_store,
+                    control,
+                    cadence,
                     logger=log,
                 )
                 if handled:

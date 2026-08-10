@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from imageshield.providers.ratelimit import RetryPolicy
 from imageshield.search.hive import HiveWebSearchProvider
 
 BASE = "https://api.thehive.ai"
@@ -26,11 +27,18 @@ def _ok_body(matches: list[dict[str, Any]], quality: str | None = "good") -> dic
     return {"status": [{"response": {"output": output}}]}
 
 
-def _adapter(handler: Any) -> HiveWebSearchProvider:
+# Two retries rather than the config default of three: enough to prove the
+# bound without making every 429 test wait on four round trips. jitter_fraction
+# 0 keeps the (zero) waits deterministic.
+RETRY = RetryPolicy(max_retries=2, max_wait_seconds=1.0, jitter_fraction=0.0)
+
+
+def _adapter(handler: Any, retry: RetryPolicy = RETRY) -> HiveWebSearchProvider:
     return HiveWebSearchProvider(
         base_url=BASE,
         api_key="k-test",
         timeout_seconds=5.0,
+        retry_policy=retry,
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
@@ -136,9 +144,10 @@ async def test_429_retries_once_then_succeeds() -> None:
     assert len(calls) == 2
     assert result.status == "ok"
     assert len(result.matches) == 1
+    assert result.attempts == 2  # recorded on provider_calls.attempt
 
 
-async def test_429_twice_is_rate_limited_not_infinite() -> None:
+async def test_persistent_429_is_rate_limited_and_bounded() -> None:
     calls: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -146,8 +155,11 @@ async def test_429_twice_is_rate_limited_not_infinite() -> None:
         return httpx.Response(429, headers={"retry-after": "0"}, json={"why": "still no"})
 
     result = await _adapter(handler).search("https://seed/s.jpg")
-    assert len(calls) == 2  # exactly one retry — bounded, unlike the old lambda
+    # 1 initial + PROVIDER_MAX_RETRIES retries, then stop. Bounded, unlike the
+    # old lambda's unbounded recursion (weeklyInfringementScanner.js:1148).
+    assert len(calls) == 1 + RETRY.max_retries
     assert result.status == "rate_limited"
+    assert result.attempts == 1 + RETRY.max_retries
     assert result.http_status == 429
     assert result.matches == []
     assert result.raw_response == {"why": "still no"}
