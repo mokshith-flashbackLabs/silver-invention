@@ -29,7 +29,7 @@ from imageshield.db.connection import make_async_pool
 from imageshield.http.app import create_app
 from imageshield.search.store import PostgresSearchStore
 from imageshield.types import ProviderId, UserRef
-from tests.db import run_migrate
+from tests.db import ensure_subject, run_migrate
 from tests.db import throwaway_db as throwaway_db  # re-exported for fixture discovery
 
 if sys.platform == "win32":
@@ -60,7 +60,8 @@ VALID_ENV: dict[str, str] = {
     "REKOGNITION_COLLECTION_ID": "identity-v1",
     "LIVENESS_MIN_CONFIDENCE": "90",
     "FACE_MATCH_THRESHOLD": "95",
-    "MIN_ENROLMENT_AGE": "18",
+    "MIN_ENROLMENT_AGE": "13",
+    "MIN_DISCOVERY_AGE": "18",
     "LIVENESS_SESSION_TTL_SECONDS": "600",
     "LIVENESS_MAX_ATTEMPTS_24H": "5",
     "HIVE_API_KEY": "hive-key-for-tests",
@@ -81,7 +82,8 @@ def make_config(**overrides: Any) -> Config:
         "rekognition_collection_id": "identity-v1",
         "liveness_min_confidence": 90.0,
         "face_match_threshold": 95.0,
-        "min_enrolment_age": 18,
+        "min_enrolment_age": 13,
+        "min_discovery_age": 18,
         "liveness_session_ttl_seconds": 600,
         "liveness_max_attempts_24h": 5,
         "hive_api_key": "hive-key-for-tests",
@@ -128,6 +130,9 @@ async def search_fixture(
     try:
         store = PostgresSearchStore(pool)
         user_ref = UserRef(uuid4())
+        # Step 8: search_seeds FKs to subjects. Production writes this row inside
+        # the enrolment transaction; a fixture that starts from a seed asserts it.
+        await ensure_subject(pool, user_ref)
         seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
         run_id = await store.create_run(
             user_ref, seed_id, (ProviderId("hive"), ProviderId("google"))
@@ -434,6 +439,7 @@ async def banded_infringements(calibration_store: Any) -> BandedFixture:
 
     store = PostgresSearchStore(calibration_store._pool)
     user_ref = UserRef(uuid4())
+    await ensure_subject(calibration_store._pool, user_ref)
     seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
     run_id = await store.create_run(
         user_ref, seed_id, (ProviderId("hive"), ProviderId("google"))
@@ -445,6 +451,7 @@ async def banded_infringements(calibration_store: Any) -> BandedFixture:
     # Two users, because "how many people does this retune affect" is the
     # number replay exists to report and a single-user fixture cannot prove it.
     second_user = UserRef(uuid4())
+    await ensure_subject(calibration_store._pool, second_user)
     for owner, scores in (
         (user_ref, ("0.60", "0.80", "0.99")),
         (second_user, ("0.65", "0.97")),

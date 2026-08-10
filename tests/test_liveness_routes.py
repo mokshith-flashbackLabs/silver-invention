@@ -46,6 +46,8 @@ from imageshield.liveness.models import (
     ProviderResult,
     UploadError,
 )
+from imageshield.subjects.models import Eligibility
+from imageshield.types import UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
 
 AUTH = {"X-Service-Token": SERVICE_TOKEN}
@@ -83,6 +85,9 @@ class FakeLivenessStore:
         self.rows: dict[UUID, LivenessSessionRow] = {}
         self.enrolments: dict[UUID, EnrolmentRow] = {}  # keyed by session_id
         self.notifies: list[str] = []
+        # Written only by finalize_enrolled, in the same call that writes the
+        # enrolment row — the fake mirrors the real store's one transaction.
+        self.subjects: dict[UserRef, Eligibility] = {}
 
     def add(self, row: LivenessSessionRow) -> LivenessSessionRow:
         self.rows[row.session_id] = row
@@ -166,9 +171,13 @@ class FakeLivenessStore:
         reference_image_uri: str,
         audit_image_uris: tuple[str, ...],
         enrolment: NewEnrolment,
+        eligibility: Eligibility,
     ) -> tuple[LivenessSessionRow, EnrolmentRow] | None:
         if self.rows[session_id].completed_at is not None:
             return None
+        # Step 8: the subjects row joins the enrolment transaction. Recorded on
+        # the fake so a test can assert the pairing without a database.
+        self.subjects[UserRef(enrolment.user_ref)] = eligibility
         row = self.set(
             session_id,
             status="consumed",
@@ -329,6 +338,9 @@ class Harness:
                     "https://proxy-s3.example/audit-0.jpg?X-Amz-Signature=def",
                     "https://proxy-s3.example/audit-1.jpg?X-Amz-Signature=ghi",
                 ],
+                # Step 8: required, no default. The tests that specifically
+                # exercise its absence pass an explicit body without it.
+                "subject_is_adult": True,
             }
         return self.client.post(f"/v1/liveness/{session_id}/result", json=body, headers=merged)
 
@@ -584,7 +596,11 @@ def test_result_non_http_presigned_url_is_400() -> None:
 
     response = h.result(
         row.session_id,
-        body={"reference_put_url": "file:///etc/passwd", "audit_put_urls": []},
+        body={
+            "reference_put_url": "file:///etc/passwd",
+            "audit_put_urls": [],
+            "subject_is_adult": True,
+        },
     )
 
     assert response.status_code == 400
@@ -813,6 +829,93 @@ def test_passed_session_enrols_and_consumes() -> None:
     enrolment = h.store.enrolments[row.session_id]
     assert enrolment.source_object_uri == "https://proxy-s3.example/ref.jpg"
     assert h.store.notifies == [str(row.session_id)]
+    # Step 8: the subject row is written by the same call that writes the
+    # enrolment row, and nothing else writes it.
+    eligibility = h.store.subjects[UserRef(row.user_ref)]
+    assert (eligibility.discovery_eligible, eligibility.eligibility_reason) == (
+        True,
+        "adult",
+    )
+
+
+# ── Step 8: subject_is_adult is required, with no default ────────────────
+
+
+def _result_body(**overrides: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "reference_put_url": "https://proxy-s3.example/ref.jpg?X-Amz-Signature=abc",
+        "audit_put_urls": [],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_a_missing_subject_is_adult_is_400_and_writes_no_enrolment() -> None:
+    """Step-8 done-when. No default in either direction: defaulting true scans a
+    minor, defaulting false silently breaks adult monitoring. Both fail
+    quietly, which is why the field is mandatory rather than inferred."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id, _result_body())
+
+    assert response.status_code == 400
+    assert error_body(response)["code"] == "subject_eligibility_required"
+    # Nothing happened: no enrolment, no subject row, no index call, and the
+    # session is untouched so the proxy can retry with the field present.
+    assert h.store.enrolments == {}
+    assert h.store.subjects == {}
+    assert h.face_index.index_calls == []
+    assert h.store.rows[row.session_id].completed_at is None
+
+
+def test_a_non_boolean_subject_is_adult_is_a_422_not_a_coerced_true() -> None:
+    """"yes" and 1 must not silently become True. The whole reason this field is
+    mandatory is that a wrong value is invisible."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id, _result_body(subject_is_adult="maybe"))
+
+    assert response.status_code == 422
+    assert h.store.subjects == {}
+
+
+def test_a_minor_enrols_successfully_but_is_marked_ineligible() -> None:
+    """Minors enrol in v1 — consent, guardianship and household seats all work.
+    Enrolment succeeds; discovery is what must not run for them, and the refusal
+    happens at dispatch on the strength of this row."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(
+        row.session_id,
+        _result_body(subject_is_adult=False),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["enrolled"] is True
+    assert h.store.enrolments[row.session_id].user_ref == row.user_ref
+    eligibility = h.store.subjects[UserRef(row.user_ref)]
+    assert eligibility.discovery_eligible is False
+    assert eligibility.eligibility_reason == "minor_discovery_deferred"
+
+
+def test_a_quality_rejected_session_writes_no_subject_row() -> None:
+    """No enrolment, so no subject — and therefore no seed and no discovery.
+    That is the safe direction: an absent subject row refuses discovery."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    h.face_index.next_result = IndexRejected(reasons=("EXCEEDS_MAX_FACES",))
+
+    response = h.result(row.session_id)
+
+    assert response.json()["enrolled"] is False
+    assert h.store.subjects == {}
 
 
 def test_lookalike_users_enrol_as_two_distinct_identities() -> None:

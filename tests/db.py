@@ -26,6 +26,9 @@ from urllib.parse import urlsplit, urlunsplit
 import psycopg
 import pytest
 from psycopg import sql
+from psycopg_pool import AsyncConnectionPool
+
+from imageshield.types import UserRef
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATE_SCRIPT = ROOT / "scripts" / "migrate.py"
@@ -114,6 +117,22 @@ def second_throwaway_db(throwaway_db: str) -> Iterator[str]:
         yield db_url
     finally:
         _drop_scratch_database(maintenance_url, db_name)
+
+
+async def ensure_subject(
+    pool: AsyncConnectionPool, user_ref: UserRef, *, adult: bool = True
+) -> None:
+    """Register ``user_ref`` as a subject so a seed can reference it.
+
+    Step 8 gave ``search_seeds.user_ref`` a foreign key to ``subjects``, which
+    means an unparented seed is no longer creatable — the point of the
+    constraint. Production writes this row inside the enrolment transaction;
+    tests that start from a seed rather than an enrolment call this instead.
+    """
+    from imageshield.subjects.eligibility import eligibility_for
+    from imageshield.subjects.store import PostgresSubjectStore
+
+    await PostgresSubjectStore(pool).upsert_subject(user_ref, eligibility_for(adult))
 
 
 def run_migrate(database_url: str, *args: str) -> subprocess.CompletedProcess[str]:

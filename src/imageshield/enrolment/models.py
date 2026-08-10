@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
+from imageshield.types import UserRef
+
 # Stored in liveness_sessions.failure_reason when IndexFaces' HIGH quality
 # filter rejects the frame, and surfaced verbatim as the response `reason` so
 # the proxy can tell "liveness passed, enrolment didn't" apart and start a
@@ -17,7 +19,10 @@ QUALITY_REJECTED_REASON = "quality_rejected"
 class NewEnrolment:
     """What the route hands the store after a successful IndexFaces."""
 
-    user_ref: UUID
+    # UserRef, not a bare UUID: step 8 passes this straight into the subjects
+    # upsert inside the enrolment transaction, and the whole point of the
+    # NewType is that a session_id cannot arrive there by accident.
+    user_ref: UserRef
     collection_id: str
     external_face_id: str
     quality_score: float | None

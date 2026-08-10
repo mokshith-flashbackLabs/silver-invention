@@ -23,6 +23,8 @@ from imageshield.db.connection import make_async_pool
 from imageshield.enrolment.models import QUALITY_REJECTED_REASON, NewEnrolment
 from imageshield.liveness.models import CreateRejection, LivenessSessionRow
 from imageshield.liveness.store import PostgresLivenessStore
+from imageshield.subjects.eligibility import eligibility_for
+from imageshield.types import UserRef
 from tests.db import run_migrate
 
 
@@ -248,9 +250,9 @@ async def test_get_unknown_session_returns_none(store: PostgresLivenessStore) ->
 # --- Step 4: finalize_enrolled / finalize_quality_rejected -------------------
 
 
-def _new_enrolment(user_ref: object) -> NewEnrolment:
+def _new_enrolment(user_ref: UserRef) -> NewEnrolment:
     return NewEnrolment(
-        user_ref=user_ref,  # type: ignore[arg-type]
+        user_ref=user_ref,
         collection_id="identity-v1",
         external_face_id=f"face-{uuid4()}",
         quality_score=99.5,
@@ -271,6 +273,7 @@ async def test_finalize_enrolled_consumes_and_inserts_atomically(
         reference_image_uri="https://proxy-s3.example/ref.jpg",
         audit_image_uris=("https://proxy-s3.example/audit-0.jpg",),
         enrolment=_new_enrolment(row.user_ref),
+        eligibility=eligibility_for(True),
     )
 
     assert outcome is not None
@@ -284,6 +287,101 @@ async def test_finalize_enrolled_consumes_and_inserts_atomically(
     assert enrolment.user_ref == row.user_ref
     assert enrolment.status == "active"
     assert enrolment.model_id == "rekognition:7.0"
+
+
+async def test_the_subject_row_and_the_enrolment_row_commit_together(
+    store: PostgresLivenessStore, migrated_db: str
+) -> None:
+    """Step-8 done-when: the subject row and enrolment row commit in ONE
+    transaction — kill between and confirm neither.
+
+    Killing a process mid-transaction is not directly reproducible in-process,
+    so this proves the equivalent guarantee at the level Postgres enforces it:
+    a forced abort inside the transaction leaves NOTHING, including the session
+    consumption that happens first. There is no interleaving in which an
+    enrolment exists without its eligibility flag, or vice versa.
+    """
+    row = await _create(store)
+    duplicate_face = _new_enrolment(row.user_ref)
+
+    # Second session, same external_face_id. enrolments_face_uniq aborts the
+    # transaction AFTER the session UPDATE and the subjects upsert have run.
+    await store.finalize_enrolled(
+        row.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+        enrolment=duplicate_face,
+        eligibility=eligibility_for(True),
+    )
+    second = await _create(store)
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await store.finalize_enrolled(
+            second.session_id,
+            confidence=98.7,
+            reference_image_uri="https://proxy-s3.example/ref2.jpg",
+            audit_image_uris=(),
+            enrolment=duplicate_face,
+            eligibility=eligibility_for(False),  # would flip the flag, if it landed
+        )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        # The second session is untouched...
+        assert conn.execute(
+            "SELECT status FROM liveness_sessions WHERE session_id = %s",
+            (second.session_id,),
+        ).fetchone() == ("created",)
+        # ...and the first subject's flag was NOT overwritten by the aborted
+        # transaction's ineligible assertion.
+        assert conn.execute(
+            "SELECT discovery_eligible, eligibility_reason FROM subjects"
+            " WHERE user_ref = %s",
+            (row.user_ref,),
+        ).fetchone() == (True, "adult")
+        assert conn.execute("SELECT count(*) FROM enrolments").fetchone() == (1,)
+
+
+async def test_finalize_enrolled_writes_the_subject_row_in_the_same_call(
+    store: PostgresLivenessStore, migrated_db: str
+) -> None:
+    row = await _create(store)
+
+    await store.finalize_enrolled(
+        row.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+        enrolment=_new_enrolment(row.user_ref),
+        eligibility=eligibility_for(False),
+    )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(
+            "SELECT discovery_eligible, eligibility_reason FROM subjects"
+            " WHERE user_ref = %s",
+            (row.user_ref,),
+        ).fetchone() == (False, "minor_discovery_deferred")
+
+
+async def test_quality_rejection_writes_no_subject_row(
+    store: PostgresLivenessStore, migrated_db: str
+) -> None:
+    """Only the enrolling path asserts eligibility. No enrolment means no
+    subject, which means no seed and no discovery — the safe direction."""
+    row = await _create(store)
+
+    await store.finalize_quality_rejected(
+        row.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+    )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM subjects WHERE user_ref = %s", (row.user_ref,)
+        ).fetchone() == (0,)
 
 
 async def test_finalize_enrolled_returns_none_when_already_finalized(
@@ -305,6 +403,7 @@ async def test_finalize_enrolled_returns_none_when_already_finalized(
         reference_image_uri="https://proxy-s3.example/ref.jpg",
         audit_image_uris=(),
         enrolment=_new_enrolment(row.user_ref),
+        eligibility=eligibility_for(True),
     )
 
     assert outcome is None  # and, per the FK, no enrolment row can exist
@@ -351,6 +450,7 @@ async def test_finalize_enrolled_emits_notify_in_the_transaction(
             reference_image_uri="https://proxy-s3.example/ref.jpg",
             audit_image_uris=(),
             enrolment=_new_enrolment(row.user_ref),
+            eligibility=eligibility_for(True),
         )
 
         gen = listener.notifies()

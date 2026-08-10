@@ -17,6 +17,8 @@ from psycopg_pool import AsyncConnectionPool
 from imageshield.enrolment.models import QUALITY_REJECTED_REASON, EnrolmentRow, NewEnrolment
 from imageshield.enrolment.store import to_enrolment_row
 from imageshield.liveness.models import CreateRejection, LivenessSessionRow
+from imageshield.subjects.models import Eligibility
+from imageshield.subjects.store import upsert_subject
 from imageshield.types import SessionId, UserRef
 
 _COLUMNS = (
@@ -154,6 +156,7 @@ class LivenessStore(Protocol):
         reference_image_uri: str,
         audit_image_uris: tuple[str, ...],
         enrolment: NewEnrolment,
+        eligibility: Eligibility,
     ) -> tuple[LivenessSessionRow, EnrolmentRow] | None: ...
 
     async def finalize_quality_rejected(
@@ -322,7 +325,21 @@ class PostgresLivenessStore:
         reference_image_uri: str,
         audit_image_uris: tuple[str, ...],
         enrolment: NewEnrolment,
+        eligibility: Eligibility,
     ) -> tuple[LivenessSessionRow, EnrolmentRow] | None:
+        """Session consumption + subject row + enrolment row + NOTIFY, all in
+        ONE transaction (step 8).
+
+        The subject upsert sits deliberately BEFORE the enrolments insert:
+        enrolment is what creates the subject, and migration 0008 notes the FK
+        from ``enrolments.user_ref`` to ``subjects`` as follow-up. Writing in
+        this order is what makes adding that constraint a one-line migration
+        rather than a reordering exercise.
+
+        Neither row can exist without the other. Killing the process between
+        them leaves nothing behind: no enrolment claiming a subject that has no
+        eligibility flag, and no subject row for someone who never enrolled.
+        """
         async with self._pool.connection() as conn, conn.transaction():
             cur = await conn.execute(
                 _CONSUME_SQL,
@@ -337,6 +354,7 @@ class PostgresLivenessStore:
             session_record = await cur.fetchone()
             if session_record is None:
                 return None  # concurrent finalizer won; caller compensates
+            await upsert_subject(conn, enrolment.user_ref, eligibility)
             cur = await conn.execute(
                 _INSERT_ENROLMENT_SQL,
                 {

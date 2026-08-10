@@ -28,6 +28,12 @@ ONE transaction. Quality rejection consumes the session without enrolling
 (response ``reason='quality_rejected'``); a transient indexing failure is a
 503 that writes and consumes nothing, so the proxy retries with the same
 ``Idempotency-Key``.
+
+Step 8: the result call also carries ``subject_is_adult``, and the ``subjects``
+row joins that same transaction. It is required with no default — see
+``imageshield.subjects.eligibility``. Only the enrolling path writes it: a
+failed or quality-rejected session leaves no subject row, so no seed can be
+created for that user and discovery cannot run. That is the safe direction.
 """
 
 from __future__ import annotations
@@ -72,6 +78,7 @@ from imageshield.liveness.models import (
 from imageshield.liveness.provider import LivenessProvider
 from imageshield.liveness.store import LivenessStore
 from imageshield.liveness.uploader import ObjectUploader
+from imageshield.subjects.eligibility import eligibility_for
 from imageshield.types import SessionId, UserRef
 
 log = structlog.get_logger("imageshield.liveness")
@@ -216,6 +223,19 @@ async def post_liveness_result(
             "reference_put_url and audit_put_urls are required.",
             retryable=False,
         )
+    if body.subject_is_adult is None:
+        # No default, by design (step 8). Defaulting true scans a minor;
+        # defaulting false silently breaks adult monitoring. Both fail quietly.
+        raise ServiceError(
+            400,
+            "subject_eligibility_required",
+            "subject_is_adult is required: the proxy must compute it from DOB"
+            f" against MIN_DISCOVERY_AGE ({cfg.min_discovery_age}). There is no"
+            " default — one direction would scan a minor and the other would"
+            " silently stop monitoring an adult.",
+            retryable=False,
+        )
+    eligibility = eligibility_for(body.subject_is_adult)
     _require_presigned(body.reference_put_url)
     for url in body.audit_put_urls:
         _require_presigned(url)
@@ -389,6 +409,7 @@ async def post_liveness_result(
             model_id=indexed.model_id,
             source_object_uri=source_object_uri,
         ),
+        eligibility=eligibility,
     )
     if outcome is None:
         # A concurrent result call finalized first — the face just indexed is

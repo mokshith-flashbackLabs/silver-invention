@@ -13,6 +13,8 @@ from imageshield.enrolment.models import NewEnrolment
 from imageshield.enrolment.store import PostgresEnrolmentStore
 from imageshield.liveness.models import LivenessSessionRow
 from imageshield.liveness.store import PostgresLivenessStore
+from imageshield.subjects.eligibility import eligibility_for
+from imageshield.types import UserRef
 from tests.db import run_migrate
 
 
@@ -36,10 +38,10 @@ async def stores(
         await pool.close()
 
 
-async def _enrol_user(liveness: PostgresLivenessStore, user_ref: object) -> str:
+async def _enrol_user(liveness: PostgresLivenessStore, user_ref: UserRef) -> str:
     """Create + pass + enrol one session; return the external_face_id."""
     row = await liveness.create_session(
-        user_ref=user_ref,  # type: ignore[arg-type]
+        user_ref=user_ref,
         provider_session_id=f"prov-{uuid4()}",
         ttl_seconds=600,
         max_attempts_24h=5,
@@ -52,13 +54,14 @@ async def _enrol_user(liveness: PostgresLivenessStore, user_ref: object) -> str:
         reference_image_uri="https://proxy-s3.example/ref.jpg",
         audit_image_uris=(),
         enrolment=NewEnrolment(
-            user_ref=user_ref,  # type: ignore[arg-type]
+            user_ref=user_ref,
             collection_id="identity-v1",
             external_face_id=face_id,
             quality_score=99.0,
             model_id="rekognition:7.0",
             source_object_uri="https://proxy-s3.example/ref.jpg",
         ),
+        eligibility=eligibility_for(True),
     )
     assert outcome is not None
     return face_id
@@ -68,11 +71,11 @@ async def test_get_active_returns_only_this_users_active_rows(
     stores: tuple[PostgresLivenessStore, PostgresEnrolmentStore],
 ) -> None:
     liveness, enrolments = stores
-    user_ref, other = uuid4(), uuid4()
+    user_ref, other = UserRef(uuid4()), UserRef(uuid4())
     face_id = await _enrol_user(liveness, user_ref)
     await _enrol_user(liveness, other)
 
-    active = await enrolments.get_active_enrolments(user_ref)  # type: ignore[arg-type]
+    active = await enrolments.get_active_enrolments(user_ref)
 
     assert [e.external_face_id for e in active] == [face_id]
     assert all(e.status == "active" for e in active)
@@ -82,11 +85,11 @@ async def test_tombstone_flips_status_and_is_idempotent(
     stores: tuple[PostgresLivenessStore, PostgresEnrolmentStore],
 ) -> None:
     liveness, enrolments = stores
-    user_ref = uuid4()
+    user_ref = UserRef(uuid4())
     await _enrol_user(liveness, user_ref)
 
-    first = await enrolments.tombstone_enrolments(user_ref)  # type: ignore[arg-type]
-    second = await enrolments.tombstone_enrolments(user_ref)  # type: ignore[arg-type]
+    first = await enrolments.tombstone_enrolments(user_ref)
+    second = await enrolments.tombstone_enrolments(user_ref)
 
     assert first == 1
     assert second == 0  # nothing active left: idempotent
