@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from imageshield.types import UserRef
 
@@ -49,12 +49,19 @@ class LivenessSessionCreateResponse(BaseModel):
 
 
 class LivenessResultRequest(ServiceModel):
-    """Both URL fields are semantically required; they are Optional here only
-    so their absence maps to the contract's 400 (presigned_urls_missing)
-    rather than pydantic's 422 — the step-3 spec pins the status code."""
+    """All three fields are semantically required; they are Optional here only
+    so their absence maps to the contract's 400 (presigned_urls_missing /
+    subject_eligibility_required) rather than pydantic's 422 — the step-3 and
+    step-8 specs pin the status codes."""
 
     reference_put_url: str | None = None
     audit_put_urls: list[str] | None = None
+    # Computed by the proxy as `age >= MIN_DISCOVERY_AGE` against a DOB this
+    # service never sees. NO DEFAULT, and the absence is a 400: defaulting true
+    # scans a minor, defaulting false silently breaks adult monitoring. Both
+    # fail quietly, which is exactly why the field is mandatory rather than
+    # inferred (step-8 brief).
+    subject_is_adult: bool | None = None
 
 
 class LivenessResultResponse(BaseModel):
@@ -71,6 +78,14 @@ class LivenessStatusResponse(BaseModel):
     status: Literal["created", "pending", "passed", "failed", "expired", "consumed"]
     confidence: float | None
     enrolled: bool = False
+
+
+class SubjectResponse(BaseModel):
+    """What the proxy can ask about a subject. Deliberately two fields: this is
+    the eligibility answer, not a user record — we have no user model."""
+
+    discovery_eligible: bool
+    eligibility_reason: Literal["adult", "minor_discovery_deferred"]
 
 
 class SeedCreateRequest(ServiceModel):
@@ -103,12 +118,24 @@ class SearchCreateResponse(BaseModel):
 
 
 class SearchRunStatusResponse(BaseModel):
-    status: Literal["queued", "running", "completed"]
+    # 'refused' means the subject stopped being eligible for discovery between
+    # this run being enqueued and a worker claiming it. It must stay distinct
+    # from 'completed': the proxy has to be able to tell a user "we did not
+    # search" rather than "we searched and found nothing" (INVARIANTS #8b).
+    status: Literal["queued", "running", "completed", "refused"]
     providers_attempted: list[str]
     # MUST stay distinguishable from providers_attempted: a silent provider
-    # outage must never look identical to "nothing found".
+    # outage must never look identical to "nothing found". Step 8 adds three
+    # more ways to be attempted-but-not-succeeded — kill switch, open breaker,
+    # exhausted budget — which is another reason the pair has to stay separate.
     providers_succeeded: list[str]
     matches_found: int
+    # Tiering must never be silent (step 8). The proxy needs both of these to
+    # tell a user their real monitoring cadence: someone on 'dormant' who
+    # believes they are scanned weekly is being misled about a safety product.
+    scan_tier: Literal["new", "standard", "relaxed", "dormant", "priority"]
+    # None until the first completed scan sets it.
+    next_scan_after: datetime | None
 
 
 class AttestationItem(BaseModel):
@@ -146,3 +173,54 @@ class InfringementItem(BaseModel):
 
 class InfringementsResponse(BaseModel):
     infringements: list[InfringementItem]
+
+
+class ProviderReasonRequest(ServiceModel):
+    """A reason is mandatory on every admin write.
+
+    Not paperwork: ``providers.enabled = false`` with no recorded reason is the
+    state where nobody remembers whether the provider is off because of a
+    billing surprise, a vendor breach, or a test somebody forgot to undo — and
+    the difference decides whether turning it back on is safe.
+    """
+
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ProviderDisableRequest(ProviderReasonRequest):
+    """Same shape as its parent, named separately because the step-8 contract
+    pins ``{ reason }`` on ``disable`` specifically."""
+
+
+class ProviderAdminResponse(BaseModel):
+    provider_id: str
+    enabled: bool | None = None
+    breaker_state: str | None = None
+
+
+class ProviderHealthItem(BaseModel):
+    provider_id: str
+    enabled: bool
+    breaker_state: str
+    breaker_reason: str | None
+    call_count: int
+    # Money crosses this boundary as a decimal STRING, never a JSON number: a
+    # float round-trip is exactly the drift the Decimal columns exist to avoid.
+    cost_usd: str
+    daily_budget_usd: str | None
+    monthly_budget_usd: str | None
+    month_to_date_cost_usd: str
+    budget_headroom_usd: str | None
+    # None when the window held no calls — not the same fact as a 0.0 rate.
+    success_rate: float | None
+    window_call_count: int
+    successful_calls_24h: int
+    latency_p50_ms: int | None
+    latency_p99_ms: int | None
+    alarms: list[dict[str, str]]
+
+
+class ProviderHealthResponse(BaseModel):
+    as_of: datetime
+    window_hours: int
+    providers: list[ProviderHealthItem]

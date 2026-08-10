@@ -29,15 +29,20 @@ from imageshield.enrolment.faceindex import RekognitionFaceIndex
 from imageshield.enrolment.store import PostgresEnrolmentStore
 from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
+from imageshield.http.routes.admin_providers import router as admin_providers_router
 from imageshield.http.routes.enrolments import router as enrolments_router
 from imageshield.http.routes.health import router as health_router
 from imageshield.http.routes.liveness import router as liveness_router
 from imageshield.http.routes.ping import admin_router, v1_router
 from imageshield.http.routes.search import router as search_router
+from imageshield.http.routes.subjects import router as subjects_router
 from imageshield.liveness.provider import RekognitionLivenessProvider
 from imageshield.liveness.store import PostgresLivenessStore
 from imageshield.liveness.uploader import HttpxObjectUploader
+from imageshield.providers.observability import PostgresProviderObservability
+from imageshield.providers.store import PostgresProviderControlStore
 from imageshield.search.store import PostgresSearchStore
+from imageshield.subjects.store import PostgresSubjectStore
 
 
 @asynccontextmanager
@@ -65,6 +70,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.enrolment_store = PostgresEnrolmentStore(pool)
     if getattr(app.state, "search_store", None) is None:
         app.state.search_store = PostgresSearchStore(pool)
+    if getattr(app.state, "subject_store", None) is None:
+        app.state.subject_store = PostgresSubjectStore(pool)
+    if getattr(app.state, "provider_control_store", None) is None:
+        app.state.provider_control_store = PostgresProviderControlStore(
+            pool,
+            cache_seconds=cfg.provider_config_cache_seconds,
+            failure_threshold=cfg.provider_failure_threshold,
+            default_cooldown_seconds=cfg.breaker_cooldown_seconds,
+            max_cooldown_seconds=cfg.breaker_cooldown_max_seconds,
+        )
+    if getattr(app.state, "provider_observability", None) is None:
+        app.state.provider_observability = PostgresProviderObservability(pool)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     if cfg.auth_disabled:
@@ -101,5 +118,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(liveness_router)
     app.include_router(enrolments_router)
     app.include_router(search_router)
+    app.include_router(subjects_router)
     app.include_router(admin_router)
+    app.include_router(admin_providers_router)
     return app

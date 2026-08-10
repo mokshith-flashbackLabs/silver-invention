@@ -22,19 +22,19 @@ def test_right_token_gets_200(client: TestClient) -> None:
 
 
 def test_admin_route_needs_both_tokens(client: TestClient) -> None:
-    assert client.get("/admin/ping").status_code == 401
+    assert client.get("/v1/admin/ping").status_code == 401
     assert (
-        client.get("/admin/ping", headers={"X-Service-Token": SERVICE_TOKEN}).status_code == 401
+        client.get("/v1/admin/ping", headers={"X-Service-Token": SERVICE_TOKEN}).status_code == 401
     )
     # Admin token alone is not enough either — admin is *in addition to* service.
     assert (
         client.get(
-            "/admin/ping", headers={"X-Admin-Service-Token": ADMIN_SERVICE_TOKEN}
+            "/v1/admin/ping", headers={"X-Admin-Service-Token": ADMIN_SERVICE_TOKEN}
         ).status_code
         == 401
     )
     response = client.get(
-        "/admin/ping",
+        "/v1/admin/ping",
         headers={
             "X-Service-Token": SERVICE_TOKEN,
             "X-Admin-Service-Token": ADMIN_SERVICE_TOKEN,
@@ -45,7 +45,7 @@ def test_admin_route_needs_both_tokens(client: TestClient) -> None:
 
 def test_service_token_is_not_valid_as_admin_token(client: TestClient) -> None:
     response = client.get(
-        "/admin/ping",
+        "/v1/admin/ping",
         headers={
             "X-Service-Token": SERVICE_TOKEN,
             "X-Admin-Service-Token": SERVICE_TOKEN,

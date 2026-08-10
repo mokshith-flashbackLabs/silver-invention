@@ -23,7 +23,10 @@ if TYPE_CHECKING:
     from imageshield.liveness.provider import LivenessProvider
     from imageshield.liveness.store import LivenessStore
     from imageshield.liveness.uploader import ObjectUploader
+    from imageshield.providers.observability import ProviderObservability
+    from imageshield.providers.store import ProviderControlStore
     from imageshield.search.store import SearchStore
+    from imageshield.subjects.store import SubjectStore
 
 DbCheck = Callable[[], Awaitable[None]]
 
@@ -85,3 +88,18 @@ def get_enrolment_store(request: Request) -> EnrolmentStore:
 def get_search_store(request: Request) -> SearchStore:
     store: SearchStore = _required_state(request, "search_store")  # type: ignore[assignment]
     return store
+
+
+def get_subject_store(request: Request) -> SubjectStore:
+    store: SubjectStore = _required_state(request, "subject_store")  # type: ignore[assignment]
+    return store
+
+
+def get_provider_control_store(request: Request) -> ProviderControlStore:
+    store: ProviderControlStore = _required_state(request, "provider_control_store")  # type: ignore[assignment]
+    return store
+
+
+def get_provider_observability(request: Request) -> ProviderObservability:
+    obs: ProviderObservability = _required_state(request, "provider_observability")  # type: ignore[assignment]
+    return obs
