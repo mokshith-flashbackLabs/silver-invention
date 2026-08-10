@@ -327,13 +327,24 @@ Until a provider is calibrated its results go into `review` band only — never 
 never `drop`. See `CLAUDE.md` §7.3 for the two keys, and
 `docs/superpowers/specs/2026-08-07-step-7-calibration-banding-design.md` for the full design.
 
-## 2.4 Cost and failure isolation
+## 2.4 Cost and failure isolation — **built** (step 8)
 
 - Per-provider daily budget cap, enforced before dispatch. Circuit-breaks when exceeded.
 - Per-provider kill switch in config, hot-reloadable.
 - One provider failing never fails the run — record it in `providers_succeeded` and continue.
 - Log `cost_usd` per run. N providers × M users × weekly cadence multiplies fast.
 - Exponential backoff with jitter; respect provider rate limits as hard caps, not targets.
+
+Built as `src/imageshield/providers/`. Three corrections this section needed once it met the code:
+
+- **"Circuit-breaks when exceeded" conflated two things.** A budget skip and a breaker trip are
+  different: budget exhaustion is not a provider fault and must not open a breaker, or a cheap day
+  would take a healthy provider out of rotation. They are separate statuses and separate steps of the
+  guard chain (INVARIANTS #37, #40).
+- **A skip has to be recorded, not just "continued past".** Otherwise partial coverage is invisible and
+  reads as "found nothing" (#41).
+- **Cadence was missing entirely**, and it is the only lever here that reduces cost rather than
+  capping it — see §2.6.
 
 ## 2.5 Done when
 
@@ -343,6 +354,25 @@ never `drop`. See `CLAUDE.md` §7.3 for the two keys, and
 - An uncalibrated provider cannot place a hit in `auto_confirm`
 - Replaying an identical provider response creates no duplicate hit
 - `cost_usd` is queryable per user per month
+
+## 2.6 Adaptive cadence and subject eligibility — **built** (step 8)
+
+Two additions this document did not anticipate, both from the step-8 brief.
+
+**Adaptive cadence** (`search/cadence.py`, migration 0009): `new` / `standard` / `relaxed` / `dormant`
+/ `priority` on `search_seeds`, recomputed after every run that actually looked. Weekly →
+fortnightly at 8 empty scans → monthly at 20; any non-empty scan promotes to weekly `priority`. A
+4–10× reduction, and the tier plus `next_scan_after` are exposed on `GET /v1/search/runs/{run_id}`
+because a user on `dormant` who thinks they are scanned weekly is being misled (INVARIANTS #42).
+
+The scheduler that *reads* `next_scan_after` is the recheck loop and is still out of scope.
+
+**Subject eligibility** (`subjects/`, migration 0008): `MIN_ENROLMENT_AGE` drops to 13 so minors can
+enrol — consent, guardianship, household seats — while `MIN_DISCOVERY_AGE` stays 18 and
+`POST /v1/search` refuses for anyone ineligible before a run row exists. Discovery for a minor would
+put CSAM in this pipeline, and screening/reporting are deferred, so nothing looks. INVARIANTS #8/#8b.
+
+This also closed a gap §1.2 left open: `subjects` is the first table to parent a `user_ref`.
 
 ---
 

@@ -250,7 +250,8 @@ is the third-party provider search that exists in the code today, and the two ar
 that will eventually feed the same report surface.
 
 Tables: `search_seeds`, `search_runs`, `content_urls`, `provider_calls`, `infringements`,
-`attestations`. Migrations `0001`, `0004`, `0005`, `0006`.
+`attestations`, `subjects`, `provider_spend`. Migrations `0001`, `0004`, `0005`, `0006`, `0007`,
+`0008`, `0009`.
 
 ### The thing found vs. the observation of it
 
@@ -505,6 +506,146 @@ bands over history when a provider retunes. One row per (run, provider) is bound
 JSONB is not, so `python -m imageshield.search.retention` nulls payloads older than
 `RAW_RESPONSE_RETENTION_DAYS` (default 90) and leaves the metadata row — status, http_status,
 latency, cost — intact.
+
+### Subject eligibility — **built** (step 8, migration 0008)
+
+The first table in this schema that parents a `user_ref`. Before it,
+`enrolments.user_ref`, `search_seeds.user_ref` and `infringements.user_ref` were unparented UUIDs with
+no subject record anywhere.
+
+```sql
+CREATE TABLE subjects (
+  user_ref            UUID PRIMARY KEY,
+  discovery_eligible  BOOLEAN NOT NULL,
+  eligibility_reason  TEXT NOT NULL
+                      CHECK (eligibility_reason IN ('adult','minor_discovery_deferred')),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- The pairing is enforced by the database, not by every writer: a row
+  -- claiming 'adult' AND ineligible is the exact corruption that would let a
+  -- minor be scanned while the reason column reads reassuringly.
+  CONSTRAINT subjects_reason_matches_flag CHECK (
+    (discovery_eligible = true  AND eligibility_reason = 'adult') OR
+    (discovery_eligible = false AND eligibility_reason = 'minor_discovery_deferred')
+  )
+);
+
+CREATE INDEX subjects_ineligible_idx ON subjects (user_ref) WHERE discovery_eligible = false;
+
+ALTER TABLE search_seeds
+  ADD CONSTRAINT search_seeds_subject_fk FOREIGN KEY (user_ref) REFERENCES subjects(user_ref);
+```
+
+Written **only** by the enrolment transaction (`liveness/store.py::finalize_enrolled`), from the
+required `subject_is_adult` field on `POST /v1/liveness/{sid}/result`, and in the same transaction as
+the `enrolments` row — subject first, so the follow-up FK from `enrolments` is a one-line migration.
+A failed or quality-rejected session writes no subject row, which is the safe direction: no subject
+means no seed and no discovery.
+
+`ON CONFLICT DO UPDATE ... WHERE discovery_eligible IS DISTINCT FROM EXCLUDED.discovery_eligible` —
+so a DOB correction applies, and `updated_at` means "the assertion changed" rather than "the user
+enrolled again". See INVARIANTS #8 / #8b for why the flag lives here and not in the request.
+
+Because the flag is mutable, **`discovery_eligible` is re-read on `claim_run`** and a run whose subject
+stopped being eligible between enqueue and dispatch is set to `search_runs.status = 'refused'` — never
+`completed`, which would read as "we looked and found nothing" about a search that never ran. The
+`LEFT JOIN` + `COALESCE(..., false)` makes a missing subject row read as ineligible rather than as an
+unclaimable run. INVARIANTS #43.
+
+The FK means `POST /v1/seeds` can now fail where it previously could not. `create_seed` translates
+`ForeignKeyViolation` into a domain error so the route answers `409 subject_unknown` — the same code
+`POST /v1/search` uses for the identical condition — rather than letting psycopg's exception escape as
+a bare `500` with none of the error envelope. Note that a **minor may hold seeds**: only discovery is
+refused for them, so `/v1/seeds` checks existence, not eligibility.
+
+**Follow-up:** the same FK on `enrolments`. Deferred in 0008 because enrolment is what creates the
+subject row; the intra-transaction ordering had to exist and be tested first.
+
+### Cost, breakers, kill switches, cadence — **built** (step 8, migration 0009)
+
+```sql
+ALTER TABLE providers
+  ADD COLUMN cost_per_call_usd  NUMERIC(10,6),
+  ADD COLUMN monthly_budget_usd NUMERIC(10,2),
+  ADD COLUMN rate_limit_per_min INT,
+  ADD COLUMN breaker_state      TEXT NOT NULL DEFAULT 'closed'
+                                CHECK (breaker_state IN ('closed','open','half_open')),
+  ADD COLUMN breaker_opened_at  TIMESTAMPTZ,
+  ADD COLUMN breaker_reason     TEXT,
+  -- Not in the step-8 sketch, and both required by the state machine:
+  -- the counter has to be durable (in-process state resets on deploy and is
+  -- per-worker), and doubling the cooldown needs the CURRENT cooldown.
+  ADD COLUMN breaker_consecutive_failures INT NOT NULL DEFAULT 0,
+  ADD COLUMN breaker_cooldown_seconds INT;
+
+-- `daily_budget_usd` already existed (0001) and is NOT re-added. It was
+-- declared before anything enforced it; 0009 is what starts enforcing it.
+
+ALTER TABLE provider_calls
+  ADD CONSTRAINT provider_calls_status_valid CHECK (
+    status IN ('ok','error','rate_limited','timeout',
+               'budget_exceeded','breaker_open','provider_disabled')
+  );
+
+-- Pre-aggregated, one row per provider per day.
+CREATE TABLE provider_spend (
+  provider_id   TEXT NOT NULL REFERENCES providers(provider_id),
+  spend_date    DATE NOT NULL,          -- UTC; a DST-shifting day boundary
+  call_count    INT NOT NULL DEFAULT 0, -- gives two 23h and two 25h days a year
+  cost_usd      NUMERIC(14,6) NOT NULL DEFAULT 0,   -- scale >= the price's scale
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider_id, spend_date)
+);
+
+ALTER TABLE search_seeds
+  ADD COLUMN scan_tier TEXT NOT NULL DEFAULT 'standard'
+             CHECK (scan_tier IN ('new','standard','relaxed','dormant','priority')),
+  ADD COLUMN next_scan_after TIMESTAMPTZ,
+  ADD COLUMN consecutive_empty_scans INT NOT NULL DEFAULT 0;
+
+CREATE INDEX seeds_due_idx ON search_seeds (next_scan_after) WHERE status = 'active';
+```
+
+Three things worth stating about these columns:
+
+**The accumulator's scale must be >= the price's scale.** `cost_usd` is `NUMERIC(14,6)` against a
+`NUMERIC(10,6)` `cost_per_call_usd`, and it was `NUMERIC(12,4)` until measurement showed why that is
+wrong: the upsert coerces each increment to the column type *before* adding, so a narrower column
+rounds every individual call rather than rounding the total once. Against Postgres 16 — ten calls at
+0.000250 stored 0.0030 (+20%, cap binds early, a provider with headroom gets skipped); ten at 0.000040
+stored 0.0000, so the accumulator never grows and a configured daily budget silently stops binding.
+That last one is a fail-open in the one check INVARIANTS #38 requires to fail closed. Google's 0.003500
+is exact at four decimals, which is the only reason it would not have shown today. See INVARIANTS #39b.
+
+**`provider_spend` exists so the request path never aggregates.** The budget guard reads exactly one
+row by primary key. `provider_calls` grows with every call ever made, so a `SUM` over it would make
+the guard protecting spend slower in proportion to how much has been spent (INVARIANTS #38). The
+`provider_calls` insert, the `provider_spend` upsert and the breaker transition share **one
+transaction** under a row lock on `providers` (#39).
+
+**`provider_calls.status`'s CHECK is load-bearing, not hygiene.** `providers_succeeded` is derived
+from it, so a typo'd status silently becomes a not-ok row — which reads downstream as coverage we did
+not have. The three step-8 values are skips: a provider that was *not called*, recorded rather than
+silent (#41).
+
+**Cost figures as shipped.** `google.cost_per_call_usd = 0.003500` — Cloud Vision Web Detection list
+price, USD 3.50 per 1000 units, one annotate request with one `WEB_DETECTION` feature = one unit.
+`hive.cost_per_call_usd` is deliberately **NULL**: Hive Web Search is contract-priced and no measured
+or quoted figure exists in this repo (the devtools harness measured the *liveness* cost, ≈USD 0.015,
+and nothing else). A budget enforced against an unsourced number is worse than no budget, because the
+error surfaces on an invoice. Both `daily_budget_usd` values are NULL, so behaviour is unchanged; a
+budget set *without* a cost fails closed (#38).
+
+**Follow-up:** fill `hive.cost_per_call_usd` and both `daily_budget_usd` values from the signed Hive
+agreement. Until then the mechanism is built and tested but enforcing nothing for hive.
+
+`monthly_budget_usd` is reported and alarmed on (`monthly_spend_near_budget`, the column's ONLY
+enforcement), **not** enforced at dispatch: the dispatch guard is
+deliberately one indexed row, and widening it to a month of rows would put a range scan on the request
+path. Month-to-date is computed in the admin observability read
+(`providers/observability.py`), which sums at most 31 pre-aggregated rows in Python — so there is no
+SQL aggregation over spend anywhere in `src/imageshield/providers/`, and the rule holds by inspection
+of the directory rather than by remembering which module is on which path.
 
 ---
 

@@ -187,6 +187,45 @@ transaction, and the `search:runs` worker (the queue's consumer, a separate proc
 relay) claims and executes it. One provider failing never fails the run;
 `search_runs.providers_succeeded` stays distinguishable from `providers_attempted`.
 
+### 3.6b Provider control plane (v1 — built, step 8)
+
+`src/imageshield/providers/` — the module that decides **whether to call a provider at all**. The
+adapters in §3.6 know how to talk to a provider; this knows whether they are allowed to.
+
+The whole of it is one ordered chain, run per provider at *dispatch* time in the worker:
+
+```
+ELIGIBILITY (whole request, in the route) → ENABLED → BREAKER → BUDGET → DISPATCH
+```
+
+Ordering is load-bearing: the cheapest and most absolute checks come first, so an eligibility refusal
+never consumes budget or trips a breaker. Steps 2–4 never fail the run — a skipped provider is
+recorded in `provider_calls` and stays in `providers_attempted` while being absent from
+`providers_succeeded`, exactly like a timeout, because partial coverage must stay visible.
+
+| Concern | Where | Notes |
+|---|---|---|
+| Guard chain | `gate.py` | The one place a pre-dispatch decision is made |
+| Budget | `budget.py` | One indexed `provider_spend` row, before the call. Unknown cost + set budget → fails closed |
+| Circuit breaker | `breaker.py` + `store.py` | 5 consecutive failures → open. 429 and zero-match 200s are **not** failures. Half-open probe claimed by a conditional `UPDATE`, so exactly one across N workers |
+| Rate limiting | `ratelimit.py` | One shared bounded, jittered 429 driver for both adapters |
+| Kill switch | `store.py` + `/v1/admin/providers/*` | `providers.enabled`, re-read within ≤30s. No deploy |
+| Metrics + alarms | `observability.py` | Calls, cost, success rate, p50/p99, headroom, month-to-date |
+
+Running the chain at dispatch rather than at request time is what makes a kill switch flipped *after*
+enqueue still prevent the call.
+
+Two subject-facing pieces sit alongside it. **`subjects`** (`subjects/`, migration 0008) is the first
+table in this schema to parent a `user_ref`, and it carries the one flag that stops discovery running
+for a minor — asserted once at enrolment, in the same transaction as the enrolment row. **Adaptive
+cadence** (`search/cadence.py`) demotes seeds that keep coming back empty and promotes any seed with a
+hit; it is the only cost lever here that reduces spend rather than capping it, and the tier is exposed
+on the run-status response because a user must not be told a cadence they are not on.
+
+The alarm that matters most is `no_successful_calls_24h`. A provider silently returning nothing looks
+exactly like a quiet week for infringements, and an undetected outage means users are told they are
+clear when nothing actually looked. Delivery of these alarms to CloudWatch is step 9.
+
 ### 3.7 Crop fetcher
 
 Its own deployable, on its own egress path, with **no VPC access to any internal service**.

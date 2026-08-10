@@ -127,8 +127,17 @@ code being written **now**, carrying the same numbers.
 7. **Deletion calls `DeleteFaces` first, verifies absence, then tombstones.** If the tombstone
    succeeds and the Rekognition call fails, the face stays searchable with no record pointing at it.
    The old repo calls `DeleteFaces` nowhere, under a comment claiming BIPA compliance.
-8. **`MIN_ENROLMENT_AGE` is read from config at request time.** v1 ships at 18. v2 lowers it. That
-   must not be a code change.
+8. **Both age floors are read from config at request time.** There are two, and the split is
+   load-bearing: `MIN_ENROLMENT_AGE = 13` (who may enrol — consent, guardianship, household seats)
+   and `MIN_DISCOVERY_AGE = 18` (who may be *searched*). Neither inline. Boot refuses if discovery
+   sits below enrolment.
+8b. **Discovery never runs for an ineligible subject, and the refusal rests on data we own.**
+   `subjects.discovery_eligible` is asserted once at enrolment from the proxy's required
+   `subject_is_adult` field. `POST /v1/search` refuses first: no row → `409 subject_unknown`, false →
+   `403 discovery_not_available`, **no `search_runs` row, no provider call, one `audit_log` row**.
+   Minors enrol in v1; discovery for them would put CSAM in this pipeline, and screening/reporting are
+   deferred — so nothing looks. Lowering `MIN_DISCOVERY_AGE` alone does not enable it: the mapping
+   minor → ineligible is unconditional in code (`subjects/eligibility.py`).
 9. **No image bytes persisted. Anywhere.** We store pointers into the proxy's S3, never payloads.
    The schema lint has three parts: (a) **no `bytea` column anywhere** — the real rule, since it
    catches the failure whatever the column is named; (b) a name gate on
@@ -147,6 +156,45 @@ code being written **now**, carrying the same numbers.
    surface as pending. The user sees "still setting up," not a 500.
 34. **Partner ingest is pluggable, behind an interface.** One partner is a single point of failure.
    Do not hardcode their response shape.
+37. **Every pre-dispatch check runs in one place, in one order** —
+   ELIGIBILITY → ENABLED → BREAKER → BUDGET → DISPATCH. The order is the invariant: the cheapest and
+   most absolute come first, so an eligibility refusal never consumes budget or trips a breaker.
+   Step 1 runs **twice**: in the route before any run row exists, and again on `claim_run` at
+   dispatch, because the flag is mutable and a run can sit queued for minutes. Steps 2–4 are
+   per-provider, in `providers/gate.py`, at *dispatch* time — which is what makes the kill switch bite
+   on an already-enqueued run. Inside the chain the same rule applies recursively: the breaker's
+   durable half-open **claim** happens last, after BUDGET, so a budget refusal cannot burn the one
+   probe.
+38. **The budget check happens BEFORE the call, off one pre-aggregated row.** `provider_spend` by
+   primary key, never `SUM(provider_calls)`. A budget with an unknown `cost_per_call_usd` fails
+   **closed** — an operator who asked for a cap must not get unbounded spend because we cannot price
+   the calls. The accumulator's scale must be ≥ the price's scale (`NUMERIC(14,6)` against a
+   `NUMERIC(10,6)` price): the upsert coerces each increment before adding, so a narrower column
+   rounds every call and, under ~0.00005/call, never grows at all — a silent fail-open in the one
+   check that must fail closed.
+39. **Spend, the call row, and the breaker transition commit together**, under a row lock on
+   `providers`. A rolled-back call records no spend; the lock stops N workers each needing N failures
+   to open one breaker. Likewise **run completion and the cadence update commit together**: a
+   completed run is unclaimable, so a crash between them loses the tier change with no retry path.
+40. **A breaker opens on brokenness, never on an ordinary result.** Failure = timeout, 5xx,
+   connection error, malformed response. Not 429, not a 200 with zero matches, not any skip.
+   Half-open allows exactly one probe, claimed by a conditional `UPDATE` in Postgres. **The breaker
+   has no terminal state**: an inconclusive probe (a 429 — neutral, not a verdict) returns it to
+   `open` with the clock restarted and the cooldown *not* doubled, and a probe abandoned by a dead
+   worker is reclaimed after cooldown + grace. A `half_open` row nothing can leave is a provider
+   skipped forever, i.e. permanent silent partial coverage. A failure arriving while already open is
+   counted but never re-doubles the cooldown or re-alarms.
+41. **A skipped provider is recorded, never silent.** `budget_exceeded` / `breaker_open` /
+   `provider_disabled` land in `provider_calls`, and the provider stays in `providers_attempted` while
+   absent from `providers_succeeded` — like a timeout. §7.5 again.
+42. **Tiering is never silent.** `scan_tier` and `next_scan_after` are on the run-status response so
+   the proxy can state a user's real cadence. A run where no provider succeeded never changes the
+   tier — it produced no evidence, and demoting for our own outage takes the saving from the wrong
+   place. The counter is read under `FOR UPDATE`: two overlapping runs on one seed must not both read
+   the same count and both write `count + 1`.
+43. **A run refused at dispatch is `refused`, never `completed`.** A completed run with zero results
+   reads as "we looked and found nothing", which about a search that never ran is a false
+   reassurance. Same reasoning as #8b's "no run row at all" for a refusal at the route.
 
 ---
 
@@ -182,6 +230,14 @@ because the architecture doc describes them.
 | Score calibration + banding | Crop fetcher deployable |
 | URL normalisation + dedup | Recheck loop, digests |
 | Cost tracking + circuit breakers | Partner ingest adapter |
+| Subject eligibility (step 8) | CSAM screening + mandatory reporting |
+| Adaptive cadence mechanism | The scheduler that reads `next_scan_after` |
+
+Two step-8 notes on that right-hand column. **CSAM screening and reporting are what gate minor
+discovery** — `MINOR_DISCOVERY_SUPPORTED` stays `False` until both exist, and flipping it without them
+raises. **The cadence scheduler is the recheck loop**, still out of scope: step 8 writes
+`scan_tier` / `next_scan_after` on every completed run and exposes them, but nothing reads them to
+trigger a scan yet.
 
 The build spec for what's in scope is `NEAR-TERM-BUILD.md`. It is the authoritative task list.
 
@@ -256,11 +312,39 @@ providers agreeing is meaningfully different from one.
 `search_runs.providers_succeeded` exists because a silent provider outage otherwise looks identical to
 "no infringements found." That distinction matters more here than in most systems.
 
-### 7.6 Cost is a first-class concern
+### 7.6 Cost is a first-class concern — **built** (step 8)
 
 Per-provider daily budget enforced **before** dispatch, circuit-breaking when exceeded. Per-provider
 kill switch in config, hot-reloadable. One provider failing never fails the run. Log `cost_usd` per
 run — N providers × M users × weekly cadence multiplies fast.
+
+The mechanism lives in `src/imageshield/providers/`: `gate.py` (the guard chain), `budget.py`,
+`breaker.py`, `ratelimit.py` (one shared bounded-jittered 429 driver, so Hive and Google cannot drift
+apart on retry policy again), `store.py` (the one transaction), `observability.py`. Invariants #37–#42.
+
+Two things to know before touching it:
+
+- **`hive.cost_per_call_usd` is NULL and that is deliberate.** Hive Web Search is contract-priced and
+  no measured figure exists in this repo. Google's is list price (0.003500). A budget set without a
+  cost fails closed, so filling Hive's in is a prerequisite for capping Hive's spend — not a nicety.
+- **`monthly_budget_usd` is reported, not enforced at dispatch.** The dispatch guard is one indexed
+  row by design; a month is a range scan. Month-to-date is an admin read.
+
+### 7.8 The lever that actually reduces cost is cadence, not capping
+
+Budgets and breakers control spend. Adaptive cadence (`search/cadence.py`) reduces it — weekly →
+fortnightly after 8 empty scans → monthly after 20, with any non-empty scan promoting to weekly
+`priority`. That is a 4–10× reduction across a realistic population.
+
+It is also the piece with a user-facing safety consequence, so invariant #42 applies: the tier and
+`next_scan_after` are exposed on the run-status response and the proxy must tell the user the truth
+about their cadence.
+
+One stated v1 approximation: the brief defines `priority` as "any confirmed infringement in 90 days",
+and *confirmed* means adjudicated, which is not built. v1 promotes on any non-empty scan and releases
+after `SCAN_PRIORITY_RELEASE_AFTER_EMPTY` (13 ≈ 91 days at the weekly priority cadence). Replace the
+release rule with a query against confirmed infringements when the review queue lands; the promotion
+rule stays.
 
 ### 7.7 Check the terms before writing the adapter
 
@@ -306,11 +390,15 @@ reported as a step being complete.
 
 Full detail in `PROXY_INTEGRATION.md`. The shape:
 
-- Every endpoint requires `X-Service-Token`. `/admin/*` additionally requires
+- Every endpoint requires `X-Service-Token`. `/v1/admin/*` additionally requires
   `X-Admin-Service-Token`. The two values must differ — we refuse to boot if they match.
 - Every request carries `user_ref`. Never a phone, never a user object.
 - `Idempotency-Key` on `POST /v1/liveness/:id/result`. **Not** on
   `POST /v1/liveness/sessions` — that creates a provider session and burns an attempt.
+- `subject_is_adult: bool` is **required** on `POST /v1/liveness/:id/result` (step 8). No default;
+  absent is `400 subject_eligibility_required` and writes nothing. See §4 #8b.
+- `POST /v1/search` can refuse the whole request: `409 subject_unknown` / `403
+  discovery_not_available`. No `search_runs` row, no provider call, one `audit_log` row.
 - Presigned URLs from the proxy must live ≥15 minutes; we retry.
 - Completion is signalled by Postgres `NOTIFY`, not polling. The proxy holds a session-pinned
   `LISTEN` connection and treats the notify as a wake-up, reading authoritative state from the table.

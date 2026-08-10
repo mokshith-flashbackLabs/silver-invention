@@ -97,7 +97,7 @@ Therefore:
 | Token | Purpose | Required for |
 |---|---|---|
 | `SERVICE_TOKEN` | Service-to-service shared secret | Every endpoint except `/health` |
-| `ADMIN_SERVICE_TOKEN` | Privileged / reviewer operations | `/admin/*` and `/review/*`, in addition to `SERVICE_TOKEN` |
+| `ADMIN_SERVICE_TOKEN` | Privileged / reviewer operations | `/v1/admin/*` and `/v1/review/*`, in addition to `SERVICE_TOKEN` |
 
 Both set in the services environment. They **must be different values** — the service refuses to boot
 if they match.
@@ -106,7 +106,7 @@ if they match.
 
 ```
 X-Service-Token:        <SERVICE_TOKEN>
-X-Admin-Service-Token:  <ADMIN_SERVICE_TOKEN>   # /admin/* and /review/* only
+X-Admin-Service-Token:  <ADMIN_SERVICE_TOKEN>   # /v1/admin/* and /v1/review/* only
 X-User-Id:              <uuid>                  # resolved by the proxy, required on user-scoped calls
 X-Request-Id:           <uuid>                  # propagated end to end
 X-Client:               ios/1.4.2 | android/… | web/…
@@ -198,6 +198,98 @@ Full shapes in `docs/services/identity.md`. Summary:
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |
 | `GET /v1/hits/{hit_id}/crop` | Blurred face crop, streamed. `Cache-Control: no-store` |
 | `POST /v1/admin/backfill` | Trigger a backfill run. Admin token required |
+
+Step 8 adds five and changes one:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/subjects/{user_ref}` | `{ discovery_eligible, eligibility_reason }` (built, step 8). 404 for a `user_ref` we have never enrolled — "never enrolled" and "adult, eligible" must not read alike |
+| `POST /v1/admin/providers/{id}/disable` | Kill switch. Body `{ reason }`, min 3 chars. Both tokens |
+| `POST /v1/admin/providers/{id}/enable` | Body `{ reason }`. Both tokens |
+| `POST /v1/admin/providers/{id}/breaker/reset` | Force the breaker closed and clear the failure counter. Body `{ reason }`. Both tokens. Separate from `enable` on purpose: "this provider is fixed, let it back in before the cooldown" and "this provider should be receiving traffic at all" are different decisions |
+| `GET /v1/admin/providers/health` | Per-provider per-day calls, cost, success rate, p50/p99 latency, breaker state, budget headroom, and every firing alarm. Both tokens. Money crosses as decimal **strings** |
+
+Path note: every admin route is under `/v1/admin/*`, and there is exactly one admin prefix. The
+step-8 provider routes and the long-specified `POST /v1/admin/backfill` above agree; the step-1
+placeholder `/admin/ping` moved to `/v1/admin/ping` at the same time rather than leaving a second
+prefix behind. Step 9's route-auth CI gate then has one prefix to walk — a gate that covers one of two
+admin surfaces is worse than no gate, because it reads as coverage.
+
+### ⚠ BREAKING — `POST /v1/liveness/{sid}/result` gains a required field
+
+```
+subject_is_adult: bool     # REQUIRED. No default.
+```
+
+The proxy computes it as `age >= MIN_DISCOVERY_AGE` (18 in v1) from a DOB this service never sees.
+Absent → `400 subject_eligibility_required`, and **nothing is written**: no enrolment, no subject row,
+no `IndexFaces` call, and the session stays unconsumed so a retry with the field present works.
+
+There is no default in either direction, and that is deliberate. Defaulting `true` scans a minor;
+defaulting `false` silently stops monitoring an adult. Both fail quietly, which is exactly why the
+field is mandatory rather than inferred.
+
+`MIN_ENROLMENT_AGE` is now **13**, not 18: minors enrol in v1 — consent, guardianship and household
+seats all work. What they must not get is discovery.
+
+### ⚠ BREAKING — `POST /v1/search` can now refuse the whole request
+
+Two new terminal responses, before any run exists:
+
+| Status | Code | Meaning | Proxy action |
+|---|---|---|---|
+| `409` | `subject_unknown` | No `subjects` row for this `user_ref` | Enrol them. This is a state the proxy can fix, hence a conflict rather than a permission error |
+| `403` | `discovery_not_available` | The subject is a minor | Do not retry. Show honest copy: monitoring is set up, discovery is not available yet. **Not** an empty report — an empty report reads as "no matches", which for a subject nobody searched is a false reassurance |
+
+On either, **no `search_runs` row is created and no provider is called.** A refused request is
+indistinguishable in the data from one that was never made, except for a single `audit_log` row. If
+the proxy renders a report from `search_runs`, a refused subject correctly has nothing to render — ask
+`GET /v1/subjects/{user_ref}` for the reason.
+
+`POST /v1/seeds` inherits the same constraint at the database level: `search_seeds.user_ref` now has a
+foreign key to `subjects`, so creating a seed for an unenrolled `user_ref` **fails with
+`409 subject_unknown`** — the same code and the same error envelope as `POST /v1/search`, terminal, do
+not retry. Enrol the subject first.
+
+A **minor may hold seeds.** `/v1/seeds` checks that the subject exists, not that they are eligible:
+consent, guardianship and household seats all work for minors, and it is discovery that must not run.
+Only `POST /v1/search` returns `403 discovery_not_available`.
+
+### A run can also be refused *after* it was accepted
+
+`POST /v1/search` checks eligibility at the instant of the request, but the flag is mutable — a DOB
+correction at re-enrolment writes it — and the run is dispatched asynchronously. If the subject stops
+being eligible in between, the run comes back as:
+
+```
+status: 'refused'
+```
+
+**Treat `refused` as "we did not search", never as "we searched and found nothing".** It is a distinct
+status precisely so the proxy is not forced to render a completed-with-zero-results run, which is a
+false reassurance. `GET /v1/subjects/{user_ref}` carries the reason. One `audit_log` row records it with
+`refused_at: dispatch`.
+
+### `GET /v1/search/runs/{run_id}` gains two fields
+
+```
+status:          'queued' | 'running' | 'completed' | 'refused'   # 'refused' is new
+scan_tier:       'new' | 'standard' | 'relaxed' | 'dormant' | 'priority'
+next_scan_after: timestamptz | null    # null until the first completed scan
+```
+
+Additive — existing fields are unchanged. **These are for showing the user, not for internal
+bookkeeping.** Cadence is adaptive from step 8 (weekly → fortnightly after 8 empty scans → monthly
+after 20; any non-empty scan promotes to weekly `priority`), and someone on `dormant` who believes
+they are scanned weekly is being misled about a safety product. Whatever copy the report surface uses
+must be derived from these two fields.
+
+Plan tier may override — a paid tier holding `standard` as a floor is a **proxy-side** decision. We
+expose the mechanism and do not implement the policy.
+
+`providers_succeeded` now also excludes providers skipped by the kill switch, an open breaker, or an
+exhausted budget. It has always needed to stay distinguishable from `providers_attempted`; step 8 adds
+three more ways to be attempted-but-not-succeeded.
 
 ### Enrolment completion also signals via `NOTIFY`
 
@@ -310,3 +402,13 @@ The crop fetcher runs against a local fixture server, not live URLs.
   covered only by `ADMIN_SERVICE_TOKEN`, which is not sufficient for an audit trail naming an
   individual reviewer.
 - **Proxy → services observability.** Request ID propagation is specified; distributed tracing is not.
+- **Where `MIN_DISCOVERY_AGE` is published.** The proxy must compare DOB against 18 to compute
+  `subject_is_adult`, and today both sides carry that number independently — ours in config, theirs in
+  code. Services never see a DOB, so we cannot verify their arithmetic; what we can do is refuse the
+  field's absence, which we do. If v2 changes the age, both sides change together or the boolean means
+  something different on each side of the boundary. A read endpoint publishing the value would remove
+  the duplication and is not built.
+- **Alarm delivery.** `GET /v1/admin/providers/health` computes every alarm; nothing pages anyone. Wiring
+  it to CloudWatch is step 9.
+- **Minor discovery.** Deferred until CSAM screening on fetched candidates and a mandatory-reporting
+  path exist. Until then the correct behaviour is that nothing looks — see INVARIANTS #8b.

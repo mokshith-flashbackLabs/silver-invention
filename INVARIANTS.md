@@ -70,8 +70,52 @@ accounts. Treat the existing collection as unsalvageable — v2 starts an empty 
 Check: kill the process between the two operations. The face must not survive. Separately, assert in
 CI that `DeleteFaces` has at least one call site.
 
-**8. `MIN_ENROLMENT_AGE` is read from config at request time.**
-Not a constant, not inlined. v1 ships at 18. v2 lowers it. That must not be a code change.
+**8. Both age floors are read from config at request time.**
+Not constants, not inlined. There are **two**, and the split is load-bearing (step 8):
+
+```
+MIN_ENROLMENT_AGE = 13   # who may enrol: consent, guardianship, household seats
+MIN_DISCOVERY_AGE = 18   # who may be SEARCHED
+```
+
+They were one number until step 8, which is why minors were blocked from enrolling at all. Minors
+enrol in v1; **discovery must not run for them** (#8b). `MIN_DISCOVERY_AGE` drops in v2.
+
+Check: `grep -rn "\b18\b"` over `src/imageshield/{subjects,http}/` and `config.py` finds no age
+literal in executable code (`tests/test_boundaries.py` enforces this with `tokenize`, so prose
+explaining the policy is exempt and a comparison is not). Boot refuses if
+`MIN_DISCOVERY_AGE < MIN_ENROLMENT_AGE` — a discovery age below the enrolment age gates nobody.
+
+**8b. Discovery never runs for an ineligible subject, and the refusal rests on data we own.**
+`subjects.discovery_eligible` is asserted **once, at enrolment**, from the proxy's required
+`subject_is_adult` field, and stored. `POST /v1/search` refuses before anything else happens: no row
+in `subjects` → `409 subject_unknown`; `false` → `403 discovery_not_available`. **No `search_runs`
+row is created, no provider is called, and exactly one `audit_log` row is written.**
+
+Two reasons this is an invariant rather than a feature:
+
+- *Why the flag and not a per-request assertion.* This service holds `user_ref` and no DOB, and that
+  boundary is correct (CLAUDE.md §3.2). But a per-request assertion means a proxy bug silently scans
+  a minor with nothing in our data to show it. A refusal has to rest on state we hold.
+- *Why refusal and not filtering.* Discovery finds images resembling the seed and nudify sites alter
+  real photos, so for an enrolled minor a *successful* result is CSAM inside this pipeline. CSAM
+  screening and reporting are deferred until the partner corpus connects; until they exist the
+  correct behaviour is that **nothing looks**, so nothing is found and no mandatory-reporting
+  obligation starts. A filter on results implies a search ran.
+
+A `search_runs` row with zero results reads as "we looked and found nothing" — for a subject nobody
+searched that is a false reassurance, and for a minor it is a false reassurance about the exact thing
+the refusal exists to prevent (cf. #26).
+
+Lowering `MIN_DISCOVERY_AGE` does **not** by itself enable minor discovery: the proxy sends a boolean
+and `subjects/eligibility.py` maps minor → ineligible unconditionally, gated on the module constant
+`MINOR_DISCOVERY_SUPPORTED = False`. v2 needs a config change *plus* the minor-specific handling
+code, never config alone.
+
+Check: `search_seeds.user_ref` has a foreign key to `subjects` (migration 0008), so an unparented
+seed fails at the database even if the route guard were removed. Follow-up: the same FK on
+`enrolments` — enrolment creates the subject row, so the intra-transaction ordering had to be
+established first (it now is: subject before enrolment, `liveness/store.py`).
 
 ---
 
@@ -280,3 +324,140 @@ until a user asks why a dead URL is still listed.
 
 **36. The recheck loop marks `url_alive = false`; it never deletes hits.**
 A dead URL is the only good news v1 can deliver. It is also evidence. Keep it.
+
+**37. Every pre-dispatch check runs in one place, in one order.** *(step 8)*
+
+```
+POST /v1/search
+  1. ELIGIBILITY   subjects.discovery_eligible   -> 409 / 403, whole request  (#8b)
+  2. ENABLED       providers.enabled = false     -> skip that provider
+  3. BREAKER       breaker_state = 'open'        -> skip, record in provider_calls
+  4. BUDGET        spend + cost > daily          -> skip, status='budget_exceeded'
+  5. DISPATCH
+```
+
+The **order** is the invariant, not just the checks. The cheapest and most absolute come first, so an
+eligibility refusal can never consume budget or trip a breaker — it stops before either exists.
+Step 1 refuses the whole request and lives in the route (it must precede the `search_runs` row);
+steps 2–4 are per-provider, live in `providers/gate.py`, run at *dispatch* time in the worker, and
+**never fail the run**.
+
+Running 2–4 at dispatch rather than at request time is what makes the kill switch bite on a run that
+was enqueued before the switch was flipped.
+
+**38. The budget check happens BEFORE the call, off one pre-aggregated row.** *(step 8)*
+Checking after means the money is already spent. `provider_spend` is read by primary key
+(`provider_id`, `spend_date`) — never `SUM(provider_calls)`, which grows with every call ever made, so
+the guard protecting spend would slow down in proportion to how much has been spent.
+
+A budget set with `cost_per_call_usd` unknown **fails closed**. An operator who asked for a cap must
+not get unbounded spend because we cannot price the calls; failing open would leave the one provider
+nobody could price as the only one with no ceiling.
+
+Known bound: the check is check-then-act, so a daily budget can be overshot by at most
+(concurrent dispatches) × `cost_per_call_usd`. Closing it entirely means holding a row lock across a
+provider HTTP call — recorded, not discovered.
+
+Check: `grep -r "SUM(" src/imageshield/providers/` finds nothing; a mocked client records zero
+invocations when the budget is exhausted.
+
+**39. Provider spend, the call row, and the breaker transition commit together.** *(step 8)*
+One transaction, under a row lock on `providers`. A rolled-back call records no spend, and spend
+recorded without its call is money with no provenance. The lock also means N workers cannot each read
+the same failure count and each write count+1, which would need N × threshold failures to open one
+breaker.
+
+The same rule for the other read-modify-write in this step: **run completion and the seed's cadence
+update commit together**, with the seed row taken `FOR UPDATE`. Two failure modes, one fix:
+
+- *Lost tier change.* Completing the run makes it unclaimable, so a crash after that commit and
+  before the cadence commit dropped the tier change permanently — SQS redelivers and `claim_run`
+  correctly declines a completed run, so nothing retries it.
+- *Lost update.* `POST /v1/search` does not serialise per seed and `claim_run` row-locks
+  `search_runs`, not the joined seed. Without the lock, two overlapping runs both read the same
+  `consecutive_empty_scans` and both write `count + 1`; at the threshold that is the difference
+  between demoting a user to fortnightly and leaving them weekly, decided by a race.
+
+**39b. The spend accumulator's scale is ≥ the price's scale.** *(step 8)*
+`provider_spend.cost_usd` is `NUMERIC(14,6)`, matching `providers.cost_per_call_usd`'s
+`NUMERIC(10,6)`. The upsert coerces each increment to the column type **before** adding, so a
+narrower accumulator rounds every individual call instead of rounding the total once. Measured against
+Postgres 16: ten calls at 0.000250 stored 0.0030 rather than 0.0025 (+20%, so the cap binds early and
+skips a provider that still had headroom), and ten at 0.000040 stored 0.0000 — the accumulator never
+grows, `spent_today` reads 0 forever, and a configured daily budget silently stops binding.
+
+That last case is a **fail-open in the one check #38 requires to fail closed**. Google's 0.003500 is
+exact at four decimals, so nothing would have shown until the first contract price quoted per thousand
+calls with an odd third cent digit.
+
+**40. A breaker opens on brokenness, never on an ordinary result.** *(step 8)*
+Failure = timeout, 5xx, connection error, malformed response. **Not** 429 (that is rate limiting,
+retried within `PROVIDER_MAX_RETRIES` with jitter), **not** a 200 with zero matches, **not** any skip.
+
+Conflating "no matches" with failure would open every breaker on a quiet week — and stop the scans
+that exist to notice a quiet week is not normal.
+
+Half-open allows **exactly one** probe, claimed by a conditional `UPDATE` in Postgres rather than a
+per-process flag, because "one probe" is meaningless across N workers otherwise. A failed probe
+re-opens with a doubled cooldown, capped: without the cap a provider down over a weekend ends up with
+a cooldown longer than the outage, so recovery is never noticed.
+
+**40b. The breaker has no terminal state.** *(step 8)*
+Every way into `half_open` has a way out, because a `half_open` row that nothing can leave is a
+provider skipped on every run forever — permanent partial coverage waiting on a human noticing, which
+is the failure #41 and CLAUDE.md §7.5 exist to prevent. Four edges make that true:
+
+- **An inconclusive probe returns to `open`.** A persistent 429 gives `rate_limited`, which classifies
+  as *neutral* — correctly, a provider enforcing its rate limit is not broken. But the probe was
+  spent, and the claim query only matches `open`, so "change nothing" would wedge it. The clock
+  restarts; the cooldown is **not** doubled, because no verdict about brokenness was obtained.
+- **An abandoned probe is reclaimed.** A worker can claim the probe and then be killed before
+  recording. The claim's second disjunct takes a `half_open` row whose `breaker_opened_at` is older
+  than cooldown + a grace period equal to one more cooldown — long enough that it cannot steal a probe
+  that is merely slow.
+- **A failure while already `open` is counted and nothing more.** Reachable through the runtime cache:
+  another worker can still hold a `closed` snapshot for up to `PROVIDER_CONFIG_CACHE_SECONDS`. Never
+  re-double the cooldown and never re-alarm, or one outage with N workers races the cooldown to its cap
+  and delays recovery for reasons unrelated to the provider.
+- **`breaker_opened_at` is only written deliberately.** The apply step is three-valued —
+  set-to-now / clear / leave-alone. As a boolean it read as "now() or else NULL", so the transition
+  that merely bumps a failure counter wiped the very column the cooldown is measured from.
+
+The probe flag on the dispatch decision is informational only. The transition reads the **locked
+row's** state, which already says `half_open` for a probe and cannot be stale.
+
+**41. A skipped provider is recorded, never silent.** *(step 8)*
+`provider_calls.status` carries `budget_exceeded`, `breaker_open` and `provider_disabled`, and a
+skipped provider stays in `providers_attempted` while being absent from `providers_succeeded` —
+exactly like a timeout. Partial coverage has to be visible (CLAUDE.md §7.5); a silent skip is
+indistinguishable from "found nothing", which is the distinction this whole subsystem defends.
+
+**42. Tiering is never silent.** *(step 8)*
+`search_seeds.scan_tier` and `next_scan_after` are exposed on `GET /v1/search/runs/{run_id}` so the
+proxy can state a user's real monitoring cadence. Someone on `dormant` who believes they are scanned
+weekly is being misled about a safety product, which is a worse failure than the cost the tier saves.
+
+A run where **no provider succeeded** never changes the tier. It produced no evidence either way, and
+demoting a user's cadence because our own integration was down would take the cost saving out of
+exactly the wrong place.
+
+A seed created by `POST /v1/seeds` is written with `scan_tier = 'new'` explicitly rather than left to
+the column default. The default (`'standard'`) is the safe fallback for a row nobody tiered; only the
+creating write knows the seed is genuinely new. Left to the default, the whole `new` branch of
+`search/cadence.py` was unreachable, `SCAN_NEW_TIER_WEEKS` had no effect at any value, and the API
+advertised a tier it could never return.
+
+**43. A run refused at dispatch is `refused`, never `completed`.** *(step 8)*
+Eligibility is re-read on `claim_run`, not trusted from run creation: `subjects.discovery_eligible` is
+deliberately mutable (a DOB correction at re-enrolment writes it), and a queued backlog or a stale
+claim can put minutes between the route's check and the dispatch. Without the re-read, the route's 403
+guarantee holds only at the instant of the request, and #8b promises more than that.
+
+The run row already exists, so it cannot be made to disappear. What it must not do is read as
+`completed`: a completed run with zero results says "we looked and found nothing" about a search that
+never ran. `refused` + one `audit_log` row carrying `refused_at: dispatch` is the honest record, and
+the proxy can render it.
+
+A missing subject row reads as **ineligible**, via `LEFT JOIN` + `COALESCE(..., false)`. An inner join
+would return no row, which `claim_run` reports as "not claimable" — indistinguishable from a duplicate
+delivery, so the run would be retried forever instead of refused once.
