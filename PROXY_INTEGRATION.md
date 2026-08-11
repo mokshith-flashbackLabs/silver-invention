@@ -381,6 +381,55 @@ expose the mechanism and do not implement the policy.
 exhausted budget. It has always needed to stay distinguishable from `providers_attempted`; step 8 adds
 three more ways to be attempted-but-not-succeeded.
 
+### New — `POST /v1/infringements/{infringement_id}/feedback`
+
+```
+{ user_ref, signal }        signal: 'not_me' | 'confirmed' | 'uncertain'
+-> 200 { status }           the infringement's status after the write
+
+404  infringement_not_found
+```
+
+| signal | `infringements.status` becomes |
+|---|---|
+| `not_me` | `dismissed_not_me` |
+| `confirmed` | `acknowledged` |
+| `uncertain` | unchanged — but the feedback IS recorded |
+
+**The 404 covers two different facts and does not distinguish them.** A non-existent id and one
+belonging to a different `user_ref` return byte-identical responses. That is not an oversight to
+route around: a caller able to tell them apart could walk the id space and learn that a given
+infringement exists, which for this data discloses somebody's abuse. Do not ask us to split it.
+
+**Append-only.** A user changing their mind sends a second request and gets a second row; the history
+is the record. Send it every time they act, not only on a change.
+
+**`not_me` is recorded and not acted on.** It does not adjust the user's identity vectors, suppress
+future matches from that domain, or feed banding. Users reject *true* positives under distress and it
+is common — if rejections retrained the index, the users most affected by real abuse would
+systematically degrade their own protection, invisibly. A human reads the signal. Please do not build
+proxy-side suppression on top of it either.
+
+### ⚠ BREAKING — `GET /v1/search/infringements` drops `image_url` and gains two fields
+
+```
+- image_url            REMOVED
++ url_alive            bool
++ last_checked_at      timestamptz | null
+```
+
+`image_url` is **gone from this response**. It was handing any caller of a user-facing list read a
+direct link to the infringing image. Rendering a report list needs the domain, the dates, the band and
+the status — not a way to load the picture. Showing the image at all is a face crop, blurred by
+default, behind its own gated call; that endpoint is specified and not built. The column survives on
+`infringements` as evidence. This closes a contradiction your team raised.
+
+`url_alive` is set false **only** by a 404 or 410 from the weekly recheck loop. A timeout, a 5xx, or a
+403 leaves it alone — 403 in particular is *gated, not gone*. Read the pair together: `url_alive:
+false` with a recent `last_checked_at` is "this came down" and is worth telling the user, because it
+is the one unambiguously good thing this product can say. A stale `last_checked_at` means we have not
+looked lately, and you should not make the claim.
+
 ### Enrolment completion also signals via `NOTIFY`
 
 A successful enrolment emits Postgres `NOTIFY enrolment_complete` with the `session_id` as payload,

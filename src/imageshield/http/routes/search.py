@@ -245,7 +245,9 @@ async def list_infringements(
             InfringementItem(
                 infringement_id=row.infringement_id,
                 page_url=row.page_url,
-                image_url=row.image_url,
+                # No image_url. A user-facing list read must not carry a direct
+                # link to the infringing image — the column stays on the row as
+                # evidence, it just does not travel here.
                 keyed_on=row.keyed_on,
                 first_seen_at=row.first_seen_at,
                 last_seen_at=row.last_seen_at,
@@ -253,6 +255,11 @@ async def list_infringements(
                 band=row.band,
                 status=row.status,
                 band_reason=row.band_reason,
+                # Both, so the proxy can say "this came down" honestly: a false
+                # url_alive with a stale last_checked_at is not the same claim
+                # as one we verified this week.
+                url_alive=row.url_alive,
+                last_checked_at=row.last_checked_at,
                 provider_count=len(row.attestations),
                 attestations=[
                     AttestationItem(

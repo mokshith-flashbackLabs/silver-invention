@@ -146,4 +146,11 @@ class InfringementRow(BaseModel):
     band: str
     status: str
     band_reason: str | None
+    # Written only by the recheck worker, and only a 404/410 sets url_alive
+    # false. A timeout, a 5xx or a 403 leaves both alone: telling a victim
+    # their problem is fixed because a site was briefly unreachable is the
+    # wrong error to make, and the asymmetry runs the same direction as
+    # everywhere else here.
+    url_alive: bool = True
+    last_checked_at: datetime | None = None
     attestations: tuple[AttestationRow, ...]

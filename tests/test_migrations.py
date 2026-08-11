@@ -178,7 +178,7 @@ def test_0004_score_shape_check_constraint(throwaway_db: str) -> None:
     # search_matches is dropped by 0006; its constraint is asserted at the
     # migration state where the table still exists. The same shape rule lives
     # on `attestations` now — see test_0005_uniques_enforce_the_dedup_key.
-    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to_0004())
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0004_"))
     assert back.returncode == 0, back.stderr
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
@@ -293,15 +293,26 @@ def test_down_all_on_one_db_does_not_break_role_for_sibling_db(
         assert role_exists is False
 
 
-def _steps_back_to_0004() -> str:
-    """How many `down --steps N` to land just after 0004.
+def _steps_back_to(version: str) -> str:
+    """How many ``down --steps N`` to land with ``version`` still applied.
 
-    Computed from the migrations directory rather than hardcoded, so adding
-    0007 doesn't silently turn this into "revert 0006 and stop".
+    Computed from the migrations directory, never hardcoded. Hand-counted
+    numbers broke on three consecutive migrations, and the failure mode the
+    original comment feared — "a silently-wrong count would revert the wrong
+    migration and pass" — is precisely what computing it prevents. A literal
+    only fails loudly when some *other* assertion in the same test happens to
+    notice.
     """
     from tests.db import ROOT
 
-    later = [p for p in (ROOT / "migrations").glob("*.up.sql") if p.name >= "0005"]
+    # Compare the 4-digit prefix, not the whole filename: "0004_foo.up.sql" is
+    # lexicographically greater than "0004", so a substring comparison would
+    # count the target migration itself and revert one step too many.
+    later = [
+        path
+        for path in (ROOT / "migrations").glob("*.up.sql")
+        if path.name[:4] > version[:4]
+    ]
     return str(len(later))
 
 
@@ -392,7 +403,7 @@ def test_0005_migrates_existing_search_matches_rows(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     up = run_migrate(throwaway_db, "up")
     assert up.returncode == 0, up.stderr
-    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to_0004())
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0004_"))
     assert back.returncode == 0, back.stderr
 
     user = "00000000-0000-0000-0000-0000000000aa"
@@ -480,11 +491,9 @@ def test_0007_creates_calibration_tables(throwaway_db: str) -> None:
 def test_0007_down_removes_them_and_the_added_columns(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    # Five steps back: 0011 (seed ref), 0010 (consent_ref), 0009
-    # (cost/cadence), 0008 (subjects), then 0007. This number has to move
-    # whenever a migration is added, which is the point — a silently-wrong
-    # count would revert the wrong migration and pass.
-    run_migrate(throwaway_db, "down", "--steps", "5")
+    # 0007 itself must be REVERTED here (the calibration tables have to be
+    # gone), so the target is the migration before it.
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0006_"))
     with psycopg.connect(throwaway_db) as conn:
         assert CALIBRATION_TABLES & _table_names(conn) == set()
         cols = {
@@ -648,7 +657,7 @@ def test_0008_backfills_existing_enrolments_and_seeds_as_adult(throwaway_db: str
     """
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "4")  # back to 0007
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0007_"))
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         session = conn.execute(
@@ -688,7 +697,7 @@ def test_0008_backfills_existing_enrolments_and_seeds_as_adult(throwaway_db: str
 def test_0008_down_drops_the_table_and_the_constraint(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "4")  # 0011, 0010, 0009, then 0008
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0007_"))
     with psycopg.connect(throwaway_db) as conn:
         assert "subjects" not in _table_names(conn)
         assert "search_seeds_subject_fk" not in _constraints(conn, "search_seeds")
@@ -784,7 +793,7 @@ def test_0009_rejects_an_unknown_provider_call_status(throwaway_db: str) -> None
 def test_0009_down_removes_them_and_keeps_daily_budget(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "3")  # 0011, 0010, then 0009
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0008_"))
     with psycopg.connect(throwaway_db) as conn:
         assert "provider_spend" not in _table_names(conn)
         assert _columns(conn, "providers") & PROVIDER_STEP_8_COLUMNS == set()
@@ -895,7 +904,7 @@ def test_0010_backfills_pre_consent_rows_with_the_sentinel(throwaway_db: str) ->
     the sentinel and its own created_at as consent_signed_at."""
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "2")  # 0011 then 0010, back to 0009
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0009_"))
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         session_id, user_ref = _consumed_session(conn)
@@ -921,7 +930,7 @@ def test_0010_backfills_pre_consent_rows_with_the_sentinel(throwaway_db: str) ->
 def test_0010_down_removes_the_consent_columns(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "2")  # 0011 then 0010
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0009_"))
     with psycopg.connect(throwaway_db) as conn:
         assert _columns(conn, "enrolments") & CONSENT_COLUMNS == set()
         assert "enrolments_consent_not_sentinel" not in _constraints(conn, "enrolments")
@@ -984,7 +993,7 @@ def test_0011_backfills_existing_runs_with_an_empty_seed_url(throwaway_db: str) 
     """
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "1")  # back to 0010
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0010_"))
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         user_ref = conn.execute(
@@ -1024,8 +1033,147 @@ def test_0011_down_restores_the_seed_column_and_drops_the_run_url(
 ) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "1")
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0010_"))
     with psycopg.connect(throwaway_db) as conn:
         assert "source_object_uri" in _columns(conn, "search_seeds")
         assert "source_object_ref" not in _columns(conn, "search_seeds")
         assert "seed_url" not in _columns(conn, "search_runs")
+
+
+# -- 0012: user feedback on a hit ------------------------------------------
+
+
+def test_0012_creates_the_feedback_table(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        assert "infringement_feedback" in _table_names(conn)
+        assert _columns(conn, "infringement_feedback") == {
+            "feedback_id",
+            "infringement_id",
+            "user_ref",
+            "signal",
+            "created_at",
+        }
+
+
+def test_0012_rejects_an_unknown_signal(throwaway_db: str) -> None:
+    """The vocabulary is fixed at the database. A typo'd signal that inserted
+    cleanly would be counted by a reviewer as neither agreement nor
+    disagreement, silently."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        infringement_id, user_ref = _seed_infringement(conn)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO infringement_feedback (infringement_id, user_ref, signal)"
+                " VALUES (%s, %s, 'definitely_not_me')",
+                (infringement_id, user_ref),
+            )
+
+
+def test_0012_feedback_is_append_only_in_shape(throwaway_db: str) -> None:
+    """Two contradictory signals coexist. Nothing in the schema forces one row
+    per (infringement, user) -- a user changing their mind is the history, and
+    a UNIQUE here would destroy the part a reviewer needs."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        infringement_id, user_ref = _seed_infringement(conn)
+        for signal in ("not_me", "confirmed"):
+            conn.execute(
+                "INSERT INTO infringement_feedback (infringement_id, user_ref, signal)"
+                " VALUES (%s, %s, %s)",
+                (infringement_id, user_ref, signal),
+            )
+        rows = conn.execute(
+            "SELECT signal FROM infringement_feedback WHERE infringement_id = %s",
+            (infringement_id,),
+        ).fetchall()
+    assert {row[0] for row in rows} == {"not_me", "confirmed"}
+
+
+def test_0012_down_drops_the_table(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0011_"))
+    with psycopg.connect(throwaway_db) as conn:
+        assert "infringement_feedback" not in _table_names(conn)
+
+
+def _seed_infringement(conn: psycopg.Connection[tuple[Any, ...]]) -> tuple[Any, Any]:
+    """One content_url + one infringement, the minimum a feedback row needs."""
+    user_ref = conn.execute(
+        "INSERT INTO subjects (user_ref, discovery_eligible, eligibility_reason)"
+        " VALUES (gen_random_uuid(), true, 'adult') RETURNING user_ref"
+    ).fetchone()
+    assert user_ref is not None
+    conn.execute(
+        "INSERT INTO content_urls (url_hash, url, source_domain)"
+        " VALUES ('h' || repeat('a', 63), 'https://example.test/p', 'example.test')"
+        " ON CONFLICT DO NOTHING"
+    )
+    row = conn.execute(
+        "INSERT INTO infringements (user_ref, url_hash, page_url)"
+        " VALUES (%s, 'h' || repeat('a', 63), 'https://example.test/p')"
+        " RETURNING infringement_id",
+        (user_ref[0],),
+    ).fetchone()
+    assert row is not None
+    return row[0], user_ref[0]
+
+
+# -- 0013: the recheck loop's attempt clock --------------------------------
+
+
+def test_0013_adds_last_attempted_at_and_the_due_index(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        assert "last_attempted_at" in _columns(conn, "infringements")
+        # last_checked_at survives untouched: the two mean different things.
+        assert "last_checked_at" in _columns(conn, "infringements")
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE tablename = 'infringements'"
+            ).fetchall()
+        }
+    assert "infringements_recheck_due_idx" in indexes
+
+
+def test_0013_leaves_existing_rows_unattempted(throwaway_db: str) -> None:
+    """NULL, not now(). Backfilling a timestamp would tell the loop every
+    pre-existing infringement had already been tried, and the first pass would
+    skip the entire corpus."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0012_"))
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        _seed_infringement(conn)
+
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db) as conn:
+        row = conn.execute(
+            "SELECT last_attempted_at, url_alive FROM infringements"
+        ).fetchone()
+    assert row == (None, True)
+
+
+def test_0013_down_removes_the_column_and_the_index(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0012_"))
+    with psycopg.connect(throwaway_db) as conn:
+        assert "last_attempted_at" not in _columns(conn, "infringements")
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE tablename = 'infringements'"
+            ).fetchall()
+        }
+    assert "infringements_recheck_due_idx" not in indexes

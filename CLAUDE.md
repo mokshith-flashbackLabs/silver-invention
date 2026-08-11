@@ -237,16 +237,24 @@ because the architecture doc describes them.
 | `DeleteFaces` path | Adjudication queue and reviewer tooling |
 | Provider adapter interface | Report surface, hits, evidence export |
 | Score calibration + banding | Crop fetcher deployable |
-| URL normalisation + dedup | Recheck loop, digests |
+| URL normalisation + dedup | Digests |
 | Cost tracking + circuit breakers | Partner ingest adapter |
 | Subject eligibility (step 8) | CSAM screening + mandatory reporting |
 | Adaptive cadence mechanism | The scheduler that reads `next_scan_after` |
+| Infringement feedback (`not_me`) | |
+| URL recheck loop (`url_alive`) | |
 
-Two step-8 notes on that right-hand column. **CSAM screening and reporting are what gate minor
+Two notes on that right-hand column. **CSAM screening and reporting are what gate minor
 discovery** — `MINOR_DISCOVERY_SUPPORTED` stays `False` until both exist, and flipping it without them
-raises. **The cadence scheduler is the recheck loop**, still out of scope: step 8 writes
-`scan_tier` / `next_scan_after` on every completed run and exposes them, but nothing reads them to
-trigger a scan yet.
+raises. And **"recheck" now means two different things — do not confuse them:**
+
+| | What it does | State |
+|---|---|---|
+| **URL recheck loop** (`src/imageshield/recheck/`) | HEADs each infringement's `page_url` weekly and sets `url_alive` false on a 404/410 | **Built** (out-of-band task 03) |
+| **Cadence scheduler** | Reads `next_scan_after` and triggers a new *search* | **Not built.** Step 8 writes and exposes `scan_tier` / `next_scan_after`; nothing reads them to trigger anything |
+
+An earlier version of this doc called the cadence scheduler "the recheck loop", which is why the two
+are spelled out. They share no code.
 
 The build spec for what's in scope is `NEAR-TERM-BUILD.md`. It is the authoritative task list.
 

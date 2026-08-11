@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
+from imageshield.search.feedback import status_for
 from imageshield.search.models import (
     AttestationRow,
     InfringementRow,
@@ -58,6 +59,8 @@ class FakeSearchStore:
         # real Postgres raised ForeignKeyViolation and the route answered a bare
         # 500 — a divergence that hid the defect from the whole route suite.
         self.known_subjects: set[UserRef] = set()
+        self.feedback: list[tuple[UUID, UserRef, str]] = []
+        self.owners: dict[UUID, set[UserRef]] = {}
 
     async def create_seed(
         self, user_ref: UserRef, seed_kind: str, source_object_ref: str
@@ -123,6 +126,26 @@ class FakeSearchStore:
         self, user_ref: UserRef, since: datetime | None
     ) -> tuple[InfringementRow, ...]:
         return tuple(self.infringements)
+
+    async def record_feedback(
+        self, infringement_id: UUID, user_ref: UserRef, signal: str
+    ) -> str | None:
+        # Ownership is part of the LOOKUP, exactly as in the real store's WHERE
+        # clause: a foreign row and a missing row are the same miss, so the
+        # route is never handed a difference it could leak.
+        match = next(
+            (
+                row
+                for row in self.infringements
+                if row.infringement_id == infringement_id
+            ),
+            None,
+        )
+        if match is None or user_ref not in self.owners.get(infringement_id, set()):
+            return None
+        self.feedback.append((infringement_id, user_ref, signal))
+        status = status_for(signal)
+        return match.status if status is None else status
 
 
 class FakeSubjectStore:
@@ -675,3 +698,116 @@ def test_search_seed_url_is_not_recoverable_from_the_seed() -> None:
     (_, _, _, stored_url) = store.created_runs[-1]
     assert stored_url == fresh
     assert store.seeds[UUID(seed["seed_id"])].source_object_ref == SEED_REF
+
+
+# --- feedback on a hit ------------------------------------------------------
+
+
+def _an_infringement(store: FakeSearchStore, owner: UUID) -> UUID:
+    infringement_id = uuid4()
+    store.infringements.append(
+        InfringementRow(
+            infringement_id=infringement_id,
+            page_url="https://example.test/p",
+            image_url="https://example.test/i.jpg",
+            keyed_on="page_url",
+            first_seen_at=datetime.now(UTC),
+            last_seen_at=datetime.now(UTC),
+            seen_count=1,
+            band="review",
+            status="new",
+            band_reason=None,
+            attestations=(),
+        )
+    )
+    store.owners[infringement_id] = {UserRef(owner)}
+    return infringement_id
+
+
+def _feedback(client: TestClient, infringement_id: UUID, user_ref: UUID, signal: str) -> Any:
+    return client.post(
+        f"/v1/infringements/{infringement_id}/feedback",
+        json={"user_ref": str(user_ref), "signal": signal},
+        headers=AUTH,
+    )
+
+
+def test_feedback_404s_identically_for_not_yours_and_not_there() -> None:
+    """Done-when: assert both produce byte-identical responses.
+
+    The store returns the same None for both (proven in
+    tests/test_infringement_feedback.py against real Postgres); this is the
+    other half — that the route does not reintroduce a difference on the way
+    out. Everything but request_id, which is per-request by design, must match.
+    """
+    client, store, _subjects = make_client()
+    owner, intruder = uuid4(), uuid4()
+    infringement_id = _an_infringement(store, owner)
+
+    not_yours = _feedback(client, infringement_id, intruder, "confirmed")
+    not_there = _feedback(client, uuid4(), intruder, "confirmed")
+
+    assert not_yours.status_code == not_there.status_code == 404
+    mine, theirs = not_yours.json()["error"], not_there.json()["error"]
+    assert {k: v for k, v in mine.items() if k != "request_id"} == {
+        k: v for k, v in theirs.items() if k != "request_id"
+    }
+    assert mine["code"] == "infringement_not_found"
+    assert store.feedback == []
+
+
+@pytest.mark.parametrize(
+    ("signal", "expected"),
+    [
+        ("not_me", "dismissed_not_me"),
+        ("confirmed", "acknowledged"),
+        ("uncertain", "new"),
+    ],
+)
+def test_feedback_returns_the_resulting_status(signal: str, expected: str) -> None:
+    client, store, _subjects = make_client()
+    owner = uuid4()
+    infringement_id = _an_infringement(store, owner)
+
+    response = _feedback(client, infringement_id, owner, signal)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": expected}
+    assert store.feedback == [(infringement_id, UserRef(owner), signal)]
+
+
+def test_feedback_rejects_an_unknown_signal_with_422() -> None:
+    client, store, _subjects = make_client()
+    owner = uuid4()
+    infringement_id = _an_infringement(store, owner)
+
+    response = _feedback(client, infringement_id, owner, "definitely_not_me")
+
+    assert response.status_code == 422
+    assert store.feedback == []
+
+
+def test_feedback_rejects_an_unknown_body_field() -> None:
+    """extra='forbid'. `suppress_domain` is the field someone will eventually
+    try to add, and it is exactly the thing this endpoint must not do."""
+    client, store, _subjects = make_client()
+    owner = uuid4()
+    infringement_id = _an_infringement(store, owner)
+
+    response = client.post(
+        f"/v1/infringements/{infringement_id}/feedback",
+        json={"user_ref": str(owner), "signal": "not_me", "suppress_domain": True},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert store.feedback == []
+
+
+def test_feedback_requires_a_service_token() -> None:
+    client, _store, _subjects = make_client()
+    response = client.post(
+        f"/v1/infringements/{uuid4()}/feedback",
+        json={"user_ref": str(uuid4()), "signal": "not_me"},
+    )
+    assert response.status_code == 401

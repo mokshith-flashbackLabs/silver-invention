@@ -227,6 +227,40 @@ The alarm that matters most is `no_successful_calls_24h`. A provider silently re
 exactly like a quiet week for infringements, and an undetected outage means users are told they are
 clear when nothing actually looked. Delivery of these alarms to CloudWatch is step 9.
 
+### 3.6c URL recheck loop (v1 — built)
+
+`src/imageshield/recheck/` — its own process (`python -m imageshield.recheck.worker`), polled rather
+than queued: "which rows are due" is a question `infringements` answers directly.
+
+`url_alive` existed from migration 0005 and nothing ever set it false, so every infringement was
+permanently "live" and any count of live exposure equalled the total. A dead URL is also the only
+unambiguously good news v1 can deliver — detection without takedown is otherwise
+alerts-with-no-remedy, and *"this came down"* is the one purely positive thing the system can say.
+
+| Status | Verdict |
+|---|---|
+| 404, 410 | **dead** — `url_alive = false` |
+| 2xx, 3xx | alive |
+| 401, 403 | alive — *gated, not gone* |
+| 5xx, timeout, DNS failure, anything else | **unchanged** — not evidence of removal |
+
+Only 404 and 410 mark a URL dead. Telling a victim their problem is fixed because a site was briefly
+down is the wrong error to make, and the asymmetry runs the same direction as everywhere else here.
+**Nothing ever deletes an infringement** — a dead URL is still evidence, and the user has already been
+told about it.
+
+Network posture matches §3.7's crop fetcher, and for the same reason — this probes hostile domains:
+HEAD only (never GET; there is no `get` on the transport protocol to call), domain allowlist sourced
+from `content_urls.source_domain`, SSRF guards applied **after** DNS resolution, 5s timeout, 2
+redirects — with both guards re-applied to **every redirect hop**, since a guard on the first URL
+alone is what makes `302 → 169.254.169.254` work. Per-domain rate limiting, because probing one site's
+400 URLs in a burst is the traffic shape a scanner makes.
+
+Two timestamps, deliberately: `last_checked_at` ("we learned something", exposed to the proxy) moves
+only on a definite verdict, while `last_attempted_at` (migration 0013) moves on every probe and is
+what the due-queue orders by — otherwise a permanently unreachable host pins the front of every batch
+and the loop silently stops draining.
+
 ### 3.7 Crop fetcher
 
 Its own deployable, on its own egress path, with **no VPC access to any internal service**.

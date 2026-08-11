@@ -243,7 +243,13 @@ class AttestationItem(BaseModel):
 class InfringementItem(BaseModel):
     infringement_id: UUID
     page_url: str
-    image_url: str | None
+    # NO image_url. It was here and was REMOVED, deliberately: this is a
+    # user-facing list read, and it was handing any caller a direct link to the
+    # infringing image. Rendering a report list needs the domain, the dates, the
+    # band and the status — not a way to load the picture. Showing the image at
+    # all is a crop, blurred by default, behind its own gated call, and the crop
+    # fetcher is not built. The column survives on `infringements`; it is
+    # evidence. It just does not travel on this response.
     keyed_on: Literal["page_url", "image_url"]
     first_seen_at: datetime
     last_seen_at: datetime
@@ -251,6 +257,13 @@ class InfringementItem(BaseModel):
     band: str
     status: str
     band_reason: str | None
+    # Set false only by the recheck loop, and only on a 404/410. A dead URL is
+    # the one unambiguously good thing this product can tell someone in v1, and
+    # the proxy needs both fields to say it honestly: `url_alive=false` with a
+    # recent `last_checked_at` is "this came down", while a stale
+    # `last_checked_at` means we have not looked lately and should not claim.
+    url_alive: bool
+    last_checked_at: datetime | None
     # Agreement signal, not a hit count: three independent providers agreeing
     # is meaningfully different from one (CLAUDE.md §7.4).
     provider_count: int
@@ -259,6 +272,21 @@ class InfringementItem(BaseModel):
 
 class InfringementsResponse(BaseModel):
     infringements: list[InfringementItem]
+
+
+class FeedbackRequest(ServiceModel):
+    user_ref: UserRef
+    # Closed vocabulary. 'uncertain' is a real answer and is kept distinct:
+    # someone who looked at a match of their own face and could not tell has
+    # told us something, and collapsing it into either neighbour would invent a
+    # position they did not take.
+    signal: Literal["not_me", "confirmed", "uncertain"]
+
+
+class FeedbackResponse(BaseModel):
+    """The infringement's status after the write — unchanged for 'uncertain'."""
+
+    status: str
 
 
 class ProviderReasonRequest(ServiceModel):

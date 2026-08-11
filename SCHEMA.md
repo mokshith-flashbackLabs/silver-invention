@@ -252,8 +252,44 @@ is the third-party provider search that exists in the code today, and the two ar
 that will eventually feed the same report surface.
 
 Tables: `search_seeds`, `search_runs`, `content_urls`, `provider_calls`, `infringements`,
-`attestations`, `subjects`, `provider_spend`. Migrations `0001`, `0004`, `0005`, `0006`, `0007`,
-`0008`, `0009`, `0011`.
+`attestations`, `subjects`, `provider_spend`, `infringement_feedback`. Migrations `0001`, `0004`,
+`0005`, `0006`, `0007`, `0008`, `0009`, `0011`, `0012`, `0013`.
+
+### Feedback on a hit, and the one thing it must not do
+
+```sql
+CREATE TABLE infringement_feedback (
+  feedback_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  infringement_id  UUID NOT NULL REFERENCES infringements(infringement_id) ON DELETE CASCADE,
+  user_ref         UUID NOT NULL,
+  signal           TEXT NOT NULL CHECK (signal IN ('not_me','confirmed','uncertain')),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+**Append-only.** A user changing their mind writes a second row; the history is the record, and there
+is deliberately no `UNIQUE (infringement_id, user_ref)` to force one opinion per person.
+
+`signal` sets `infringements.status`: `not_me` → `dismissed_not_me`, `confirmed` → `acknowledged`,
+`uncertain` → unchanged but still recorded.
+
+**`not_me` never adjusts identity vectors, never suppresses a domain, and never feeds banding.** Users
+reject *true* positives under distress, and it is common; if rejections retrained the index, the users
+most affected by real abuse would systematically degrade their own protection, invisibly. Keep the
+signal, do not act on it. Enforced by a test that checksums `enrolments`, `attestations`,
+`content_urls`, `subjects` and `search_runs` either side of the write.
+
+### The two recheck timestamps
+
+`infringements.last_checked_at` means *we learned something* — only a definite verdict (2xx/3xx, or
+404/410) writes it, and it is exposed on `GET /v1/search/infringements` so the proxy can decide
+whether it may say "this came down".
+
+`infringements.last_attempted_at` (migration 0013) means *we tried*, and moves on every probe
+including the failures. The due-queue orders by it. Ordering by `last_checked_at` alone starves: a
+permanently unreachable host keeps its NULL, sits at the front of every batch forever, and once there
+are more such rows than `RECHECK_BATCH_SIZE` nothing else is ever checked — a loop that looks healthy
+and has stopped working.
 
 ### The durable reference vs. the expiring credential
 

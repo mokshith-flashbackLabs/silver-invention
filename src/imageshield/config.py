@@ -186,6 +186,24 @@ class Config(BaseSettings):
     outbox_batch_size: int = 50
     outbox_max_attempts: int = 8
 
+    # ── The recheck loop (src/imageshield/recheck/) ───────────────────────
+    # How stale a definite check may get before the URL is probed again.
+    recheck_interval_days: int = 7
+    # Rows per pass. The pass is sequential and per-domain paced, so this is
+    # also roughly "how long one pass takes" — keep it a size a single cycle
+    # can actually finish.
+    recheck_batch_size: int = 500
+    recheck_poll_interval_seconds: float = 300.0
+    # Matches the crop fetcher's posture (INVARIANTS #11): hard timeout, and a
+    # redirect cap low enough that a chain cannot be used to walk somewhere.
+    recheck_timeout_seconds: float = 5.0
+    recheck_max_redirects: int = 2
+    # Minimum gap between two probes of the SAME domain. Probing one site's 400
+    # URLs in a burst gets the worker blocked and, more to the point, looks like
+    # an attack from the far end — it is the traffic shape a scanner makes.
+    # Nothing is imposed across different domains.
+    recheck_per_domain_interval_seconds: float = 2.0
+
     # Requested via SERVICE_TOKEN_AUTH_DISABLED=1; only takes effect in
     # development — see :attr:`auth_disabled`.
     service_token_auth_disabled: bool = False
@@ -273,6 +291,8 @@ class Config(BaseSettings):
         "scan_dormant_after_empty",
         "scan_priority_release_after_empty",
         "provider_alarm_window_hours",
+        "recheck_interval_days",
+        "recheck_batch_size",
     )
     @classmethod
     def _positive(cls, value: int) -> int:
@@ -286,6 +306,8 @@ class Config(BaseSettings):
         "provider_timeout_seconds",
         "provider_retry_max_wait_seconds",
         "provider_config_cache_seconds",
+        "recheck_poll_interval_seconds",
+        "recheck_timeout_seconds",
     )
     @classmethod
     def _positive_float(cls, value: float) -> float:

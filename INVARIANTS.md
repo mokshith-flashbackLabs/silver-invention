@@ -164,12 +164,47 @@ No CDN, no `Cache-Control: public`, no disk write, no temp file. Response header
 
 Check: hit the crop endpoint twice and confirm two fetcher invocations.
 
-**11. The crop fetcher runs with no VPC access to any internal service.**
+**11. Anything that fetches a third-party URL runs with no VPC access to any internal service.**
 Separate egress path, deny-by-default network policy, domain allowlist sourced from
 `content_items.source_domain`, hard 5-second timeout, max response size 20 MB, redirect limit 2, and
 explicit SSRF guards rejecting private IP ranges after DNS resolution — not before.
 
-Check: point the fetcher at `http://169.254.169.254/`. It must refuse.
+Two things fetch: the **crop fetcher** (specified, not built) and the **URL recheck loop**
+(`src/imageshield/recheck/`, built). Both probe domains hosted by people with an interest in this
+system misbehaving, so the posture is the same for both. Two additions the recheck loop makes
+concrete:
+
+- **The guards apply to every redirect hop, not just the first.** A guard on the original URL alone is
+  not a guard — `https://allowed.example/x` → `302 http://169.254.169.254/` sails straight through it.
+  Redirects are followed by hand for exactly this reason.
+- **HEAD only, never GET.** Liveness needs no bytes, and the bytes in question are material already
+  classified as likely abuse. The transport protocol exposes one method, so there is no `get` to call.
+
+Check: point either at `http://169.254.169.254/`. It must refuse. Then point one at an allowlisted
+domain that *resolves* to `169.254.169.254` — a hostname check passes that and the post-DNS guard is
+the only thing that catches it.
+
+**11b. Only a 404 or a 410 marks a URL dead.**
+A timeout, a DNS failure, a 5xx, or a 403 leaves `url_alive` and `last_checked_at` untouched. 403 is
+*gated, not gone* — a host that has started requiring a login still has the material. Marking a hit
+resolved because a site was briefly down tells a victim their problem is fixed when it is not, and
+between the two available errors that is the worse one. **Nothing ever deletes an infringement:** a
+dead URL is still evidence, and the user has already been told about it.
+
+`last_checked_at` moves only on a definite verdict, because the proxy reads it to decide whether it
+may tell someone "this came down". `last_attempted_at` moves on every probe and is what the due-queue
+orders by — without the split, a permanently unreachable host pins the front of every batch and the
+loop silently stops draining.
+
+**11c. `not_me` feedback is recorded and never acted on automatically.**
+It writes an append-only `infringement_feedback` row and sets `infringements.status`. It does not
+adjust identity vectors, suppress future matches from that domain, or feed banding. Users reject
+*true* positives under distress, and it is common; if rejections retrained the identity index, the
+users most affected by real abuse would systematically degrade their own protection — invisibly, and
+concentrated on exactly the people this product exists for.
+
+Check: checksum `enrolments`, `attestations` and the infringement's band either side of a `not_me`.
+Nothing may move.
 
 **12. The crop is bbox + 15% margin, computed from `face_bbox`, and nothing outside it leaves the
 fetcher.**

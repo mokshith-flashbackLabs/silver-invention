@@ -45,6 +45,7 @@ from imageshield.calibration.bands import band_for_attestation, roll_up
 from imageshield.calibration.models import BandingPolicy
 from imageshield.outbox import QUEUE_SEARCH_RUNS, OutboxPayload, enqueue
 from imageshield.search.cadence import CadenceInput, CadenceUpdate, update_for
+from imageshield.search.feedback import status_for
 from imageshield.search.models import (
     AttestationRow,
     ClaimedRun,
@@ -260,7 +261,7 @@ _COMPLETE_RUN_SQL = """
 _LIST_INFRINGEMENTS_SQL = """
     SELECT i.infringement_id, i.page_url, i.image_url, i.keyed_on,
            i.first_seen_at, i.last_seen_at, i.seen_count, i.band, i.status,
-           i.band_reason,
+           i.band_reason, i.url_alive, i.last_checked_at,
            a.provider_id, a.score_kind, a.provider_score, a.provider_category,
            a.query_quality, a.score_version, a.first_confirmed_at,
            a.last_confirmed_at, a.confirm_count, a.band, a.calibration_version
@@ -269,6 +270,34 @@ _LIST_INFRINGEMENTS_SQL = """
     WHERE i.user_ref = %(user_ref)s
       AND (%(since)s::timestamptz IS NULL OR i.last_seen_at >= %(since)s)
     ORDER BY i.last_seen_at DESC, i.infringement_id, a.provider_id
+"""
+
+
+# Ownership and the status read in one statement. FOR UPDATE because the
+# INSERT and the status UPDATE that follow must not interleave with a
+# concurrent second opinion from the same user — the append-only history has to
+# end up agreeing with the status the last writer set.
+#
+# `user_ref` is in the WHERE, not checked afterwards: a row belonging to someone
+# else has to be indistinguishable from one that does not exist, and the
+# cleanest way to guarantee that is for the query to find nothing in both cases.
+_OWNED_INFRINGEMENT_SQL = """
+    SELECT status FROM infringements
+    WHERE infringement_id = %(infringement_id)s AND user_ref = %(user_ref)s
+    FOR UPDATE
+"""
+
+# APPEND-ONLY. Never an UPSERT: a user changing their mind is the record.
+_INSERT_FEEDBACK_SQL = """
+    INSERT INTO infringement_feedback (infringement_id, user_ref, signal)
+    VALUES (%(infringement_id)s, %(user_ref)s, %(signal)s)
+"""
+
+# Status only. NOT band, NOT url_alive, and nothing outside this table —
+# `not_me` must not reach the identity index, the attestations, or banding.
+_SET_INFRINGEMENT_STATUS_SQL = """
+    UPDATE infringements SET status = %(status)s
+    WHERE infringement_id = %(infringement_id)s AND user_ref = %(user_ref)s
 """
 
 
@@ -370,6 +399,10 @@ class SearchStore(Protocol):
     async def list_infringements(
         self, user_ref: UserRef, since: datetime | None
     ) -> tuple[InfringementRow, ...]: ...
+
+    async def record_feedback(
+        self, infringement_id: UUID, user_ref: UserRef, signal: str
+    ) -> str | None: ...
 
 
 class PostgresSearchStore:
@@ -677,6 +710,48 @@ class PostgresSearchStore:
             rows = await cur.fetchall()
         return _group_infringements(rows)
 
+    async def record_feedback(
+        self, infringement_id: UUID, user_ref: UserRef, signal: str
+    ) -> str | None:
+        """Append the feedback row and apply its status. ``None`` = not theirs
+        or not there, and the caller must not tell those two apart.
+
+        Exactly two tables are touched, in one transaction:
+        ``infringement_feedback`` (INSERT) and ``infringements.status``
+        (UPDATE). Nothing reaches ``enrolments``, ``attestations``, the
+        Rekognition collection, or any band — see ``search/feedback.py`` for
+        why that restraint is the whole design and not an omission.
+        """
+        status = status_for(signal)
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                _OWNED_INFRINGEMENT_SQL,
+                {"infringement_id": infringement_id, "user_ref": user_ref},
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            current: str = row[0]
+            await conn.execute(
+                _INSERT_FEEDBACK_SQL,
+                {
+                    "infringement_id": infringement_id,
+                    "user_ref": user_ref,
+                    "signal": signal,
+                },
+            )
+            if status is None:
+                return current  # 'uncertain': recorded, status untouched
+            await conn.execute(
+                _SET_INFRINGEMENT_STATUS_SQL,
+                {
+                    "infringement_id": infringement_id,
+                    "user_ref": user_ref,
+                    "status": status,
+                },
+            )
+        return status
+
 
 def _group_infringements(rows: Sequence[tuple[Any, ...]]) -> tuple[InfringementRow, ...]:
     """Collapse the joined (infringement x attestation) rows, preserving the
@@ -700,6 +775,8 @@ def _group_infringements(rows: Sequence[tuple[Any, ...]]) -> tuple[InfringementR
             band,
             status,
             band_reason,
+            url_alive,
+            last_checked_at,
             att_provider_id,
             att_score_kind,
             att_provider_score,
@@ -724,6 +801,8 @@ def _group_infringements(rows: Sequence[tuple[Any, ...]]) -> tuple[InfringementR
                 band,
                 status,
                 band_reason,
+                url_alive,
+                last_checked_at,
             )
             attestations[infringement_id] = []
         attestations[infringement_id].append(
@@ -753,6 +832,8 @@ def _group_infringements(rows: Sequence[tuple[Any, ...]]) -> tuple[InfringementR
             band=head[7],
             status=head[8],
             band_reason=head[9],
+            url_alive=head[10],
+            last_checked_at=head[11],
             attestations=tuple(attestations[key]),
         )
         for key, head in heads.items()

@@ -32,6 +32,7 @@ from imageshield.http.logging import configure_logging, install_request_logging_
 from imageshield.http.routes.admin_providers import router as admin_providers_router
 from imageshield.http.routes.enrolments import router as enrolments_router
 from imageshield.http.routes.health import router as health_router
+from imageshield.http.routes.infringements import router as infringements_router
 from imageshield.http.routes.liveness import router as liveness_router
 from imageshield.http.routes.ping import admin_router, v1_router
 from imageshield.http.routes.search import router as search_router
@@ -118,6 +119,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(liveness_router)
     app.include_router(enrolments_router)
     app.include_router(search_router)
+    app.include_router(infringements_router)
     app.include_router(subjects_router)
     app.include_router(admin_router)
     app.include_router(admin_providers_router)
