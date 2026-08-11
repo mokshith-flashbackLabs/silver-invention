@@ -117,6 +117,8 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]
 "src/imageshield/liveness/provider.py" = ["TID251"]
 "src/imageshield/enrolment/faceindex.py" = ["TID251"]
 "src/imageshield/attribution/rekognition.py" = ["TID251"]
+"src/imageshield/aws_identity.py" = ["TID251"]
+"src/imageshield/recheck/worker.py" = ["TID251"]
 # Spike/eval harnesses (CLAUDE.md §8: devtools/ is outside the numbered
 # steps). Not application code; the outbox rule protects request handlers,
 # not one-off credential/region checks.

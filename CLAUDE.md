@@ -394,10 +394,12 @@ granularity, follow this list and say which step you are on.
 6. URL normalisation, dedup, attestations.
 7. Calibration harness + banding.
 8. Cost tracking, circuit breakers, kill switches.
-9. **Infrastructure and CI.** IaC for SQS + DLQs, the `identity-v1` collection, per-module DB roles,
-   and an IAM role with **no `s3:*` permissions**. Blocking CI gates: mypy strict, schema lint,
-   route-auth coverage, and greps for `SearchFacesByImage` and any S3 client. Plus
-   `docs/OPERATIONS.md`.
+9. **Infrastructure and CI — built.** Terraform in `infra/terraform/`: SQS + DLQs, the `identity-v1`
+   collection (`prevent_destroy`), secrets containers, alarms. An IAM role with **no `s3:` grant of
+   any kind**, asserted by `tests/test_iam_policy.py` against the same JSON Terraform renders.
+   Per-module DB roles are migration `0015` rather than a `.tf` file — Postgres roles are not AWS
+   resources, and a migration is already versioned, reversible, checksummed and run in CI, which is
+   what "IaC" was protecting. Plus `docs/OPERATIONS.md`.
    The face-search grep is **two** gates, not one, and must be built that way rather than built wide
    and narrowed later: a hard ban over the enrolment path (`liveness/`, `enrolment/`, `subjects/` and
    their routes), and a ban everywhere else in `src/` **except `attribution/`** — see §4 #1a. The S3

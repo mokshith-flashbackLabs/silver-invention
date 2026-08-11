@@ -1,9 +1,17 @@
 name: CI
 
-# Blocking checks on every push and PR: lint, strict typecheck, then the test
-# suite (including the schema lint's DB-backed check — INVARIANTS.md #9 — run
-# against a real Postgres, not mocked). No LocalStack here: SQS-touching tests
-# use an injected stub client (Task 4), so this workflow only needs Postgres.
+# Every check here is BLOCKING. Step 9's rule: the boundaries stop being
+# conventions at this point.
+#
+# Most of the "grep gates" the step-9 brief lists are implemented as pytest
+# tests (tests/test_boundaries.py, tests/test_iam_policy.py,
+# tests/test_route_auth_coverage.py, tests/test_schema_lint.py) rather than as
+# shell greps, and the `gates` job below runs them as a named, separate step so
+# a failure says WHICH boundary broke instead of "pytest failed".
+#
+# They are tests rather than shell because a grep in a workflow file is invisible
+# to anyone running the suite locally: a violation should fail on the developer's
+# machine before a PR exists, not first in CI. The workflow calls the same tests.
 
 on:
   push:
@@ -29,6 +37,10 @@ jobs:
           --health-retries 20
 
     env:
+      # Unreachable Postgres is a hard FAILURE here, never a skip. Without this
+      # the DB-backed tests — migrations forward and back, the schema lint's
+      # real-database check, the per-module role grants — would quietly no-op
+      # and the build would go green having proven none of them.
       REQUIRE_DB: "1"
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
 
@@ -46,7 +58,48 @@ jobs:
         run: ruff check .
 
       - name: Typecheck (mypy strict)
+        # NewType is erased at runtime; without this the typed identifiers are
+        # decoration and the user_ref boundary is convention again.
         run: mypy
 
-      - name: Test (pytest)
+      - name: Boundary gates
+        # Named separately so a failure names the boundary. Face search outside
+        # attribution/, an S3 client, a phone-shaped literal, an inline age,
+        # cross-provider score arithmetic, and the IAM policy's absent s3 grant.
+        run: pytest tests/test_boundaries.py tests/test_iam_policy.py -v
+
+      - name: Route-auth coverage
+        # Parameterised over app.routes: a new route without the service-token
+        # dependency fails the build.
+        run: pytest tests/test_route_auth_coverage.py -v
+
+      - name: Schema lint
+        # INVARIANTS #9: no bytea column anywhere, name gate, *_uri/*_url allowed.
+        run: pytest tests/test_schema_lint.py -v
+
+      - name: Migrations, forward and backward, from empty
+        run: pytest tests/test_migrations.py -v
+
+      - name: Full suite
         run: pytest tests/ -v
+
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Format
+        run: terraform -chdir=infra/terraform fmt -check -recursive
+
+      - name: Validate
+        # No AWS credentials and no backend: `init -backend=false` is enough to
+        # resolve providers and typecheck the configuration. This job is what
+        # actually proves the .tf files parse — they were authored in an
+        # environment with no terraform binary.
+        run: |
+          terraform -chdir=infra/terraform init -backend=false
+          terraform -chdir=infra/terraform validate

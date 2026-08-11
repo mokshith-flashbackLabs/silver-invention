@@ -27,6 +27,7 @@ from imageshield.attribution.fetch import HttpxPhotoFetcher
 from imageshield.attribution.fetch import make_client as make_photo_client
 from imageshield.attribution.rekognition import RekognitionFaceAttribution
 from imageshield.attribution.store import PostgresAttributionStore
+from imageshield.aws_identity import log_aws_identity
 from imageshield.config import APP_VERSION, Config, load_config
 from imageshield.db.connection import make_async_pool, make_db_check
 from imageshield.enrolment.faceindex import RekognitionFaceIndex
@@ -100,6 +101,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.photo_fetcher = HttpxPhotoFetcher(app.state.photo_http_client)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
+    # Which AWS account and region, before anything touches Rekognition.
+    # Someone will eventually run this against production by accident.
+    log_aws_identity(region=cfg.aws_region, collection_id=cfg.rekognition_collection_id)
     if cfg.auth_disabled:
         log.warning("auth.disabled", environment=cfg.environment)
     elif cfg.service_token_auth_disabled:

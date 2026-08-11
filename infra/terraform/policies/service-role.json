@@ -1,0 +1,56 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LivenessAndEnrolment",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:CreateFaceLivenessSession",
+        "rekognition:GetFaceLivenessSessionResults",
+        "rekognition:StartFaceLivenessSession"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IdentityCollectionScoped",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:IndexFaces",
+        "rekognition:DeleteFaces",
+        "rekognition:ListFaces",
+        "rekognition:DescribeCollection",
+        "rekognition:SearchFacesByImage"
+      ],
+      "Resource": "arn:aws:rekognition:${region}:${account_id}:collection/${collection_id}"
+    },
+    {
+      "Sid": "FaceDetectionIsNotCollectionScoped",
+      "Effect": "Allow",
+      "Action": ["rekognition:DetectFaces"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Queues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": [
+        "${identity_index_queue_arn}",
+        "${search_runs_queue_arn}",
+        "${identity_index_dlq_arn}",
+        "${search_runs_dlq_arn}"
+      ]
+    },
+    {
+      "Sid": "SecretsScopedToOurPrefixNotStar",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:${region}:${account_id}:secret:imageshield/${environment}/*"
+    }
+  ]
+}

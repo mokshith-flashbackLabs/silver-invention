@@ -1269,3 +1269,77 @@ def _attribution_run(conn: psycopg.Connection[tuple[Any, ...]]) -> Any:
     ).fetchone()
     assert row is not None
     return row[0]
+
+
+# -- 0015: per-module database roles ----------------------------------------
+
+MODULE_ROLES = {"identity_rw", "search_rw", "calibration_rw", "audit_w"}
+
+
+def _roles(conn: psycopg.Connection[tuple[Any, ...]]) -> set[str]:
+    rows = conn.execute(
+        "SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)", (sorted(MODULE_ROLES),)
+    ).fetchall()
+    return {row[0] for row in rows}
+
+
+def test_0015_creates_every_module_role(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        assert _roles(conn) == MODULE_ROLES
+
+
+def test_0015_audit_w_can_insert_but_never_update_or_delete(throwaway_db: str) -> None:
+    """The step-9 done-when: `UPDATE audit_log` fails under the application
+    role. An audit log an application can edit is not an audit log."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute("SET ROLE audit_w")
+        conn.execute("INSERT INTO audit_log (actor_type, action) VALUES ('system', 't')")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE audit_log SET action = 'changed'")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM audit_log")
+        conn.execute("RESET ROLE")
+
+
+def test_0015_identity_cannot_touch_search_tables(throwaway_db: str) -> None:
+    """Least privilege is only real if it refuses something. The identity role
+    holds the biometric path; discovery data is not its business."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute("SET ROLE identity_rw")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("SELECT * FROM infringements")
+        conn.execute("RESET ROLE")
+
+
+def test_0015_search_cannot_read_the_enrolment_table(throwaway_db: str) -> None:
+    """The one that matters most. `enrolments` binds a face vector to a person;
+    the discovery path has no reason to read it, and the role says so."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute("SET ROLE search_rw")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("SELECT external_face_id FROM enrolments")
+        # ...but the tables the out-of-band tasks added ARE its business.
+        conn.execute("SELECT count(*) FROM infringement_feedback")
+        conn.execute("SELECT count(*) FROM attributed_faces")
+        conn.execute("RESET ROLE")
+
+
+def test_0015_no_role_can_edit_the_migration_ledger(throwaway_db: str) -> None:
+    """A role that could edit schema_migrations could make an applied migration
+    look unapplied — and the next deploy would re-run it."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        for role in sorted(MODULE_ROLES):
+            conn.execute(f"SET ROLE {role}")
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("DELETE FROM schema_migrations")
+            conn.execute("RESET ROLE")

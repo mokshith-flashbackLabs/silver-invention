@@ -6,6 +6,7 @@ fails BEFORE a PR exists. Permanent — never delete.
 
 from __future__ import annotations
 
+import ast
 import re
 import tokenize
 from pathlib import Path
@@ -259,5 +260,104 @@ def test_no_cross_provider_averaging_in_scoring_code() -> None:
         for path in _scored_source_files()
         for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
         if FORBIDDEN_CROSS_PROVIDER_MATHS.search(line)
+    ]
+    assert offenders == []
+
+
+# ── Step 9: no phone-shaped literal, in src/ or in migrations/ ──────────────
+#
+# CLAUDE.md §3.2: this service never sees a phone number — "not in a column,
+# not in a log line, not in an ExternalImageId". A phone-shaped LITERAL means
+# one got in: test data somebody pasted from the old system, or a column
+# default nobody meant.
+#
+# The shape is redaction.py's, deliberately. The runtime redactor and this
+# build-time gate must agree on what "phone-shaped" means, or a string the
+# redactor would scrub could sit in source unnoticed.
+_PHONE_CANDIDATE_RE = re.compile(r"\+?\d[\d\-\s().]{4,18}\d")
+
+# STRING LITERALS ONLY, and never docstrings or comments. Verified against the
+# whole repo before being narrowed: the naive line-wise version found fourteen
+# hits and every one was prose — money literals (0.003500), citations into the
+# old repo (js:1078-1160), migration ranges (0004-0006), and the URL-safe
+# charset in urlhash.py. Zero real numbers.
+#
+# A gate with fourteen false positives and no true ones does not get fixed; it
+# gets deleted, or worse, the prose gets mangled to satisfy it. So the scope is
+# where a phone number could actually DO something: a value the program holds.
+# The same reasoning as the age gate above, reached the same way.
+def _string_literals(path: Path) -> list[tuple[int, str]]:
+    """(line, value) for every non-docstring string constant in a Python file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
+        ):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstrings.add(id(first.value))
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+def _sql_literals(path: Path) -> list[tuple[int, str]]:
+    """(line, value) for single-quoted literals, skipping `--` comment lines."""
+    found: list[tuple[int, str]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        code = line.split("--", 1)[0]
+        found.extend((number, value) for value in re.findall(r"'([^']*)'", code))
+    return found
+
+
+def _phone_shaped(value: str) -> str | None:
+    for candidate in _PHONE_CANDIDATE_RE.findall(value):
+        # A phone number is never glued to a letter. This is what keeps
+        # urlhash.py's "...xyz0123456789-._~" charset out of the results.
+        start = value.index(candidate)
+        before = value[start - 1] if start else ""
+        after = value[start + len(candidate) : start + len(candidate) + 1]
+        if before.isalnum() or after.isalnum():
+            continue
+        digits = sum(1 for char in candidate if char.isdigit())
+        if 7 <= digits <= 15:
+            return candidate
+    return None
+
+
+def test_no_phone_shaped_literal_in_src() -> None:
+    """PERMANENT. §3.2 is the boundary, not a style preference: every request
+    carries an opaque user_ref, and a phone number held anywhere here means the
+    proxy leaked one or somebody hardcoded test data from the old system."""
+    offenders = [
+        f"{path.name}:{line}: {shape}"
+        for path in _source_files()
+        for line, value in _string_literals(path)
+        if (shape := _phone_shaped(value)) is not None
+    ]
+    assert offenders == []
+
+
+def test_no_phone_shaped_literal_in_migrations() -> None:
+    """Migrations get their own check: a column DEFAULT or a backfill literal is
+    where a real number would hide. It is not code anybody reads twice, and it
+    lands in every environment."""
+    migrations = sorted((SRC.parent / "migrations").glob("*.sql"))
+    assert migrations, "migrations/ scan found nothing — path wrong?"
+    offenders = [
+        f"{path.name}:{line}: {shape}"
+        for path in migrations
+        for line, value in _sql_literals(path)
+        if (shape := _phone_shaped(value)) is not None
     ]
     assert offenders == []
