@@ -12,11 +12,38 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
-# The fragmentation bug's fingerprints: any face-search call in this codebase
-# means identity is about to come from a similarity score (INVARIANTS #1).
+# The fragmentation bug's fingerprints (INVARIANTS #1). The pattern is
+# unchanged from when this gate covered all of src/; what changed is WHERE it is
+# applied — see ENROLMENT_PATH and ATTRIBUTION_DIR below.
 FORBIDDEN_SEARCH = re.compile(
     r"search_faces_by_image|SearchFacesByImage|search_users_by_image|search_faces\b|SearchFaces\b"
 )
+
+# Where identity is established. A face-search call HERE is the fragmentation
+# bug itself: the old system's processFaceRecognition (server.js:9585) searched
+# the collection during enrolment and minted or overwrote a user_ref from the
+# result. INVARIANTS #1 has always been worded against this path specifically
+# ("SearchFacesByImage must not appear in the enrolment path"); until now the
+# test was stricter than the rule and covered all of src/.
+ENROLMENT_PATH = (
+    "liveness",
+    "enrolment",
+    "subjects",
+)
+ENROLMENT_PATH_FILES = (
+    "http/routes/liveness.py",
+    "http/routes/enrolments.py",
+)
+
+# The ONE exemption (INVARIANTS #1a). Attribution matches a face in a
+# THIRD-PARTY photo against a caller-supplied list of already-enrolled
+# user_refs. It cannot corrupt an identity: no user_ref is created, reassigned
+# or merged, every candidate was named in the request, and a non-match is a
+# first-class success whose worst case is a seed not registered.
+#
+# Exactly one directory. Adding a second costs a code change and a review, which
+# is the whole point of naming it here rather than passing an exclude list.
+ATTRIBUTION_DIR = "attribution"
 
 # No S3 client, ever (CLAUDE.md §3.3): presigned URLs via httpx are the only
 # path to bytes.
@@ -68,6 +95,24 @@ CALIBRATE_CLI = Path(__file__).resolve().parents[1] / "devtools" / "calibrate"
 
 def _source_files() -> list[Path]:
     files = sorted(SRC.rglob("*.py"))
+    assert files, "src/ scan found nothing — path wrong?"
+    return files
+
+
+def _enrolment_path_files() -> list[Path]:
+    """Every module where identity is established."""
+    package = SRC / "imageshield"
+    files = [p for d in ENROLMENT_PATH for p in sorted((package / d).rglob("*.py"))]
+    files += [package / name for name in ENROLMENT_PATH_FILES]
+    missing = [p for p in files if not p.exists()]
+    assert not missing, f"enrolment-path scan lists files that do not exist: {missing}"
+    return files
+
+
+def _files_outside_attribution() -> list[Path]:
+    """All of src/ except the one exempt directory."""
+    exempt = SRC / "imageshield" / ATTRIBUTION_DIR
+    files = [p for p in sorted(SRC.rglob("*.py")) if exempt not in p.parents]
     assert files, "src/ scan found nothing — path wrong?"
     return files
 
@@ -140,10 +185,34 @@ def test_no_inline_age_literal_where_ages_are_decided() -> None:
     assert offenders == []
 
 
-def test_no_face_search_anywhere_in_src() -> None:
+def test_no_face_search_in_the_enrolment_path() -> None:
+    """PERMANENT. A hit here IS the fragmentation bug (INVARIANTS #1).
+
+    Identity comes from the authenticated request, always. A face search in
+    this path means a similarity score is about to decide who someone is —
+    which in the old system minted a fresh user_ref for a returning user
+    scoring 92 against a 95 threshold, orphaning their monitoring history and
+    leaving their old faces in the collection under a dead ID.
+    """
     offenders = [
         str(path)
-        for path in _source_files()
+        for path in _enrolment_path_files()
+        if FORBIDDEN_SEARCH.search(path.read_text(encoding="utf-8"))
+    ]
+    assert offenders == []
+
+
+def test_face_search_appears_only_in_the_attribution_module() -> None:
+    """PERMANENT. The exemption in INVARIANTS #1a is exactly one directory.
+
+    Narrower than the enrolment-path gate above and less catastrophic when it
+    fires: a face search in, say, ``search/`` or ``recheck/`` is not the
+    fragmentation bug, but it is face search somewhere nobody reasoned about.
+    Both tests exist because the two failures deserve different alarm.
+    """
+    offenders = [
+        str(path)
+        for path in _files_outside_attribution()
         if FORBIDDEN_SEARCH.search(path.read_text(encoding="utf-8"))
     ]
     assert offenders == []

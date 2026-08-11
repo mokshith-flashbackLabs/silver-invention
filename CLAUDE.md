@@ -119,6 +119,12 @@ code being written **now**, carrying the same numbers.
    code path where a face search result determines who someone is. The old system's
    `processFaceRecognition` (`server.js:9585`) does exactly this with thresholds varying 90/95/99 —
    that's the fragmentation bug. `SearchFacesByImage` must not appear in the enrolment path.
+1a. **Face search is permitted for attribution, and only in `attribution/`.** Matching a face in a
+   *third-party photo* against a caller-supplied list of *already-enrolled* `user_ref`s cannot
+   corrupt an identity: nothing is created or reassigned, and the worst case is a seed not
+   registered. Five conditions attach, and the load-bearing one is that matches outside the
+   candidate list are discarded **before they can influence anything** — that filter is what stops
+   one user's photo becoming another user's monitored seed. Full text in `INVARIANTS.md` #1a.
 1b. **One threshold per purpose, from config.** No inline literals. The 90/95/99 spread across call
    sites is what makes #1's failure fire.
 2. **No enrolment without a passed liveness session and a consent reference from the proxy.**
@@ -390,6 +396,11 @@ granularity, follow this list and say which step you are on.
    and an IAM role with **no `s3:*` permissions**. Blocking CI gates: mypy strict, schema lint,
    route-auth coverage, and greps for `SearchFacesByImage` and any S3 client. Plus
    `docs/OPERATIONS.md`.
+   The face-search grep is **two** gates, not one, and must be built that way rather than built wide
+   and narrowed later: a hard ban over the enrolment path (`liveness/`, `enrolment/`, `subjects/` and
+   their routes), and a ban everywhere else in `src/` **except `attribution/`** — see §4 #1a. The S3
+   grep stays whole-`src/`; there is no exemption to that one. `tests/test_boundaries.py` already
+   enforces both shapes, so the CI step mirrors it rather than inventing its own scoping.
 
 Step 9 is not optional and not last-by-importance. The IAM grant is one of only three places the
 data boundary is enforced by something other than discipline — the other two are the schema lint

@@ -75,6 +75,10 @@ No `SearchFacesByImage` anywhere in this path (INVARIANTS #1). Identity is the `
 supplies; a similarity score never determines who someone is. Sessions are single-use with a
 10-minute TTL — replay returns `410`.
 
+Face search *is* permitted in one place — `attribution/`, matching a face in a third-party photo
+against a caller-supplied list of already-enrolled `user_ref`s (INVARIANTS #1a). That is a different
+operation with a different failure cost, and it is barred from this path specifically.
+
 ### 2.2 Forward match loop (async, minutes)
 
 Continuous. Drains `match:forward`.

@@ -180,7 +180,8 @@ retry blind. `POST /.../result` accepts `Idempotency-Key`.
 1. **No `SearchFacesByImage` in this path.** Identity is the `user_ref` the proxy supplies. The
    existing `processFaceRecognition` (`server.js:9585`) derives identity from a search result with
    thresholds varying 90/95/99 across call sites — that is the fragmentation bug. Do not reuse it,
-   do not port it, do not reference it.
+   do not port it, do not reference it. (Face search is permitted in `attribution/` alone, for a
+   different operation — INVARIANTS #1a. It is barred *here* regardless.)
 2. **One threshold, from config.** `LIVENESS_MIN_CONFIDENCE`, `FACE_MATCH_THRESHOLD`. No inline
    literals anywhere.
 3. **`QualityFilter: HIGH`**, not `AUTO`.

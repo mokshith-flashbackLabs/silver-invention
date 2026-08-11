@@ -27,6 +27,41 @@ The old system violates this in both directions. Verified by audit:
 Both are the same root cause. Deriving identity from the session fixes both.
 
 Check: grep the enrolment path for `SearchFacesByImage` and `searchUsersByImage`. Neither may appear.
+`tests/test_boundaries.py::test_no_face_search_in_the_enrolment_path`.
+
+**1a. Face search is permitted for ATTRIBUTION, and only there.**
+
+The two operations look alike and are distinguished by what a wrong answer costs:
+
+| | Input | Output | Cost of being wrong |
+|---|---|---|---|
+| **Identity resolution — forbidden** | a person presenting themselves | who they are | a wrong or newly-minted `user_ref`; orphaned history; one user receiving another's matches |
+| **Attribution — permitted** | a third-party photo + a caller-supplied list of already-enrolled `user_ref`s | which of *those* candidates appears in it | a seed not registered |
+
+Attribution is permitted only where **all five** of these hold. Any one missing and it is identity
+resolution wearing attribution's clothes:
+
+1. Every candidate is a `user_ref` **the caller named in the request**. The search never introduces
+   one the caller did not supply.
+2. Matches whose `ExternalImageId` is absent from the candidate list are **discarded before the
+   result can influence anything**. Household scoping is a result filter — `SearchFacesByImage` takes
+   `CollectionId`, `Image`, `FaceMatchThreshold`, `MaxFaces` and `QualityFilter`, and there is no way
+   to restrict the search set. This filter is the only thing standing between a stranger outranking a
+   household member and person A's photo becoming person B's monitored seed.
+3. No `user_ref` is created, reassigned, merged or deleted on any path reachable from the result.
+4. A non-match is a first-class success — not an error, not a retry, and never a fallback to
+   "create". It is the common case: most faces in most photos belong to people who are not enrolled.
+5. One threshold, from config (#1b), and the attribution threshold is a **different knob** from
+   anything in the enrolment path.
+
+It may live in `src/imageshield/attribution/` and nowhere else. That is one directory; adding a
+second costs a code change and a review, which is the point of naming it rather than maintaining an
+exclusion list.
+
+Check: plant a non-candidate match that outscores the real one and confirm it is discarded.
+`tests/test_boundaries.py::test_face_search_appears_only_in_the_attribution_module` holds the
+boundary; a companion test asserts the exemption is actually used, so it cannot rot into a dead
+carve-out that someone later widens because nothing needs it.
 
 **1b. There is exactly one similarity threshold per purpose, read from config.**
 Not per call site. The old system's 90/95/99 spread across paths is what makes #1's miss case fire.
