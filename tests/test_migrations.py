@@ -480,11 +480,11 @@ def test_0007_creates_calibration_tables(throwaway_db: str) -> None:
 def test_0007_down_removes_them_and_the_added_columns(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    # Four steps back: 0010 (consent_ref), 0009 (cost/cadence), 0008
-    # (subjects), then 0007. This number has to move whenever a migration is
-    # added, which is the point — a silently-wrong count would revert the
-    # wrong migration and pass.
-    run_migrate(throwaway_db, "down", "--steps", "4")
+    # Five steps back: 0011 (seed ref), 0010 (consent_ref), 0009
+    # (cost/cadence), 0008 (subjects), then 0007. This number has to move
+    # whenever a migration is added, which is the point — a silently-wrong
+    # count would revert the wrong migration and pass.
+    run_migrate(throwaway_db, "down", "--steps", "5")
     with psycopg.connect(throwaway_db) as conn:
         assert CALIBRATION_TABLES & _table_names(conn) == set()
         cols = {
@@ -648,7 +648,7 @@ def test_0008_backfills_existing_enrolments_and_seeds_as_adult(throwaway_db: str
     """
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "3")  # back to 0007
+    run_migrate(throwaway_db, "down", "--steps", "4")  # back to 0007
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         session = conn.execute(
@@ -688,7 +688,7 @@ def test_0008_backfills_existing_enrolments_and_seeds_as_adult(throwaway_db: str
 def test_0008_down_drops_the_table_and_the_constraint(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "3")  # 0010, 0009, then 0008
+    run_migrate(throwaway_db, "down", "--steps", "4")  # 0011, 0010, 0009, then 0008
     with psycopg.connect(throwaway_db) as conn:
         assert "subjects" not in _table_names(conn)
         assert "search_seeds_subject_fk" not in _constraints(conn, "search_seeds")
@@ -758,7 +758,7 @@ def test_0009_rejects_an_unknown_scan_tier(throwaway_db: str) -> None:
             )
         with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
             conn.execute(
-                "INSERT INTO search_seeds (user_ref, seed_kind, source_object_uri, scan_tier)"
+                "INSERT INTO search_seeds (user_ref, seed_kind, source_object_ref, scan_tier)"
                 " VALUES ('11111111-1111-1111-1111-111111111111', 'user_supplied',"
                 "         'https://s3/x.jpg', 'hourly')"
             )
@@ -784,7 +784,7 @@ def test_0009_rejects_an_unknown_provider_call_status(throwaway_db: str) -> None
 def test_0009_down_removes_them_and_keeps_daily_budget(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "2")  # 0010 then 0009
+    run_migrate(throwaway_db, "down", "--steps", "3")  # 0011, 0010, then 0009
     with psycopg.connect(throwaway_db) as conn:
         assert "provider_spend" not in _table_names(conn)
         assert _columns(conn, "providers") & PROVIDER_STEP_8_COLUMNS == set()
@@ -895,7 +895,7 @@ def test_0010_backfills_pre_consent_rows_with_the_sentinel(throwaway_db: str) ->
     the sentinel and its own created_at as consent_signed_at."""
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "1")  # back to 0009
+    run_migrate(throwaway_db, "down", "--steps", "2")  # 0011 then 0010, back to 0009
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         session_id, user_ref = _consumed_session(conn)
@@ -921,7 +921,111 @@ def test_0010_backfills_pre_consent_rows_with_the_sentinel(throwaway_db: str) ->
 def test_0010_down_removes_the_consent_columns(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "1")
+    run_migrate(throwaway_db, "down", "--steps", "2")  # 0011 then 0010
     with psycopg.connect(throwaway_db) as conn:
         assert _columns(conn, "enrolments") & CONSENT_COLUMNS == set()
         assert "enrolments_consent_not_sentinel" not in _constraints(conn, "enrolments")
+
+
+# ── 0011: durable seed ref vs per-run presigned URL ───────────────────────
+
+
+def _column_comment(
+    conn: psycopg.Connection[tuple[Any, ...]], table: str, column: str
+) -> str | None:
+    row = conn.execute(
+        "SELECT col_description(%s::regclass, ordinal_position)"
+        " FROM information_schema.columns"
+        " WHERE table_name = %s AND column_name = %s",
+        (table, table, column),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def test_0011_renames_the_seed_column_and_adds_the_run_url(throwaway_db: str) -> None:
+    """The expiring thing moves onto the expiring object.
+
+    A presigned URL is a short-lived credential (SigV4 caps at 7 days), not a
+    durable identifier. Stored on the seed it works in week 1 and 403s forever
+    after — surfacing as "the provider is failing", not "our URLs expired".
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        seed_columns = _columns(conn, "search_seeds")
+        assert "source_object_ref" in seed_columns
+        assert "source_object_uri" not in seed_columns
+        assert "seed_url" in _columns(conn, "search_runs")
+        nullable = conn.execute(
+            "SELECT is_nullable FROM information_schema.columns"
+            " WHERE table_name = 'search_runs' AND column_name = 'seed_url'"
+        ).fetchone()
+        assert nullable == ("NO",)
+        # enrolments.source_object_uri is a DIFFERENT column and must not move:
+        # it is the ReferenceImage pointer, and INVARIANTS #9 names it.
+        assert "source_object_uri" in _columns(conn, "enrolments")
+
+
+def test_0011_documents_that_the_ref_is_never_a_presigned_url(throwaway_db: str) -> None:
+    """The comment is the durable warning. Someone will look at a TEXT column
+    holding an object key and reach for a URL; the column has to say no."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        comment = _column_comment(conn, "search_seeds", "source_object_ref")
+    assert comment is not None
+    assert "presigned" in comment.lower()
+
+
+def test_0011_backfills_existing_runs_with_an_empty_seed_url(throwaway_db: str) -> None:
+    """The real upgrade path. Existing runs cannot be repaired — a presigned URL
+    cannot be turned back into an object key — so they get '' and the proxy
+    re-enqueues. The rows survive; nothing is silently rewritten to look valid.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "1")  # back to 0010
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        user_ref = conn.execute(
+            "INSERT INTO subjects (user_ref, discovery_eligible, eligibility_reason)"
+            " VALUES (gen_random_uuid(), true, 'adult') RETURNING user_ref"
+        ).fetchone()
+        assert user_ref is not None
+        seed = conn.execute(
+            "INSERT INTO search_seeds (user_ref, seed_kind, source_object_uri)"
+            " VALUES (%s, 'user_supplied',"
+            "         'https://s3/seed.jpg?X-Amz-Signature=deadbeef')"
+            " RETURNING seed_id",
+            (user_ref[0],),
+        ).fetchone()
+        assert seed is not None
+        conn.execute(
+            "INSERT INTO search_runs (seed_id, user_ref, providers_attempted,"
+            " threshold_config) VALUES (%s, %s, '{hive}', '{}')",
+            (seed[0], user_ref[0]),
+        )
+
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db) as conn:
+        assert conn.execute("SELECT seed_url FROM search_runs").fetchone() == ("",)
+        # The dead presigned URL is preserved verbatim under the new name, not
+        # salvaged and not deleted: the count of these is what gets reported so
+        # the proxy knows which seeds to re-register.
+        assert conn.execute(
+            "SELECT source_object_ref FROM search_seeds"
+        ).fetchone() == ("https://s3/seed.jpg?X-Amz-Signature=deadbeef",)
+
+
+def test_0011_down_restores_the_seed_column_and_drops_the_run_url(
+    throwaway_db: str,
+) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "1")
+    with psycopg.connect(throwaway_db) as conn:
+        assert "source_object_uri" in _columns(conn, "search_seeds")
+        assert "source_object_ref" not in _columns(conn, "search_seeds")
+        assert "seed_url" not in _columns(conn, "search_runs")

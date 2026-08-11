@@ -23,6 +23,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
@@ -48,7 +49,9 @@ class FakeSearchStore:
         self.seeds: dict[UUID, SeedRow] = {}
         self.runs: dict[UUID, RunRow] = {}
         self.infringements: list[InfringementRow] = []
-        self.created_runs: list[tuple[UserRef, UUID, tuple[ProviderId, ...]]] = []
+        self.created_runs: list[
+            tuple[UserRef, UUID, tuple[ProviderId, ...], str]
+        ] = []
         self.enabled: tuple[ProviderId, ...] = (ProviderId("google"), ProviderId("hive"))
         # Models migration 0008's search_seeds_subject_fk. Without this the fake
         # accepted a seed for an unparented user_ref and returned 201, while the
@@ -57,7 +60,7 @@ class FakeSearchStore:
         self.known_subjects: set[UserRef] = set()
 
     async def create_seed(
-        self, user_ref: UserRef, seed_kind: str, source_object_uri: str
+        self, user_ref: UserRef, seed_kind: str, source_object_ref: str
     ) -> UUID:
         if self.known_subjects and user_ref not in self.known_subjects:
             raise UnknownSubject("no subjects row for this user_ref")
@@ -66,7 +69,7 @@ class FakeSearchStore:
             seed_id=seed_id,
             user_ref=user_ref,
             seed_kind=seed_kind,
-            source_object_uri=source_object_uri,
+            source_object_ref=source_object_ref,
             status="active",
             created_at=datetime.now(UTC),
         )
@@ -76,10 +79,17 @@ class FakeSearchStore:
         return self.seeds.get(seed_id)
 
     async def create_run(
-        self, user_ref: UserRef, seed_id: UUID, providers_attempted: Sequence[ProviderId]
+        self,
+        user_ref: UserRef,
+        seed_id: UUID,
+        providers_attempted: Sequence[ProviderId],
+        *,
+        seed_url: str,
     ) -> UUID:
         run_id = uuid4()
-        self.created_runs.append((user_ref, seed_id, tuple(providers_attempted)))
+        self.created_runs.append(
+            (user_ref, seed_id, tuple(providers_attempted), seed_url)
+        )
         return run_id
 
     async def get_run(self, run_id: UUID) -> RunRow | None:
@@ -158,11 +168,30 @@ def _enrolled_adult(subjects: FakeSubjectStore, user_ref: UUID) -> None:
     subjects.subjects[UserRef(user_ref)] = eligibility_for(True)
 
 
+# An opaque durable object key, NOT a URL. A presigned URL arriving here is
+# the exact bug 0011 fixes, so the validator refuses it (see the 422 tests).
+SEED_REF = "seeds/2026/08/9f1c1e6a.jpg"
+# A freshly-minted presigned GET, supplied per run by the proxy. Lives on the
+# RUN, never on the seed.
+SEED_URL = "https://proxy-s3.example/seed.jpg?X-Amz-Signature=abc"
+
+
 def _seed_body(user_ref: UUID) -> dict[str, Any]:
     return {
         "user_ref": str(user_ref),
         "seed_kind": "user_supplied",
-        "source_object_uri": "https://proxy-s3.example/seed.jpg?sig=abc",
+        "source_object_ref": SEED_REF,
+    }
+
+
+def _search_body(
+    user_ref: UUID | str, seed_id: UUID | str, **extra: Any
+) -> dict[str, Any]:
+    return {
+        "user_ref": str(user_ref),
+        "seed_id": str(seed_id),
+        "seed_url": SEED_URL,
+        **extra,
     }
 
 
@@ -186,12 +215,61 @@ def test_create_seed_201() -> None:
     assert store.seeds[seed_id].seed_kind == "user_supplied"
 
 
-def test_create_seed_rejects_non_http_uri_and_bad_kind() -> None:
-    client, _, _subjects = make_client()
-    body = _seed_body(uuid4())
-    body["source_object_uri"] = "s3://bucket/key.jpg"  # we hold no S3 creds
-    assert client.post("/v1/seeds", json=body, headers=AUTH).status_code == 422
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "https://proxy-s3.example/seed.jpg?X-Amz-Signature=deadbeef",
+        "https://proxy-s3.example/seed.jpg",
+        "http://proxy-s3.example/seed.jpg",
+        "HTTPS://PROXY-S3.EXAMPLE/seed.jpg",
+        "seeds/abc.jpg?x-amz-signature=deadbeef",
+    ],
+)
+def test_create_seed_rejects_a_presigned_url_with_422(ref: str) -> None:
+    """Done-when: POST /v1/seeds REJECTS an https:// value, asserted with a real
+    presigned-URL-shaped string.
 
+    The validator is INVERTED from what it was -- it used to *require* https://.
+    A presigned URL is a credential with days of life; stored on a seed it 403s
+    forever from week two and presents as a provider outage rather than as our
+    URLs expiring. It arriving here is the exact bug 0011 fixes, so it has to
+    fail loudly rather than be accepted and quietly rot.
+    """
+    client, store, _subjects = make_client()
+    body = _seed_body(uuid4())
+    body["source_object_ref"] = ref
+
+    response = client.post("/v1/seeds", json=body, headers=AUTH)
+
+    assert response.status_code == 422
+    assert store.seeds == {}
+
+
+@pytest.mark.parametrize(
+    "ref", ["seeds/2026/08/abc.jpg", "s3://bucket/key.jpg", "abc123"]
+)
+def test_create_seed_accepts_an_opaque_durable_ref(ref: str) -> None:
+    """Anything that is not an http(s) URL and carries no signature.
+
+    `s3://` passes now, where it used to be refused for "we hold no S3 creds".
+    That reason no longer applies: we never dereference the ref at all -- the
+    proxy resolves it and mints the presigned GET. Only the *expiring* shapes
+    are refused.
+    """
+    client, store, subjects = make_client()
+    user_ref = uuid4()
+    _enrolled_adult(subjects, user_ref)
+    body = _seed_body(user_ref)
+    body["source_object_ref"] = ref
+
+    response = client.post("/v1/seeds", json=body, headers=AUTH)
+
+    assert response.status_code == 201
+    assert store.seeds[UUID(response.json()["seed_id"])].source_object_ref == ref
+
+
+def test_create_seed_rejects_a_bad_kind() -> None:
+    client, _, _subjects = make_client()
     body = _seed_body(uuid4())
     body["seed_kind"] = "scraped"
     assert client.post("/v1/seeds", json=body, headers=AUTH).status_code == 422
@@ -205,16 +283,20 @@ def test_create_search_202_defaults_to_all_enabled_providers() -> None:
 
     response = client.post(
         "/v1/search",
-        json={"user_ref": str(user_ref), "seed_id": seed["seed_id"]},
+        json=_search_body(user_ref, seed["seed_id"]),
         headers=AUTH,
     )
 
     assert response.status_code == 202
     assert UUID(response.json()["run_id"])
-    [(run_user, run_seed, providers)] = store.created_runs
+    [(run_user, run_seed, providers, run_seed_url)] = store.created_runs
     assert run_user == user_ref
     assert run_seed == UUID(seed["seed_id"])
     assert providers == ("google", "hive")
+    # The presigned URL is stored on the RUN. The seed keeps only its opaque
+    # ref, which is what stops it expiring a week after creation.
+    assert run_seed_url == SEED_URL
+    assert store.seeds[run_seed].source_object_ref == SEED_REF
 
 
 def test_create_search_subset_and_unknown_provider() -> None:
@@ -225,7 +307,7 @@ def test_create_search_subset_and_unknown_provider() -> None:
 
     ok = client.post(
         "/v1/search",
-        json={"user_ref": str(user_ref), "seed_id": seed["seed_id"], "providers": ["hive"]},
+        json=_search_body(user_ref, seed["seed_id"], providers=["hive"]),
         headers=AUTH,
     )
     assert ok.status_code == 202
@@ -233,11 +315,9 @@ def test_create_search_subset_and_unknown_provider() -> None:
 
     bad = client.post(
         "/v1/search",
-        json={
-            "user_ref": str(user_ref),
-            "seed_id": seed["seed_id"],
-            "providers": ["hive", "pimeyes"],
-        },
+        json=_search_body(
+            user_ref, seed["seed_id"], providers=["hive", "pimeyes"]
+        ),
         headers=AUTH,
     )
     assert bad.status_code == 422
@@ -254,12 +334,12 @@ def test_create_search_wrong_user_or_missing_seed_is_404() -> None:
 
     stolen = client.post(
         "/v1/search",
-        json={"user_ref": str(intruder), "seed_id": seed["seed_id"]},
+        json=_search_body(intruder, seed["seed_id"]),
         headers=AUTH,
     )
     missing = client.post(
         "/v1/search",
-        json={"user_ref": str(owner), "seed_id": str(uuid4())},
+        json=_search_body(owner, uuid4()),
         headers=AUTH,
     )
 
@@ -369,14 +449,14 @@ def test_an_ineligible_subject_gets_403_and_no_run_is_created() -> None:
         seed_id=seed_id,
         user_ref=UserRef(user_ref),
         seed_kind="enrolment",
-        source_object_uri="https://s3/x.jpg",
+        source_object_ref=SEED_REF,
         status="active",
         created_at=datetime.now(UTC),
     )
 
     response = client.post(
         "/v1/search",
-        json={"user_ref": str(user_ref), "seed_id": str(seed_id)},
+        json=_search_body(user_ref, seed_id),
         headers=AUTH,
     )
 
@@ -401,7 +481,7 @@ def test_an_unknown_subject_gets_409_not_403() -> None:
 
     response = client.post(
         "/v1/search",
-        json={"user_ref": str(user_ref), "seed_id": str(uuid4())},
+        json=_search_body(user_ref, uuid4()),
         headers=AUTH,
     )
 
@@ -423,7 +503,7 @@ def test_the_eligibility_check_runs_before_the_seed_lookup() -> None:
 
     response = client.post(
         "/v1/search",
-        json={"user_ref": str(minor), "seed_id": seed["seed_id"]},
+        json=_search_body(minor, seed["seed_id"]),
         headers=AUTH,
     )
 
@@ -519,3 +599,79 @@ def test_infringements_nest_attestations_and_serialise_both_score_shapes() -> No
     assert categorical["score_kind"] == "categorical"
     assert categorical["provider_score"] is None
     assert categorical["provider_category"] == "full_match"
+
+
+# --- seed_url: the per-run credential, required on every search -------------
+
+
+def test_search_without_seed_url_is_400_seed_url_required() -> None:
+    """Done-when. No default and no fallback to the seed.
+
+    Falling back to the seed is precisely the bug: the seed holds a durable ref
+    now, and before 0011 it held a credential that had already expired. Either
+    way, silently substituting it dispatches a search that cannot fetch and
+    reports it as a provider failure.
+    """
+    client, store, subjects = make_client()
+    user_ref = uuid4()
+    _enrolled_adult(subjects, user_ref)
+    seed = client.post("/v1/seeds", json=_seed_body(user_ref), headers=AUTH).json()
+
+    response = client.post(
+        "/v1/search",
+        json={"user_ref": str(user_ref), "seed_id": seed["seed_id"]},
+        headers=AUTH,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "seed_url_required"
+    assert store.created_runs == []
+
+
+@pytest.mark.parametrize(
+    "seed_url",
+    [
+        "http://proxy-s3.example/seed.jpg",
+        "s3://bucket/key.jpg",
+        "seeds/2026/08/abc.jpg",
+        "ftp://proxy-s3.example/seed.jpg",
+    ],
+)
+def test_search_with_a_non_https_seed_url_is_422(seed_url: str) -> None:
+    """Done-when. https only — this URL is fetched by a third-party provider
+    over the public internet, so plaintext would put the seed image (a photo of
+    the user's face) on the wire in the clear."""
+    client, store, subjects = make_client()
+    user_ref = uuid4()
+    _enrolled_adult(subjects, user_ref)
+    seed = client.post("/v1/seeds", json=_seed_body(user_ref), headers=AUTH).json()
+
+    response = client.post(
+        "/v1/search",
+        json=_search_body(user_ref, seed["seed_id"], seed_url=seed_url),
+        headers=AUTH,
+    )
+
+    assert response.status_code == 422
+    assert store.created_runs == []
+
+
+def test_search_seed_url_is_not_recoverable_from_the_seed() -> None:
+    """The two values are independent by construction: a run's URL bears no
+    relationship to its seed's ref, and nothing derives one from the other."""
+    client, store, subjects = make_client()
+    user_ref = uuid4()
+    _enrolled_adult(subjects, user_ref)
+    seed = client.post("/v1/seeds", json=_seed_body(user_ref), headers=AUTH).json()
+    fresh = "https://proxy-s3.example/minted-just-now.jpg?X-Amz-Signature=zzz"
+
+    response = client.post(
+        "/v1/search",
+        json=_search_body(user_ref, seed["seed_id"], seed_url=fresh),
+        headers=AUTH,
+    )
+
+    assert response.status_code == 202
+    (_, _, _, stored_url) = store.created_runs[-1]
+    assert stored_url == fresh
+    assert store.seeds[UUID(seed["seed_id"])].source_object_ref == SEED_REF

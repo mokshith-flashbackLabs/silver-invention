@@ -55,7 +55,7 @@ async def create_seed(
     # flow fail for a user we deliberately support.
     try:
         seed_id = await store.create_seed(
-            body.user_ref, body.seed_kind, body.source_object_uri
+            body.user_ref, body.seed_kind, body.source_object_ref
         )
     except UnknownSubject as exc:
         raise ServiceError(
@@ -76,8 +76,23 @@ async def create_search(
     store: SearchStore = Depends(get_search_store),
     subjects: SubjectStore = Depends(get_subject_store),
 ) -> SearchCreateResponse:
+    # Body shape first: cheaper and more absolute than any guard, reads nothing,
+    # and refuses before the audit trail begins. There is deliberately NO
+    # fallback to the seed — the seed holds a durable ref that no provider can
+    # fetch, so substituting it would dispatch a search that cannot work and
+    # then report the failure as a provider outage. That is the whole bug.
+    if body.seed_url is None:
+        raise ServiceError(
+            400,
+            "seed_url_required",
+            "seed_url is required: a freshly-minted presigned GET for this run,"
+            " ≥15-minute TTL. The seed holds a durable reference, not a fetchable"
+            " URL, and this service holds no S3 credentials to mint one.",
+            retryable=False,
+        )
+
     # ── Guard chain step 1: ELIGIBILITY ──────────────────────────────────
-    # First, before anything else, and before any row exists. An eligibility
+    # First of the guards, and before any row exists. An eligibility
     # refusal must consume no budget and touch no breaker, which it cannot do
     # if it happens after them.
     await _require_discovery_eligible(body.user_ref, cfg, subjects)
@@ -101,7 +116,9 @@ async def create_search(
             retryable=True,
         )
 
-    run_id = await store.create_run(body.user_ref, body.seed_id, selected)
+    run_id = await store.create_run(
+        body.user_ref, body.seed_id, selected, seed_url=body.seed_url
+    )
     log.info(
         "search.run_enqueued",
         run_id=str(run_id),

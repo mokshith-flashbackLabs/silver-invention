@@ -49,7 +49,9 @@ async def test_nulls_only_rows_past_the_window_and_is_idempotent(
         user_ref = UserRef(uuid4())
         await ensure_subject(pool, user_ref)
         seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/i.jpg")
-        run_id = await store.create_run(user_ref, seed_id, (HIVE,))
+        run_id = await store.create_run(
+            user_ref, seed_id, (HIVE,), seed_url="https://proxy-s3.example/run.jpg?X-Amz-Signature=fixture"
+        )
         # provider_calls is written by the control store from step 8 onward, so
         # it shares a transaction with the spend upsert and the breaker.
         control = PostgresProviderControlStore(

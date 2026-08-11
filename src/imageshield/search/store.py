@@ -87,13 +87,13 @@ _THRESHOLD_CONFIG_V1 = {"band": "review", "reason": "uncalibrated_v1"}
 # the default made the whole 'new' branch of search/cadence.py unreachable and
 # SCAN_NEW_TIER_WEEKS a knob with no effect at any value.
 _CREATE_SEED_SQL = """
-    INSERT INTO search_seeds (user_ref, seed_kind, source_object_uri, scan_tier)
-    VALUES (%(user_ref)s, %(seed_kind)s, %(source_object_uri)s, 'new')
+    INSERT INTO search_seeds (user_ref, seed_kind, source_object_ref, scan_tier)
+    VALUES (%(user_ref)s, %(seed_kind)s, %(source_object_ref)s, 'new')
     RETURNING seed_id
 """
 
 _GET_SEED_SQL = """
-    SELECT seed_id, user_ref, seed_kind, source_object_uri, status, created_at,
+    SELECT seed_id, user_ref, seed_kind, source_object_ref, status, created_at,
            scan_tier, next_scan_after, consecutive_empty_scans
     FROM search_seeds WHERE seed_id = %(seed_id)s
 """
@@ -123,9 +123,14 @@ _LOCK_SEED_FOR_CADENCE_SQL = """
     FOR UPDATE
 """
 
+# seed_url is per-run and expiring: the proxy mints it at enqueue. It is NOT
+# read from search_seeds -- that column is a durable opaque reference now, and
+# reading it here would put an unfetchable value in front of a provider.
 _CREATE_RUN_SQL = """
-    INSERT INTO search_runs (seed_id, user_ref, providers_attempted, threshold_config)
-    VALUES (%(seed_id)s, %(user_ref)s, %(providers)s, %(threshold_config)s)
+    INSERT INTO search_runs (seed_id, user_ref, providers_attempted,
+                             threshold_config, seed_url)
+    VALUES (%(seed_id)s, %(user_ref)s, %(providers)s, %(threshold_config)s,
+            %(seed_url)s)
     RETURNING run_id
 """
 
@@ -164,7 +169,7 @@ _CLAIM_RUN_SQL = f"""
       AND (r.status = 'queued'
            OR (r.status = 'running'
                AND r.claimed_at < now() - interval '{_STALE_CLAIM_MINUTES} minutes'))
-    RETURNING r.run_id, r.seed_id, r.user_ref, s.source_object_uri,
+    RETURNING r.run_id, r.seed_id, r.user_ref, r.seed_url,
               r.providers_attempted, COALESCE(sub.discovery_eligible, false)
 """
 
@@ -320,13 +325,18 @@ def fan_out(matches: Sequence[ProviderMatch]) -> list[InfringementKey]:
 
 class SearchStore(Protocol):
     async def create_seed(
-        self, user_ref: UserRef, seed_kind: str, source_object_uri: str
+        self, user_ref: UserRef, seed_kind: str, source_object_ref: str
     ) -> UUID: ...
 
     async def get_seed(self, seed_id: UUID) -> SeedRow | None: ...
 
     async def create_run(
-        self, user_ref: UserRef, seed_id: UUID, providers_attempted: Sequence[ProviderId]
+        self,
+        user_ref: UserRef,
+        seed_id: UUID,
+        providers_attempted: Sequence[ProviderId],
+        *,
+        seed_url: str,
     ) -> UUID: ...
 
     async def get_run(self, run_id: UUID) -> RunRow | None: ...
@@ -367,7 +377,7 @@ class PostgresSearchStore:
         self._pool = pool
 
     async def create_seed(
-        self, user_ref: UserRef, seed_kind: str, source_object_uri: str
+        self, user_ref: UserRef, seed_kind: str, source_object_ref: str
     ) -> UUID:
         """Raises :class:`UnknownSubject` when no ``subjects`` row exists.
 
@@ -384,7 +394,7 @@ class PostgresSearchStore:
                     {
                         "user_ref": user_ref,
                         "seed_kind": seed_kind,
-                        "source_object_uri": source_object_uri,
+                        "source_object_ref": source_object_ref,
                     },
                 )
                 row = await cur.fetchone()
@@ -406,7 +416,7 @@ class PostgresSearchStore:
             seed_id=row[0],
             user_ref=parse_user_ref(row[1]),
             seed_kind=row[2],
-            source_object_uri=row[3],
+            source_object_ref=row[3],
             status=row[4],
             created_at=row[5],
             scan_tier=row[6],
@@ -415,10 +425,20 @@ class PostgresSearchStore:
         )
 
     async def create_run(
-        self, user_ref: UserRef, seed_id: UUID, providers_attempted: Sequence[ProviderId]
+        self,
+        user_ref: UserRef,
+        seed_id: UUID,
+        providers_attempted: Sequence[ProviderId],
+        *,
+        seed_url: str,
     ) -> UUID:
         """Run row + outbox row, one transaction (never synchronous — the
-        step-2 outbox is the only dispatch path)."""
+        step-2 outbox is the only dispatch path).
+
+        ``seed_url`` is stored on the RUN. It is a credential with minutes to
+        hours of life; the seed's own reference is durable and is never used to
+        dispatch.
+        """
         async with self._pool.connection() as conn, conn.transaction():
             cur = await conn.execute(
                 _CREATE_RUN_SQL,
@@ -427,6 +447,7 @@ class PostgresSearchStore:
                     "user_ref": user_ref,
                     "providers": list(providers_attempted),
                     "threshold_config": Jsonb(_THRESHOLD_CONFIG_V1),
+                    "seed_url": seed_url,
                 },
             )
             row = await cur.fetchone()

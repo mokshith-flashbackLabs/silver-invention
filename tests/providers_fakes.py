@@ -197,6 +197,26 @@ def ok_result(
     )
 
 
+def fetch_failed_result(provider_id: ProviderId) -> ProviderResult:
+    """What a provider returns when it cannot fetch the seed_url.
+
+    The shape an EXPIRED presigned URL produces: S3 answers the provider's GET
+    with 403, so the provider reports it could not retrieve the image. It is a
+    provider `error`, not a timeout -- and deliberately not "ok with zero
+    matches", which would be indistinguishable from a clean empty scan and
+    would demote the user's cadence for our credential expiring.
+    """
+    return ProviderResult(
+        provider_id=provider_id,
+        status="error",
+        matches=[],
+        raw_response={"error": "could not fetch image", "upstream_status": 403},
+        http_status=400,
+        latency_ms=120,
+        error_detail="seed_url returned 403 (expired presigned URL)",
+    )
+
+
 def timeout_result(provider_id: ProviderId) -> ProviderResult:
     return ProviderResult(
         provider_id=provider_id,
@@ -283,12 +303,20 @@ class FakeSeedStore:
         raise NotImplementedError
 
 
+# Deliberately unrelated. The seed's ref is durable and opaque; the run's URL
+# is a credential the proxy mints per run. `make_claim` below does NOT derive
+# one from the other — it used to, which mirrored the production defect where
+# the seed's stored presigned URL was what got dispatched.
+SEED_REF = "seeds/2026/08/seed.jpg"
+RUN_SEED_URL = "https://proxy-s3.example/minted.jpg?X-Amz-Signature=fresh"
+
+
 def make_seed(**overrides: Any) -> SeedRow:
     defaults: dict[str, Any] = {
         "seed_id": uuid4(),
         "user_ref": UserRef(uuid4()),
         "seed_kind": "user_supplied",
-        "source_object_uri": "https://s3/seed.jpg",
+        "source_object_ref": SEED_REF,
         "status": "active",
         "created_at": datetime.now(UTC),
     }
@@ -299,6 +327,7 @@ def make_claim(
     providers: tuple[ProviderId, ...],
     seed: SeedRow | None = None,
     *,
+    seed_url: str = RUN_SEED_URL,
     discovery_eligible: bool = True,
 ) -> ClaimedRun:
     resolved = seed if seed is not None else make_seed()
@@ -306,7 +335,8 @@ def make_claim(
         run_id=uuid4(),
         seed_id=resolved.seed_id,
         user_ref=resolved.user_ref,
-        seed_url=resolved.source_object_uri,
+        # From the RUN, never from the seed (migration 0011).
+        seed_url=seed_url,
         providers_attempted=providers,
         discovery_eligible=discovery_eligible,
     )

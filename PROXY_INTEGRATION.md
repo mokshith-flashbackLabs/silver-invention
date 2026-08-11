@@ -289,6 +289,62 @@ A **minor may hold seeds.** `/v1/seeds` checks that the subject exists, not that
 consent, guardianship and household seats all work for minors, and it is discovery that must not run.
 Only `POST /v1/search` returns `403 discovery_not_available`.
 
+### ⚠ BREAKING — the seed no longer holds a URL, and every search must carry one
+
+**This fixes a live bug.** `search_seeds` stored the presigned GET URL, and a presigned URL is a
+short-lived credential — SigV4 caps at 7 days. So a seed worked for its first week and then failed
+forever, and the failure looked like *the provider is broken*, not *our URL expired*. It never showed
+up in testing because fresh seeds work. It would have surfaced on the second scheduled scan of every
+seed, with step 8's zero-successful-calls alarm firing and pointing at the wrong thing.
+
+The durable identifier and the expiring credential are now separate, and the expiring one lives on
+the expiring object:
+
+| | Where it lives | What it is |
+|---|---|---|
+| `source_object_ref` | `search_seeds`, forever | **Opaque durable reference** — the object key. Never a URL. Reconciliation only; we never dereference it |
+| `seed_url` | `search_runs`, per run | **Freshly-minted presigned GET.** What the provider actually fetches |
+
+```
+POST /v1/seeds
+  { user_ref, seed_kind, source_object_ref }
+
+  source_object_ref   was `source_object_uri`. RENAMED and the validator is INVERTED.
+                      422 on anything starting http:// or https://, on anything
+                      containing X-Amz-Signature, and on blank.
+                      Send the object key. `s3://bucket/key` is also accepted.
+
+POST /v1/search
+  { user_ref, seed_id, seed_url, providers? }
+
+  seed_url            REQUIRED. https:// only (422 otherwise) — a third-party
+                      provider fetches it over the public internet and the object
+                      behind it is a photograph of the user's face.
+                      Absent -> 400 seed_url_required. No default, and NO fallback
+                      to the seed: falling back is the bug.
+```
+
+**Mint it with a minimum 15-minute TTL.** We cannot enforce that and do not try.
+
+**If it expires between enqueue and dispatch**, the providers fail normally: the run completes,
+`providers_succeeded` is empty, and the seed's cadence is *unchanged* (a run where nothing succeeded
+is not evidence of an empty scan). Re-enqueue with a fresh URL. Treat "completed, empty
+`providers_succeeded`, fetch-shaped failures" as *re-enqueue*, not as a provider outage. There is
+deliberately no refresh path on our side — building one would require the S3 credentials this service
+does not hold.
+
+**Seed registration, proxy side.** After an upload confirms, call `POST /v1/seeds` with the durable
+object key and store the returned `seed_id` alongside your own media row so the two systems
+reconcile. `seed_kind = 'user_supplied'` for user-selected photos; `'enrolment'` for the liveness
+ReferenceImage.
+
+**Why the seeds matter more than they look.** The only seed monitoring has ever had is the liveness
+ReferenceImage — a selfie taken thirty seconds earlier that nobody has ever reposted. Image search
+finds *that image*, reposted or altered, so searching a private selfie finds nothing by construction.
+Searching photos the user actually published is what makes a nudify edit of a real photo findable at
+all. Wiring the photo-picker upload to `POST /v1/seeds` is proxy- and mobile-side work; the contract
+above is already built and waiting.
+
 ### A run can also be refused *after* it was accepted
 
 `POST /v1/search` checks eligibility at the instant of the request, but the flag is mutable — a DOB

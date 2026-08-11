@@ -133,9 +133,12 @@ async def search_fixture(
         # Step 8: search_seeds FKs to subjects. Production writes this row inside
         # the enrolment transaction; a fixture that starts from a seed asserts it.
         await ensure_subject(pool, user_ref)
-        seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
+        seed_id = await store.create_seed(user_ref, "user_supplied", "seeds/img.jpg")
         run_id = await store.create_run(
-            user_ref, seed_id, (ProviderId("hive"), ProviderId("google"))
+            user_ref,
+            seed_id,
+            (ProviderId("hive"), ProviderId("google")),
+            seed_url="https://proxy-s3.example/run.jpg?X-Amz-Signature=fixture",
         )
         yield store, run_id, user_ref
     finally:
@@ -440,9 +443,12 @@ async def banded_infringements(calibration_store: Any) -> BandedFixture:
     store = PostgresSearchStore(calibration_store._pool)
     user_ref = UserRef(uuid4())
     await ensure_subject(calibration_store._pool, user_ref)
-    seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
+    seed_id = await store.create_seed(user_ref, "user_supplied", "seeds/img.jpg")
     run_id = await store.create_run(
-        user_ref, seed_id, (ProviderId("hive"), ProviderId("google"))
+        user_ref,
+        seed_id,
+        (ProviderId("hive"), ProviderId("google")),
+        seed_url="https://proxy-s3.example/run.jpg?X-Amz-Signature=fixture",
     )
     hive = ProviderId("hive")
     desc = ProviderDescriptor(

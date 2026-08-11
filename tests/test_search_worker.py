@@ -13,7 +13,13 @@ from uuid import UUID, uuid4
 from imageshield.search.models import ClaimedRun
 from imageshield.search.worker import handle_message
 from imageshield.types import ProviderId
-from tests.providers_fakes import CADENCE, FakeControlStore, make_seed, runtime
+from tests.providers_fakes import (
+    CADENCE,
+    RUN_SEED_URL,
+    FakeControlStore,
+    make_seed,
+    runtime,
+)
 
 HIVE = ProviderId("hive")
 
@@ -83,7 +89,7 @@ def _claim(run_id: UUID, seed: Any) -> ClaimedRun:
         run_id=run_id,
         seed_id=seed.seed_id,
         user_ref=seed.user_ref,
-        seed_url=seed.source_object_uri,
+        seed_url=RUN_SEED_URL,
         providers_attempted=(HIVE,),
         # No default on the model, deliberately: a caller must state it, so a
         # future claim path cannot forget to read the flag and silently dispatch.

@@ -22,6 +22,7 @@ from tests.providers_fakes import (
     FakeControlStore,
     FakeSeedStore,
     RecordingProvider,
+    fetch_failed_result,
     make_claim,
     make_seed,
     ok_result,
@@ -94,8 +95,8 @@ async def test_one_provider_timing_out_still_completes_with_the_others_results()
 
     assert outcome.providers_succeeded == (HIVE,)
     assert outcome.matches_recorded == 2
-    assert hive.calls == [store.seed.source_object_uri]
-    assert google.calls == [store.seed.source_object_uri]
+    assert hive.calls == [claim.seed_url]
+    assert google.calls == [claim.seed_url]
     # Both calls recorded — a timeout is a provider_calls row, never silence.
     assert {r.status for _, r, _ in control.outcomes} == {"ok", "timeout"}
     assert [p.provider_id for _, p, _ in store.matches] == [HIVE]
@@ -146,7 +147,7 @@ async def test_disabled_provider_is_never_called_and_the_run_still_completes() -
     )
 
     assert google.calls == []  # the whole point: no API call
-    assert hive.calls == [store.seed.source_object_uri]
+    assert hive.calls == [claim.seed_url]
     assert outcome.providers_succeeded == (HIVE,)
     assert outcome.providers_skipped == (GOOGLE,)
     assert [(pid, reason) for _, pid, reason, _ in control.skips] == [
@@ -222,7 +223,7 @@ async def test_half_open_probe_is_dispatched_when_the_claim_is_won() -> None:
 
     outcome = await execute_run(claim, {HIVE: hive}, store, {}, control, CADENCE)
 
-    assert hive.calls == [store.seed.source_object_uri]  # exactly one probe
+    assert hive.calls == [claim.seed_url]  # exactly one probe
     assert outcome.providers_succeeded == (HIVE,)
     assert control.skips == []
 
@@ -275,3 +276,46 @@ async def test_a_run_where_nothing_succeeded_does_not_change_the_tier() -> None:
     )
 
     assert store.cadence_updates == []
+
+
+async def test_an_expired_seed_url_completes_the_run_and_leaves_cadence_alone() -> None:
+    """Done-when: a run whose seed_url 403s completes with an empty
+    providers_succeeded and NO cadence change.
+
+    This is the failure mode 0011 makes recoverable rather than permanent. If
+    the URL expires between enqueue and dispatch the providers fail normally;
+    the proxy re-enqueues with a freshly minted one. There is deliberately no
+    refresh path on this side -- adding one would need the S3 credentials this
+    service does not hold.
+
+    The cadence half is the part that matters for the user. A run where nothing
+    succeeded is not evidence of an empty scan, so `should_retier` filters it
+    out: otherwise our own expired credential would quietly demote someone from
+    weekly to fortnightly monitoring, taking the cost saving from exactly the
+    wrong place.
+    """
+    hive = RecordingProvider(HIVE, result=fetch_failed_result(HIVE))
+    google = RecordingProvider(GOOGLE, result=fetch_failed_result(GOOGLE))
+    store, control = FakeSeedStore(), FakeControlStore(BOTH)
+    claim = make_claim(
+        (HIVE, GOOGLE),
+        store.seed,
+        seed_url="https://proxy-s3.example/seed.jpg?X-Amz-Signature=expired",
+    )
+
+    outcome = await execute_run(
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE
+    )
+
+    # Both were genuinely attempted — this is a fetch failure, not a skip.
+    assert hive.calls == [claim.seed_url]
+    assert google.calls == [claim.seed_url]
+    # The run COMPLETES (it ran), with nothing succeeded and nothing found.
+    assert store.completed == [(claim.run_id, ())]
+    assert outcome.providers_succeeded == ()
+    assert outcome.matches_recorded == 0
+    assert store.refusals == []  # 'refused' is for ineligibility, not failure
+    # And the seed's cadence is untouched.
+    assert store.cadence_updates == []
+    # Both failures are recorded rows, never silence (CLAUDE.md §7.5).
+    assert {r.status for _, r, _ in control.outcomes} == {"error"}

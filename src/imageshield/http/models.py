@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Literal
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -137,14 +138,34 @@ class SubjectResponse(BaseModel):
 class SeedCreateRequest(ServiceModel):
     user_ref: UserRef
     seed_kind: Literal["enrolment", "user_supplied", "public_profile"]
-    source_object_uri: str  # proxy's S3, http(s) presigned GET — never s3://
+    # An OPAQUE DURABLE reference to the proxy's object — an object key, not a
+    # URL. The validator below is INVERTED from what it was: it used to *require*
+    # https://, which is how a presigned GET came to be stored on a row that
+    # outlives it by years.
+    source_object_ref: str
 
-    @field_validator("source_object_uri")
+    @field_validator("source_object_ref")
     @classmethod
-    def _http_only(cls, value: str) -> str:
-        if not value.startswith(("https://", "http://")):
+    def _not_a_url(cls, value: str) -> str:
+        """Refuse anything that looks like a fetchable, expiring URL.
+
+        A presigned URL arriving here is the exact defect this column was
+        renamed to fix — it works for a week and then 403s forever, and the
+        failure surfaces as a provider outage. Silently accepting one would
+        reintroduce the bug with a new column name, so it fails loudly.
+        """
+        if not value.strip():
+            raise ValueError("source_object_ref must not be blank")
+        if urlsplit(value).scheme.lower() in {"http", "https"}:
             raise ValueError(
-                "must be an http(s) URL (presigned GET) — this service holds no S3 credentials"
+                "source_object_ref must be an opaque durable reference, not a URL."
+                " A presigned URL expires (SigV4 caps at 7 days) and this column"
+                " does not; pass the object key and supply seed_url per search run."
+            )
+        if "x-amz-signature" in value.lower():
+            raise ValueError(
+                "source_object_ref carries a presigned signature — that is a"
+                " credential, not an identifier"
             )
         return value
 
@@ -157,6 +178,25 @@ class SearchCreateRequest(ServiceModel):
     user_ref: UserRef
     seed_id: UUID
     providers: list[str] | None = None  # default: all enabled providers
+    # A freshly-minted presigned GET, per run, ≥15-minute TTL. Optional here
+    # only so its absence maps to 400 seed_url_required rather than pydantic's
+    # 422 — there is no default and no fallback to the seed. Falling back is
+    # precisely the bug: the seed holds a durable ref that no provider can
+    # fetch, so substituting it would dispatch a search that cannot work and
+    # report it as a provider failure.
+    seed_url: str | None = None
+
+    @field_validator("seed_url")
+    @classmethod
+    def _https_only(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parts = urlsplit(value)
+        # https only: a third-party provider fetches this over the public
+        # internet, and the object behind it is a photograph of the user's face.
+        if parts.scheme.lower() != "https" or not parts.netloc:
+            raise ValueError("seed_url must be an absolute https:// URL")
+        return value
 
 
 class SearchCreateResponse(BaseModel):

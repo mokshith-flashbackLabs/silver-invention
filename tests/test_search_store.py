@@ -76,13 +76,24 @@ def _google_match(url: str, category: str = "full_match") -> ProviderMatch:
     )
 
 
+# Deliberately unrelated strings. The seed's ref is durable and opaque; the
+# run's URL is a credential the proxy mints per run. Nothing derives one from
+# the other, and these tests would not notice if something did unless the two
+# values differ.
+SEED_REF = "seeds/2026/08/img.jpg"
+RUN_SEED_URL = "https://proxy-s3.example/minted.jpg?X-Amz-Signature=fresh"
+
+
 async def _seeded_run(
-    store: PostgresSearchStore, user_ref: UserRef
+    store: PostgresSearchStore,
+    user_ref: UserRef,
+    *,
+    seed_url: str = RUN_SEED_URL,
 ) -> tuple[UUID, UUID]:
     # Step 8: search_seeds FKs to subjects, so the subject row comes first.
     await ensure_subject(store._pool, user_ref)
-    seed_id = await store.create_seed(user_ref, "user_supplied", "https://s3/img.jpg")
-    run_id = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
+    seed_id = await store.create_seed(user_ref, "user_supplied", SEED_REF)
+    run_id = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE), seed_url=seed_url)
     return seed_id, run_id
 
 
@@ -94,12 +105,12 @@ def _query(db_url: str, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[An
 async def test_seed_roundtrip(store: PostgresSearchStore) -> None:
     user_ref = _user()
     await ensure_subject(store._pool, user_ref)
-    seed_id = await store.create_seed(user_ref, "enrolment", "https://s3/ref.jpg")
+    seed_id = await store.create_seed(user_ref, "enrolment", "enrolments/ref.jpg")
     seed = await store.get_seed(seed_id)
     assert seed is not None
     assert seed.user_ref == user_ref
     assert seed.seed_kind == "enrolment"
-    assert seed.source_object_uri == "https://s3/ref.jpg"
+    assert seed.source_object_ref == "enrolments/ref.jpg"
     # Step-8 cadence: a seed created here IS new, and create_seed says so
     # explicitly rather than leaving the column default ("standard") to speak
     # for it — the default is the fallback for a row nobody tiered. Same
@@ -127,7 +138,7 @@ async def test_seed_for_unknown_subject_fails_at_the_database(
     agreement with the constraint (or race it).
     """
     with pytest.raises(UnknownSubject) as raised:
-        await store.create_seed(_user(), "user_supplied", "https://s3/img.jpg")
+        await store.create_seed(_user(), "user_supplied", SEED_REF)
 
     assert isinstance(raised.value.__cause__, psycopg.errors.ForeignKeyViolation)
     assert "search_seeds_subject_fk" in str(raised.value.__cause__)
@@ -164,7 +175,7 @@ async def test_claim_run_transitions_queued_to_running_once(
     assert claim is not None
     assert claim.run_id == run_id
     assert claim.user_ref == user_ref
-    assert claim.seed_url == "https://s3/img.jpg"
+    assert claim.seed_url == RUN_SEED_URL
     assert claim.providers_attempted == ("hive", "google")
 
     assert await store.claim_run(run_id) is None  # already claimed, fresh
@@ -270,7 +281,9 @@ async def test_concurrent_completions_on_one_seed_lose_no_empty_scan(
     """
     user_ref = _user()
     seed_id, first = await _seeded_run(store, user_ref)
-    second = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
+    second = await store.create_run(
+        user_ref, seed_id, (HIVE, GOOGLE), seed_url=RUN_SEED_URL
+    )
 
     await asyncio.gather(
         store.complete_run(first, seed_id, (HIVE,), retier=_retier(False)),
@@ -691,7 +704,9 @@ async def test_52_weekly_rescans_over_static_corpus_add_zero_rows(
 
     first_week_counts: tuple[int, int, int] | None = None
     for week in range(52):
-        run_id = await store.create_run(user_ref, seed_id, (HIVE, GOOGLE))
+        run_id = await store.create_run(
+            user_ref, seed_id, (HIVE, GOOGLE), seed_url=RUN_SEED_URL
+        )
         await store.record_infringements(run_id, user_ref, HIVE_DESC, hive_corpus, {})
         await store.record_infringements(run_id, user_ref, GOOGLE_DESC, google_corpus, {})
         await store.complete_run(run_id, seed_id, (HIVE, GOOGLE), retier=None)
@@ -716,3 +731,55 @@ async def test_52_weekly_rescans_over_static_corpus_add_zero_rows(
     listed = await store.list_infringements(user_ref, None)
     assert len(listed) == 3
     assert all(len(inf.attestations) == 2 for inf in listed)
+
+
+async def test_claim_run_seed_url_comes_from_the_run_not_the_seed(
+    store: PostgresSearchStore, migrated_db: str
+) -> None:
+    """Done-when: assert with a run whose SEED row holds a deliberately wrong
+    value.
+
+    This is the whole point of 0011. If the claim ever reads the seed again, a
+    week-old presigned URL comes back, every provider 403s, and it reads as a
+    provider outage rather than as our credential expiring. The seed row here
+    holds a string that would be obviously wrong to dispatch, so a regression
+    cannot pass by coincidence.
+    """
+    user_ref = _user()
+    await ensure_subject(store._pool, user_ref)
+    seed_id = await store.create_seed(user_ref, "user_supplied", "DO-NOT-DISPATCH-THIS")
+    run_id = await store.create_run(
+        user_ref, seed_id, (HIVE,), seed_url="https://proxy-s3.example/right.jpg?sig=1"
+    )
+
+    claim = await store.claim_run(run_id)
+
+    assert claim is not None
+    assert claim.seed_url == "https://proxy-s3.example/right.jpg?sig=1"
+    # ...and the seed is untouched by the run.
+    seed = await store.get_seed(seed_id)
+    assert seed is not None
+    assert seed.source_object_ref == "DO-NOT-DISPATCH-THIS"
+
+
+async def test_two_runs_on_one_seed_carry_their_own_urls(
+    store: PostgresSearchStore,
+) -> None:
+    """The per-run URL is what makes a re-scan work a month later: the seed is
+    unchanged and the proxy mints a fresh credential each time."""
+    user_ref = _user()
+    await ensure_subject(store._pool, user_ref)
+    seed_id = await store.create_seed(user_ref, "user_supplied", SEED_REF)
+
+    first = await store.create_run(
+        user_ref, seed_id, (HIVE,), seed_url="https://s3.example/week-1.jpg?sig=a"
+    )
+    second = await store.create_run(
+        user_ref, seed_id, (HIVE,), seed_url="https://s3.example/week-9.jpg?sig=b"
+    )
+
+    claim_first = await store.claim_run(first)
+    claim_second = await store.claim_run(second)
+    assert claim_first is not None and claim_second is not None
+    assert claim_first.seed_url == "https://s3.example/week-1.jpg?sig=a"
+    assert claim_second.seed_url == "https://s3.example/week-9.jpg?sig=b"

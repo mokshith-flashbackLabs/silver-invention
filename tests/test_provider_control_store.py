@@ -61,7 +61,9 @@ async def wired(
         user_ref = UserRef(uuid4())
         await ensure_subject(pool, user_ref)
         seed_id = await search.create_seed(user_ref, "user_supplied", "https://s3/x.jpg")
-        run_id = await search.create_run(user_ref, seed_id, (HIVE, GOOGLE))
+        run_id = await search.create_run(
+            user_ref, seed_id, (HIVE, GOOGLE), seed_url="https://proxy-s3.example/run.jpg?X-Amz-Signature=fixture"
+        )
         yield (
             PostgresProviderControlStore(
                 pool,

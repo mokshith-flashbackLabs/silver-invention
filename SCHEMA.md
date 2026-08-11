@@ -253,7 +253,27 @@ that will eventually feed the same report surface.
 
 Tables: `search_seeds`, `search_runs`, `content_urls`, `provider_calls`, `infringements`,
 `attestations`, `subjects`, `provider_spend`. Migrations `0001`, `0004`, `0005`, `0006`, `0007`,
-`0008`, `0009`.
+`0008`, `0009`, `0011`.
+
+### The durable reference vs. the expiring credential
+
+`search_seeds.source_object_ref` (migration 0011, renamed from `source_object_uri`) is an **opaque
+durable reference** to the proxy's object — an object key. `search_runs.seed_url` is a **presigned
+GET, minted per run** by the proxy at enqueue.
+
+They are separate because they have different lifetimes and merging them is a bug that hides. The
+seed row outlives everything; a presigned URL expires in at most 7 days (SigV4's cap). Stored
+together, a seed works for one week and then every scan of it fails with a 403 that reads as a
+provider outage — invisible in testing, because fresh seeds always work.
+
+`ClaimedRun.seed_url` reads `search_runs`, never the seed. If the URL expires before dispatch the
+providers fail normally, the run completes with an empty `providers_succeeded`, and cadence is left
+alone (`should_retier` — a run where nothing succeeded is not evidence of an empty scan). The proxy
+re-enqueues. There is no refresh path here: building one would need S3 credentials this service does
+not hold.
+
+Note this is `search_seeds` only. `enrolments.source_object_uri` is a different column — the
+ReferenceImage pointer named in INVARIANTS #9 — and is unchanged.
 
 ### The thing found vs. the observation of it
 

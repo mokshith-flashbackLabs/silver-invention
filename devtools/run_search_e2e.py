@@ -105,9 +105,16 @@ async def main() -> int:
         await PostgresSubjectStore(pool).upsert_subject(
             user_ref, eligibility_for(True)
         )
-        seed_id = await store.create_seed(user_ref, "user_supplied", seed_url)
-        run_id = await store.create_run(user_ref, seed_id, tuple(providers))
-        print(f"seed {seed_id}\nrun  {run_id}\nseed_url {seed_url}\n")
+        # 0011 split: the seed holds a durable opaque ref, the RUN holds the
+        # fetchable URL. Production gets the URL from the proxy at enqueue; this
+        # script has no proxy, so it passes the public URL straight through as
+        # the per-run credential and stores a derived key as the seed's ref.
+        seed_ref = f"devtools/e2e/{uuid4()}"
+        seed_id = await store.create_seed(user_ref, "user_supplied", seed_ref)
+        run_id = await store.create_run(
+            user_ref, seed_id, tuple(providers), seed_url=seed_url
+        )
+        print(f"seed {seed_id}\nref  {seed_ref}\nrun  {run_id}\nseed_url {seed_url}\n")
 
         claim = await store.claim_run(run_id)
         assert claim is not None, "fresh run must be claimable"

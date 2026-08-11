@@ -37,7 +37,13 @@ class SeedRow(BaseModel):
     seed_id: UUID
     user_ref: UserRef
     seed_kind: str
-    source_object_uri: str
+    # An OPAQUE DURABLE reference to the proxy's S3 object — an object key, not
+    # a URL. It used to hold a presigned GET, which is a credential with at most
+    # 7 days of life (SigV4's cap): the seed worked in week one and 403'd forever
+    # after, presenting as "the provider is failing" rather than "our URLs
+    # expired". The expiring half now lives on the run (``ClaimedRun.seed_url``),
+    # minted fresh by the proxy per search.
+    source_object_ref: str
     status: str
     created_at: datetime
     # Step 8 cadence state. Defaulted to the migration's own defaults so a
@@ -77,6 +83,12 @@ class ClaimedRun(BaseModel):
     run_id: UUID
     seed_id: UUID
     user_ref: UserRef
+    # Read from ``search_runs``, NEVER from the seed. The proxy mints it at
+    # enqueue with a ≥15-minute TTL; if it expires before dispatch the providers
+    # fail normally, the run completes with an empty ``providers_succeeded``,
+    # and cadence is unchanged (``should_retier``). The proxy re-enqueues with a
+    # fresh one — there is no refresh path here, and adding one would require S3
+    # credentials this service deliberately does not hold.
     seed_url: str
     providers_attempted: tuple[ProviderId, ...]
     # Re-read at claim time, not trusted from run creation. The route checked it
