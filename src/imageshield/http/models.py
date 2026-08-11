@@ -283,6 +283,67 @@ class FeedbackRequest(ServiceModel):
     signal: Literal["not_me", "confirmed", "uncertain"]
 
 
+class AttributeRequest(ServiceModel):
+    photo_ref: str  # the proxy's photo_id. Opaque to us — never dereferenced.
+    requested_by: UserRef
+    # Enrolled people who MAY be in this photo. The search cannot be restricted
+    # to them (the API takes no candidate set), so this is the list every match
+    # is filtered against afterwards — see attribution/resolve.py.
+    candidate_refs: list[UserRef]
+    presigned_get_url: str
+
+    @field_validator("photo_ref")
+    @classmethod
+    def _ref_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("photo_ref must not be blank")
+        return value
+
+    @field_validator("presigned_get_url")
+    @classmethod
+    def _https_only(cls, value: str) -> str:
+        parts = urlsplit(value)
+        # https only. The object behind it is a photograph of someone's face,
+        # and it crosses the public internet to reach Rekognition.
+        if parts.scheme.lower() != "https" or not parts.netloc:
+            raise ValueError("presigned_get_url must be an absolute https:// URL")
+        return value
+
+    @field_validator("candidate_refs")
+    @classmethod
+    def _at_least_one_candidate(cls, value: list[UserRef]) -> list[UserRef]:
+        # Zero candidates cannot attribute anything, so the whole call is a
+        # no-op that still costs a DetectFaces and N searches. Refuse it rather
+        # than bill for a result that is empty by construction.
+        if not value:
+            raise ValueError("candidate_refs must name at least one enrolled person")
+        return value
+
+
+class AttributedFaceItem(BaseModel):
+    face_index: int
+    bbox: dict[str, float]
+    # "This region is a face". NOT the same quantity as match_score, and kept
+    # in a separate field so a confident detection of a stranger can never read
+    # as a confident identification.
+    detect_confidence: float
+    # None is the COMMON case: most faces in most photos belong to people who
+    # are not enrolled. Not an error, and not something to render as a failure.
+    resolved_user_ref: UUID | None
+    match_score: float | None
+
+
+class RegisteredSeedItem(BaseModel):
+    user_ref: UUID
+    seed_id: UUID
+
+
+class AttributeResponse(BaseModel):
+    run_id: UUID
+    faces: list[AttributedFaceItem]
+    seeds_registered: list[RegisteredSeedItem]
+
+
 class FeedbackResponse(BaseModel):
     """The infringement's status after the write — unchanged for 'uncertain'."""
 

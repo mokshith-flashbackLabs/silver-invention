@@ -279,6 +279,28 @@ most affected by real abuse would systematically degrade their own protection, i
 signal, do not act on it. Enforced by a test that checksums `enrolments`, `attestations`,
 `content_urls`, `subjects` and `search_runs` either side of the write.
 
+### Attribution (migration 0014)
+
+`attribution_runs` + `attributed_faces`, and `search_seeds.attributed_face_id` linking a seed back to
+the face that produced it.
+
+`detect_confidence` and `match_score` are **different quantities in different columns**, and the
+`CHECK ((resolved_user_ref IS NULL) = (match_score IS NULL))` pairs the second with its person. The
+first is "this region is a face"; the second is "this face is that person". Conflating them is how a
+confident detection of a *stranger* reads as a confident identification of a *user*.
+
+`resolved_user_ref IS NULL` is first-class and expected — it is most faces in most photos. Every
+detected face gets a row and a bbox regardless, because dropping the unattributed ones makes "we saw
+three faces and matched one" indistinguishable from "we saw one".
+
+`match_threshold`, `max_candidates` and `model_id` are recorded **on the run**, for the same reason
+`search_runs.threshold_config` exists: a later retune otherwise makes every historical attribution
+uninterpretable.
+
+Run, faces and seeds commit in **one transaction**. A half-written run — some faces present, some
+missing — would be indistinguishable from "those faces matched nobody", and those two must never be
+confusable: the first is a normal result, the second is a lost seed.
+
 ### The two recheck timestamps
 
 `infringements.last_checked_at` means *we learned something* — only a definite verdict (2xx/3xx, or

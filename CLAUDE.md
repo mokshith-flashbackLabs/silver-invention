@@ -249,6 +249,8 @@ because the architecture doc describes them.
 | Adaptive cadence mechanism | The scheduler that reads `next_scan_after` |
 | Infringement feedback (`not_me`) | |
 | URL recheck loop (`url_alive`) | |
+| Attribution: face → seed (`/v1/attribute`) | `discovered-v1`, clustering, cluster claims |
+| | The shield rule / photo protection / coverage arithmetic |
 
 Two notes on that right-hand column. **CSAM screening and reporting are what gate minor
 discovery** — `MINOR_DISCOVERY_SUPPORTED` stays `False` until both exist, and flipping it without them

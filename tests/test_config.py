@@ -277,3 +277,34 @@ def test_the_retry_jitter_fraction_must_be_a_fraction() -> None:
         make_config(provider_retry_jitter_fraction=1.5)
     with pytest.raises(ValidationError):
         make_config(provider_retry_jitter_fraction=-0.1)
+
+
+# -- Attribution knobs ------------------------------------------------------
+
+
+def test_a_single_candidate_search_refuses_to_boot() -> None:
+    """Done-when: max_candidates < 2 is rejected by the config schema at boot.
+
+    Refused HERE rather than at the call site because the failure a single
+    candidate produces is silent. A stranger who outranks the household member
+    is the only result returned, the candidate filter discards it, and the
+    photo never becomes a seed for its own owner. Nothing raises, nothing is
+    logged as wrong, and the coverage loss grows with the collection. A knob
+    whose bad value is invisible has to be refused where it is set.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        make_config(attribution_max_candidates=1)
+    with pytest.raises(ValidationError):
+        make_config(attribution_max_candidates=0)
+    assert make_config(attribution_max_candidates=2).attribution_max_candidates == 2
+
+
+def test_the_attribution_threshold_is_its_own_knob() -> None:
+    """INVARIANTS #1b: one threshold per purpose. "Is this face that person" is
+    a different question from "is this a live human", and sharing a number
+    between them is how the old system's 90/95/99 spread started."""
+    cfg = make_config(attribution_match_threshold=88.5, liveness_min_confidence=95.0)
+    assert cfg.attribution_match_threshold == 88.5
+    assert cfg.liveness_min_confidence == 95.0

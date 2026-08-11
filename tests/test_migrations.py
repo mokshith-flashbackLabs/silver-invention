@@ -1177,3 +1177,95 @@ def test_0013_down_removes_the_column_and_the_index(throwaway_db: str) -> None:
             ).fetchall()
         }
     assert "infringements_recheck_due_idx" not in indexes
+
+
+# -- 0014: attribution ------------------------------------------------------
+
+
+def test_0014_creates_the_attribution_tables(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        tables = _table_names(conn)
+        assert {"attribution_runs", "attributed_faces"} <= tables
+        assert "attributed_face_id" in _columns(conn, "search_seeds")
+
+
+def test_0014_rejects_a_score_without_a_person_and_a_person_without_a_score(
+    throwaway_db: str,
+) -> None:
+    """The CHECK pairs them. A match score with no person, or a person with no
+    score, is a bug that should fail at the insert rather than become an
+    unreadable row later — they are DIFFERENT quantities from
+    detect_confidence and each other."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        run_id = _attribution_run(conn)
+        for resolved, score in (("gen_random_uuid()", "NULL"), ("NULL", "99.1")):
+            with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
+                conn.execute(
+                    "INSERT INTO attributed_faces (run_id, face_index, bbox,"
+                    " detect_confidence, resolved_user_ref, match_score, model_id)"
+                    f" VALUES (%s, 0, '{{}}'::jsonb, 99.9, {resolved}, {score},"
+                    "         'rekognition:7.0')",
+                    (run_id,),
+                )
+
+
+def test_0014_allows_an_unattributed_face(throwaway_db: str) -> None:
+    """NULL/NULL is the COMMON case — most faces in most photos belong to
+    people who are not enrolled, and the bbox is stored for every one of them."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        run_id = _attribution_run(conn)
+        conn.execute(
+            "INSERT INTO attributed_faces (run_id, face_index, bbox,"
+            " detect_confidence, model_id)"
+            " VALUES (%s, 0, '{\"x\":0.1,\"y\":0.2,\"w\":0.3,\"h\":0.4}'::jsonb,"
+            "         99.9, 'rekognition:7.0')",
+            (run_id,),
+        )
+        row = conn.execute(
+            "SELECT resolved_user_ref, match_score, bbox FROM attributed_faces"
+        ).fetchone()
+    assert row is not None
+    assert row[0] is None and row[1] is None
+    assert row[2] == {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}
+
+
+def test_0014_one_row_per_face_index_per_run(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        run_id = _attribution_run(conn)
+        stmt = (
+            "INSERT INTO attributed_faces (run_id, face_index, bbox,"
+            " detect_confidence, model_id)"
+            " VALUES (%s, 0, '{}'::jsonb, 99.9, 'rekognition:7.0')"
+        )
+        conn.execute(stmt, (run_id,))
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            conn.execute(stmt, (run_id,))
+
+
+def test_0014_down_removes_everything_and_keeps_the_seeds(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0013_"))
+    with psycopg.connect(throwaway_db) as conn:
+        assert {"attribution_runs", "attributed_faces"} & _table_names(conn) == set()
+        assert "search_seeds" in _table_names(conn)
+        assert "attributed_face_id" not in _columns(conn, "search_seeds")
+
+
+def _attribution_run(conn: psycopg.Connection[tuple[Any, ...]]) -> Any:
+    row = conn.execute(
+        "INSERT INTO attribution_runs (photo_ref, requested_by, candidate_count,"
+        " match_threshold, max_candidates, model_id)"
+        " VALUES ('photo-1', gen_random_uuid(), 2, 92.0, 5, 'rekognition:7.0')"
+        " RETURNING run_id"
+    ).fetchone()
+    assert row is not None
+    return row[0]

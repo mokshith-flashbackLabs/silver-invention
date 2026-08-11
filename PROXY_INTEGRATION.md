@@ -430,6 +430,74 @@ false` with a recent `last_checked_at` is "this came down" and is worth telling 
 is the one unambiguously good thing this product can say. A stale `last_checked_at` means we have not
 looked lately, and you should not make the claim.
 
+### New — `POST /v1/attribute`
+
+```
+{ photo_ref, requested_by, candidate_refs: [uuid], presigned_get_url }
+-> 200 {
+     run_id,
+     faces: [ { face_index, bbox, detect_confidence,
+                resolved_user_ref | null, match_score | null } ],
+     seeds_registered: [ { user_ref, seed_id } ]
+   }
+503 attribution_unavailable   (retryable; the run is recorded as 'failed')
+```
+
+`match_threshold` and `max_candidates` are **not** request fields, though an earlier draft of the
+contract had them. They come from our config: a per-request threshold would defeat INVARIANTS #1b
+("one threshold per purpose, from config"), and a per-request `max_candidates` would let a caller send
+`1` and bypass a floor we refuse to boot below. Both are still recorded on the run, which is what they
+were wanted for — a later retune must not make historical attributions uninterpretable.
+
+**The face is the unit, not the photo.**
+
+| Photo contains | Result |
+|---|---|
+| one enrolled person + two strangers | **one** seed, for that person |
+| two enrolled household members | **two** seeds, one each, independent |
+| nobody enrolled | **zero** seeds, `200`, faces returned with `resolved_user_ref: null` |
+| no faces at all | `200`, empty list, run completed |
+
+`resolved_user_ref: null` is the **common case and not an error** — most faces in most photos belong
+to people who are not enrolled. Do not render it as a failure or retry on it. Every detected face
+comes back with its bbox, attributed or not, so you can draw boxes.
+
+`presigned_get_url` must be **https and ≥15 minutes**. `photo_ref` is your `photo_id`, opaque to us —
+it becomes the seed's `source_object_ref`, so it must be the durable key, never a URL (see 0011).
+
+### ⚠ The proxy's photo-level gate is being replaced by this
+
+`image_backend/src/media/ports.ts`, `registerSeed`, currently reads — quoted from the task brief,
+**INFERRED**, we have not read that repo:
+
+> *"THE CALLER MUST ONLY CALL THIS FOR A FULLY PROTECTED PHOTO — every detected face resolving to a
+> covered person. A photo with one unrecognised face never becomes a seed."*
+
+That gate protects the right thing — a non-consenting person should not become the *subject* of a
+search — but it is photo-level, so one stranger in frame discards a valid seed for the owner. Since
+screen 16 asks for social photos, strangers in frame are the norm, and the gate would throw away most
+of the corpus.
+
+Face-level gating protects the same thing more precisely: the stranger is never attributed, never
+gets a seed, and never becomes a monitored subject. Only enrolled people are monitored, which was the
+actual concern. Please change `registerSeed` to call `/v1/attribute` and register what comes back.
+
+### On the record — the whole photo goes to Hive, not a face crop
+
+A seed registered for a matched face uses the **full photo**. Hive is image search: it matches *the
+image*, and a face crop will not match the full photo it came from, so cropping collapses recall to
+near zero and defeats the purpose.
+
+Stated plainly rather than buried: **an unattributed person's face travels with the photo** when it
+goes to Hive. The reasons this is acceptable rather than merely convenient —
+
+- Screen 16 asks specifically for photos *"you've recently shared on social media"*. The photo is
+  already public, and Hive's ~25B-image index very likely holds it already.
+- Hive receives the image to *match* it, not to identify anyone. No face vector is created for the
+  unattributed person, and nothing about them is stored on our side beyond a bounding box.
+
+If that trade stops being acceptable, the lever is the seed rule, not the crop.
+
 ### Enrolment completion also signals via `NOTIFY`
 
 A successful enrolment emits Postgres `NOTIFY enrolment_complete` with the `session_id` as payload,

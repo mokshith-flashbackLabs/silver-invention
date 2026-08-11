@@ -231,6 +231,33 @@ The alarm that matters most is `no_successful_calls_24h`. A provider silently re
 exactly like a quiet week for infringements, and an undetected outage means users are told they are
 clear when nothing actually looked. Delivery of these alarms to CloudWatch is step 9.
 
+### 3.6d Attribution (v1 — built except the provider adapter)
+
+`src/imageshield/attribution/` — the only module permitted to call face search (INVARIANTS #1a).
+
+Hive is image search: it finds *the image*, reposted or altered. The enrolment `ReferenceImage` is a
+selfie taken thirty seconds earlier that nobody has ever reposted, so searching it finds nothing,
+correctly, forever. The seeds that matter are the social photos screen 16 asks for, and attribution is
+what says which enrolled person a photo should be a seed *for*. Without it, monitoring runs perfectly
+and reports nothing.
+
+**The face is the unit, not the photo.** One enrolled face among strangers is a valid seed for that
+person; two enrolled household members produce two independent seeds; a face matching nobody is
+ignored, which is the common case and not an error.
+
+Household scoping is a **result filter, not a search parameter** — `SearchFacesByImage` accepts only
+`CollectionId`, `Image`, `FaceMatchThreshold`, `MaxFaces` and `QualityFilter`, so the search runs
+against the whole collection and non-candidates are discarded in `resolve.py` before they can
+influence anything. That filter is the only thing between "a stranger outranked the household member"
+and "person A's photo became person B's seed", which is why it is pure, isolated, and tested with a
+planted non-candidate that outscores the real one.
+
+**Open: how a single face is isolated for the search.** `SearchFacesByImage` "first detects the
+largest face in the image", so three calls on one photo search the same face three times. Isolating
+face N needs a crop, which needs an image codec this repo does not depend on. The `search_face` port
+takes the whole image plus which face precisely so that decision lands in one adapter without
+disturbing the schema, the resolution rule, the store or the route.
+
 ### 3.6c URL recheck loop (v1 — built)
 
 `src/imageshield/recheck/` — its own process (`python -m imageshield.recheck.worker`), polled rather

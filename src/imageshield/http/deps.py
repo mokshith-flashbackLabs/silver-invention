@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 from fastapi import Request
 
+from imageshield.attribution.provider import FaceAttributionProvider, PhotoFetcher
+from imageshield.attribution.store import AttributionStore
 from imageshield.config import Config
 
 if TYPE_CHECKING:
@@ -88,6 +90,23 @@ def get_enrolment_store(request: Request) -> EnrolmentStore:
 def get_search_store(request: Request) -> SearchStore:
     store: SearchStore = _required_state(request, "search_store")  # type: ignore[assignment]
     return store
+
+
+def get_attribution_store(request: Request) -> AttributionStore:
+    store: AttributionStore = _required_state(request, "attribution_store")  # type: ignore[assignment]
+    return store
+
+
+def get_attribution_provider(request: Request) -> FaceAttributionProvider:
+    provider: FaceAttributionProvider = _required_state(  # type: ignore[assignment]
+        request, "attribution_provider"
+    )
+    return provider
+
+
+def get_photo_fetcher(request: Request) -> PhotoFetcher:
+    fetcher: PhotoFetcher = _required_state(request, "photo_fetcher")  # type: ignore[assignment]
+    return fetcher
 
 
 def get_subject_store(request: Request) -> SubjectStore:

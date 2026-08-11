@@ -186,6 +186,22 @@ class Config(BaseSettings):
     outbox_batch_size: int = 50
     outbox_max_attempts: int = 8
 
+    # ── Attribution (src/imageshield/attribution/) ────────────────────────
+    # "Is this face that person" — a DIFFERENT quantity from
+    # LIVENESS_MIN_CONFIDENCE ("is this a live human") and from
+    # detect_confidence ("is this region a face"). One threshold per purpose,
+    # from config, never a shared literal (INVARIANTS #1b).
+    attribution_match_threshold: float = 92.0
+    # MaxFaces on the search. At least two, enforced below and at boot.
+    #
+    # A single-candidate search silently loses coverage as the collection
+    # grows: a stranger outranking the household member returns ONLY the
+    # stranger, that match is discarded by the candidate filter, and the photo
+    # never becomes a seed for its own owner. Nothing errors; the seed simply
+    # never appears. The floor is the only thing standing between that and a
+    # monitoring product that quietly finds less the more people enrol.
+    attribution_max_candidates: int = 5
+
     # ── The recheck loop (src/imageshield/recheck/) ───────────────────────
     # How stale a definite check may get before the URL is probed again.
     recheck_interval_days: int = 7
@@ -308,6 +324,7 @@ class Config(BaseSettings):
         "provider_config_cache_seconds",
         "recheck_poll_interval_seconds",
         "recheck_timeout_seconds",
+        "attribution_match_threshold",
     )
     @classmethod
     def _positive_float(cls, value: float) -> float:
@@ -347,6 +364,25 @@ class Config(BaseSettings):
         if self.service_token == self.admin_service_token:
             raise ValueError(
                 "SERVICE_TOKEN and ADMIN_SERVICE_TOKEN must differ — refusing to start"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _attribution_max_candidates_floor(self) -> Config:
+        """At least two, refused at BOOT rather than at the call site.
+
+        The failure a single candidate produces is silent: a stranger who
+        outranks the household member is the only result, the candidate filter
+        discards it, and the photo never becomes a seed for its own owner.
+        Nothing raises, nothing is logged as wrong, and the coverage loss grows
+        with the collection. A knob whose bad value is invisible has to be
+        refused where it is set.
+        """
+        if self.attribution_max_candidates < 2:
+            raise ValueError(
+                "ATTRIBUTION_MAX_CANDIDATES must be >= 2 — a single-candidate"
+                " search silently drops the real match whenever any stranger in"
+                " the collection outranks it"
             )
         return self
 
