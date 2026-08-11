@@ -218,6 +218,29 @@ def test_face_search_appears_only_in_the_attribution_module() -> None:
     assert offenders == []
 
 
+def test_the_attribution_exemption_is_actually_used() -> None:
+    """PERMANENT. An exemption nobody uses should be DELETED, not widened.
+
+    Without this, ``attribution/`` could quietly stop calling face search — a
+    refactor, a rewrite, a module that moves — and the carve-out in
+    ``test_face_search_appears_only_in_the_attribution_module`` would sit there
+    as a standing permission with no justification behind it. The next person
+    who needs face search somewhere else finds an unused exemption and widens
+    it rather than arguing for a new one.
+    """
+    package = SRC / "imageshield" / ATTRIBUTION_DIR
+    assert package.is_dir(), f"{ATTRIBUTION_DIR}/ is gone — remove the exemption"
+    users = [
+        path.name
+        for path in sorted(package.rglob("*.py"))
+        if FORBIDDEN_SEARCH.search(path.read_text(encoding="utf-8"))
+    ]
+    assert users, (
+        f"{ATTRIBUTION_DIR}/ no longer calls face search. Delete the exemption in"
+        " INVARIANTS #1a and this file rather than leaving it standing."
+    )
+
+
 def test_no_s3_client_anywhere_in_src() -> None:
     offenders = [
         str(path)

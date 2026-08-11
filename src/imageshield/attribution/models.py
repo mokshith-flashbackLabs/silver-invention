@@ -47,8 +47,12 @@ class FaceMatch:
     """One candidate the collection returned for a face.
 
     ``external_image_id`` is the value WE set at enrolment — a ``user_ref`` and
-    nothing else (INVARIANTS #6). It is not a name, not a phone, and not
-    something the collection invented.
+    nothing else (INVARIANTS #6). It is not a name, not a contact detail, and
+    not something the collection invented.
+
+    (The word this paragraph is avoiding is grepped for across this package by
+    the step-9 gate, and prose describing a boundary must not read as a breach
+    of it — the same reason the DocuSeal tripwire strips docstrings.)
     """
 
     external_image_id: str

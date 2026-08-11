@@ -23,6 +23,10 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
+from imageshield.attribution.fetch import HttpxPhotoFetcher
+from imageshield.attribution.fetch import make_client as make_photo_client
+from imageshield.attribution.rekognition import RekognitionFaceAttribution
+from imageshield.attribution.store import PostgresAttributionStore
 from imageshield.config import APP_VERSION, Config, load_config
 from imageshield.db.connection import make_async_pool, make_db_check
 from imageshield.enrolment.faceindex import RekognitionFaceIndex
@@ -84,6 +88,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     if getattr(app.state, "provider_observability", None) is None:
         app.state.provider_observability = PostgresProviderObservability(pool)
+    if getattr(app.state, "attribution_store", None) is None:
+        app.state.attribution_store = PostgresAttributionStore(pool)
+    if getattr(app.state, "attribution_provider", None) is None:
+        app.state.attribution_provider = RekognitionFaceAttribution(
+            region=cfg.aws_region
+        )
+    if getattr(app.state, "photo_fetcher", None) is None:
+        # Closed in the lifespan's teardown below, with the pool.
+        app.state.photo_http_client = make_photo_client()
+        app.state.photo_fetcher = HttpxPhotoFetcher(app.state.photo_http_client)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     if cfg.auth_disabled:
@@ -98,6 +112,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        client = getattr(app.state, "photo_http_client", None)
+        if client is not None:
+            await client.aclose()
         await pool.close()
 
 

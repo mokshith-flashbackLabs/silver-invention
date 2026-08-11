@@ -11,8 +11,16 @@ requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Flashback Labs" }]
 # Mirrors the Flashback agent service scaffold (AgentMeeMaw/pyproject.toml)
-# minus its LLM/ML stack: no openai/anthropic/voyageai/numpy/hdbscan/Pillow/
-# scipy/pgvector/redis. None are needed here (CLAUDE.md §2, §10).
+# minus its LLM/ML stack: no openai/anthropic/voyageai/numpy/hdbscan/scipy/
+# pgvector/redis. None are needed here (CLAUDE.md §2, §10).
+#
+# Pillow IS here, and it is the one exception to that list. Attribution has to
+# search for a SPECIFIC face in a photo, and SearchFacesByImage "first detects
+# the largest face in the image" -- so three calls on a three-face photo search
+# the same face three times. Isolating face N means cropping to its bounding
+# box, and there is no stdlib JPEG codec. Used for exactly that, in exactly one
+# module (attribution/crop.py); it is not a general image-processing dependency
+# and nothing else may reach for it.
 # pydantic-settings is an addition over Flashback: the build spec requires
 # settings-class env validation rather than hand-rolled _required() lookups.
 dependencies = [
@@ -24,6 +32,8 @@ dependencies = [
     "pydantic-settings>=2.5.0,<3.0",
     "structlog>=24.4.0",
     "httpx>=0.27.2",
+    # attribution/crop.py ONLY -- see the note above.
+    "pillow>=11.0.0,<12.0",
 ]
 
 [project.optional-dependencies]
@@ -106,6 +116,7 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]
 "src/imageshield/search/worker.py" = ["TID251"]
 "src/imageshield/liveness/provider.py" = ["TID251"]
 "src/imageshield/enrolment/faceindex.py" = ["TID251"]
+"src/imageshield/attribution/rekognition.py" = ["TID251"]
 # Spike/eval harnesses (CLAUDE.md §8: devtools/ is outside the numbered
 # steps). Not application code; the outbox rule protects request handlers,
 # not one-off credential/region checks.

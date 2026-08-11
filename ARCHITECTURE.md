@@ -231,7 +231,7 @@ The alarm that matters most is `no_successful_calls_24h`. A provider silently re
 exactly like a quiet week for infringements, and an undetected outage means users are told they are
 clear when nothing actually looked. Delivery of these alarms to CloudWatch is step 9.
 
-### 3.6d Attribution (v1 — built except the provider adapter)
+### 3.6d Attribution (v1 — built)
 
 `src/imageshield/attribution/` — the only module permitted to call face search (INVARIANTS #1a).
 
@@ -252,11 +252,17 @@ influence anything. That filter is the only thing between "a stranger outranked 
 and "person A's photo became person B's seed", which is why it is pure, isolated, and tested with a
 planted non-candidate that outscores the real one.
 
-**Open: how a single face is isolated for the search.** `SearchFacesByImage` "first detects the
-largest face in the image", so three calls on one photo search the same face three times. Isolating
-face N needs a crop, which needs an image codec this repo does not depend on. The `search_face` port
-takes the whole image plus which face precisely so that decision lands in one adapter without
-disturbing the schema, the resolution rule, the store or the route.
+**Each face is isolated by cropping before it is searched.** `SearchFacesByImage` "first detects the
+largest face in the image", so three calls on one photo would otherwise search the same face three
+times. `crop.py` cuts the bbox plus a 25% margin — enough surrounding head for the embedding to be
+good, tight enough that a neighbour does not become the largest face in the crop and get attributed
+instead — clamping boxes that Rekognition projects past the frame edge. That crop is the only reason
+Pillow is a dependency, and it is used nowhere else.
+
+Rekognition takes `Bytes` or `S3Object` and has no URL form, so the photo is read through the proxy's
+presigned GET into memory and discarded — the same shape as the enrolment path, and subject to the
+same rule: bytes in memory are fine, bytes on disk or in a column are not (INVARIANTS #9). There is
+no S3 client.
 
 ### 3.6c URL recheck loop (v1 — built)
 
