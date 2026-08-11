@@ -4,6 +4,7 @@ tests/test_liveness_store.py: own down --all + up arrange step)."""
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -60,6 +61,9 @@ async def _enrol_user(liveness: PostgresLivenessStore, user_ref: UserRef) -> str
             quality_score=99.0,
             model_id="rekognition:7.0",
             source_object_uri="https://proxy-s3.example/ref.jpg",
+            consent_ref=uuid4(),
+            consent_document_sha256="sha256:" + "a" * 64,
+            consent_signed_at=datetime.now(UTC),
         ),
         eligibility=eligibility_for(True),
     )

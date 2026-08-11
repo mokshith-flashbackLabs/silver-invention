@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import Any, Protocol
+from uuid import UUID
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -100,18 +101,28 @@ _CONSUME_SQL = f"""
 
 _ENROLMENT_COLUMNS = (
     "enrolment_id, session_id, user_ref, collection_id, external_face_id,"
-    " quality_score, model_id, source_object_uri, status, created_at, deleted_at"
+    " quality_score, model_id, source_object_uri, status, created_at, deleted_at,"
+    " consent_ref, consent_document_sha256, consent_signed_at"
 )
 
 _INSERT_ENROLMENT_SQL = f"""
     INSERT INTO enrolments
       (session_id, session_status, user_ref, collection_id, external_face_id,
-       quality_score, model_id, source_object_uri)
+       quality_score, model_id, source_object_uri,
+       consent_ref, consent_document_sha256, consent_signed_at)
     VALUES
       (%(session_id)s, 'consumed', %(user_ref)s, %(collection_id)s,
        %(external_face_id)s, %(quality_score)s, %(model_id)s,
-       %(source_object_uri)s)
+       %(source_object_uri)s, %(consent_ref)s, %(consent_document_sha256)s,
+       %(consent_signed_at)s)
     RETURNING {_ENROLMENT_COLUMNS}
+"""
+
+# The proxy reconciles its own consent records against what we actually bound
+# an enrolment to. Read off enrolments, not liveness_sessions: consent belongs
+# to the enrolment, and a session that never enrolled has none.
+_SELECT_CONSENT_REF_SQL = """
+    SELECT consent_ref FROM enrolments WHERE session_id = %(session_id)s
 """
 
 _NOTIFY_SQL = "SELECT pg_notify('enrolment_complete', %(session_id)s::text)"
@@ -167,6 +178,8 @@ class LivenessStore(Protocol):
         reference_image_uri: str,
         audit_image_uris: tuple[str, ...],
     ) -> LivenessSessionRow | None: ...
+
+    async def get_enrolment_consent_ref(self, session_id: SessionId) -> UUID | None: ...
 
 
 def _to_row(record: tuple[Any, ...]) -> LivenessSessionRow:
@@ -365,6 +378,9 @@ class PostgresLivenessStore:
                     "quality_score": enrolment.quality_score,
                     "model_id": enrolment.model_id,
                     "source_object_uri": enrolment.source_object_uri,
+                    "consent_ref": enrolment.consent_ref,
+                    "consent_document_sha256": enrolment.consent_document_sha256,
+                    "consent_signed_at": enrolment.consent_signed_at,
                 },
             )
             enrolment_record = await cur.fetchone()
@@ -393,3 +409,10 @@ class PostgresLivenessStore:
             )
             record = await cur.fetchone()
         return _to_row(record) if record is not None else None
+
+    async def get_enrolment_consent_ref(self, session_id: SessionId) -> UUID | None:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_SELECT_CONSENT_REF_SQL, {"session_id": session_id})
+            record = await cur.fetchone()
+        consent_ref: UUID | None = record[0] if record is not None else None
+        return consent_ref

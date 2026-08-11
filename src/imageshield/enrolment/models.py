@@ -14,6 +14,14 @@ from imageshield.types import UserRef
 # fresh session (step-4 brief).
 QUALITY_REJECTED_REASON = "quality_rejected"
 
+# Reserved. Migration 0010 backfills it onto enrolments written before consent
+# was required, so NOT NULL could be applied without deleting a biometric
+# enrolment. The proxy must never issue it, and a fresh enrolment carrying it
+# is refused twice over: here with a clean 422, and by the database CHECK
+# ``enrolments_consent_not_sentinel``, which is what makes it impossible rather
+# than merely discouraged.
+SENTINEL_CONSENT_REF = UUID("00000000-0000-0000-0000-000000000000")
+
 
 @dataclass(frozen=True, slots=True)
 class NewEnrolment:
@@ -28,6 +36,13 @@ class NewEnrolment:
     quality_score: float | None
     model_id: str
     source_object_uri: str
+    # Consent lives in the PROXY: it holds profile.persons, the guardianship
+    # graph, and the DocuSeal webhook, and it is the only party that can work
+    # out who is required to sign. We hold the reference and the hash IT
+    # computed — evidence that consent exists, not the record of it.
+    consent_ref: UUID
+    consent_document_sha256: str
+    consent_signed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +60,9 @@ class EnrolmentRow:
     status: str
     created_at: datetime
     deleted_at: datetime | None
+    consent_ref: UUID
+    consent_document_sha256: str
+    consent_signed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

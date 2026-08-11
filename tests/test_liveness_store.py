@@ -14,13 +14,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import psycopg
 import pytest
 
 from imageshield.db.connection import make_async_pool
-from imageshield.enrolment.models import QUALITY_REJECTED_REASON, NewEnrolment
+from imageshield.enrolment.models import (
+    QUALITY_REJECTED_REASON,
+    SENTINEL_CONSENT_REF,
+    NewEnrolment,
+)
 from imageshield.liveness.models import CreateRejection, LivenessSessionRow
 from imageshield.liveness.store import PostgresLivenessStore
 from imageshield.subjects.eligibility import eligibility_for
@@ -250,15 +256,23 @@ async def test_get_unknown_session_returns_none(store: PostgresLivenessStore) ->
 # --- Step 4: finalize_enrolled / finalize_quality_rejected -------------------
 
 
-def _new_enrolment(user_ref: UserRef) -> NewEnrolment:
-    return NewEnrolment(
-        user_ref=user_ref,
-        collection_id="identity-v1",
-        external_face_id=f"face-{uuid4()}",
-        quality_score=99.5,
-        model_id="rekognition:7.0",
-        source_object_uri="https://proxy-s3.example/ref.jpg",
-    )
+CONSENT_SIGNED_AT = datetime(2026, 8, 10, 9, 30, tzinfo=UTC)
+
+
+def _new_enrolment(user_ref: UserRef, **overrides: Any) -> NewEnrolment:
+    defaults: dict[str, Any] = {
+        "user_ref": user_ref,
+        "collection_id": "identity-v1",
+        "external_face_id": f"face-{uuid4()}",
+        "quality_score": 99.5,
+        "model_id": "rekognition:7.0",
+        "source_object_uri": "https://proxy-s3.example/ref.jpg",
+        "consent_ref": uuid4(),
+        "consent_document_sha256": "sha256:" + "b" * 64,
+        "consent_signed_at": CONSENT_SIGNED_AT,
+    }
+    defaults.update(overrides)
+    return NewEnrolment(**defaults)
 
 
 async def test_finalize_enrolled_consumes_and_inserts_atomically(
@@ -457,3 +471,121 @@ async def test_finalize_enrolled_emits_notify_in_the_transaction(
         notification = await asyncio.wait_for(anext(gen), timeout=5)
         await gen.aclose()
     assert notification.payload == str(row.session_id)
+
+
+# --- consent_ref: recorded here, owned by the proxy -------------------------
+
+
+async def test_finalize_enrolled_persists_the_consent_evidence(
+    store: PostgresLivenessStore, migrated_db: str
+) -> None:
+    row = await _create(store)
+    consent_ref = uuid4()
+
+    outcome = await store.finalize_enrolled(
+        row.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+        enrolment=_new_enrolment(row.user_ref, consent_ref=consent_ref),
+        eligibility=eligibility_for(True),
+    )
+
+    assert outcome is not None
+    _, enrolment = outcome
+    assert enrolment.consent_ref == consent_ref
+    assert enrolment.consent_signed_at == CONSENT_SIGNED_AT
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        stored = conn.execute(
+            "SELECT consent_ref, consent_document_sha256, consent_signed_at"
+            " FROM enrolments WHERE session_id = %s",
+            (row.session_id,),
+        ).fetchone()
+    assert stored == (consent_ref, "sha256:" + "b" * 64, CONSENT_SIGNED_AT)
+
+
+async def test_consent_the_enrolment_and_the_consume_commit_together(
+    store: PostgresLivenessStore, migrated_db: str
+) -> None:
+    """Done-when: all three consent fields land in the SAME transaction as the
+    index and the session consume — kill mid-write and confirm no partial row.
+
+    Killing a process mid-transaction is not reproducible in-process, so this
+    proves the equivalent at the level Postgres enforces it: a forced abort
+    inside the transaction leaves NOTHING behind, including the session
+    consumption that runs first. There is no interleaving that yields an
+    enrolment without the consent that authorised it, and none that consumes a
+    session for an enrolment that never landed.
+    """
+    first = await _create(store)
+    duplicate_face = _new_enrolment(first.user_ref)
+    await store.finalize_enrolled(
+        first.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+        enrolment=duplicate_face,
+        eligibility=eligibility_for(True),
+    )
+
+    # Second session, same external_face_id: enrolments_face_uniq aborts the
+    # transaction after the consume has already run.
+    second = await _create(store)
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        await store.finalize_enrolled(
+            second.session_id,
+            confidence=98.7,
+            reference_image_uri="https://proxy-s3.example/ref2.jpg",
+            audit_image_uris=(),
+            enrolment=duplicate_face,
+            eligibility=eligibility_for(True),
+        )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(
+            "SELECT status FROM liveness_sessions WHERE session_id = %s",
+            (second.session_id,),
+        ).fetchone() == ("created",)
+        assert conn.execute("SELECT count(*) FROM enrolments").fetchone() == (1,)
+
+
+async def test_the_database_refuses_the_sentinel_consent_ref(
+    store: PostgresLivenessStore,
+) -> None:
+    """The route rejects it with a 422 first, but the constraint is what makes
+    it impossible: an app-layer check alone does not survive a new writer."""
+    row = await _create(store)
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        await store.finalize_enrolled(
+            row.session_id,
+            confidence=98.7,
+            reference_image_uri="https://proxy-s3.example/ref.jpg",
+            audit_image_uris=(),
+            enrolment=_new_enrolment(row.user_ref, consent_ref=SENTINEL_CONSENT_REF),
+            eligibility=eligibility_for(True),
+        )
+
+
+async def test_get_enrolment_consent_ref_reads_back_what_was_written(
+    store: PostgresLivenessStore,
+) -> None:
+    row = await _create(store)
+    consent_ref = uuid4()
+    await store.finalize_enrolled(
+        row.session_id,
+        confidence=98.7,
+        reference_image_uri="https://proxy-s3.example/ref.jpg",
+        audit_image_uris=(),
+        enrolment=_new_enrolment(row.user_ref, consent_ref=consent_ref),
+        eligibility=eligibility_for(True),
+    )
+
+    assert await store.get_enrolment_consent_ref(row.session_id) == consent_ref
+
+
+async def test_get_enrolment_consent_ref_is_none_when_nothing_enrolled(
+    store: PostgresLivenessStore,
+) -> None:
+    row = await _create(store)
+    assert await store.get_enrolment_consent_ref(row.session_id) is None

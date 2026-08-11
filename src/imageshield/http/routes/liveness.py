@@ -235,6 +235,25 @@ async def post_liveness_result(
             " silently stop monitoring an adult.",
             retryable=False,
         )
+    if (
+        body.consent_ref is None
+        or body.consent_document_sha256 is None
+        or body.consent_signed_at is None
+    ):
+        # No default and no inference. Consent lives in the proxy — it holds
+        # the persons table, the guardianship graph and the DocuSeal webhook,
+        # and it is the only party that can determine who is required to sign.
+        # This service knows a user_ref and a face vector. Synthesising a
+        # reference here would be fabricating the evidence that Article 9
+        # biometric processing rests on.
+        raise ServiceError(
+            400,
+            "consent_required",
+            "consent_ref, consent_document_sha256 and consent_signed_at are"
+            " required. The proxy collects consent and supplies the reference;"
+            " this service records it and never derives it.",
+            retryable=False,
+        )
     eligibility = eligibility_for(body.subject_is_adult)
     _require_presigned(body.reference_put_url)
     for url in body.audit_put_urls:
@@ -408,6 +427,12 @@ async def post_liveness_result(
             quality_score=indexed.quality_score,
             model_id=indexed.model_id,
             source_object_uri=source_object_uri,
+            # Same transaction as the session consume and the subjects upsert:
+            # there is no interleaving in which an enrolment exists without the
+            # consent that authorised it.
+            consent_ref=body.consent_ref,
+            consent_document_sha256=body.consent_document_sha256,
+            consent_signed_at=body.consent_signed_at,
         ),
         eligibility=eligibility,
     )
@@ -461,11 +486,20 @@ async def get_liveness_session(
     session_id: UUID,
     store: LivenessStore = Depends(get_liveness_store),
 ) -> LivenessStatusResponse:
-    row = await store.get_session(SessionId(session_id))
+    sid = SessionId(session_id)
+    row = await store.get_session(sid)
     if row is None:
         raise ServiceError(404, "session_not_found", "Unknown liveness session.", retryable=False)
+    enrolled = _enrolled(row)
+    # Only read consent when an enrolment can exist. A session that failed,
+    # expired, or was consumed by the quality-rejected path has none, and the
+    # second round-trip would always return NULL.
+    consent_ref = await store.get_enrolment_consent_ref(sid) if enrolled else None
     return LivenessStatusResponse(
-        status=_effective_status(row), confidence=row.confidence, enrolled=_enrolled(row)
+        status=_effective_status(row),
+        confidence=row.confidence,
+        enrolled=enrolled,
+        consent_ref=consent_ref,
     )
 
 

@@ -117,8 +117,9 @@ up, the queue backs up.
 The only module holding Article 9 data. Own database, own credentials, own DB role. Nothing else may
 connect to it (INVARIANTS #14).
 
-Owns: liveness session lifecycle, enrolment, the Rekognition collection, consent artifacts, and the
-identity vector index.
+Owns: liveness session lifecycle, enrolment, the Rekognition collection, the identity vector index,
+and the **consent reference** on an enrolment. Consent records and signed artifacts belong to the
+proxy — see `PROXY_INTEGRATION.md` §4.
 
 Does **not** own: `users`, phone numbers, OTP, sessions. Those are the proxy's. Identity keys everything on
 the opaque `user_ref` the proxy supplies.
@@ -252,7 +253,7 @@ caller, even on error paths.
 | Push tokens, notification delivery | **Proxy** | Proxy tables |
 | Enrolment selfies (S3) | **Proxy** | S3 |
 | Liveness sessions, enrolments, vectors | **Services** | Postgres (identity DB) |
-| Consent records + signed artifacts | **Services** | Postgres + S3 via presigned |
+| Consent records + signed artifacts | **Proxy** | Proxy tables + DocuSeal. Services hold only `enrolments.consent_ref` and the hash the proxy computed |
 | Content index, candidates, search runs | **Services** | Postgres |
 | Review queue and decisions | **Services** | Postgres |
 | Reports, hits, recheck state | **Services** | Postgres |
@@ -270,8 +271,11 @@ Postgres, schema-per-module, distinct DB role per module. Full DDL in `SCHEMA.md
 
 Three properties that are load-bearing:
 
-**`enrolments` has `NOT NULL` FKs to both a passed liveness session and a signed consent record.** The
-schema makes it structurally impossible to index a face without both.
+**`enrolments` cannot exist without both a consumed liveness session and consent evidence.** The
+session half is a composite FK pinned to `status = 'consumed'`; the consent half is three `NOT NULL`
+columns — `consent_ref`, `consent_document_sha256`, `consent_signed_at` — supplied by the proxy and
+written in the same transaction. The schema makes it structurally impossible to index a face without
+both. The consent *document* stays in the proxy; we hold the reference (INVARIANTS #2).
 
 **Every row that holds or references a vector carries `model_id`.** Vectors from different models are
 not comparable, and a cosine similarity between an AdaFace vector and anything else is a plausible-

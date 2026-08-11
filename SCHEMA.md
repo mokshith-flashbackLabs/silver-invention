@@ -57,38 +57,36 @@ users (
 self-declared; treat it as an assertion, not a fact. Our own `MIN_ENROLMENT_AGE` check is
 defence-in-depth, not the primary gate.
 
-### Consent
+### Consent — **not a table in this repo**
 
-```sql
-CREATE TYPE consent_status AS ENUM ('pending', 'signed', 'withdrawn', 'expired');
+There is no `consent_records` table here, and there will not be one. An earlier draft of this
+document specified one; that design is reversed.
 
-CREATE TABLE consent_records (
-  consent_id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_ref               UUID NOT NULL,
-  signer_user_ref        UUID NOT NULL,
-  document_version       TEXT NOT NULL,          -- 'biometric-consent-v1.0'
-  document_sha256        TEXT NOT NULL,          -- hash of the exact rendered text
-  document_uri           TEXT NOT NULL,          -- immutable store of the signed artifact
-  provider               TEXT NOT NULL DEFAULT 'docuseal',
-  provider_submission_id TEXT,
-  status                 consent_status NOT NULL DEFAULT 'pending',
-  signed_at              TIMESTAMPTZ,
-  withdrawn_at           TIMESTAMPTZ,
-  signer_ip              INET,
-  created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+**Consent lives in the proxy.** It holds `profile.persons`, `profile.guardianships` with
+`subject_dob` triggers, and `profile.v_consent_eligibility` computing `required_signer_role` and
+`blocked_reason` — the hard part, already built. It is also the only public ingress, so the DocuSeal
+webhook must terminate there. This repo knows a `user_ref` and a face vector; it cannot determine who
+is required to sign.
 
-CREATE INDEX consent_user_idx ON consent_records (user_ref, status);
-CREATE UNIQUE INDEX consent_provider_uniq
-  ON consent_records (provider, provider_submission_id)
-  WHERE provider_submission_id IS NOT NULL;
-```
+**We hold a reference, not a record.** Three columns on `enrolments` (migration 0010), all
+`NOT NULL`:
 
-`signer_user_ref = user_ref` for self-consent. They diverge only for guardian co-signature (v2). Both
-are real authenticated accounts — never a typed-in name.
+| Column | Meaning |
+|---|---|
+| `consent_ref` | The proxy's `consent_id`. Indexed — "which enrolments does this consent cover" is the question asked after a withdrawal |
+| `consent_document_sha256` | The hash **the proxy computed** of the exact rendered text. We never compute one, because we never see the document |
+| `consent_signed_at` | When it was signed. Rejected at the API if in the future |
 
-`document_sha256` is the column that makes consent demonstrable. Storing `consentSigned: true` (what
-the current system does) proves nothing about *what* was agreed to.
+`consent_document_sha256` is what makes consent demonstrable. Storing `consentSigned: true` (what the
+old system does) proves nothing about *what* was agreed to — and the hash is worth exactly as much as
+the proxy's discipline in computing it over the real artifact.
+
+`00000000-0000-0000-0000-000000000000` is reserved: 0010 backfills it onto rows written before
+consent was required, so `NOT NULL` could be applied without deleting a biometric enrolment.
+`enrolments_consent_not_sentinel` is `NOT VALID` — it grandfathers exactly those rows and enforces on
+every write after. The proxy must never issue it.
+
+Enforcement survives the move; the document does not cross the boundary. See `INVARIANTS.md` #2.
 
 ### Liveness
 
@@ -124,7 +122,11 @@ CREATE TABLE enrolments (
   enrolment_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_ref            UUID NOT NULL,
   liveness_session_id UUID NOT NULL REFERENCES liveness_sessions(session_id),
-  consent_id          UUID NOT NULL REFERENCES consent_records(consent_id),
+  -- Consent lives in the PROXY. We hold the reference and the hash it computed,
+  -- never a FK to a local table and never the document. See "Consent" above.
+  consent_ref             UUID NOT NULL,
+  consent_document_sha256 TEXT NOT NULL,
+  consent_signed_at       TIMESTAMPTZ NOT NULL,
   model_id            TEXT NOT NULL,             -- 'rekognition:identity-v1'
   collection_id       TEXT NOT NULL,             -- Rekognition collection
   external_face_id    TEXT NOT NULL,             -- Rekognition FaceId

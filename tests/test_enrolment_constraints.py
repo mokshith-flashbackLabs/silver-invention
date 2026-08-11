@@ -13,12 +13,16 @@ import pytest
 
 from tests.db import run_migrate
 
+# Migration 0010 made the three consent columns NOT NULL, so every enrolment
+# INSERT now carries consent evidence — including the ones written here purely
+# to be refused by some *other* constraint.
 INSERT_ENROLMENT = """
     INSERT INTO enrolments
       (session_id, user_ref, collection_id, external_face_id, model_id,
-       source_object_uri)
+       source_object_uri, consent_ref, consent_document_sha256, consent_signed_at)
     VALUES (%s, %s, 'identity-v1', %s, 'rekognition:7.0',
-            'https://proxy-s3.example/ref.jpg')
+            'https://proxy-s3.example/ref.jpg',
+            gen_random_uuid(), 'sha256:abc', now())
 """
 
 
@@ -74,9 +78,11 @@ def test_session_status_column_only_accepts_consumed(migrated_db: str) -> None:
             conn.execute(
                 "INSERT INTO enrolments"
                 " (session_id, session_status, user_ref, collection_id,"
-                "  external_face_id, model_id, source_object_uri)"
+                "  external_face_id, model_id, source_object_uri,"
+                "  consent_ref, consent_document_sha256, consent_signed_at)"
                 " VALUES (%s, 'failed', %s, 'identity-v1', %s, 'rekognition:7.0',"
-                "  'https://proxy-s3.example/ref.jpg')",
+                "  'https://proxy-s3.example/ref.jpg',"
+                "  gen_random_uuid(), 'sha256:abc', now())",
                 (session_id, user_ref, f"face-{uuid4()}"),
             )
 

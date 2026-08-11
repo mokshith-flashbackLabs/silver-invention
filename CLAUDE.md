@@ -71,7 +71,8 @@ We hold **no AWS S3 credentials**. If they aren't in the environment, the mistak
 
 - Liveness session lifecycle and the provider relationship.
 - Enrolment: quality gate, `IndexFaces`, the `identity-v1` collection, `DeleteFaces`.
-- Consent records and their versioned artifacts.
+- The **consent reference** on an enrolment — `consent_ref`, the proxy's hash, and the signing time.
+  The record and the document are the proxy's; we hold a pointer and enforce that it exists.
 - The content index, matching, candidates, search runs. *(specified, not yet built)*
 - The review queue and adjudication decisions. *(specified, not yet built)*
 - Reports, hits, recheck state, evidence export. *(specified, not yet built)*
@@ -81,6 +82,12 @@ We hold **no AWS S3 credentials**. If they aren't in the environment, the mistak
 
 - Auth, OTP, sessions, `users`. **The proxy is the auth boundary.**
 - Phone numbers, profile fields, billing, push delivery.
+- **Consent: the records, the signed artifacts, and the DocuSeal relationship.** It has
+  `profile.persons`, `profile.guardianships` with `subject_dob` triggers, and
+  `profile.v_consent_eligibility` computing `required_signer_role` — the hard part, already built.
+  It is also the only public ingress, so the webhook must terminate there. We hold a `consent_ref`
+  and the hash *it* computed; we never render, fetch or hash the document, and we cannot determine
+  who is required to sign.
 - All S3 buckets, all credentials, all object lifecycle.
 - All user-facing reads for the report UI (read-only Postgres access to our schemas).
 
@@ -114,8 +121,10 @@ code being written **now**, carrying the same numbers.
    that's the fragmentation bug. `SearchFacesByImage` must not appear in the enrolment path.
 1b. **One threshold per purpose, from config.** No inline literals. The 90/95/99 spread across call
    sites is what makes #1's failure fire.
-2. **No enrolment without a passed liveness session.** Enforced by the `UNIQUE` FK on
-   `liveness_enrolments.session_id`. The constraint does the work, not the application code.
+2. **No enrolment without a passed liveness session and a consent reference from the proxy.**
+   Enforced by the `UNIQUE` FK on `liveness_enrolments.session_id` and by 0010's three `NOT NULL`
+   consent columns. The constraints do the work, not the application code. The consent *document*
+   lives in the proxy — we hold `consent_ref` plus the hash it computed, and never compute one.
 3. **Liveness sessions are single-use, 10-minute TTL.** Once an enrolment references one, it's
    consumed. Replay returns `410`.
 4. **Never mix vectors or scores from different models.** Every row carries `model_id`. A similarity

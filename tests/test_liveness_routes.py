@@ -24,15 +24,19 @@ The behaviours pinned here are the step-3 "done when" list:
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.enrolment.models import (
     QUALITY_REJECTED_REASON,
+    SENTINEL_CONSENT_REF,
     EnrolmentRow,
     FaceIndexUnavailable,
     IndexedFace,
@@ -51,6 +55,18 @@ from imageshield.types import UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
 
 AUTH = {"X-Service-Token": SERVICE_TOKEN}
+
+# The consent evidence the proxy supplies on every result call. Required with
+# no default (out-of-band consent_ref task): the proxy owns consent, we hold a
+# reference, and its absence has to be structurally impossible rather than
+# merely discouraged.
+CONSENT_REF = "9f1c1e6a-0000-4000-8000-aaaaaaaaaaaa"
+SENTINEL_CONSENT_REF_STR = str(SENTINEL_CONSENT_REF)
+CONSENT_FIELDS: dict[str, Any] = {
+    "consent_ref": CONSENT_REF,
+    "consent_document_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "consent_signed_at": "2026-08-10T12:00:00Z",
+}
 
 
 def _now() -> datetime:
@@ -200,10 +216,19 @@ class FakeLivenessStore:
             status="active",
             created_at=_now(),
             deleted_at=None,
+            # Consent evidence rides the same write as the enrolment: the
+            # proxy collected it, we only record the reference.
+            consent_ref=enrolment.consent_ref,
+            consent_document_sha256=enrolment.consent_document_sha256,
+            consent_signed_at=enrolment.consent_signed_at,
         )
         self.enrolments[session_id] = enrolment_row
         self.notifies.append(str(session_id))
         return row, enrolment_row
+
+    async def get_enrolment_consent_ref(self, session_id: UUID) -> UUID | None:
+        enrolment = self.enrolments.get(session_id)
+        return enrolment.consent_ref if enrolment is not None else None
 
     async def finalize_quality_rejected(
         self,
@@ -341,6 +366,7 @@ class Harness:
                 # Step 8: required, no default. The tests that specifically
                 # exercise its absence pass an explicit body without it.
                 "subject_is_adult": True,
+                **CONSENT_FIELDS,
             }
         return self.client.post(f"/v1/liveness/{session_id}/result", json=body, headers=merged)
 
@@ -596,11 +622,9 @@ def test_result_non_http_presigned_url_is_400() -> None:
 
     response = h.result(
         row.session_id,
-        body={
-            "reference_put_url": "file:///etc/passwd",
-            "audit_put_urls": [],
-            "subject_is_adult": True,
-        },
+        body=_result_body(
+            subject_is_adult=True, reference_put_url="file:///etc/passwd", audit_put_urls=[]
+        ),
     )
 
     assert response.status_code == 400
@@ -764,7 +788,12 @@ def test_get_session_returns_status_and_confidence() -> None:
     response = h.client.get(f"/v1/liveness/{row.session_id}", headers=AUTH)
 
     assert response.status_code == 200
-    assert response.json() == {"status": "passed", "confidence": 97.25, "enrolled": False}
+    assert response.json() == {
+        "status": "passed",
+        "confidence": 97.25,
+        "enrolled": False,
+        "consent_ref": None,
+    }
 
 
 def test_get_unknown_session_is_404() -> None:
@@ -845,8 +874,15 @@ def _result_body(**overrides: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
         "reference_put_url": "https://proxy-s3.example/ref.jpg?X-Amz-Signature=abc",
         "audit_put_urls": [],
+        **CONSENT_FIELDS,
     }
     body.update(overrides)
+    return body
+
+
+def _body_without(field: str) -> dict[str, Any]:
+    body = _result_body(subject_is_adult=True)
+    del body[field]
     return body
 
 
@@ -1053,4 +1089,193 @@ def test_get_status_reports_enrolled() -> None:
     response = h.client.get(f"/v1/liveness/{row.session_id}", headers=AUTH)
 
     assert response.status_code == 200
-    assert response.json() == {"status": "consumed", "confidence": 99.5, "enrolled": True}
+    assert response.json() == {
+        "status": "consumed",
+        "confidence": 99.5,
+        "enrolled": True,
+        "consent_ref": CONSENT_REF,
+    }
+
+
+# ── consent_ref: the proxy owns consent, we hold the reference ───────────────
+
+
+@pytest.mark.parametrize(
+    "field", ["consent_ref", "consent_document_sha256", "consent_signed_at"]
+)
+def test_a_missing_consent_field_is_400_and_writes_nothing(field: str) -> None:
+    """Done-when: an enrolment attempt with no consent_ref returns
+    400 consent_required and writes NO row.
+
+    Do not default, do not infer. This service cannot determine who is required
+    to sign — it holds a user_ref and a face vector, and no DOB, no
+    guardianship graph, no persons table. Inventing a consent reference would
+    be fabricating the evidence that Article 9 processing rests on.
+    """
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id, _body_without(field))
+
+    assert response.status_code == 400
+    assert error_body(response)["code"] == "consent_required"
+    # Nothing happened, and the session stays unconsumed so the proxy can
+    # retry with the field present rather than burning a liveness attempt.
+    assert h.store.enrolments == {}
+    assert h.store.subjects == {}
+    assert h.face_index.index_calls == []
+    assert h.store.rows[row.session_id].completed_at is None
+
+
+def test_the_sentinel_consent_ref_is_rejected_with_422() -> None:
+    """The all-zero UUID is the migration's backfill artifact for rows written
+    before consent was required. It is reserved: the proxy must never issue it,
+    and an enrolment carrying it is not consented. Refused here AND by the
+    database CHECK — the app layer gives a clean error, the constraint is what
+    makes it impossible."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(
+        row.session_id,
+        _result_body(subject_is_adult=True, consent_ref=SENTINEL_CONSENT_REF_STR),
+    )
+
+    assert response.status_code == 422
+    assert h.store.enrolments == {}
+    assert h.face_index.index_calls == []
+
+
+def test_a_malformed_consent_ref_is_422() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(
+        row.session_id, _result_body(subject_is_adult=True, consent_ref="not-a-uuid")
+    )
+
+    assert response.status_code == 422
+    assert h.store.enrolments == {}
+
+
+def test_a_future_consent_signed_at_is_422() -> None:
+    """Consent cannot have been signed after the moment we are told about it.
+    A future timestamp is either a broken clock or fabricated evidence, and
+    both make the record worthless for the one purpose it has."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    future = (_now() + timedelta(hours=1)).isoformat()
+
+    response = h.result(
+        row.session_id, _result_body(subject_is_adult=True, consent_signed_at=future)
+    )
+
+    assert response.status_code == 422
+    assert h.store.enrolments == {}
+    assert h.face_index.index_calls == []
+
+
+def test_a_blank_consent_document_sha256_is_422() -> None:
+    """NOT NULL alone permits '' — the same defect 0007's consent_basis CHECK
+    exists to close. A blank hash proves nothing about what was agreed to,
+    which is the entire reason the column is stored."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(
+        row.session_id, _result_body(subject_is_adult=True, consent_document_sha256="   ")
+    )
+
+    assert response.status_code == 422
+    assert h.store.enrolments == {}
+
+
+def test_consent_evidence_lands_on_the_enrolment_row() -> None:
+    """All three fields reach the store on the SAME call that consumes the
+    session and writes the enrolment — one transaction, no second write."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 200
+    enrolment = h.store.enrolments[row.session_id]
+    assert enrolment.consent_ref == UUID(CONSENT_REF)
+    assert enrolment.consent_document_sha256 == CONSENT_FIELDS["consent_document_sha256"]
+    assert enrolment.consent_signed_at == datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+
+
+def test_get_session_returns_the_consent_ref_for_reconciliation() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    h.result(row.session_id)
+
+    response = h.client.get(f"/v1/liveness/{row.session_id}", headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["consent_ref"] == CONSENT_REF
+
+
+def test_get_session_consent_ref_is_null_before_enrolment() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+
+    response = h.client.get(f"/v1/liveness/{row.session_id}", headers=AUTH)
+
+    assert response.json()["consent_ref"] is None
+
+
+def test_no_consent_module_hashes_a_document_or_speaks_to_docuseal() -> None:
+    """PERMANENT TEST. Done-when: ``grep -rn "consent" src/`` shows no DocuSeal
+    client, no document rendering, and no hashing of a document. We store a
+    hash the PROXY computed; we never compute one, because we never see the
+    document — and if we ever did, it would have crossed the boundary this
+    whole design exists to hold.
+
+    Scoped to modules that mention consent, deliberately. hashlib is legitimate
+    elsewhere (``search/urlhash.py`` hashes URLs — that is the dedup key), so a
+    blanket ban would be a false positive, and a test that cries wolf is a test
+    someone eventually deletes.
+
+    Comments and docstrings are stripped before matching, for the same reason:
+    this file and three modules explain *why* the DocuSeal webhook terminates
+    at the proxy, and prose that describes a boundary must not read as a
+    breach of it. A real client would survive the strip — an import, a base
+    URL, a call.
+    """
+    src = Path(__file__).resolve().parents[1] / "src"
+    offenders: list[str] = []
+    for path in sorted(src.rglob("*.py")):
+        code = _code_without_prose(path)
+        if "docuseal" in code:
+            offenders.append(f"{path.name}: DocuSeal client")
+        if "consent" in code and ("hashlib" in code or "hmac" in code):
+            offenders.append(f"{path.name}: hashes a document")
+    assert offenders == []
+
+
+def _code_without_prose(path: Path) -> str:
+    """Source with comments and docstrings removed. ``ast.unparse`` drops
+    comments outright; the walk drops the docstring off every module, class
+    and function."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
+        ):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            node.body.pop(0)
+    return ast.unparse(tree).lower()

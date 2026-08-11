@@ -11,6 +11,7 @@ the session.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 import psycopg
 import pytest
@@ -479,10 +480,11 @@ def test_0007_creates_calibration_tables(throwaway_db: str) -> None:
 def test_0007_down_removes_them_and_the_added_columns(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    # Three steps back: 0009 (cost/cadence), 0008 (subjects), then 0007. This
-    # number has to move whenever a migration is added, which is the point —
-    # a silently-wrong count would revert the wrong migration and pass.
-    run_migrate(throwaway_db, "down", "--steps", "3")
+    # Four steps back: 0010 (consent_ref), 0009 (cost/cadence), 0008
+    # (subjects), then 0007. This number has to move whenever a migration is
+    # added, which is the point — a silently-wrong count would revert the
+    # wrong migration and pass.
+    run_migrate(throwaway_db, "down", "--steps", "4")
     with psycopg.connect(throwaway_db) as conn:
         assert CALIBRATION_TABLES & _table_names(conn) == set()
         cols = {
@@ -646,7 +648,7 @@ def test_0008_backfills_existing_enrolments_and_seeds_as_adult(throwaway_db: str
     """
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "2")  # back to 0007
+    run_migrate(throwaway_db, "down", "--steps", "3")  # back to 0007
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         session = conn.execute(
@@ -686,7 +688,7 @@ def test_0008_backfills_existing_enrolments_and_seeds_as_adult(throwaway_db: str
 def test_0008_down_drops_the_table_and_the_constraint(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "2")  # 0009 then 0008
+    run_migrate(throwaway_db, "down", "--steps", "3")  # 0010, 0009, then 0008
     with psycopg.connect(throwaway_db) as conn:
         assert "subjects" not in _table_names(conn)
         assert "search_seeds_subject_fk" not in _constraints(conn, "search_seeds")
@@ -782,7 +784,7 @@ def test_0009_rejects_an_unknown_provider_call_status(throwaway_db: str) -> None
 def test_0009_down_removes_them_and_keeps_daily_budget(throwaway_db: str) -> None:
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
-    run_migrate(throwaway_db, "down", "--steps", "1")
+    run_migrate(throwaway_db, "down", "--steps", "2")  # 0010 then 0009
     with psycopg.connect(throwaway_db) as conn:
         assert "provider_spend" not in _table_names(conn)
         assert _columns(conn, "providers") & PROVIDER_STEP_8_COLUMNS == set()
@@ -790,3 +792,136 @@ def test_0009_down_removes_them_and_keeps_daily_budget(throwaway_db: str) -> Non
         # 0001's column survives: dropping it here would make this migration
         # destructive to something it never created.
         assert "daily_budget_usd" in _columns(conn, "providers")
+
+
+# ── 0010: the consent reference on enrolments ─────────────────────────────
+
+# Reserved: the proxy must never issue it. It exists only so NOT NULL could be
+# applied to rows written before consent was required.
+SENTINEL_CONSENT_REF = "00000000-0000-0000-0000-000000000000"
+
+CONSENT_COLUMNS = {"consent_ref", "consent_document_sha256", "consent_signed_at"}
+
+_INSERT_CONSUMED_SESSION = (
+    "INSERT INTO liveness_sessions (user_ref, provider_session_id, status,"
+    " attempt_number, expires_at, consumed_at, completed_at)"
+    " VALUES (gen_random_uuid(), gen_random_uuid()::text, 'consumed', 1,"
+    "         now() + interval '10 minutes', now(), now())"
+    " RETURNING session_id, user_ref"
+)
+
+_INSERT_ENROLMENT_WITH_CONSENT = (
+    "INSERT INTO enrolments (session_id, session_status, user_ref, collection_id,"
+    " external_face_id, model_id, source_object_uri,"
+    " consent_ref, consent_document_sha256, consent_signed_at)"
+    " VALUES (%s, 'consumed', %s, 'identity-v1', %s, 'rekognition:7.0',"
+    "         'https://proxy-s3.example/ref.jpg', %s, 'sha256:abc', now())"
+)
+
+
+def _consumed_session(conn: psycopg.Connection[tuple[Any, ...]]) -> tuple[Any, Any]:
+    row = conn.execute(_INSERT_CONSUMED_SESSION).fetchone()
+    assert row is not None
+    return row[0], row[1]
+
+
+def test_0010_adds_the_consent_columns_as_not_null(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        assert _columns(conn, "enrolments") >= CONSENT_COLUMNS
+        nullability = conn.execute(
+            "SELECT is_nullable FROM information_schema.columns"
+            " WHERE table_name = 'enrolments' AND column_name = ANY(%s)",
+            (sorted(CONSENT_COLUMNS),),
+        ).fetchall()
+    # NOT NULL is the whole point: INVARIANTS #2's second half was previously
+    # enforced nowhere, so a consent-free enrolment was writable.
+    assert {row[0] for row in nullability} == {"NO"}
+
+
+def test_0010_rejects_an_enrolment_with_no_consent_ref(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        session_id, user_ref = _consumed_session(conn)
+        with pytest.raises(psycopg.errors.NotNullViolation):
+            conn.execute(
+                "INSERT INTO enrolments (session_id, session_status, user_ref,"
+                " collection_id, external_face_id, model_id, source_object_uri)"
+                " VALUES (%s, 'consumed', %s, 'identity-v1', 'face-1',"
+                "         'rekognition:7.0', 'https://proxy-s3.example/ref.jpg')",
+                (session_id, user_ref),
+            )
+
+
+def test_0010_rejects_a_fresh_enrolment_carrying_the_sentinel(throwaway_db: str) -> None:
+    """Done-when: the sentinel is refused by the DATABASE, not by application
+    code — so this asserts it with raw SQL, with no application code in the
+    path at all. The sentinel is a migration artifact; it is not a valid state
+    going forward, and an app-layer check alone would not survive a new writer.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        session_id, user_ref = _consumed_session(conn)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                _INSERT_ENROLMENT_WITH_CONSENT,
+                (session_id, user_ref, "face-1", SENTINEL_CONSENT_REF),
+            )
+
+
+def test_0010_accepts_a_real_consent_ref(throwaway_db: str) -> None:
+    """The CHECK must reject only the sentinel — a normal enrolment still writes."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        session_id, user_ref = _consumed_session(conn)
+        conn.execute(
+            _INSERT_ENROLMENT_WITH_CONSENT,
+            (session_id, user_ref, "face-1", "11111111-2222-3333-4444-555555555555"),
+        )
+        stored = conn.execute(
+            "SELECT consent_ref::text, consent_document_sha256 FROM enrolments"
+        ).fetchone()
+    assert stored == ("11111111-2222-3333-4444-555555555555", "sha256:abc")
+
+
+def test_0010_backfills_pre_consent_rows_with_the_sentinel(throwaway_db: str) -> None:
+    """The real upgrade path: roll back to 0009, write an enrolment from before
+    consent was required, roll forward. The row must survive — dropping it
+    would destroy a biometric enrolment (CLAUDE.md §5, never DELETE) — carrying
+    the sentinel and its own created_at as consent_signed_at."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "1")  # back to 0009
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        session_id, user_ref = _consumed_session(conn)
+        conn.execute(
+            "INSERT INTO enrolments (session_id, session_status, user_ref,"
+            " collection_id, external_face_id, model_id, source_object_uri)"
+            " VALUES (%s, 'consumed', %s, 'identity-v1', 'face-1',"
+            "         'rekognition:7.0', 'https://proxy-s3.example/ref.jpg')",
+            (session_id, user_ref),
+        )
+
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db) as conn:
+        row = conn.execute(
+            "SELECT consent_ref::text, consent_document_sha256,"
+            " consent_signed_at = created_at FROM enrolments"
+        ).fetchone()
+    assert row == (SENTINEL_CONSENT_REF, "PRE_CONSENT_TEST_DATA", True)
+
+
+def test_0010_down_removes_the_consent_columns(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    run_migrate(throwaway_db, "down", "--steps", "1")
+    with psycopg.connect(throwaway_db) as conn:
+        assert _columns(conn, "enrolments") & CONSENT_COLUMNS == set()
+        assert "enrolments_consent_not_sentinel" not in _constraints(conn, "enrolments")

@@ -36,6 +36,12 @@ def make_enrolment(**overrides: Any) -> EnrolmentRow:
         "status": "active",
         "created_at": datetime.now(UTC),
         "deleted_at": None,
+        # The proxy's consent record, referenced not held. Deletion does not
+        # touch it: withdrawing consent is the proxy's write, and tombstoning
+        # here must not silently rewrite the evidence of what was agreed to.
+        "consent_ref": uuid4(),
+        "consent_document_sha256": "sha256:" + "c" * 64,
+        "consent_signed_at": datetime.now(UTC),
     }
     defaults.update(overrides)
     return EnrolmentRow(**defaults)

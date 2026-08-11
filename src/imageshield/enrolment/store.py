@@ -18,7 +18,8 @@ from imageshield.types import UserRef
 
 _ENROLMENT_COLUMNS = (
     "enrolment_id, session_id, user_ref, collection_id, external_face_id,"
-    " quality_score, model_id, source_object_uri, status, created_at, deleted_at"
+    " quality_score, model_id, source_object_uri, status, created_at, deleted_at,"
+    " consent_ref, consent_document_sha256, consent_signed_at"
 )
 
 _ACTIVE_SQL = f"""
@@ -71,6 +72,9 @@ def to_enrolment_row(record: tuple[Any, ...]) -> EnrolmentRow:
         status,
         created_at,
         deleted_at,
+        consent_ref,
+        consent_document_sha256,
+        consent_signed_at,
     ) = record
     return EnrolmentRow(
         enrolment_id=enrolment_id,
@@ -86,4 +90,7 @@ def to_enrolment_row(record: tuple[Any, ...]) -> EnrolmentRow:
         status=str(status),
         created_at=created_at,
         deleted_at=deleted_at,
+        consent_ref=consent_ref,
+        consent_document_sha256=consent_document_sha256,
+        consent_signed_at=consent_signed_at,
     )

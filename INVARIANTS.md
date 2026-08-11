@@ -32,11 +32,28 @@ Check: grep the enrolment path for `SearchFacesByImage` and `searchUsersByImage`
 Not per call site. The old system's 90/95/99 spread across paths is what makes #1's miss case fire.
 A threshold literal appearing inline anywhere is a defect.
 
-**2. No enrolment without a passed liveness session and a signed consent record.**
-Enforced by `NOT NULL` FKs on `enrolments`. Also assert in application code before calling
-`IndexFaces`, because a future migration could relax the constraint.
+**2. No enrolment without a passed liveness session and a consent reference supplied by the proxy.**
+Two halves, enforced separately. The session half is migration 0003's composite FK to
+`(session_id, status)`, pinned to `'consumed'`. The consent half is migration 0010:
+`enrolments.consent_ref`, `consent_document_sha256` and `consent_signed_at`, all `NOT NULL`, written
+in the same transaction as the index and the session consume. Also assert in application code before
+calling `IndexFaces`, because a future migration could relax the constraint.
 
-Check: attempt to create an enrolment with a `failed` liveness session. It must raise.
+**The consent document itself lives in the proxy and does not cross the boundary.** The proxy owns
+`profile.persons`, `profile.guardianships` and `profile.v_consent_eligibility` — which is what
+computes who is *required* to sign — and it is the only public ingress, so the DocuSeal webhook
+terminates there. This repo knows a `user_ref` and a face vector; it cannot determine the required
+signer, and it never renders, fetches or hashes the document. `consent_document_sha256` is a hash the
+proxy computed. We record the evidence and make its absence structurally impossible; we do not verify
+the signature, because we never see what was signed.
+
+`00000000-0000-0000-0000-000000000000` is reserved. Migration 0010 backfills it onto enrolments
+written before consent was required, so `NOT NULL` could be applied without deleting a biometric
+enrolment. The proxy must never issue it, and `enrolments_consent_not_sentinel` (`NOT VALID`, so it
+grandfathers those rows and enforces on every subsequent write) refuses it at the database.
+
+Check: attempt to create an enrolment with a `failed` liveness session. It must raise. Attempt one
+with no `consent_ref`, and one with the sentinel, directly in SQL. Both must raise.
 
 **3. Liveness must be a fresh session, not a replayed one.**
 `liveness_sessions.session_id` is single-use. Once an enrolment references it, it cannot be referenced

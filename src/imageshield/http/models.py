@@ -7,12 +7,13 @@ the typed-identifier discipline (CLAUDE.md §10).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from imageshield.enrolment.models import SENTINEL_CONSENT_REF
 from imageshield.types import UserRef
 
 
@@ -62,6 +63,47 @@ class LivenessResultRequest(ServiceModel):
     # fail quietly, which is exactly why the field is mandatory rather than
     # inferred (step-8 brief).
     subject_is_adult: bool | None = None
+    # Consent evidence, supplied by the proxy. All three are required and none
+    # is defaulted or inferred: this service holds a user_ref and a face
+    # vector, and cannot determine who is required to sign — the proxy has the
+    # persons table, the guardianship graph, and the DocuSeal webhook. Absent
+    # -> 400 consent_required, same shape as the two fields above.
+    consent_ref: UUID | None = None
+    consent_document_sha256: str | None = None
+    consent_signed_at: datetime | None = None
+
+    @field_validator("consent_ref")
+    @classmethod
+    def _not_the_sentinel(cls, value: UUID | None) -> UUID | None:
+        if value == SENTINEL_CONSENT_REF:
+            raise ValueError(
+                "consent_ref is the reserved pre-consent sentinel; it is a migration"
+                " artifact and must never be issued by the proxy"
+            )
+        return value
+
+    @field_validator("consent_document_sha256")
+    @classmethod
+    def _not_blank(cls, value: str | None) -> str | None:
+        # NOT NULL alone permits '' — the same defect 0007's consent_basis
+        # CHECK exists to close. A blank hash proves nothing about *what* was
+        # agreed to, which is the only reason the column exists.
+        if value is not None and not value.strip():
+            raise ValueError("consent_document_sha256 must not be blank")
+        return value
+
+    @field_validator("consent_signed_at")
+    @classmethod
+    def _not_in_the_future(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        # A naive timestamp is read as UTC rather than rejected: ISO 8601
+        # without an offset is common, and guessing local time here would be
+        # the actual error.
+        moment = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        if moment > datetime.now(UTC):
+            raise ValueError("consent_signed_at is in the future")
+        return value
 
 
 class LivenessResultResponse(BaseModel):
@@ -78,6 +120,10 @@ class LivenessStatusResponse(BaseModel):
     status: Literal["created", "pending", "passed", "failed", "expired", "consumed"]
     confidence: float | None
     enrolled: bool = False
+    # So the proxy can reconcile its own consent record against what an
+    # enrolment was actually bound to. None until an enrolment exists — a
+    # session that never enrolled has no consent to report.
+    consent_ref: UUID | None = None
 
 
 class SubjectResponse(BaseModel):

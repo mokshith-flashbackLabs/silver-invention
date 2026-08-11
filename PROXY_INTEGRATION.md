@@ -37,7 +37,8 @@ AGENTMEEMAW** and each has a reason.
 
 ### Services repo owns
 
-- Identity: liveness sessions, consent records, enrolment, the Rekognition collection.
+- Identity: liveness sessions, enrolment, the Rekognition collection, and the **consent reference**
+  on an enrolment. Consent records and signed artifacts themselves are the proxy's — see §4.
 - Match: partner ingest, forward and backfill search, candidate emission.
 - Adjudication: review queue, reviewer decisions.
 - Report generation — all **writes** to `report_hits`, `reports`, `search_runs`.
@@ -54,8 +55,9 @@ Holds in local dev, staging, and production without exception.
 
 ### Hard rules — the proxy MUST NOT
 
-- Write to any identity table: `users`, `consent_records`, `liveness_sessions`, `enrolments`.
-  Not even reads — see §6.
+- Write to any identity table: `users`, `liveness_sessions`, `enrolments`. Not even reads — see §6.
+  (`consent_records` no longer appears here because it is no longer ours — it lives in the proxy's
+  own schema, which the proxy naturally owns outright.)
 - Write to `report_hits`, `reports`, `match_candidates`, `search_runs`, `review_*`. Reads only, and
   only the columns in §6.
 - Hold, proxy, cache, or log **face bytes**. Selfies go client → S3 via presigned URL, never through
@@ -187,13 +189,11 @@ Full shapes in `docs/services/identity.md`. Summary:
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/users` | Create identity record. Proxy supplies `phone_e164`, gets `user_id` |
-| `GET /v1/users/{id}` | Enrolment + consent status. Never returns vectors or face IDs |
+| `GET /v1/users/{id}` | Enrolment status. Never returns vectors or face IDs. Consent status is the proxy's own — we can echo the `consent_ref` an enrolment was bound to, nothing more |
 | `PATCH /v1/users/{id}` | Profile fields. Partial — absent fields untouched |
-| `POST /v1/users/{id}/consent` | Render, hash, store, create DocuSeal submission. Takes `return_url` from the client |
 | `POST /v1/liveness/sessions` | Create session (built, step 3). Returns `provider_session_id` for the client SDK. Rejects `Idempotency-Key` — see §3 |
-| `POST /v1/liveness/{sid}/result` | Retrieve + persist the result, index on pass (built, steps 3–4). Requires `Idempotency-Key` and presigned PUT URLs. `enrolled: true` once `IndexFaces` succeeds; `passed` + `enrolled: false` + `reason: 'quality_rejected'` means the frame failed the HIGH quality gate — start a FRESH session. 503 (`face_index_unavailable`) means retry with the same key |
-| `GET /v1/liveness/{sid}` | Read session status + `enrolled` (built, steps 3–4). Pure read — no side effects; enrolment is triggered by the result call |
-| `POST /v1/users/{id}/enrolment/upload-url` | Presigned PUT for a selfie. See §5 |
+| `POST /v1/liveness/{sid}/result` | Retrieve + persist the result, index on pass (built, steps 3–4). Requires `Idempotency-Key`, presigned PUT URLs, `subject_is_adult`, and the three consent fields below. `enrolled: true` once `IndexFaces` succeeds; `passed` + `enrolled: false` + `reason: 'quality_rejected'` means the frame failed the HIGH quality gate — start a FRESH session. 503 (`face_index_unavailable`) means retry with the same key |
+| `GET /v1/liveness/{sid}` | Read session status, `enrolled`, and `consent_ref` (built, steps 3–4). Pure read — no side effects; enrolment is triggered by the result call |
 | `DELETE /v1/enrolments/{user_ref}` | `DeleteFaces` → verify via `ListFaces` → tombstone (built, step 4). Idempotent 204; nothing calls it in v1. Full user deletion (`DELETE /v1/users/{id}`) remains specified-not-built — this is the enrolment-owning piece of it |
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |
 | `GET /v1/hits/{hit_id}/crop` | Blurred face crop, streamed. `Cache-Control: no-store` |
@@ -231,6 +231,40 @@ field is mandatory rather than inferred.
 
 `MIN_ENROLMENT_AGE` is now **13**, not 18: minors enrol in v1 — consent, guardianship and household
 seats all work. What they must not get is discovery.
+
+### ⚠ BREAKING — `POST /v1/liveness/{sid}/result` gains three required consent fields
+
+```
+consent_ref:             uuid       # REQUIRED. No default.
+consent_document_sha256: string     # REQUIRED. The hash YOU computed.
+consent_signed_at:       iso8601    # REQUIRED. Must not be in the future.
+```
+
+**Consent moved to the proxy, and this is the reference that replaces it.** The old contract had
+`POST /v1/users/{id}/consent` here — render, hash, store, create a DocuSeal submission. That row is
+**deleted, not deferred**: it is not being built. You own `profile.persons`,
+`profile.guardianships` with its `subject_dob` triggers, and `profile.v_consent_eligibility`
+computing `required_signer_role` and `blocked_reason` — the genuinely hard part, and it already
+exists. You are also the only public ingress, so the DocuSeal webhook has to terminate at you.
+This service knows a `user_ref` and a face vector. It cannot work out who is required to sign.
+
+| Condition | Response |
+|---|---|
+| Any of the three absent | `400 consent_required`. Nothing is written — no enrolment, no subject row, no `IndexFaces` call — and the session stays unconsumed, so a retry with the fields present works |
+| `consent_ref` malformed, or the reserved sentinel `00000000-0000-0000-0000-000000000000` | `422` |
+| `consent_document_sha256` blank or whitespace | `422` |
+| `consent_signed_at` in the future | `422` |
+
+The three land on the `enrolments` row **inside the same transaction** as `IndexFaces` succeeding and
+the session being consumed. There is no interleaving that produces an enrolment without the consent
+that authorised it.
+
+`GET /v1/liveness/{sid}` returns `consent_ref` so you can reconcile against your own record. It is
+`null` until an enrolment exists.
+
+**We do not verify the signature and we never see the document.** We record a hash you computed, as
+evidence that consent exists, and we make its absence structurally impossible. Whether consent was
+genuinely collected is your assertion — the same shape as `subject_is_adult`.
 
 ### ⚠ BREAKING — `POST /v1/search` can now refuse the whole request
 
@@ -304,26 +338,32 @@ This is what collapses the old `/api/consent/*` and `/api/web-consent/*` split i
 
 ---
 
-## 5. Face bytes never transit the proxy
+## 5. Object storage — the proxy mints, we PUT and discard
 
-⚠ **DIFFERS FROM AGENTMEEMAW** in the direction of the existing tribute/storybook pattern — the proxy
-mints presigned URLs, the service does the work.
+The previous contents of this section were **wrong and are deleted.** They described the services
+repo minting the presigned PUT and owning the bucket ("the bucket belongs to the identity service,
+the proxy has no read access"), which contradicts §1 of this same file — *"Proxy owns … minting
+presigned S3 URLs"* — and `CLAUDE.md` §3.3, *"We hold no AWS S3 credentials."* §1 and `CLAUDE.md`
+are correct. The 5-minute TTL it quoted also contradicted the ≥15-minute floor the step briefs
+require.
+
+The real flow, as built:
 
 ```
-1. Client → Proxy:     POST /enrolment/upload-url
-2. Proxy  → Services:  POST /v1/users/{id}/enrolment/upload-url
-3. Services → Proxy:   { upload_url, object_key, expires_at }   (presigned PUT, 5 min)
-4. Proxy  → Client:    { upload_url, object_key }
-5. Client → S3:        PUT the selfie directly
-6. Client → Proxy:     POST /enrolment/complete { object_key }
-7. Proxy  → Services:  forwards; identity service reads from its own bucket
+1. Client → Proxy:     start enrolment
+2. Proxy:              mints presigned PUT URLs (reference + audit frames)
+3. Proxy  → Services:  POST /v1/liveness/{sid}/result { reference_put_url, audit_put_urls, … }
+4. Services → S3:      PUT the frames through those URLs, then discard the bytes
 ```
 
-The bucket belongs to the identity service. The proxy has no read access. Object keys are UUID-derived
-— never `<phone>.jpg`.
+**All buckets, credentials and object lifecycle are the proxy's** (`CLAUDE.md` §3). This service
+holds no S3 client and no AWS S3 permissions — step 9's IAM role grants no `s3:*` at all, which is
+one of only three places the data boundary is enforced by something other than discipline.
 
-The proxy never base64s an image into a request body. The old `/upload-selfie` pattern does exactly
-that and does not survive.
+Presigned URLs must live **≥15 minutes**; we retry. What we persist is the URL with the query string
+stripped — the query is the signature, i.e. a credential, and it must not reach a column or a log
+line. The proxy never base64s an image into a request body; the old `/upload-selfie` pattern does
+exactly that and does not survive.
 
 ---
 

@@ -138,7 +138,8 @@ does the work, not the application code.
 
 **No phone column.** `user_ref` is the only identifier services hold, and it maps 1:1 onto the v2
 `user_id`. These two tables migrate into `SCHEMA.md`'s `liveness_sessions` and `enrolments` with a
-column rename and the addition of the `consent_id` FK.
+column rename and the addition of the three `consent_*` columns (migration 0010). Not a FK: consent
+lives in the proxy, so what lands here is a reference and the hash the proxy computed, not a row.
 
 ## 1.3 Endpoints
 
