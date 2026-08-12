@@ -36,6 +36,7 @@ from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
 from imageshield.http.routes.admin_providers import router as admin_providers_router
 from imageshield.http.routes.attribution import router as attribution_router
+from imageshield.http.routes.config_floors import router as config_floors_router
 from imageshield.http.routes.enrolments import router as enrolments_router
 from imageshield.http.routes.health import router as health_router
 from imageshield.http.routes.infringements import router as infringements_router
@@ -144,6 +145,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(infringements_router)
     app.include_router(attribution_router)
     app.include_router(subjects_router)
+    app.include_router(config_floors_router)
     app.include_router(admin_router)
     app.include_router(admin_providers_router)
     return app

@@ -89,7 +89,20 @@ We hold **no AWS S3 credentials**. If they aren't in the environment, the mistak
   and the hash *it* computed; we never render, fetch or hash the document, and we cannot determine
   who is required to sign.
 - All S3 buckets, all credentials, all object lifecycle.
-- All user-facing reads for the report UI (read-only Postgres access to our schemas).
+- All user-facing reads for the report UI — **through the four `svc` views and nothing else**
+  (migration 0016). `imageshield_proxy_ro` holds `USAGE` on `svc` and `SELECT` on
+  `v_person_enrolment_state`, `v_person_report_summary`, `v_person_hits`,
+  `v_person_liveness_attempts`. No grant on any base table, no `USAGE` on `public`; a view's base-table
+  reads are checked against the view owner, so `SELECT * FROM public.enrolments` under that role is a
+  Postgres permission error rather than something application code has to remember. `PROXY_INTEGRATION.md`
+  §6 previously granted `SELECT` on `report.reports`, `report.report_hits` and `report.hit_feedback` —
+  three tables that never existed here.
+
+  **The views are a versioned contract, and that is the tightest coupling in this architecture.** Two
+  repos share a database because the proxy's own views JOIN against ours and you cannot JOIN against
+  HTTP. Columns may be added freely; none may be removed or retyped without a coordinated deploy, and
+  dropping them breaks the proxy while breaking nothing here. Before touching `svc`, read
+  `PROXY_INTEGRATION.md` §6 and `SCHEMA.md` §2c.
 
 ### Hard rules
 
@@ -247,9 +260,11 @@ because the architecture doc describes them.
 | Cost tracking + circuit breakers | Partner ingest adapter |
 | Subject eligibility (step 8) | CSAM screening + mandatory reporting |
 | Adaptive cadence mechanism | The scheduler that reads `next_scan_after` |
-| Infringement feedback (`not_me`) | |
+| Infringement feedback (`not_me` / `authorised`) | |
 | URL recheck loop (`url_alive`) | |
 | Attribution: face → seed (`/v1/attribute`) | `discovered-v1`, clustering, cluster claims |
+| The four `svc` contract views (0016) | |
+| `GET /v1/config/floors` | |
 | | The shield rule / photo protection / coverage arithmetic |
 
 Two notes on that right-hand column. **CSAM screening and reporting are what gate minor
@@ -422,6 +437,14 @@ reported as a step being complete.
 
 Full detail in `PROXY_INTEGRATION.md`. The shape:
 
+- `GET /v1/config/floors` publishes `MIN_DISCOVERY_AGE`, `MIN_ENROLMENT_AGE`,
+  `ATTRIBUTION_MAX_CANDIDATES` and `ATTRIBUTION_MATCH_THRESHOLD`, read from config at request time.
+  The proxy asserts against it at boot and refuses to start on a mismatch. Never serve these from a
+  constant declared beside the route — that is a second copy, and it starts lying the moment somebody
+  edits one and not the other.
+- **Every error carries the `{error:{code,message,retryable,request_id}}` envelope, including `401` and
+  `422`** — plus Starlette's own `404`/`405`. `422` adds `error.details` (`loc` + `msg` only; never the
+  rejected `input`, which may be the phone number `extra='forbid'` exists to reject).
 - Every endpoint requires `X-Service-Token`. `/v1/admin/*` additionally requires
   `X-Admin-Service-Token`. The two values must differ — we refuse to boot if they match.
 - Every request carries `user_ref`. Never a phone, never a user object.

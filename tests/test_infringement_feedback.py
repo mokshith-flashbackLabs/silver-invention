@@ -134,6 +134,7 @@ async def test_a_refused_feedback_writes_nothing(
         ("not_me", "dismissed_not_me"),
         ("confirmed", "acknowledged"),
         ("uncertain", "new"),  # unchanged, but still recorded
+        ("authorised", "authorised"),
     ],
 )
 async def test_each_signal_sets_the_specified_status(
@@ -257,3 +258,68 @@ async def test_feedback_survives_being_given_twice_with_the_same_signal(
     await store.record_feedback(infringement_id, owner, "not_me")
 
     assert _checksum(migrated_db, "infringement_feedback")[0] == 2
+
+
+# ── the fourth signal ────────────────────────────────────────────────────────
+
+
+async def test_authorised_terminates_and_leaves_live_exposure(
+    store: PostgresSearchStore, migrated_db: str
+) -> None:
+    """Done-when: ``signal = 'authorised'`` resolves the infringement, and a
+    subsequent ``v_person_report_summary`` shows ``live_exposure_count`` one
+    lower.
+
+    'authorised' means "this is me, and it is authorised" — my own post, a
+    licensed use. It exists as a fourth signal because the alternatives were
+    both wrong: 'uncertain' records the opposite of what the user said and
+    leaves the hit open forever, and 'confirmed' claims an infringement the user
+    explicitly denied. Without the exclusion from live_exposure_count, a user
+    whose own licensed photo is flagged keeps paying exposure points with no way
+    to clear it.
+    """
+    infringement_id, owner = await _an_infringement(store, migrated_db)
+
+    def exposure() -> int:
+        with psycopg.connect(migrated_db, autocommit=True) as conn:
+            row = conn.execute(
+                "SELECT live_exposure_count FROM svc.v_person_report_summary"
+                " WHERE person_ref = %s",
+                (owner,),
+            ).fetchone()
+        assert row is not None
+        count: int = row[0]
+        return count
+
+    before = exposure()
+
+    assert await store.record_feedback(infringement_id, owner, "authorised") == (
+        "authorised"
+    )
+
+    assert exposure() == before - 1
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        recorded = conn.execute(
+            "SELECT signal FROM infringement_feedback WHERE infringement_id = %s",
+            (infringement_id,),
+        ).fetchall()
+    assert [row[0] for row in recorded] == ["authorised"]
+
+
+async def test_an_unknown_signal_is_refused_by_the_database(
+    store: PostgresSearchStore, migrated_db: str
+) -> None:
+    """The vocabulary is a CHECK constraint, not a convention the route happens
+    to enforce. The pydantic Literal is the first gate; this is the one that
+    holds if somebody writes to the table directly."""
+    infringement_id, owner = await _an_infringement(store, migrated_db)
+
+    with (
+        pytest.raises(psycopg.errors.CheckViolation),
+        psycopg.connect(migrated_db, autocommit=True) as conn,
+    ):
+        conn.execute(
+            "INSERT INTO infringement_feedback (infringement_id, user_ref, signal)"
+            " VALUES (%s, %s, 'not_infringement')",
+            (infringement_id, owner),
+        )

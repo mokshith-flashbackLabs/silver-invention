@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Literal, get_args
 
-FeedbackSignal = Literal["not_me", "confirmed", "uncertain"]
+FeedbackSignal = Literal["not_me", "confirmed", "uncertain", "authorised"]
 
 FEEDBACK_SIGNALS: tuple[str, ...] = get_args(FeedbackSignal)
 
@@ -32,10 +32,22 @@ FEEDBACK_SIGNALS: tuple[str, ...] = get_args(FeedbackSignal)
 # collapsed into either of the other two. Someone who is unsure about a match
 # of their own face has told us something; forcing it to 'dismissed' or
 # 'acknowledged' would be inventing a position they did not take.
+#
+# 'authorised' means **"this is me, and it is authorised"** — my own post, a
+# licensed use, a photo I published myself. It is a fourth signal rather than a
+# reuse of an existing one because mapping it to 'uncertain' would be wrong
+# twice: it records the opposite of what the user said, and 'uncertain' leaves
+# the status alone so the hit never resolves. It TERMINATES, and it is excluded
+# from ``svc.v_person_report_summary.live_exposure_count`` — without that
+# exclusion a user whose own licensed photo is flagged keeps paying exposure
+# points with no way to clear it. That is the same inversion the legacy system
+# had, where reporting abuse permanently depressed your score and dismissing a
+# hit improved it, in a milder form.
 _STATUS_BY_SIGNAL: dict[str, str | None] = {
     "not_me": "dismissed_not_me",
     "confirmed": "acknowledged",
     "uncertain": None,
+    "authorised": "authorised",
 }
 
 

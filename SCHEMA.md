@@ -253,7 +253,7 @@ that will eventually feed the same report surface.
 
 Tables: `search_seeds`, `search_runs`, `content_urls`, `provider_calls`, `infringements`,
 `attestations`, `subjects`, `provider_spend`, `infringement_feedback`. Migrations `0001`, `0004`,
-`0005`, `0006`, `0007`, `0008`, `0009`, `0011`, `0012`, `0013`.
+`0005`, `0006`, `0007`, `0008`, `0009`, `0011`, `0012`, `0013`, `0016`.
 
 ### Feedback on a hit, and the one thing it must not do
 
@@ -262,7 +262,8 @@ CREATE TABLE infringement_feedback (
   feedback_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   infringement_id  UUID NOT NULL REFERENCES infringements(infringement_id) ON DELETE CASCADE,
   user_ref         UUID NOT NULL,
-  signal           TEXT NOT NULL CHECK (signal IN ('not_me','confirmed','uncertain')),
+  signal           TEXT NOT NULL
+                   CHECK (signal IN ('not_me','confirmed','uncertain','authorised')),
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -271,7 +272,21 @@ CREATE TABLE infringement_feedback (
 is deliberately no `UNIQUE (infringement_id, user_ref)` to force one opinion per person.
 
 `signal` sets `infringements.status`: `not_me` → `dismissed_not_me`, `confirmed` → `acknowledged`,
-`uncertain` → unchanged but still recorded.
+`authorised` → `authorised`, `uncertain` → unchanged but still recorded.
+
+**`authorised` (migration 0016) is the fourth signal**, and it means *"this is me, and it is
+authorised"* — my own post, a licensed use, a photo the user published themselves. It exists because the
+proxy's `not_infringement` action had nowhere to go, and both alternatives were wrong: `uncertain`
+records the opposite of what the user said *and* leaves the status unchanged so the hit never resolves,
+while `confirmed` claims an infringement the user explicitly denied. It **terminates** the hit and is
+**excluded from `svc.v_person_report_summary.live_exposure_count`** — without the exclusion, a user
+whose own licensed photo is flagged keeps paying exposure points with no way to clear it.
+
+0016 also puts a `CHECK` on `infringements.status`
+(`new`, `acknowledged`, `dismissed_not_me`, `authorised`, `url_dead`, `withdrawn`), which 0005 left
+unconstrained. The vocabulary stops being a convention once it is a published contract column
+(`svc.v_person_hits.hit_status`). `url_dead` and `withdrawn` are declared and unwritten in v1: the
+recheck loop sets `url_alive` and leaves `status` alone (0013), and nothing withdraws.
 
 **`not_me` never adjusts identity vectors, never suppresses a domain, and never feeds banding.** Users
 reject *true* positives under distress, and it is common; if rejections retrained the index, the users
@@ -729,6 +744,84 @@ of the directory rather than by remembering which module is on which path.
 
 ---
 
+## 2c. The `svc` contract views — **built** (migration 0016)
+
+Four views in an `svc` schema, read by the proxy's `src/services/contract/readers.ts` over a direct
+Postgres connection. `PROXY_INTEGRATION.md` §6 is the contract-facing description; this is the
+schema-facing one.
+
+```sql
+CREATE SCHEMA svc;
+CREATE ROLE imageshield_proxy_ro NOLOGIN;
+GRANT USAGE  ON SCHEMA svc TO imageshield_proxy_ro;
+GRANT SELECT ON svc.v_person_enrolment_state, svc.v_person_report_summary,
+                svc.v_person_hits, svc.v_person_liveness_attempts
+  TO imageshield_proxy_ro;
+```
+
+| View | Base | Purpose |
+|---|---|---|
+| `v_person_enrolment_state` | `enrolments` (active only) | Feeds the proxy's `v_covered_persons`. Status, `model_id`, timestamp — never a vector, never an `external_face_id` (INVARIANTS #14) |
+| `v_person_report_summary` | `subjects` LEFT JOIN aggregates | The home-screen numbers, including `live_exposure_count` |
+| `v_person_hits` | `infringements` + representative attestation | One row per hit, with provenance to the seed and the attributed face |
+| `v_person_liveness_attempts` | `liveness_sessions`, 24h window | The rate-limit pre-check |
+
+**Why views and not HTTP.** The proxy's own views JOIN against `v_person_enrolment_state`, and their
+migration 0001 already does `LEFT JOIN profile.v_consent_eligibility`. You cannot JOIN against HTTP.
+That is the deciding reason, ahead of the single-source-of-truth argument for `live_exposure_count`.
+
+**The cost, stated deliberately:** two repos now share a database and these four views are a
+**versioned contract**. Columns may be added; none may be removed or retyped without a coordinated
+deploy. Dropping them breaks the proxy and nothing here, so `0016_...down.sql` is a coordinated deploy
+rather than a rollback.
+
+**SELECT on the four views and nothing else.** No grant on any base table and no `USAGE` on `public`.
+A view's base-table reads are checked against the view owner, which is what lets the projection through
+while `enrolments`, `attestations` and `attributed_faces` stay closed — enforced by Postgres, not by
+application logic. `tests/test_svc_views.py` asserts `SELECT * FROM public.enrolments` under that role
+raises `InsufficientPrivilege`.
+
+### Column shapes worth knowing
+
+- **`v_person_report_summary` is driven off `subjects`**, so a person with zero infringements appears
+  **with zeroes** rather than vanishing. The obvious form (`GROUP BY user_ref` over `infringements`)
+  produces the missing row, and a missing row and a row of zeroes render very differently on a home
+  screen. Its three aggregates are separate subqueries: joining `infringements` to `search_runs` first
+  multiplies every count by the other table's cardinality, and it looks right until a user has more
+  than one of each.
+- **`live_exposure_count` excludes** dead URLs, `dismissed_not_me` and `authorised`. This is the number
+  the legacy scoring inverted — every unresolved match cost 18 points, so reporting abuse permanently
+  depressed the score while dismissing a hit improved it.
+- **`monitored_sources`** counts providers that actually returned for this person *and* are still
+  enabled, not configured ones (CLAUDE.md §7.5). **`last_run_at`** and **`first_scan_completed_at`**
+  count `status = 'completed'` runs only: a run refused at dispatch carries a `completed_at` and looked
+  at nothing (INVARIANTS #43).
+- **`v_person_hits` is one row per hit**, not per attestation. `match_id` / `match_status` / `score`
+  come from one representative attestation chosen deterministically (strongest band, then highest raw
+  score, then `provider_id`); `provider_count` carries the agreement signal. Nothing is blended across
+  providers — provider A's 0.92 and provider B's 0.92 are different quantities (INVARIANTS #15c).
+- **Permanently NULL:** `report_id` (there is no `reports` table — the hit is the unit), `title` (we do
+  not fetch or parse the host page), `resolution_note` (no adjudication surface exists). Returned as
+  typed NULLs rather than omitted: a missing column breaks the proxy's reader, a NULL does not.
+- **`match_lifecycle` carries four values, two of which cannot occur in v1.** `open` and `url_dead` are
+  reachable; `takedown_requested` and `removed` are not, because takedown is not built. Declared anyway
+  so the proxy's reader needs no change later.
+- **`v_person_hits` omits `image_url`, `thumbnail_url` and `evidence_image_url`, permanently.** The
+  column stays on `infringements` as evidence and does not travel on a user-facing read — the same
+  conclusion 0005 and the `GET /v1/search/infringements` change reached. A test asserts the absence,
+  because widening the view is the one change nothing else would fail on.
+- **`v_person_liveness_attempts`** has no row for a person with no attempts in the window, which is
+  safe here: it is a rate-limit pre-check and there is no number to render. Its window must stay the
+  same predicate `LIVENESS_MAX_ATTEMPTS_24H` is enforced against in `liveness/store.py` — two clocks
+  means the proxy's pre-check passes and our refusal fires.
+
+**Open question, deliberately not decided here:** these views translate our vocabulary into the
+proxy's (`infringements` → `hits`, `attestations` → `matches`). Legitimate for a view, and it also
+freezes the split permanently. Worth a deliberate choice while there is no production data — put to
+the proxy team, not decided unilaterally.
+
+---
+
 ## 3. Adjudication service
 
 ```sql
@@ -830,6 +923,12 @@ CREATE TABLE hit_feedback (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
+
+⚠ **This whole section is the unbuilt report module and always was.** `reports`, `report_hits` and
+`hit_feedback` do not exist. What was built instead is `infringements` + `attestations` (§2b) and
+`infringement_feedback`, whose fourth signal is `authorised`. `PROXY_INTEGRATION.md` §6 granted the
+proxy `SELECT` on these three tables for months; migration 0016 replaced that with the `svc` views in
+§2c. If you are looking for the shipped shape, it is §2b and §2c, not here.
 
 ---
 

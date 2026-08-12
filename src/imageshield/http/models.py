@@ -15,6 +15,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
+from imageshield.search.feedback import FeedbackSignal
 from imageshield.types import UserRef
 
 
@@ -133,6 +134,31 @@ class SubjectResponse(BaseModel):
 
     discovery_eligible: bool
     eligibility_reason: Literal["adult", "minor_discovery_deferred"]
+
+
+class FloorsResponse(BaseModel):
+    """The floors both repos carry, published so neither has to guess.
+
+    Today `ATTRIBUTION_MAX_CANDIDATES` on the proxy side *documents* our floor
+    and enforces nothing, and `MIN_DISCOVERY_AGE` is carried independently in
+    both repos — so if v2 moves it, `subject_is_adult` means something different
+    on each side of the boundary and nothing detects that. The proxy asserts
+    against this at boot and refuses to start on a mismatch, which turns a
+    silent divergence into a failed deploy.
+
+    Every field is read from :class:`Config` at request time, never from a
+    separate constant — a constant here is a second copy that lies the moment
+    somebody edits one and not the other, which is the failure this endpoint
+    exists to prevent.
+    """
+
+    min_discovery_age: int
+    min_enrolment_age: int
+    attribution_max_candidates: int
+    # A decimal crosses as a STRING, matching GET /v1/admin/providers/health.
+    # A float round-trip is exactly the drift the NUMERIC columns exist to
+    # avoid, and the proxy compares this for equality.
+    attribution_match_threshold: str
 
 
 class SeedCreateRequest(ServiceModel):
@@ -276,11 +302,12 @@ class InfringementsResponse(BaseModel):
 
 class FeedbackRequest(ServiceModel):
     user_ref: UserRef
-    # Closed vocabulary. 'uncertain' is a real answer and is kept distinct:
-    # someone who looked at a match of their own face and could not tell has
-    # told us something, and collapsing it into either neighbour would invent a
-    # position they did not take.
-    signal: Literal["not_me", "confirmed", "uncertain"]
+    # Closed vocabulary, taken from ``search/feedback.py`` rather than restated:
+    # the signal set and the signal → status mapping are one fact, and two
+    # copies of it drift. 'uncertain' is a real answer and is kept distinct
+    # (someone who looked and could not tell has told us something);
+    # 'authorised' is "this is me, and it is authorised" and terminates the hit.
+    signal: FeedbackSignal
 
 
 class AttributeRequest(ServiceModel):

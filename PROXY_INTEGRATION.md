@@ -180,6 +180,18 @@ forwards `message` verbatim to a client, and never forwards `request_id` to a cl
 ⚠ **DIFFERS FROM AGENTMEEMAW:** no ad-hoc status codes. The old backend uses `600` and `700` as error
 signals. Standard HTTP only — `400`, `401`, `403`, `404`, `409`, `422`, `429`, `5xx`.
 
+**`401` and `422` are now in this envelope too** (task 06). They previously kept FastAPI's default
+shape, which meant a client parsing `error.code` unconditionally read an empty string on exactly the
+two responses it hits most while wiring up a new integration — your §4 finding. Starlette's own `404`
+(no such route) and `405` (wrong method) are enveloped as well, with codes `not_found` and
+`method_not_allowed`, since a client that has to special-case *those* has the same problem somewhere
+less obvious.
+
+`422` carries one additional key, `error.details`: a list of `{ loc, msg }`. It deliberately does
+**not** include the rejected `input` the framework's default echoes back — for this service that value
+came from you and may be the phone number `extra='forbid'` exists to reject (§1), and it must not
+reappear in your error logs.
+
 ---
 
 ## 4. Endpoints the proxy calls
@@ -208,6 +220,17 @@ Step 8 adds five and changes one:
 | `POST /v1/admin/providers/{id}/enable` | Body `{ reason }`. Both tokens |
 | `POST /v1/admin/providers/{id}/breaker/reset` | Force the breaker closed and clear the failure counter. Body `{ reason }`. Both tokens. Separate from `enable` on purpose: "this provider is fixed, let it back in before the cooldown" and "this provider should be receiving traffic at all" are different decisions |
 | `GET /v1/admin/providers/health` | Per-provider per-day calls, cost, success rate, p50/p99 latency, breaker state, budget headroom, and every firing alarm. Both tokens. Money crosses as decimal **strings** |
+
+Task 06 adds one more, and it is not admin-gated:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/config/floors` | `{ min_discovery_age, min_enrolment_age, attribution_max_candidates, attribution_match_threshold }`. Read straight from our config at request time, never from a constant. Assert against it at boot and refuse to start on a mismatch — that turns a silent divergence into a failed deploy. `attribution_match_threshold` crosses as a decimal **string** (`"92.00"`), matching `GET /v1/admin/providers/health` |
+
+It is deliberately on the plain service token rather than the admin one. It publishes four policy
+numbers already written down in `INVARIANTS.md`, and you need them on **every boot** — requiring the
+admin token for a boot-time dependency would put the admin token in the proxy's ordinary runtime
+environment, which is a worse trade than the disclosure.
 
 Path note: every admin route is under `/v1/admin/*`, and there is exactly one admin prefix. The
 step-8 provider routes and the long-specified `POST /v1/admin/backfill` above agree; the step-1
@@ -384,17 +407,30 @@ three more ways to be attempted-but-not-succeeded.
 ### New — `POST /v1/infringements/{infringement_id}/feedback`
 
 ```
-{ user_ref, signal }        signal: 'not_me' | 'confirmed' | 'uncertain'
+{ user_ref, signal }        signal: 'not_me' | 'confirmed' | 'uncertain' | 'authorised'
 -> 200 { status }           the infringement's status after the write
 
 404  infringement_not_found
 ```
 
-| signal | `infringements.status` becomes |
-|---|---|
-| `not_me` | `dismissed_not_me` |
-| `confirmed` | `acknowledged` |
-| `uncertain` | unchanged — but the feedback IS recorded |
+| signal | your action | `infringements.status` becomes |
+|---|---|---|
+| `not_me` | `not_me` | `dismissed_not_me` |
+| `confirmed` | `infringement` | `acknowledged` |
+| `authorised` | `not_infringement` | `authorised` |
+| `uncertain` | — | unchanged — but the feedback IS recorded |
+
+**`authorised` is new, and it is the home for your `not_infringement`.** It means *"this is me, and it
+is authorised"* — my own post, a licensed use, a photo I published myself. You were right to drop the
+action from the client rather than map it to `uncertain`: that would have recorded the opposite of what
+the user said, and `uncertain` leaves the status alone so the hit would never resolve.
+
+It **terminates** the hit, and it is **excluded from `live_exposure_count`** (§6). Without that
+exclusion a user whose own licensed photo is flagged keeps paying exposure points with no way to clear
+it — the same inversion `live_exposure_count` exists to fix, in a milder form.
+
+`uncertain` is unchanged and stays distinct. Someone who looked at a match of their own face and could
+not tell has told us something.
 
 **The 404 covers two different facts and does not distinguish them.** A non-existent id and one
 belonging to a different `user_ref` return byte-identical responses. That is not an oversight to
@@ -461,6 +497,13 @@ were wanted for — a later retune must not make historical attributions uninter
 `resolved_user_ref: null` is the **common case and not an error** — most faces in most photos belong
 to people who are not enrolled. Do not render it as a failure or retry on it. Every detected face
 comes back with its bbox, attributed or not, so you can draw boxes.
+
+**An empty `candidate_refs` is `422`, and our doc did not say so.** You found this by reading our
+validator, which refuses it — correctly, since a zero-candidate call is a no-op that still bills a
+`DetectFaces` and N searches. But you were right that you were going to send it: a household with a
+lapsed subscription has no covered persons, which is normal rather than exceptional. **Do not call
+`/v1/attribute` with an empty candidate list** — there is nothing for it to attribute to, and the
+answer is knowable on your side without a round trip.
 
 `presigned_get_url` must be **https and ≥15 minutes**. `photo_ref` is your `photo_id`, opaque to us —
 it becomes the seed's `source_object_ref`, so it must be the durable key, never a URL (see 0011).
@@ -542,29 +585,123 @@ exactly that and does not survive.
 
 ## 6. Postgres access from the proxy
 
-⚠ **DIFFERS FROM AGENTMEEMAW:** narrower. AgentMeeMaw gives Node read access to the whole canonical
-graph with a forbidden-column list. Here, access is per-schema and identity is entirely off-limits.
+⚠ **CORRECTED (task 06).** Every previous version of this section was wrong. It granted
+`SELECT` on `report.reports`, `report.report_hits` and `report.hit_feedback` — **none of which has
+ever existed in this repo.** They come from an early `SCHEMA.md` draft with a "report module" we never
+built; we built `infringements` and `attestations` instead, with different names and a different shape.
+The grant named a schema that was never created. That was our mistake, not yours, and it is why
+`src/services/contract/readers.ts` was written against a contract nobody here had agreed to implement.
 
-| Schema | Proxy access |
+### The four `svc` views
+
+The views your reader expects now exist, in an `svc` schema, owned by this repo (migration 0016).
+
+| View | Key columns |
 |---|---|
-| `identity` | **None.** No role, no grant, no network path |
-| `report` | `SELECT` on `reports`, `report_hits`, `hit_feedback` |
-| `match` | **None** |
-| `adjudication` | **None** |
+| `svc.v_person_enrolment_state` | `person_ref`, `status`, `model_id`, `enrolled_at` |
+| `svc.v_person_report_summary` | `person_ref`, `active_reports`, `unresolved_matches`, `live_exposure_count`, `last_run_at`, `first_scan_completed_at`, `monitored_sources` |
+| `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score` |
+| `svc.v_person_liveness_attempts` | `person_ref`, `attempts_24h`, `last_attempt_at` |
 
-Reasoning: identity holds Article 9 biometric data and the isolation is the point (INVARIANTS #14).
-Report reads are high-volume and user-facing, so direct reads beat HTTP round-trips — that's the case
-AgentMeeMaw's pattern is good for, and it applies here.
+**Why views and not an HTTP endpoint.** Your single-source-of-truth argument for `live_exposure_count`
+is sound, but the deciding reason is a different one: **your own views JOIN against ours.**
+`v_person_enrolment_state` feeds your `v_covered_persons`, and your migration 0001 already does
+`LEFT JOIN profile.v_consent_eligibility`. You cannot JOIN against HTTP — which also rules out the
+option nobody listed, extending `GET /v1/search/infringements`. That would have worked for the report
+screen and failed for coverage.
 
-Proxy uses a distinct DB role with `SELECT` only on those three tables. Verify by attempting an
-`INSERT` — it must fail with a permission error, not be caught by application logic.
+### ⚠ These four views are a versioned contract
+
+Stating the cost on the record, because it is being accepted deliberately rather than by default: **two
+repos now share a database.**
+
+- We may **add** columns freely.
+- We may **never remove or retype** a column without a coordinated deploy.
+- Dropping the views breaks your repo and nothing in ours, so `0016_svc_contract_views.down.sql` is a
+  coordinated deploy, not a rollback anyone runs alone.
+
+That is tighter coupling than anything else in this architecture. It is the price of the JOIN.
+
+### The role, and what it deliberately cannot reach
+
+```sql
+CREATE ROLE imageshield_proxy_ro NOLOGIN;
+GRANT USAGE  ON SCHEMA svc TO imageshield_proxy_ro;
+GRANT SELECT ON svc.v_person_enrolment_state, svc.v_person_report_summary,
+                svc.v_person_hits, svc.v_person_liveness_attempts
+  TO imageshield_proxy_ro;
+```
+
+**`SELECT` on the four views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
+view's base-table reads are checked against the view *owner*, which is what lets exactly this
+projection through while `enrolments`, `attestations` and `attributed_faces` stay closed. Verify by
+attempting `SELECT * FROM public.enrolments` as that role: it must fail with a permission error, not be
+caught by application logic. `tests/test_svc_views.py` asserts it.
+
+Identity remains entirely off-limits (INVARIANTS #14). `v_person_enrolment_state` carries a status, a
+model id and a timestamp — never a vector, never an `external_face_id`.
+
+### Column notes you need before building UI
+
+**Permanently `NULL`, because there is no source for them here.** Returned as typed NULLs rather than
+omitted, so your reader does not break — but do not build UI expecting them to fill in:
+
+- `v_person_hits.report_id` — there is no `reports` table. The hit *is* the unit.
+- `v_person_hits.title` — we do not fetch or parse the host page.
+- `v_person_hits.resolution_note` — no adjudication surface exists (specified, not built).
+
+**`match_lifecycle` has four values and only two can occur in v1:**
+
+| value | when | v1 |
+|---|---|---|
+| `open` | `url_alive = true` | reachable |
+| `url_dead` | `url_alive = false` | reachable |
+| `takedown_requested` | — | **unreachable — takedown is not in v1** |
+| `removed` | — | **unreachable — same** |
+
+The column is declared with all four so your reader needs no change later. Do not ship UI for the two
+that cannot happen.
+
+**`live_exposure_count` excludes exactly three things:** dead URLs, `dismissed_not_me`, and
+`authorised`. This is the number the legacy scoring got backwards — every unresolved match cost 18
+points, so marking a hit "this is abuse of me" left it unresolved and permanently depressed the score
+while *dismissing* one improved it. **Reporting abuse must never make the number worse.**
+
+**`monitored_sources` counts providers that actually returned for this person and are still enabled**,
+not configured ones. "We monitor 2 sources" while one has an open breaker is a false claim (`CLAUDE.md`
+§7.5). **`last_run_at` and `first_scan_completed_at` count completed runs only** — a run refused at
+dispatch has a `completed_at` and looked at nothing (INVARIANTS #43). Refusal reasons are on
+`GET /v1/subjects/{user_ref}`.
+
+**One row per hit, not per attestation.** `match_id`, `match_status` and `score` come from a single
+representative attestation, chosen deterministically (strongest band, then highest raw score, then
+provider id). `provider_count` is the agreement signal — three independent providers agreeing is
+meaningfully different from one. No score is ever blended across providers: provider A's 0.92 and
+provider B's 0.92 are different quantities.
+
+**`v_person_liveness_attempts` has no row for a person with no attempts in the window.** Unlike the
+report summary, absent is safe here: it is a rate-limit pre-check, no row means no attempts, and there
+is no home-screen number to render wrong. The window is the same predicate
+`LIVENESS_MAX_ATTEMPTS_24H` is enforced against, deliberately — two clocks here would mean your
+pre-check passes and our refusal fires.
 
 ### Columns the proxy must never surface to a client
 
-- `report_hits.source_url` — only behind the interstitial copy action (INVARIANTS #22)
-- `report_hits.face_bbox` — internal to crop rendering
-- `report_hits.candidate_id`, `decision_id` — provenance, not user-facing
-- Anything from `match` or `adjudication`
+- `v_person_hits.host_page_url` — only behind the interstitial copy action (INVARIANTS #22)
+- `v_person_hits.face_bbox` — internal to crop rendering
+- `v_person_hits.match_id`, `source_photo_id` — provenance, not user-facing
+
+**`v_person_hits` deliberately omits `image_url`, `thumbnail_url` and `evidence_image_url`, and it must
+stay that way.** You reached the same conclusion we did in migration 0005 and in the
+`GET /v1/search/infringements` change: the column stays on the row as evidence and does not travel on a
+user-facing read. If pixels ever need to reach a client it is a blurred face crop behind a separate,
+access-logged path with its own authorisation — never by widening this view.
+
+### Open question for you, not decided here
+
+These views translate our vocabulary into yours: `infringements` → `hits`, `attestations` → `matches`. That is a legitimate use of a view, and it also **freezes the split permanently.** Worth a
+deliberate choice while there is no production data: translate in the view forever, or rename on one
+side now. Not ours to decide unilaterally.
 
 ---
 
@@ -615,12 +752,10 @@ The crop fetcher runs against a local fixture server, not live URLs.
   covered only by `ADMIN_SERVICE_TOKEN`, which is not sufficient for an audit trail naming an
   individual reviewer.
 - **Proxy → services observability.** Request ID propagation is specified; distributed tracing is not.
-- **Where `MIN_DISCOVERY_AGE` is published.** The proxy must compare DOB against 18 to compute
-  `subject_is_adult`, and today both sides carry that number independently — ours in config, theirs in
-  code. Services never see a DOB, so we cannot verify their arithmetic; what we can do is refuse the
-  field's absence, which we do. If v2 changes the age, both sides change together or the boolean means
-  something different on each side of the boundary. A read endpoint publishing the value would remove
-  the duplication and is not built.
+- ~~**Where `MIN_DISCOVERY_AGE` is published.**~~ **Closed by task 06:** `GET /v1/config/floors`
+  publishes it alongside `MIN_ENROLMENT_AGE` and the two attribution floors. We still never see a DOB
+  and still cannot verify the proxy's arithmetic - what changed is that the proxy can verify the
+  *number*, at boot, and refuse to start on a mismatch.
 - **Alarm delivery.** `GET /v1/admin/providers/health` computes every alarm; nothing pages anyone. Wiring
   it to CloudWatch is step 9.
 - **Minor discovery.** Deferred until CSAM screening on fetched candidates and a mandatory-reporting
