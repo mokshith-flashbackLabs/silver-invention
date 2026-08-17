@@ -23,7 +23,6 @@
         { "name": "SEARCH_PROVIDER", "value": "stub" },
         { "name": "DEV_FACE_CEILING", "value": "50" },
         { "name": "ATTRIBUTION_MAX_INFLIGHT", "value": "4" },
-        { "name": "ATTRIBUTION_MAX_CANDIDATES", "value": "20" },
         { "name": "SEARCH_MATCH_THRESHOLD", "value": "95" },
         { "name": "FACE_MATCH_THRESHOLD", "value": "95" },
         { "name": "ENROLMENT_COLLISION_THRESHOLD", "value": "99" },

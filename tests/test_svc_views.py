@@ -45,6 +45,72 @@ EXPECTED_COLUMNS: dict[str, set[str]] = {
     view: set(columns) for view, columns in EXPECTED_VIEWS.items()
 }
 
+# ── AND a frozen second copy, on purpose ─────────────────────────────────────
+#
+# This is DELIBERATELY a hand-maintained duplicate of the names above, and it
+# must be edited by hand. Read that twice before "tidying" it into another
+# comprehension.
+#
+# Deriving EXPECTED_COLUMNS from EXPECTED_VIEWS removed one kind of drift and
+# introduced another: the readiness gate and its test now share a single
+# definition, so ONE edit relaxes both at once. Rename `host_page_url` to
+# `page_url` in migration 0016 and in svc_contract.py and this suite stays
+# green — while the proxy's `src/services/contract/readers.ts` breaks on its next
+# read, in the repo that did not make the change.
+#
+# What the duplication buys is a VISIBLE diff. Changing the contract now touches
+# two files that must agree, which is a shape a reviewer notices, and the
+# noticing is the whole mechanism — nothing here can tell a deliberate
+# coordinated rename from an accidental one. That is a judgement call about
+# another repo's reader and no assertion can make it.
+#
+# So: when this list and EXPECTED_VIEWS disagree, the question is not "which is
+# stale" but "has the proxy shipped the matching change". Names only; the types
+# live in svc_contract.py and /readyz asserts them against the database.
+FROZEN_CONTRACT_COLUMNS: dict[str, set[str]] = {
+    "v_person_enrolment_state": {
+        "person_ref",
+        "status",
+        "model_id",
+        "enrolled_at",
+    },
+    "v_person_report_summary": {
+        "person_ref",
+        "active_reports",
+        "unresolved_matches",
+        "live_exposure_count",
+        "last_run_at",
+        "first_scan_completed_at",
+        "monitored_sources",
+    },
+    "v_person_hits": {
+        "hit_id",
+        "report_id",
+        "person_ref",
+        "source_photo_id",
+        "hit_status",
+        "last_checked_at",
+        "match_id",
+        "source_domain",
+        "host_page_url",
+        "face_bbox",
+        "title",
+        "detected_at",
+        "match_status",
+        "match_action",
+        "match_lifecycle",
+        "resolved_at",
+        "resolution_note",
+        "provider_count",
+        "score",
+    },
+    "v_person_liveness_attempts": {
+        "person_ref",
+        "attempts_24h",
+        "last_attempt_at",
+    },
+}
+
 
 @pytest.fixture
 def migrated_db(throwaway_db: str) -> str:
@@ -194,6 +260,22 @@ def _infringement(
 
 
 # ── the contract surface itself ──────────────────────────────────────────────
+
+
+def test_the_readiness_gate_still_declares_the_frozen_contract() -> None:
+    """The independent witness. No database, no fixtures — a pure comparison of
+    two hand-agreed lists.
+
+    ``EXPECTED_COLUMNS`` is derived from the readiness gate's own declaration, so
+    on its own it cannot catch a rename: edit ``EXPECTED_VIEWS`` and migration
+    0016 together and every assertion in this file still passes while the proxy's
+    reader breaks. ``FROZEN_CONTRACT_COLUMNS`` is the second copy that makes such
+    a change a two-file diff.
+
+    If this fails, do not sync the lists reflexively. Ask whether the proxy has
+    shipped the matching change — the answer is what decides which side is wrong.
+    """
+    assert EXPECTED_COLUMNS == FROZEN_CONTRACT_COLUMNS
 
 
 def test_the_four_views_exist_with_the_columns_the_proxy_reads(migrated_db: str) -> None:

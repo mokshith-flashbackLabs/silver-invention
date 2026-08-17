@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+from imageshield.config import Config
+
 ECS_DIR = Path(__file__).resolve().parents[1] / "infra" / "ecs"
 SERVICES_TASK = ECS_DIR / "imageshield-dev-services.json"
 MIGRATE_TASK = ECS_DIR / "imageshield-dev-migrate-services.json"
@@ -144,6 +146,74 @@ def test_services_declares_the_stub_provider_and_matching_regions() -> None:
     assert env["SEARCH_PROVIDER"] == "stub"
     assert env["AWS_REGION"] == env["REKOGNITION_REGION"] == "ap-south-1"
     assert env["SEARCH_MATCH_THRESHOLD"] != "80"
+
+
+def _supplied_names(path: Path) -> set[str]:
+    """Every variable the container will actually see, from both blocks.
+
+    Upper-cased because pydantic-settings is case-insensitive: a field named
+    ``database_url`` is fed by ``DATABASE_URL``, and comparing the two forms
+    directly would report every field as missing.
+    """
+    container = _load(path)["containerDefinitions"][0]
+    return {entry["name"].upper() for entry in container.get("environment", [])} | {
+        entry["name"].upper() for entry in container.get("secrets", [])
+    }
+
+
+def test_every_required_config_field_is_supplied_by_the_task_definition() -> None:
+    """A required field the task definition omits is a crash loop, and the only
+    place it surfaces is CloudWatch — after the deploy, in a log nobody is
+    watching yet. `Config` validates at boot and exits non-zero naming the key,
+    which is the right behaviour and also the least visible one.
+
+    Derived from ``Config.model_fields`` rather than transcribed, so a field
+    added with no default fails here on the commit that adds it rather than on
+    the deploy that ships it.
+    """
+    required = {
+        name.upper()
+        for name, field in Config.model_fields.items()
+        if field.is_required()
+    }
+    assert required, "no required fields found — model_fields introspection broke"
+
+    missing = required - _supplied_names(SERVICES_TASK)
+    assert missing == set(), (
+        f"{SERVICES_TASK.name} omits required config: {sorted(missing)}."
+        " The container will exit non-zero at boot with these names in its log."
+    )
+
+
+def test_the_task_definition_sets_no_variable_config_does_not_read() -> None:
+    """The reverse direction, and how ATTRIBUTION_MAX_CANDIDATES=20 got in: it
+    was copied from the handoff's `api` (proxy) env block rather than its
+    `services` block. `extra="ignore"` means a name this service does not read is
+    accepted in silence, so a variable set for the wrong container looks exactly
+    like one that works.
+
+    ENROLMENT_QUALITY_FILTER is the one documented exception: invariant #5 pins
+    `QualityFilter: HIGH` in code, so the variable is inert by design and is
+    present only because the handoff's env block lists it. A knob the operator
+    sets that silently vanishes is worse than one documented as having no reader.
+    """
+    known = {name.upper() for name in Config.model_fields}
+    inert_by_design = {"ENROLMENT_QUALITY_FILTER"}
+    unread = _supplied_names(SERVICES_TASK) - known - inert_by_design
+    assert unread == set(), (
+        f"{SERVICES_TASK.name} sets variables this service does not read:"
+        f" {sorted(unread)}. extra='ignore' accepts them silently."
+    )
+
+
+def test_attribution_max_candidates_is_not_pinned_in_the_task_definition() -> None:
+    """It has a default of 5 in config and was never required here. Setting 20
+    quadruples attribution's Rekognition `MaxFaces` and makes
+    `GET /v1/config/floors` publish 20 — which the proxy asserts against at boot,
+    so the two repos disagree about a published floor over a variable that was
+    copied from the wrong block of the handoff.
+    """
+    assert "ATTRIBUTION_MAX_CANDIDATES" not in _supplied_names(SERVICES_TASK)
 
 
 def test_the_migration_task_does_not_serve_http() -> None:
