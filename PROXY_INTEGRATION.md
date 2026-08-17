@@ -641,6 +641,34 @@ caught by application logic. `tests/test_svc_views.py` asserts it.
 Identity remains entirely off-limits (INVARIANTS #14). `v_person_enrolment_state` carries a status, a
 model id and a timestamp — never a vector, never an `external_face_id`.
 
+### The membership grant — migration 0017, and it is ours to run
+
+`imageshield_proxy_ro` is `NOLOGIN` on purpose: it is a grant target, not an identity, so nothing
+about it needs a password anybody has to rotate. That leaves a second half nobody had built —
+**until 0017, no role was a member of it, so the grant above reached nobody.** While your side
+connected as the database owner this was invisible, because an owner reads everything; connecting as
+`app_backend` in dev makes it the difference between the report screen working and failing on its
+first read.
+
+`0017_proxy_ro_grant_chain` grants membership to `imageshield_proxy`, `app_backend` and `app_worker`,
+each conditional on the role existing when it applies.
+
+- **Why it is ours and not yours.** Membership requires `ADMIN OPTION` on `imageshield_proxy_ro`,
+  which our migration runner holds implicitly because 0016 created the role. Your migrator cannot
+  complete this chain from your side however much it wants to.
+- **Why three names.** One grant to `imageshield_proxy` would reach every login role you have — your
+  0012/0013 make all three members of it — but `imageshield_proxy` does not exist until *your* 0001
+  applies, and the deploy order is services-first, because your `/readyz` cannot pass without these
+  views. `app_backend` and `app_worker` come from the cluster bootstrap and exist before either repo
+  migrates. Enumerating all three makes the chain complete in either order.
+- **It creates none of them.** A migration here that conjured `app_backend` would make a missing
+  deploy step look like a successful one.
+
+**What this asks of you: one thing, later.** A *new* login role on your side gets nothing
+automatically unless it is a member of `imageshield_proxy`. If you add one and grant it
+`imageshield_proxy` (as 0012 and 0013 both do), the chain reaches it with no change here. If you add
+one that is not, tell us and we add a migration — there is no way for us to notice.
+
 ### Column notes you need before building UI
 
 **Permanently `NULL`, because there is no source for them here.** Returned as typed NULLs rather than

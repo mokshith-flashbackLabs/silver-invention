@@ -99,6 +99,13 @@ We hold **no AWS S3 credentials**. If they aren't in the environment, the mistak
   §6 previously granted `SELECT` on `report.reports`, `report.report_hits` and `report.hit_feedback` —
   three tables that never existed here.
 
+  That role is `NOLOGIN` and **had no members until `0017`**, so for its first five days the contract
+  reached nobody and nothing failed — the proxy connected as the database owner, which reads
+  everything. `0017` grants membership to their `imageshield_proxy`, `app_backend` and `app_worker`,
+  each conditional on the role existing, and only this repo can: `ADMIN OPTION` follows whoever
+  created the role. A new login role on their side is covered automatically if it is a member of
+  `imageshield_proxy`, and invisible to us if it is not.
+
   **The views are a versioned contract, and that is the tightest coupling in this architecture.** Two
   repos share a database because the proxy's own views JOIN against ours and you cannot JOIN against
   HTTP. Columns may be added freely; none may be removed or retyped without a coordinated deploy, and

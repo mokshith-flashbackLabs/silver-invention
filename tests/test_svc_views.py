@@ -15,13 +15,16 @@ make these tests about those paths; what is under test is a projection.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import Iterator
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from imageshield.http.svc_contract import EXPECTED_VIEWS
 from tests.db import run_migrate
@@ -613,3 +616,117 @@ def test_an_unknown_infringement_status_is_refused_by_the_database(
                 " WHERE infringement_id = %s",
                 (infringement,),
             )
+
+
+# ── the grant chain (0017) ───────────────────────────────────────────────────
+#
+# 0016 grants SELECT to `imageshield_proxy_ro`, which is NOLOGIN, and nothing
+# was ever granted membership in it. The gap was invisible while the proxy
+# connected as the database owner; in dev it connects as `app_backend`, so the
+# views being readable is now a property of the membership rather than of
+# ownership. These tests are the only place that distinction is checked.
+
+
+@contextlib.contextmanager
+def _proxy_login_role(db_url: str, name: str) -> Iterator[None]:
+    """Stand in for one of the proxy's deployed login roles.
+
+    Roles are cluster-wide, not per-database, so the throwaway database gives no
+    isolation here and the role has to be created and removed explicitly. A
+    cluster that already has the role — a developer pointed at something real —
+    is left exactly as it was found, including on the way out.
+    """
+    identifier = sql.Identifier(name)
+    with psycopg.connect(db_url, autocommit=True) as conn:
+        existed = (
+            conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,)).fetchone()
+            is not None
+        )
+        if not existed:
+            conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(identifier))
+    try:
+        yield
+    finally:
+        if not existed:
+            with psycopg.connect(db_url, autocommit=True) as conn:
+                conn.execute(
+                    sql.SQL("REVOKE imageshield_proxy_ro FROM {}").format(identifier)
+                )
+                conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(identifier))
+
+
+def _is_member(db_url: str, member: str, role: str) -> bool:
+    row = _one(
+        db_url,
+        "SELECT pg_has_role(%s, %s, 'USAGE') AS inherits",
+        (member, role),
+    )
+    return bool(row["inherits"])
+
+
+def test_a_deployed_proxy_login_role_reads_the_views_and_nothing_else(
+    throwaway_db: str,
+) -> None:
+    """Done-when: the role the proxy actually connects as can SELECT the four
+    views, and still cannot touch a base table.
+
+    ``test_the_proxy_role_reads_the_views_and_nothing_else`` proves the grant on
+    ``imageshield_proxy_ro``; this proves it *reaches somebody*. Without 0017
+    both pass and the deploy still fails, because a NOLOGIN role with no members
+    is a contract with no reader.
+    """
+    with _proxy_login_role(throwaway_db, "app_backend"):
+        assert run_migrate(throwaway_db, "down", "--all").returncode == 0
+        up_result = run_migrate(throwaway_db, "up")
+        assert up_result.returncode == 0, up_result.stderr
+
+        assert _is_member(throwaway_db, "app_backend", "imageshield_proxy_ro")
+        with psycopg.connect(throwaway_db, autocommit=True) as conn:
+            conn.execute("SET ROLE app_backend")
+            for view in VIEWS:
+                conn.execute(f"SELECT * FROM svc.{view}")  # must not raise
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("SELECT * FROM public.enrolments")
+            conn.execute("RESET ROLE")
+
+
+def test_reverting_the_chain_revokes_membership_and_leaves_their_role_alone(
+    throwaway_db: str,
+) -> None:
+    """The down leg removes the grant we made and nothing else. Dropping
+    ``app_worker`` to reverse a SELECT would take the proxy's worker offline —
+    a much larger action than the one being undone.
+    """
+    with _proxy_login_role(throwaway_db, "app_worker"):
+        assert run_migrate(throwaway_db, "down", "--all").returncode == 0
+        assert run_migrate(throwaway_db, "up").returncode == 0
+        assert _is_member(throwaway_db, "app_worker", "imageshield_proxy_ro")
+
+        # --steps 1 reverts the newest applied migration. If a 0018 lands, this
+        # asserts loudly rather than silently reverting the wrong one.
+        revert = run_migrate(throwaway_db, "down", "--steps", "1")
+        assert revert.returncode == 0, revert.stderr
+        applied = {
+            row["filename"]
+            for row in _rows(throwaway_db, "SELECT filename FROM schema_migrations")
+        }
+        assert "0017_proxy_ro_grant_chain.up.sql" not in applied
+
+        assert not _is_member(throwaway_db, "app_worker", "imageshield_proxy_ro")
+        assert _rows(
+            throwaway_db, "SELECT 1 FROM pg_roles WHERE rolname = 'app_worker'"
+        ), "0017's down leg dropped a role it does not own"
+
+
+def test_the_grant_target_never_becomes_an_identity(migrated_db: str) -> None:
+    """``imageshield_proxy_ro`` stays NOLOGIN. It is a grant target, not a login:
+    a password on it would be a second way into this database that no deploy
+    rotates. This also covers the CI condition — no proxy role exists there, so
+    0017 grants nothing and must still apply cleanly, which every other test in
+    this file exercises.
+    """
+    row = _one(
+        migrated_db,
+        "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'imageshield_proxy_ro'",
+    )
+    assert row["rolcanlogin"] is False
