@@ -342,9 +342,15 @@ Expected: PASS — the rename is compile-visible, so any missed site shows here.
 
 - [ ] **Step 7: Run mypy to catch missed rename sites**
 
-Run: `python -m mypy src tests`
-Expected: no errors. `mypy --strict` is what proves the rename is complete;
-`grep` is not.
+Run: `python -m mypy` — **bare, with no path arguments.** Configuration comes
+from `pyproject.toml` (`strict = true`, `packages = ["imageshield"]`,
+`python_version = "3.11"`), which is exactly how CI invokes it. Passing
+`src tests` instead type-checks the test suite under settings it was never
+written for and reports ~159 spurious errors on a clean tree.
+
+Expected: `Success: no issues found in 88 source files` (the count grows as
+files are added). `mypy` strict is what proves the rename is complete; `grep`
+is not.
 
 - [ ] **Step 8: Commit**
 
@@ -479,10 +485,29 @@ def test_readyz_needs_no_service_token(client: TestClient) -> None:
     assert response.status_code in (200, 503)
 ```
 
-Reuse whatever DB fixtures `tests/db.py` already provides (`throwaway_db`,
-`run_migrate`); if a `db_conn`/`migrated_db` fixture pair does not exist yet,
-add it to `tests/conftest.py` following the pattern the existing DB tests use.
-Do not invent a second migration mechanism.
+**Fixtures — follow the repo's existing pattern exactly.** There is no global
+`db_conn` fixture and no global `migrated_db`. `tests/db.py` provides
+session-scoped `throwaway_db` (a disposable database URL) and `run_migrate`.
+`tests/test_svc_views.py:74` defines its own file-local `migrated_db` fixture:
+
+```python
+@pytest.fixture
+def migrated_db(throwaway_db: str) -> str:
+    down_result = run_migrate(throwaway_db, "down", "--all")
+    assert down_result.returncode == 0, down_result.stderr
+    up_result = run_migrate(throwaway_db, "up")
+    assert up_result.returncode == 0, up_result.stderr
+    return throwaway_db
+```
+
+Copy that shape into `tests/test_readyz.py` (importing `run_migrate` from
+`tests.db`), and take connections with
+`await psycopg.AsyncConnection.connect(migrated_db, autocommit=True)` —
+`check_svc_contract` is async because the route's pool is async, so the tests are
+async too. `asyncio_mode = "auto"` is already set in `pyproject.toml`, so no
+`@pytest.mark.asyncio` decorator is needed. Rewrite the test signatures above to
+take `migrated_db: str` and open their own connection; do not invent a second
+migration mechanism.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -604,10 +629,42 @@ async def check_svc_contract(conn: AsyncConnection) -> list[str]:
     return problems
 ```
 
-Verify each declared type against `migrations/0016_svc_contract_views.up.sql`
-before moving on. If a real type differs from what is written above, the
-migration is authoritative — fix this table, not the migration. Run the
-happy-path test to confirm rather than trusting the list.
+**These types are verified, not guessed.** All 37 columns were dumped from
+`information_schema` against a freshly migrated scratch database on 2026-08-17
+and match this table exactly — including `face_bbox` (jsonb), `score` (numeric)
+and `source_photo_id` (text). Use the table as written. The happy-path test
+proves it again on every run.
+
+- [ ] **Step 3b: Make the existing view test import this table instead of duplicating it**
+
+`tests/test_svc_views.py:37` already declares `EXPECTED_COLUMNS` — the same four
+views' column names, transcribed from the proxy's contract document. Leaving both
+creates two copies of one contract, which is precisely what CLAUDE.md §9 forbids
+("a second copy … starts lying the moment somebody edits one and not the other").
+
+`src/imageshield/http/svc_contract.py` is now the single source of truth. In
+`tests/test_svc_views.py`, delete the literal `EXPECTED_COLUMNS` block and derive
+it:
+
+```python
+from imageshield.http.svc_contract import EXPECTED_VIEWS
+
+# Derived, not transcribed: src/imageshield/http/svc_contract.py is the single
+# source of truth for the contract's shape, and /readyz refuses to come up when
+# the database disagrees with it. A second literal list here would be a second
+# copy of a cross-repo contract — CLAUDE.md §9. Order is still not part of the
+# contract (their reader selects by name); presence and spelling are.
+EXPECTED_COLUMNS: dict[str, set[str]] = {
+    view: set(columns) for view, columns in EXPECTED_VIEWS.items()
+}
+```
+
+Leave every assertion in that file unchanged — including
+`test_the_permanently_null_columns_are_present_and_typed`, which independently
+checks three `data_type` values against real Postgres.
+
+Run: `REQUIRE_DB=1 python -m pytest tests/test_svc_views.py -q`
+Expected: PASS, same count as before the change.
 
 - [ ] **Step 4: Add the response model**
 
@@ -1066,6 +1123,9 @@ Create `infra/ecs/imageshield-dev-services.json`. Secret ARN suffixes are
         { "name": "DEV_FACE_CEILING", "value": "50" },
         { "name": "ATTRIBUTION_MAX_INFLIGHT", "value": "4" },
         { "name": "ATTRIBUTION_MAX_CANDIDATES", "value": "20" },
+        { "name": "SEARCH_MATCH_THRESHOLD", "value": "95" },
+        { "name": "FACE_MATCH_THRESHOLD", "value": "95" },
+        { "name": "ENROLMENT_COLLISION_THRESHOLD", "value": "99" },
         { "name": "MIN_ENROLMENT_AGE", "value": "13" },
         { "name": "MIN_DISCOVERY_AGE", "value": "18" },
         { "name": "LIVENESS_MIN_CONFIDENCE", "value": "90" },
@@ -1106,12 +1166,13 @@ The health check uses `python` rather than the handoff's `wget`, because the
 process answers) not `/readyz` — ECS would kill and restart a container that is
 up but waiting on migrations, which is a crash loop rather than a signal.
 
-`SEARCH_MATCH_THRESHOLD`, `FACE_MATCH_THRESHOLD` and
-`ENROLMENT_COLLISION_THRESHOLD` are **deliberately absent above** — they are
-required with no default and the handoff says to pin them, not to guess. Add
-them in Task 6 Step 4 with the operator's chosen numbers. The test asserting
-`SEARCH_MATCH_THRESHOLD != "80"` will fail until they are added, which is the
-intended forcing function.
+The three thresholds are **pinned by the operator**, not defaulted:
+`SEARCH_MATCH_THRESHOLD=95` (chosen 2026-08-17, matching the existing enrolment
+threshold — not a measured value, and dev dispatches no provider calls under
+`SEARCH_PROVIDER=stub`), `FACE_MATCH_THRESHOLD=95` (existing `.env.example`
+value), `ENROLMENT_COLLISION_THRESHOLD=99` (unread in v1, so any valid number is
+equivalent). All three are boot-required with no default, so omitting any one
+gives a container that cannot start.
 
 - [ ] **Step 6: Write the migration task definition**
 
@@ -1155,7 +1216,8 @@ command, migrator credential, no ports.
 - [ ] **Step 7: Run the tests**
 
 Run: `python -m pytest tests/test_ecs_task_defs.py -v`
-Expected: all PASS except `test_services_declares_the_stub_provider_and_matching_regions`, which fails on the missing `SEARCH_MATCH_THRESHOLD` until Task 6 Step 4. Leave it failing and say so at the task gate — do not add a placeholder threshold to make it green.
+Expected: all PASS. The three thresholds are pinned in Step 5, so there is no
+knowingly-red test here.
 
 - [ ] **Step 8: Commit**
 
@@ -1312,13 +1374,17 @@ failure — read the error.
 
 ```bash
 python -m ruff check .
-python -m mypy src tests
+python -m mypy
 REQUIRE_DB=1 python -m pytest -q
 docker buildx build --platform linux/arm64 -t imageshield/services:preflight .
 ```
 
 All four must be green. `pytest` alone has previously hidden 13 lint errors, so
-all four, every time. The one expected failure from Task 4 Step 7 is fixed by
+all four, every time. `mypy` takes **no path arguments** — see Task 1 Step 7.
+The "both scopes" of mypy are covered inside pytest by
+`tests/test_typecheck.py`: the package must pass strict, and
+`tests/fixtures_typecheck/bad_ids.py` must *fail* it, which is what proves the
+`NewType` gate is still alive rather than decorative. The one expected failure from Task 4 Step 7 is fixed by
 Step 4 below — do not deploy with it still failing.
 
 - [ ] **Step 2: Resolve the real secret ARN suffixes**
@@ -1355,15 +1421,14 @@ aws iam get-role-policy --role-name imageshield-dev-services \
 Confirm no `s3:PutObject` appears and every `rekognition:` collection statement
 names a `-dev-` ARN.
 
-- [ ] **Step 4: Pin the thresholds**
+- [ ] **Step 4: Thresholds — already pinned, nothing to do**
 
-Ask the operator for `SEARCH_MATCH_THRESHOLD`, `FACE_MATCH_THRESHOLD` and
-`ENROLMENT_COLLISION_THRESHOLD`. Add them to
-`infra/ecs/imageshield-dev-services.json`, then confirm
-`tests/test_ecs_task_defs.py` is fully green and commit.
+Done in Task 4 Step 5: `SEARCH_MATCH_THRESHOLD=95`, `FACE_MATCH_THRESHOLD=95`,
+`ENROLMENT_COLLISION_THRESHOLD=99`, supplied by the operator on 2026-08-17.
 
-Do not invent these numbers. The handoff's §11 says explicitly not to tune a
-threshold from a dev measurement, and §2.2 of the spec makes them boot-required
+Confirm they are present in `infra/ecs/imageshield-dev-services.json` and move
+on. Do not substitute your own numbers: the handoff's §11 says not to tune a
+threshold from a dev measurement, and these are boot-required with no default
 precisely so they cannot be defaulted into existence.
 
 - [ ] **Step 5: Build and push the real image**
