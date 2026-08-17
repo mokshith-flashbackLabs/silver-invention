@@ -54,7 +54,7 @@ async def attribute(
             requested_by=body.requested_by,
             candidate_refs=tuple(body.candidate_refs),
             presigned_get_url=body.presigned_get_url,
-            collection_id=cfg.rekognition_collection_id,
+            collection_id=cfg.identity_collection,
             match_threshold=cfg.attribution_match_threshold,
             max_candidates=cfg.attribution_max_candidates,
             fetcher=fetcher,

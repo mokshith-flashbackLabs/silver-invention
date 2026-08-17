@@ -52,7 +52,54 @@ class Config(BaseSettings):
     admin_service_token: str
 
     aws_region: str
-    rekognition_collection_id: str
+
+    # Renamed from REKOGNITION_COLLECTION_ID to match the deploy contract
+    # (DEPLOY-DEV-HANDOFF §5). Hard rename, no alias: the old name is not in any
+    # deployed environment, and two names for one value is the drift CLAUDE.md §9
+    # warns about.
+    identity_collection: str
+
+    # The region the identity collection lives in. A Rekognition collection is
+    # regional: enrol into one region, search another, and the second is empty.
+    # Nothing errors — it reads as "no matches", which is the one wrong answer
+    # this product must never give silently. Asserted equal to aws_region below.
+    rekognition_region: str
+
+    # ── Declared, validated, and NOT READ in v1 ───────────────────────────
+    # Both exist so the deployed env block matches DEPLOY-DEV-HANDOFF §5
+    # literally; a variable the operator sets that silently vanishes is worse
+    # than one that is documented as inert.
+    #
+    # discovered_collection: `discovered-v1` and clustering are "specified, do
+    # not build yet" (CLAUDE.md §6).
+    discovered_collection: str
+    # enrolment_collision_threshold: THERE IS NO COLLISION CHECK, deliberately.
+    # Wiring this to one means a similarity score influencing enrolment, which is
+    # invariant #1 ("identity never comes from a similarity score") and the
+    # fragmentation bug the old system shipped. Read #1 and #1a before giving
+    # this a reader.
+    enrolment_collision_threshold: float
+
+    # Threshold for provider face-search matching. DISTINCT from
+    # face_match_threshold (enrolment) and attribution_match_threshold
+    # (attribution) — one threshold per purpose, invariant #1b. Refused at
+    # exactly 80: that is Rekognition's default, i.e. the value nobody chose.
+    search_match_threshold: float
+
+    # Concurrent in-flight attribution searches.
+    attribution_max_inflight: int
+
+    # 'stub' dispatches no provider call at all. In development this is the only
+    # thing standing between a test run and billable Hive traffic — the dev key
+    # is real, Hive has no sandbox, and its cost_per_call_usd is NULL so the
+    # step-8 budget guard fails closed and caps nothing. Asserted below.
+    search_provider: Literal["stub", "hive", "google"] = "stub"
+
+    # Dev-only guard on collection size, so a runaway test cannot enrol
+    # thousands of faces into a shared dev collection.
+    dev_face_ceiling: int
+
+    log_level: Literal["debug", "info", "warning", "error"] = "info"
 
     liveness_min_confidence: float
     face_match_threshold: float
@@ -249,14 +296,14 @@ class Config(BaseSettings):
             raise ValueError("is still set to a placeholder")
         return value
 
-    @field_validator("aws_region")
+    @field_validator("aws_region", "rekognition_region")
     @classmethod
     def _region(cls, value: str) -> str:
         if not _AWS_REGION_RE.match(value):
             raise ValueError("must be an AWS region like ap-south-1")
         return value
 
-    @field_validator("rekognition_collection_id")
+    @field_validator("identity_collection", "discovered_collection")
     @classmethod
     def _non_empty(cls, value: str) -> str:
         if not value.strip():
@@ -274,7 +321,12 @@ class Config(BaseSettings):
         AnyHttpUrl(value)
         return value
 
-    @field_validator("liveness_min_confidence", "face_match_threshold")
+    @field_validator(
+        "liveness_min_confidence",
+        "face_match_threshold",
+        "enrolment_collision_threshold",
+        "search_match_threshold",
+    )
     @classmethod
     def _confidence(cls, value: float) -> float:
         if not 0 <= value <= 100:
@@ -309,6 +361,8 @@ class Config(BaseSettings):
         "provider_alarm_window_hours",
         "recheck_interval_days",
         "recheck_batch_size",
+        "attribution_max_inflight",
+        "dev_face_ceiling",
     )
     @classmethod
     def _positive(cls, value: int) -> int:
@@ -421,6 +475,67 @@ class Config(BaseSettings):
                 "SCAN_PRIORITY_RELEASE_AFTER_EMPTY must be >= SCAN_RELAXED_AFTER_EMPTY"
                 " — a seed with a recent hit must never be demoted sooner than one"
                 " that never had one"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _rekognition_region_matches_deployment(self) -> Config:
+        """D7. Refused at boot because the failure is silent everywhere else.
+
+        A collection is regional. Enrol into ap-south-1, search us-east-1, and
+        the search succeeds against an empty collection: no error, no alarm,
+        just "no matches in monitored sources" forever. CLAUDE.md §1 calls a
+        false negative a broken promise, and this is the cheapest way to make one.
+        """
+        if self.rekognition_region != self.aws_region:
+            raise ValueError(
+                "REKOGNITION_REGION must equal AWS_REGION — a collection is"
+                " regional, and searching the wrong region returns an empty"
+                " result that is indistinguishable from 'no matches'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _no_debug_logging_in_production(self) -> Config:
+        """Debug logs in this service carry user_ref, bounding boxes and
+        provider payloads. The redaction processor covers known keys; debug
+        level widens what reaches the log in the first place."""
+        if self.environment == "production" and self.log_level == "debug":
+            raise ValueError(
+                "LOG_LEVEL must not be 'debug' when ENVIRONMENT=production"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _development_uses_the_stub_provider(self) -> Config:
+        """The dev Hive credential is a REAL key — Hive has no sandbox.
+
+        Hive Web Search is contract-priced and `hive.cost_per_call_usd` is NULL,
+        so a budget set against it fails closed and caps nothing (§7.6). That
+        makes config the only cheap place to stop a dev run spending real money,
+        and an env edit alone must not be enough to do it.
+        """
+        if self.environment == "development" and self.search_provider != "stub":
+            raise ValueError(
+                "SEARCH_PROVIDER must be 'stub' when ENVIRONMENT=development —"
+                " the dev provider keys are real and Hive has no sandbox"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _search_threshold_is_deliberate(self) -> Config:
+        """80 is Rekognition's FaceMatchThreshold default.
+
+        The handoff says "pin it — not 80" because the default is the value you
+        get when nobody made a decision, and for the threshold that decides
+        whether someone is told their face is in porn, an accidental value is
+        not acceptable. Any other number is fine; this only refuses the one that
+        means "unset".
+        """
+        if self.search_match_threshold == 80.0:
+            raise ValueError(
+                "SEARCH_MATCH_THRESHOLD must not be exactly 80 — that is"
+                " Rekognition's default, i.e. an unchosen value; pin a measured one"
             )
         return self
 

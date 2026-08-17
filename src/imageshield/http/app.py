@@ -104,7 +104,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     # Which AWS account and region, before anything touches Rekognition.
     # Someone will eventually run this against production by accident.
-    log_aws_identity(region=cfg.aws_region, collection_id=cfg.rekognition_collection_id)
+    log_aws_identity(region=cfg.aws_region, collection_id=cfg.identity_collection)
     if cfg.auth_disabled:
         log.warning("auth.disabled", environment=cfg.environment)
     elif cfg.service_token_auth_disabled:

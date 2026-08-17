@@ -381,7 +381,7 @@ async def post_liveness_result(
     source_object_uri = _strip_query(body.reference_put_url)
     try:
         indexed = await face_index.index_face(
-            collection_id=cfg.rekognition_collection_id,
+            collection_id=cfg.identity_collection,
             external_image_id=str(row.user_ref),  # user_ref and NOTHING else
             image_bytes=result.reference_image,
         )
@@ -422,7 +422,7 @@ async def post_liveness_result(
         audit_image_uris=tuple(stored_audit_uris),
         enrolment=NewEnrolment(
             user_ref=UserRef(row.user_ref),
-            collection_id=cfg.rekognition_collection_id,
+            collection_id=cfg.identity_collection,
             external_face_id=indexed.face_id,
             quality_score=indexed.quality_score,
             model_id=indexed.model_id,
@@ -440,7 +440,7 @@ async def post_liveness_result(
         # A concurrent result call finalized first — the face just indexed is
         # a duplicate. Remove it so the collection keeps exactly one face per
         # active enrolment (step-4 done-when), then replay/410 as appropriate.
-        await face_index.delete_faces(cfg.rekognition_collection_id, (indexed.face_id,))
+        await face_index.delete_faces(cfg.identity_collection, (indexed.face_id,))
         return await _completed_replay(store, sid, idempotency_key)
 
     final, enrolment = outcome

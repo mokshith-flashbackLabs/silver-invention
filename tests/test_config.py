@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from imageshield.config import Config, ConfigError, load_config
 from tests.conftest import SERVICE_TOKEN, VALID_ENV, make_config
@@ -22,7 +23,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> pytest.MonkeyP
 
 def test_valid_env_loads(clean_env: pytest.MonkeyPatch) -> None:
     cfg = load_config()
-    assert cfg.rekognition_collection_id == "identity-v1"
+    assert cfg.identity_collection == "identity-v1"
     assert cfg.environment == "production"
     assert cfg.auth_disabled is False
 
@@ -63,6 +64,7 @@ def test_equal_tokens_refuse_to_start(clean_env: pytest.MonkeyPatch) -> None:
         ("LIVENESS_MAX_ATTEMPTS_24H", "0"),
         ("DATABASE_URL", "mysql://nope"),
         ("AWS_REGION", "not-a-region"),
+        ("REKOGNITION_REGION", "not-a-region"),
         ("HIVE_BASE_URL", "not a url"),
         ("HIVE_API_KEY", "changeme"),
         ("SERVICE_TOKEN", "short"),
@@ -308,3 +310,64 @@ def test_the_attribution_threshold_is_its_own_knob() -> None:
     cfg = make_config(attribution_match_threshold=88.5, liveness_min_confidence=95.0)
     assert cfg.attribution_match_threshold == 88.5
     assert cfg.liveness_min_confidence == 95.0
+
+
+# ── Dev deploy handoff: rename + four boot assertions ─────────────────────
+
+
+def test_rekognition_region_must_equal_aws_region() -> None:
+    """D7. A regional collection reached from the wrong region is empty, and an
+    empty collection is indistinguishable from 'no matches'."""
+    with pytest.raises(ValidationError, match="REKOGNITION_REGION"):
+        make_config(aws_region="ap-south-1", rekognition_region="us-east-1")
+
+
+def test_matching_regions_are_accepted() -> None:
+    cfg = make_config(aws_region="ap-south-1", rekognition_region="ap-south-1")
+    assert cfg.rekognition_region == "ap-south-1"
+
+
+def test_debug_logging_is_refused_in_production() -> None:
+    with pytest.raises(ValidationError, match="LOG_LEVEL"):
+        make_config(environment="production", log_level="debug")
+
+
+def test_debug_logging_is_allowed_in_development() -> None:
+    cfg = make_config(environment="development", log_level="debug", search_provider="stub")
+    assert cfg.log_level == "debug"
+
+
+def test_development_refuses_a_live_provider() -> None:
+    """The dev Hive key is real and Hive has no sandbox; its price is NULL so the
+    budget guard fails closed and caps nothing."""
+    with pytest.raises(ValidationError, match="SEARCH_PROVIDER"):
+        make_config(environment="development", search_provider="hive")
+
+
+def test_production_allows_a_live_provider() -> None:
+    cfg = make_config(environment="production", search_provider="hive")
+    assert cfg.search_provider == "hive"
+
+
+def test_search_match_threshold_refuses_the_rekognition_default() -> None:
+    """80 is the value you get when nobody chose one."""
+    with pytest.raises(ValidationError, match="SEARCH_MATCH_THRESHOLD"):
+        make_config(search_match_threshold=80.0)
+
+
+def test_search_match_threshold_accepts_a_deliberate_value() -> None:
+    assert make_config(search_match_threshold=88.5).search_match_threshold == 88.5
+
+
+def test_identity_collection_replaces_the_old_name() -> None:
+    assert make_config().identity_collection == "identity-v1"
+    assert not hasattr(make_config(), "rekognition_collection_id")
+
+
+def test_unread_fields_are_still_validated() -> None:
+    """DISCOVERED_COLLECTION and ENROLMENT_COLLISION_THRESHOLD have no reader in
+    v1, but a blank or out-of-range value must still refuse to boot."""
+    with pytest.raises(ValidationError):
+        make_config(discovered_collection="   ")
+    with pytest.raises(ValidationError):
+        make_config(enrolment_collision_threshold=101.0)
