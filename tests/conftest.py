@@ -75,6 +75,15 @@ VALID_ENV: dict[str, str] = {
     "GOOGLE_VISION_API_KEY": "google-key-for-tests",
     "SQS_IDENTITY_INDEX_URL": "http://localhost:14566/000000000000/imageshield-identity-index",
     "SQS_SEARCH_RUNS_URL": "http://localhost:14566/000000000000/imageshield-search-runs",
+    # ENVIRONMENT is unset here, so this block loads as `production` — which is
+    # the point: VALID_ENV is what a real deployed environment looks like. A
+    # production config carrying the stub is now refused at boot (the stub
+    # searches nothing), so a live provider has to be named. Deleting this key
+    # therefore IS fatal, which is why it belongs in the block that
+    # test_missing_key_is_fatal_and_named parametrises over; an earlier version of
+    # this file left it out on the grounds that it had a default and could not be
+    # missed. It can be, in the direction that matters.
+    "SEARCH_PROVIDER": "hive",
 }
 
 
@@ -106,6 +115,15 @@ def make_config(**overrides: Any) -> Config:
         "sqs_search_runs_url": VALID_ENV["SQS_SEARCH_RUNS_URL"],
     }
     values.update(overrides)
+    # A production config carrying the stub is refused at boot: the stub searches
+    # nothing, so every report would read "no matches in monitored sources" with
+    # no error anywhere (config.py:_production_never_uses_the_stub_provider). The
+    # default above is 'stub' because that is what an unset SEARCH_PROVIDER gives
+    # you, so a test that asks for production without naming a provider gets the
+    # real stack — otherwise this helper would build an invalid Config and every
+    # production-flavoured test would fail on a knob it was not about.
+    if values.get("environment") == "production" and "search_provider" not in overrides:
+        values["search_provider"] = "hive"
     return Config(**values)
 
 

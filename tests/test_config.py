@@ -349,6 +349,21 @@ def test_production_allows_a_live_provider() -> None:
     assert cfg.search_provider == "hive"
 
 
+def test_production_refuses_the_stub_provider() -> None:
+    """The other direction, and it is the dangerous one.
+
+    `search_provider` defaults to 'stub', so production inherits it from an
+    unset variable rather than from a decision. The stub returns zero matches
+    and makes no call, so a production deploy carrying it reports "no matches in
+    monitored sources" for every user, forever, with nothing failing: no error,
+    no alarm, no provider_calls row that looks wrong. CLAUDE.md §1 — a false
+    negative is a broken promise, and this is the cheapest way to make one for
+    the entire population at once.
+    """
+    with pytest.raises(ValidationError, match="SEARCH_PROVIDER"):
+        make_config(environment="production", search_provider="stub")
+
+
 def test_search_match_threshold_refuses_the_rekognition_default() -> None:
     """80 is the value you get when nobody chose one."""
     with pytest.raises(ValidationError, match="SEARCH_MATCH_THRESHOLD"):

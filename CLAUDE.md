@@ -378,6 +378,20 @@ Two things to know before touching it:
 - **`monthly_budget_usd` is reported, not enforced at dispatch.** The dispatch guard is one indexed
   row by design; a month is a range scan. Month-to-date is an admin read.
 
+**`SEARCH_PROVIDER=stub` is the switch that stops dev spending money, and it is enforced in two
+places, not one.** `config.py` refuses to boot when `ENVIRONMENT=development` and the value is
+anything else; `search/worker.py:build_providers` builds `search/stub.py` **instead of** Hive and
+Google, so no object in the worker holds a live key. For one release the config assertion existed
+alone and `build_providers` constructed both real adapters unconditionally — the switch was wired to
+nothing while its docstring claimed to be the only thing standing between a test run and a Hive bill.
+A safety switch wired to nothing is worse than no switch: it produces false confidence. Both edges
+are now refused at boot, and the production edge is the dangerous one — the stub searches nothing, so
+a production deploy carrying it answers "no matches in monitored sources" for every user forever with
+nothing failing anywhere. The stub keeps its own `provider_id`, never Hive's or Google's, and it has
+no `providers` row, so it is never in `providers_attempted`: under `stub`, a dev run records
+`no adapter registered for this provider` per provider and completes with nothing succeeded. That is
+deliberate. It is not a fixture generator.
+
 ### 7.8 The lever that actually reduces cost is cadence, not capping
 
 Budgets and breakers control spend. Adaptive cadence (`search/cadence.py`) reduces it — weekly →

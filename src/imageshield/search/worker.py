@@ -54,6 +54,7 @@ from imageshield.search.hive import HiveWebSearchProvider
 from imageshield.search.provider import SearchProvider
 from imageshield.search.runner import execute_run
 from imageshield.search.store import RUN_REQUESTED_EVENT, PostgresSearchStore, SearchStore
+from imageshield.search.stub import StubSearchProvider
 from imageshield.types import ProviderId
 
 _WAIT_TIME_SECONDS = 10  # SQS long poll
@@ -83,6 +84,25 @@ def build_sqs_consumer(config: Config) -> SqsConsumer:
 
 
 def build_providers(config: Config) -> dict[ProviderId, SearchProvider]:
+    """The adapter registry for this process, chosen by ``SEARCH_PROVIDER``.
+
+    ``stub`` builds the stub **instead of** Hive and Google, never alongside.
+    That word does the work: the real adapters are not constructed at all, so no
+    object in this process holds a live provider key and no code path — a future
+    edit included — can reach one. Disabling them at dispatch instead would leave
+    two loaded clients and one guard between them and a bill; `hive`'s
+    ``cost_per_call_usd`` is NULL, so the budget guard caps nothing (§7.6) and
+    that guard is thinner than it looks.
+
+    ``hive`` and ``google`` both select the real stack, whole. Which of the pair
+    actually runs is ``providers.enabled``'s job — the hot-reloadable per-provider
+    kill switch — not this boot-time knob's, and narrowing here would give one
+    provider's outage two different off switches that disagree.
+    """
+    if config.search_provider == "stub":
+        stub = StubSearchProvider()
+        return {stub.id: stub}
+
     retry = retry_policy_from_config(config)
     return {
         ProviderId("hive"): HiveWebSearchProvider(

@@ -89,10 +89,22 @@ class Config(BaseSettings):
     # Concurrent in-flight attribution searches.
     attribution_max_inflight: int
 
-    # 'stub' dispatches no provider call at all. In development this is the only
-    # thing standing between a test run and billable Hive traffic — the dev key
-    # is real, Hive has no sandbox, and its cost_per_call_usd is NULL so the
-    # step-8 budget guard fails closed and caps nothing. Asserted below.
+    # Which adapters `search/worker.py:build_providers` constructs. 'stub' builds
+    # `search/stub.py` INSTEAD of Hive and Google — never alongside — so no object
+    # in the worker holds a live provider key and no code path can reach one. In
+    # development that is the only thing standing between a test run and billable
+    # Hive traffic: the dev key is real, Hive has no sandbox, and its
+    # cost_per_call_usd is NULL so the step-8 budget guard fails closed and caps
+    # nothing.
+    #
+    # 'hive' and 'google' both mean "the real stack". Selecting one provider of
+    # the pair is `providers.enabled`'s job (hot-reloadable, §7.6), not this
+    # boot-time knob's.
+    #
+    # BOTH edges are asserted below, and they fail for opposite reasons: dev must
+    # not carry a live provider (money), production must not carry the stub (a
+    # deploy that answers "no matches" for everyone, forever, with nothing
+    # failing anywhere).
     search_provider: Literal["stub", "hive", "google"] = "stub"
 
     # Dev-only guard on collection size, so a runaway test cannot enrol
@@ -514,11 +526,39 @@ class Config(BaseSettings):
         so a budget set against it fails closed and caps nothing (§7.6). That
         makes config the only cheap place to stop a dev run spending real money,
         and an env edit alone must not be enough to do it.
+
+        This is only half a switch on its own. The other half is
+        `search/worker.py:build_providers`, which honours the value; while nothing
+        read it, this assertion protected nothing.
         """
         if self.environment == "development" and self.search_provider != "stub":
             raise ValueError(
                 "SEARCH_PROVIDER must be 'stub' when ENVIRONMENT=development —"
                 " the dev provider keys are real and Hive has no sandbox"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _production_never_uses_the_stub_provider(self) -> Config:
+        """The dangerous direction, and the one that fails silently.
+
+        `search_provider` defaults to 'stub', so a production deploy inherits it
+        from an *unset* variable rather than from a decision. The stub returns
+        zero matches and calls nothing, so every user is told "no matches in
+        monitored sources" forever while nothing errors, nothing alarms, and no
+        provider_calls row looks wrong. CLAUDE.md §1: a false negative is a
+        broken promise, and this is the cheapest available way to make one for the
+        entire population at once.
+
+        Refused at boot because there is nowhere later that could notice. Every
+        other symptom of this misconfiguration is indistinguishable from a
+        population that genuinely has no infringements.
+        """
+        if self.environment == "production" and self.search_provider == "stub":
+            raise ValueError(
+                "SEARCH_PROVIDER must not be 'stub' when ENVIRONMENT=production —"
+                " the stub searches nothing, so every report would read 'no"
+                " matches in monitored sources' with no error anywhere"
             )
         return self
 

@@ -486,3 +486,22 @@ Recorded here so the deploy side does not set a variable expecting an effect.
 `SEARCH_PROVIDER=stub` is enforced in config when `ENVIRONMENT=development`: the
 dev Hive key is real, Hive has no sandbox, and `hive.cost_per_call_usd` is NULL,
 so the budget guard fails closed and caps nothing.
+
+That assertion is only half the switch, and for one release it was the only half:
+nothing outside `config.py` read the value, and `search/worker.py:build_providers`
+constructed the real Hive and Google adapters unconditionally. It now builds
+`search/stub.py` **instead of** them, so no object in the worker process holds a
+live provider key. The reverse edge is refused too — `SEARCH_PROVIDER=stub` with
+`ENVIRONMENT=production` will not boot, because the stub searches nothing and a
+deploy carrying it would report "no matches in monitored sources" for every user
+with no error anywhere.
+
+One consequence to expect in dev: `providers_attempted` comes from
+`providers.enabled` in the database, which lists `hive` and `google` and not
+`stub`. So a `POST /v1/search` under the stub records one `provider_calls` row per
+provider with `status='error'` and
+`error_detail='no adapter registered for this provider'`, and the run completes
+with `providers_succeeded = []` — no network call, no attestation, and no cadence
+change (invariant #42: a run where nothing succeeded is not evidence of an empty
+scan). That is the honest outcome, not a bug to paper over; the stub exists to
+make billable traffic impossible, not to make a dev run look successful.
