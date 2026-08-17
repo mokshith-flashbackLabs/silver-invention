@@ -13,10 +13,15 @@
       "command": ["python", "scripts/migrate.py", "up"],
       "environment": [
         { "name": "ENVIRONMENT", "value": "development" },
-        { "name": "LOG_LEVEL", "value": "debug" }
+        { "name": "LOG_LEVEL", "value": "debug" },
+        { "name": "DB_SSLMODE", "value": "require" }
       ],
       "secrets": [
-        { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/migrator_services-XXXXXX:url::" }
+        { "name": "DB_HOST", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/migrator_services-dyQTpx:host::" },
+        { "name": "DB_PORT", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/migrator_services-dyQTpx:port::" },
+        { "name": "DB_NAME", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/migrator_services-dyQTpx:dbname::" },
+        { "name": "DB_USER", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/migrator_services-dyQTpx:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/migrator_services-dyQTpx:password::" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",

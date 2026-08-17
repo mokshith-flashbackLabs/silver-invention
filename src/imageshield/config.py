@@ -19,6 +19,7 @@ from typing import Literal
 from pydantic import AnyHttpUrl, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from imageshield.db.dsn import compose_database_url
 from imageshield.env import load_dotenv_local
 
 APP_VERSION = "0.1.0"
@@ -34,6 +35,36 @@ _POSTGRES_URL_RE = re.compile(r"^postgres(ql)?://.+")
 _PROVIDER_CACHE_TTL_CAP_SECONDS = 30.0
 
 
+def _validate_postgres_url(value: str) -> str:
+    """The one regex check, shared by the ``database_url`` field validator
+    below and ``Config._resolve_database_url`` — so a malformed *composed*
+    URL is caught by the exact same rule as a malformed literal one."""
+    if not _POSTGRES_URL_RE.match(value):
+        raise ValueError("must be a postgres:// connection URL")
+    return value
+
+
+# Env-var names for DATABASE_URL's five required parts, keyed by the Config
+# field name, in the order DEPLOY-DEV-HANDOFF.md §5's backend block lists
+# them. DB_SSLMODE is deliberately absent: it has its own default (see
+# `Config.db_sslmode`) and is never "missing".
+_DATABASE_URL_PART_ENV_NAMES: dict[str, str] = {
+    "db_host": "DB_HOST",
+    "db_port": "DB_PORT",
+    "db_name": "DB_NAME",
+    "db_user": "DB_USER",
+    "db_password": "DB_PASSWORD",
+}
+
+
+def _is_missing_part(value: str | int | None) -> bool:
+    """``None`` (never set) and ``""`` (set to nothing — e.g. a Secrets
+    Manager entry resolved to an empty string) are both "not provided". An
+    int part (``db_port``) is never falsy-but-present in a way this needs to
+    special-case: ``0`` is a nonsensical port but not a *missing* one."""
+    return value is None or value == ""
+
+
 class ConfigError(RuntimeError):
     """Raised when required environment configuration is missing or malformed."""
 
@@ -47,7 +78,38 @@ class Config(BaseSettings):
     db_pool_min_size: int = 1
     db_pool_max_size: int = 4
 
-    database_url: str
+    # DATABASE_URL is the primary form and always wins when present — the
+    # precedence is asserted explicitly, and commented, in
+    # `_resolve_database_url` below. Local dev, docker compose, CI and every
+    # existing deployment set only this, untouched by everything below it.
+    #
+    # Defaulted to "" (rather than left required) so an environment that
+    # cannot publish a single DATABASE_URL can still boot: an ECS `secrets`
+    # entry injects exactly one JSON key per environment variable, and the
+    # dev RDS secret (imageshield/dev/db/app_services) is shaped `{dbname,
+    # host, password, port, username}` with no `url` key at all. The five
+    # `db_*` fields below are that alternative. `_resolve_database_url`
+    # composes and re-validates the real value from them when this is absent,
+    # so every other reader in the codebase (db/connection.py, relay.py,
+    # scripts/migrate.py has its own copy of `compose_database_url`) keeps
+    # seeing a plain, always-populated `str` — never `None`, and `mypy
+    # --strict` needs no change at any of those call sites.
+    database_url: str = ""
+    # The five parts DATABASE_URL composes from when it is not set directly.
+    # Names match what the deploy environment already publishes
+    # (DEPLOY-DEV-HANDOFF.md §5's backend block: DB_HOST, DB_PORT, DB_NAME,
+    # DB_USER, DB_SSLMODE) so both deployables read the same vocabulary. All
+    # five (minus sslmode) are required TOGETHER — see `_resolve_database_url`
+    # — a partial set is refused at boot, never silently half-applied.
+    db_host: str | None = None
+    db_port: int | None = None
+    db_name: str | None = None
+    db_user: str | None = None
+    db_password: str | None = None
+    # Defaults to `require`, and that is not cosmetic: the RDS parameter group
+    # sets `rds.force_ssl = 1`, so a connection without it is refused. Never
+    # default this to anything weaker.
+    db_sslmode: str = "require"
     service_token: str
     admin_service_token: str
 
@@ -286,9 +348,15 @@ class Config(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def _postgres_url(cls, value: str) -> str:
-        if not _POSTGRES_URL_RE.match(value):
-            raise ValueError("must be a postgres:// connection URL")
-        return value
+        if not value:
+            # "" is both the empty-default sentinel (DATABASE_URL absent) and
+            # what an explicitly empty DATABASE_URL="" looks like — either
+            # way, defer to `_resolve_database_url`, which composes a real
+            # value from DB_* parts (re-validated by `_validate_postgres_url`
+            # below, the exact same check) or raises naming what's missing. A
+            # genuinely malformed non-empty literal is still caught right here.
+            return value
+        return _validate_postgres_url(value)
 
     @field_validator("service_token", "admin_service_token")
     @classmethod
@@ -424,6 +492,60 @@ class Config(BaseSettings):
                 " kill switch has to take effect within seconds"
             )
         return value
+
+    @model_validator(mode="after")
+    def _resolve_database_url(self) -> Config:
+        """Compose DATABASE_URL from the five DB_* parts when it is absent.
+
+        Runs before every other model validator (composition has to happen
+        before anything else could read `database_url`), and is the ONLY
+        place the precedence rule lives: DATABASE_URL wins whenever it is
+        set, so this returns immediately and touches nothing else — which is
+        exactly what makes every existing environment (local dev, docker
+        compose, CI, every deployment that already sets DATABASE_URL)
+        unaffected by everything below.
+        """
+        if self.database_url:
+            return self
+
+        missing = [
+            env_name
+            for field, env_name in _DATABASE_URL_PART_ENV_NAMES.items()
+            if _is_missing_part(getattr(self, field))
+        ]
+        if len(missing) == len(_DATABASE_URL_PART_ENV_NAMES):
+            raise ValueError(
+                "DATABASE_URL is required (or all of DB_HOST, DB_PORT, DB_NAME,"
+                " DB_USER, DB_PASSWORD, to compose one) — neither was provided"
+            )
+        if missing:
+            raise ValueError(
+                "DATABASE_URL is not set, and the DB_* parts meant to compose it"
+                " are incomplete — missing: " + ", ".join(missing)
+            )
+
+        # Every name in _DATABASE_URL_PART_ENV_NAMES came back non-missing
+        # above, so all five are populated; the asserts are for mypy's sake.
+        assert self.db_host is not None
+        assert self.db_port is not None
+        assert self.db_name is not None
+        assert self.db_user is not None
+        assert self.db_password is not None
+        composed = _validate_postgres_url(
+            compose_database_url(
+                host=self.db_host,
+                port=self.db_port,
+                name=self.db_name,
+                user=self.db_user,
+                password=self.db_password,
+                sslmode=self.db_sslmode,
+            )
+        )
+        # Config is frozen (model_config above) — object.__setattr__ is the
+        # standard escape hatch for a validator that needs to fill in a
+        # derived value onto an otherwise-immutable model.
+        object.__setattr__(self, "database_url", composed)
+        return self
 
     @model_validator(mode="after")
     def _tokens_distinct(self) -> Config:

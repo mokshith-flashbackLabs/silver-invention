@@ -25,6 +25,8 @@ from pathlib import Path
 
 import psycopg
 
+from imageshield.db.dsn import compose_database_url
+
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = ROOT / "migrations"
 MIGRATION_TABLE_SQL = """
@@ -37,10 +39,50 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 
 def _database_url() -> str:
+    """DATABASE_URL if set (unchanged — still the primary form); otherwise
+    composed from DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD/DB_SSLMODE.
+
+    This script deliberately has no dependency on `imageshield.config.Config`
+    — it needs exactly one value, and `Config` requires dozens of unrelated
+    ones (HIVE_API_KEY, the SQS urls, ...) that a migration task definition
+    never supplies. `imageshield.db.dsn.compose_database_url` is the one
+    place shared with `Config._resolve_database_url`, so the percent-encoding
+    rule cannot drift between the two.
+    """
     value = os.environ.get("DATABASE_URL")
-    if not value:
-        raise SystemExit("DATABASE_URL is required")
-    return value
+    if value:
+        return value
+
+    host = os.environ.get("DB_HOST")
+    port = os.environ.get("DB_PORT")
+    name = os.environ.get("DB_NAME")
+    user = os.environ.get("DB_USER")
+    password = os.environ.get("DB_PASSWORD")
+    supplied = {"DB_HOST": host, "DB_PORT": port, "DB_NAME": name, "DB_USER": user,
+                "DB_PASSWORD": password}
+    missing = [env_name for env_name, val in supplied.items() if not val]
+
+    if len(missing) == len(supplied):
+        raise SystemExit(
+            "DATABASE_URL is required (or all of DB_HOST, DB_PORT, DB_NAME, DB_USER,"
+            " DB_PASSWORD, to compose one) — neither was set"
+        )
+    if missing:
+        raise SystemExit(
+            "DATABASE_URL is not set, and the parts meant to compose it are"
+            " incomplete — missing: " + ", ".join(missing)
+        )
+
+    assert host is not None and port is not None and name is not None
+    assert user is not None and password is not None
+    return compose_database_url(
+        host=host,
+        port=port,
+        name=name,
+        user=user,
+        password=password,
+        sslmode=os.environ.get("DB_SSLMODE", "require"),
+    )
 
 
 def _up_migrations() -> list[Path]:

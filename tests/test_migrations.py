@@ -10,7 +10,11 @@ the session.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -1343,3 +1347,48 @@ def test_0015_no_role_can_edit_the_migration_ledger(throwaway_db: str) -> None:
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute("DELETE FROM schema_migrations")
             conn.execute("RESET ROLE")
+
+
+# ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────
+#
+# The migration ECS task never goes through imageshield.config.Config (see
+# scripts/migrate.py's _database_url() docstring) — it has its OWN, smaller
+# copy of the "compose from DB_* parts" fallback, sharing only
+# imageshield.db.dsn.compose_database_url with Config. These two tests are
+# unlike tests.db.run_migrate, which always sets DATABASE_URL directly and so
+# never exercises this path. Both failure cases exit via SystemExit inside
+# _database_url() itself, before scripts/migrate.py ever calls
+# psycopg.connect(...), so neither needs a reachable database.
+
+_MIGRATE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "migrate.py"
+_PASSTHROUGH_ENV_KEYS = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "PATHEXT", "COMSPEC")
+
+
+def _run_migrate_script(
+    env_overrides: dict[str, str], tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    env = {key: os.environ[key] for key in _PASSTHROUGH_ENV_KEYS if key in os.environ}
+    env.update(env_overrides)
+    return subprocess.run(
+        [sys.executable, str(_MIGRATE_SCRIPT), "up", "--dry-run"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env=env,
+        timeout=60,
+    )
+
+
+def test_migrate_script_refuses_with_neither_database_url_nor_parts(tmp_path: Path) -> None:
+    result = _run_migrate_script({}, tmp_path)
+    assert result.returncode != 0
+    assert "DATABASE_URL" in result.stderr
+
+
+def test_migrate_script_refuses_with_partial_parts_naming_the_gap(tmp_path: Path) -> None:
+    result = _run_migrate_script(
+        {"DB_HOST": "db.internal", "DB_PORT": "5432", "DB_NAME": "imageshield", "DB_USER": "app"},
+        tmp_path,
+    )
+    assert result.returncode != 0
+    assert "DB_PASSWORD" in result.stderr

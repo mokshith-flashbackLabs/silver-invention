@@ -170,6 +170,14 @@ def test_every_required_config_field_is_supplied_by_the_task_definition() -> Non
     Derived from ``Config.model_fields`` rather than transcribed, so a field
     added with no default fails here on the commit that adds it rather than on
     the deploy that ships it.
+
+    ``database_url`` is a deliberate exception, covered separately by
+    ``test_database_url_is_supplied_directly_or_via_all_five_parts`` below: it
+    now carries a default (`""`) so it can be composed from `DB_HOST` /
+    `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` when a deployment cannot
+    publish a single `DATABASE_URL` — the dev RDS Secrets Manager secret has
+    no `url` key. A default means ``is_required()`` no longer flags it here,
+    which is exactly why it needs its own check instead.
     """
     required = {
         name.upper()
@@ -182,6 +190,33 @@ def test_every_required_config_field_is_supplied_by_the_task_definition() -> Non
     assert missing == set(), (
         f"{SERVICES_TASK.name} omits required config: {sorted(missing)}."
         " The container will exit non-zero at boot with these names in its log."
+    )
+
+
+_DATABASE_URL_PARTS = {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}
+
+
+@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK])
+def test_database_url_is_supplied_directly_or_via_all_five_parts(path: Path) -> None:
+    """The replacement for the generic check above, for exactly one field.
+
+    Still fatal if a task definition supplies neither DATABASE_URL nor a
+    complete set of DB_* parts, or supplies the parts incomplete — this is
+    the actual mismatch this suite exists to catch: the dev secret
+    (``imageshield/dev/db/app_services`` / ``migrator_services``) is
+    RDS-shaped with no ``url`` key, so a ``:url::`` secret entry resolves to
+    nothing and the container (or, for the migration task,
+    ``scripts/migrate.py``) exits non-zero at boot naming whichever of
+    DATABASE_URL/DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD is absent.
+    """
+    supplied = _supplied_names(path)
+    if "DATABASE_URL" in supplied:
+        return
+    missing_parts = _DATABASE_URL_PARTS - supplied
+    assert not missing_parts, (
+        f"{path.name} supplies neither DATABASE_URL nor a complete set of DB_*"
+        f" parts — missing {sorted(missing_parts)}. The container will exit"
+        " non-zero at boot with these names in its log."
     )
 
 

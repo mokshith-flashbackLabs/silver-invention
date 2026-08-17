@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from pydantic import ValidationError
@@ -386,3 +387,104 @@ def test_unread_fields_are_still_validated() -> None:
         make_config(discovered_collection="   ")
     with pytest.raises(ValidationError):
         make_config(enrolment_collision_threshold=101.0)
+
+
+# ── DATABASE_URL composed from DB_* parts (dev deploy handoff) ─────────────
+#
+# The dev Secrets Manager secret (imageshield/dev/db/app_services) is
+# RDS-shaped: dbname/host/password/port/username, no `url` key. An ECS
+# `secrets` entry injects exactly one JSON key per environment variable, so
+# there is no key on that secret that can produce a single DATABASE_URL.
+# These five fields are the alternative — DATABASE_URL remains the primary
+# form and wins whenever it is set (Config._resolve_database_url).
+
+_DB_PARTS_ONLY = {
+    "database_url": "",
+    "db_host": "db.internal",
+    "db_port": 5432,
+    "db_name": "imageshield",
+    "db_user": "app_services",
+    "db_password": "s3cr3t-pw",
+}
+
+
+def test_database_url_alone_is_still_the_primary_form(clean_env: pytest.MonkeyPatch) -> None:
+    """Regression: local dev, docker compose, CI and every existing deployment
+    set only DATABASE_URL, and none of them set any DB_* part. This must stay
+    untouched by the parts feature."""
+    cfg = load_config()
+    assert cfg.database_url == VALID_ENV["DATABASE_URL"]
+
+
+def test_five_parts_alone_compose_a_valid_database_url() -> None:
+    cfg = make_config(**_DB_PARTS_ONLY)
+    assert cfg.database_url.startswith(("postgres://", "postgresql://"))
+    assert "sslmode=require" in cfg.database_url
+
+
+def test_five_parts_alone_compose_a_valid_database_url_via_env(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """Same as above, but through the real boot path (env, not kwargs) — the
+    shape an ECS task definition actually produces."""
+    clean_env.delenv("DATABASE_URL")
+    clean_env.setenv("DB_HOST", "db.internal")
+    clean_env.setenv("DB_PORT", "5432")
+    clean_env.setenv("DB_NAME", "imageshield")
+    clean_env.setenv("DB_USER", "app_services")
+    clean_env.setenv("DB_PASSWORD", "s3cr3t-pw")
+    cfg = load_config()
+    assert cfg.database_url.startswith(("postgres://", "postgresql://"))
+    assert "sslmode=require" in cfg.database_url
+
+
+def test_a_password_with_url_unsafe_characters_round_trips() -> None:
+    """A generated RDS password may contain @ / : # ? % — unencoded, any of
+    those either breaks the URL or, worse, parses it as a different host."""
+    password = "p@ss/w:rd#1?%"
+    cfg = make_config(**{**_DB_PARTS_ONLY, "db_password": password})
+    parsed = urlsplit(cfg.database_url)
+    assert unquote(parsed.password) == password
+
+
+def test_both_forms_given_database_url_wins(clean_env: pytest.MonkeyPatch) -> None:
+    """Precedence is explicit, not incidental: DATABASE_URL wins over parts,
+    even when both are fully present."""
+    clean_env.setenv("DB_HOST", "should-be-ignored")
+    clean_env.setenv("DB_PORT", "5432")
+    clean_env.setenv("DB_NAME", "should-be-ignored")
+    clean_env.setenv("DB_USER", "should-be-ignored")
+    clean_env.setenv("DB_PASSWORD", "should-be-ignored")
+    cfg = load_config()
+    assert cfg.database_url == VALID_ENV["DATABASE_URL"]
+
+
+def test_neither_database_url_nor_parts_is_fatal_and_names_database_url() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        make_config(database_url="")
+    assert "DATABASE_URL" in str(excinfo.value)
+
+
+def test_neither_database_url_nor_parts_is_fatal_via_env(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    clean_env.delenv("DATABASE_URL")
+    with pytest.raises(ConfigError) as excinfo:
+        load_config()
+    assert "DATABASE_URL" in str(excinfo.value)
+
+
+def test_partial_parts_refuses_and_names_the_missing_one() -> None:
+    """DB_HOST present, DB_PASSWORD absent: a half-configured database has to
+    refuse to boot rather than start and fail on the first real request."""
+    incomplete = dict(_DB_PARTS_ONLY)
+    del incomplete["db_password"]
+    with pytest.raises(ValidationError) as excinfo:
+        make_config(**incomplete)
+    assert "DB_PASSWORD" in str(excinfo.value)
+
+
+def test_db_sslmode_defaults_to_require(config: Config) -> None:
+    """Not cosmetic: the RDS parameter group sets rds.force_ssl = 1, so a
+    connection without it is refused. Never default this to anything weaker."""
+    assert config.db_sslmode == "require"
