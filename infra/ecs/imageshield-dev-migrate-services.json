@@ -1,0 +1,31 @@
+{
+  "family": "imageshield-dev-migrate-services",
+  "networkMode": "host",
+  "requiresCompatibilities": ["EC2"],
+  "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-exec",
+  "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-services",
+  "containerDefinitions": [
+    {
+      "name": "migrate-services",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:PLACEHOLDER_SHA",
+      "essential": true,
+      "memory": 256,
+      "command": ["python", "scripts/migrate.py", "up"],
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "development" },
+        { "name": "LOG_LEVEL", "value": "debug" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/migrator_services-XXXXXX:url::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/imageshield/dev",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "migrate-services"
+        }
+      }
+    }
+  ]
+}

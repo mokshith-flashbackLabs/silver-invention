@@ -1,0 +1,57 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RekognitionOnDevCollectionsOnly",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:CreateCollection",
+        "rekognition:DescribeCollection",
+        "rekognition:IndexFaces",
+        "rekognition:DeleteFaces",
+        "rekognition:SearchFacesByImage",
+        "rekognition:ListFaces"
+      ],
+      "Resource": [
+        "arn:aws:rekognition:ap-south-1:225989356895:collection/identity-dev-v1",
+        "arn:aws:rekognition:ap-south-1:225989356895:collection/discovered-dev-v1"
+      ]
+    },
+    {
+      "Sid": "FaceLivenessIsNotCollectionScoped",
+      "Effect": "Allow",
+      "Action": [
+        "rekognition:CreateFaceLivenessSession",
+        "rekognition:StartFaceLivenessSession",
+        "rekognition:GetFaceLivenessSessionResults"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadLivenessReferenceImagesOnly",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::imageshield-dev-liveness-225989356895/*"
+    },
+    {
+      "Sid": "SqsProduceAndConsume",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": [
+        "arn:aws:sqs:ap-south-1:225989356895:imageshield-dev-identity-index",
+        "arn:aws:sqs:ap-south-1:225989356895:imageshield-dev-search-runs"
+      ]
+    },
+    {
+      "Sid": "DecryptWithTheDevKey",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+      "Resource": "arn:aws:kms:ap-south-1:225989356895:key/5b32f333-b48d-4ea0-b4a7-7b1c8e591c74"
+    }
+  ]
+}
