@@ -32,8 +32,10 @@ from tests.conftest import ADMIN_SERVICE_TOKEN, SERVICE_TOKEN, make_config
 #
 # /health is the load balancer's probe: it must answer before anything is
 # configured, and it deliberately returns no data (tests/test_auth.py asserts
-# both). Everything else in the app is behind a token.
-_UNAUTHENTICATED_PATHS = frozenset({"/health"})
+# both). /readyz is the deploy gate for the svc contract (tests/test_readyz.py)
+# — same posture, a probe cannot carry a secret. Everything else in the app is
+# behind a token.
+_UNAUTHENTICATED_PATHS = frozenset({"/health", "/readyz"})
 
 _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 

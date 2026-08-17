@@ -31,6 +31,16 @@ class HealthResponse(BaseModel):
     db: Literal["ok", "degraded"]
 
 
+class ReadyResponse(BaseModel):
+    """Readiness. Unlike HealthResponse this is allowed to be a 503 — it gates
+    a deploy, and a deploy must not succeed into a broken svc contract."""
+
+    status: str
+    version: str
+    db: str
+    problems: list[str] = []
+
+
 class PingRequest(ServiceModel):
     message: str | None = None
 

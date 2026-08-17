@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
+from imageshield.http.svc_contract import EXPECTED_VIEWS
 from tests.db import run_migrate
 
 VIEWS = (
@@ -32,41 +33,13 @@ VIEWS = (
     "v_person_liveness_attempts",
 )
 
-# Verbatim from the proxy's document. Order is not part of the contract (their
-# reader selects by name); presence and spelling are.
+# Derived, not transcribed: src/imageshield/http/svc_contract.py is the single
+# source of truth for the contract's shape, and /readyz refuses to come up when
+# the database disagrees with it. A second literal list here would be a second
+# copy of a cross-repo contract — CLAUDE.md §9. Order is still not part of the
+# contract (their reader selects by name); presence and spelling are.
 EXPECTED_COLUMNS: dict[str, set[str]] = {
-    "v_person_enrolment_state": {"person_ref", "status", "model_id", "enrolled_at"},
-    "v_person_report_summary": {
-        "person_ref",
-        "active_reports",
-        "unresolved_matches",
-        "live_exposure_count",
-        "last_run_at",
-        "first_scan_completed_at",
-        "monitored_sources",
-    },
-    "v_person_hits": {
-        "hit_id",
-        "report_id",
-        "person_ref",
-        "source_photo_id",
-        "hit_status",
-        "last_checked_at",
-        "match_id",
-        "source_domain",
-        "host_page_url",
-        "face_bbox",
-        "title",
-        "detected_at",
-        "match_status",
-        "match_action",
-        "match_lifecycle",
-        "resolved_at",
-        "resolution_note",
-        "provider_count",
-        "score",
-    },
-    "v_person_liveness_attempts": {"person_ref", "attempts_24h", "last_attempt_at"},
+    view: set(columns) for view, columns in EXPECTED_VIEWS.items()
 }
 
 

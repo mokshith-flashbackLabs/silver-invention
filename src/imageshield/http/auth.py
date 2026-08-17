@@ -12,9 +12,11 @@ Divergences from Flashback, both deliberate:
   ``ENVIRONMENT == 'development'`` (gated in ``Config.auth_disabled``).
 
 Apply ``require_service_token`` as a router-level dependency on every router
-except ``/health``; ``/v1/admin/*`` routers additionally take
-``require_admin_service_token``. There is exactly one admin prefix — see
-``routes/ping.py`` for why that matters to step 9's route-auth gate.
+except ``/health`` and ``/readyz`` — a probe cannot carry a secret, and
+``/readyz`` gates a deploy the same way ``/health`` gates the load balancer;
+``/v1/admin/*`` routers additionally take ``require_admin_service_token``.
+There is exactly one admin prefix — see ``routes/ping.py`` for why that
+matters to step 9's route-auth gate.
 """
 
 from __future__ import annotations
