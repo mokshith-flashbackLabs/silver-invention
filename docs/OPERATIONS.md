@@ -50,18 +50,35 @@ healthy, running process — killing and restarting it on a loop would not make
 that migration run any sooner, only hide that it hasn't.
 
 **`GET /readyz`** — may a deploy proceed. Checks Postgres reachability *and*
-that the four `svc` contract views (migration 0016) exist with the columns and
-types the proxy's own views join against. Returns `503` — not `/health`'s
+that the four `svc` contract views (migration 0016) exist **as views**, with the
+columns and types the proxy's own views join against, **and that
+`imageshield_proxy_ro` can still SELECT them**. Returns `503` — not `/health`'s
 always-`200` — when the db is unreachable or the contract is broken, because
 this is a deploy gate, not a liveness signal, and those are different
 questions with different right answers.
 
 **Reading the `problems` array** (empty when ready), one entry per violation:
 
-- `missing_view: svc.<view>` — the view does not exist at all.
+- `missing_view: svc.<view>` — the relation does not exist at all.
+- `not_a_view: svc.<view> is a table, expected a view` — something with the
+  right name and the right columns is standing in for the projection. Usually a
+  stub fixture; `DEPLOY-DEV-HANDOFF.md` §7 forbids `svc._stub_*` in any deployed
+  environment, and this is the check that enforces it. It serves a fixture's
+  rows, not this database's.
 - `missing_column: svc.<view>.<column>` — the view exists, the column is
   missing.
 - `wrong_column_type: svc.<view>.<column> is <found>, expected <type>`.
+- `missing_select_grant: imageshield_proxy_ro cannot SELECT svc.<view>` — the
+  view is present and correct and the proxy cannot read it. Most often a
+  migration that widened a view with `DROP VIEW` + `CREATE VIEW` rather than
+  `CREATE OR REPLACE VIEW`: the destructive form discards the grant. Re-run
+  0016's `GRANT SELECT`.
+- `missing_schema_usage: imageshield_proxy_ro has no USAGE on svc` — denies all
+  four at once, whatever each view's own grant says.
+- `missing_grant_role: imageshield_proxy_ro does not exist` — 0016 creates it,
+  0017 grants the proxy's login roles membership in it. Until it exists the
+  contract reaches nobody, and it presents on the proxy's side as "the svc views
+  are missing", which is the wrong place to look.
 
 Columns may be added freely (the check is expected-subset-of-actual), so only
 a removal or a retype ever produces an entry here.
@@ -71,6 +88,17 @@ a redeploy. `services` migrates first and creates the `svc` schema and its four
 views; the backend cannot pass its own readiness without them
 (`DEPLOY-DEV-HANDOFF.md` §7). A freshly stood-up environment is expected to
 report `missing_view` until that task has run.
+
+**`missing_view` is a claim about the database, not about this container's
+privileges.** The check reads `pg_catalog`, which is not privilege-filtered.
+It used to read `information_schema`, which is: a role sees only the columns it
+owns or holds a privilege on, and `app_services` — the role this service connects
+as — holds nothing on `svc` (0016 grants it to `imageshield_proxy_ro` alone).
+That made a correct database report four `missing_view` entries, and sent
+whoever was on call to re-run a migration that had already succeeded. If you are
+reading a `missing_view` from an older image, verify with
+`SELECT * FROM pg_views WHERE schemaname = 'svc'` as the migration runner before
+re-running anything.
 
 **The SQS gap in dev.** Neither `imageshield-dev-identity-index` nor
 `imageshield-dev-search-runs` exists yet in the dev account (verified against
