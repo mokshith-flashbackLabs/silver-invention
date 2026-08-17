@@ -55,6 +55,7 @@ copyable rather than re-derived.
 | Queues | AWS SQS — `identity:index`, `search:runs` — with a transactional outbox |
 | Tests | pytest, pytest-postgresql, pytest-asyncio, httpx |
 | Local dev | docker compose — Postgres + LocalStack (SQS) |
+| Health / readiness | `GET /health` — always `200`, db reachability only; `GET /readyz` — `503` when the `svc` contract is broken (deploy gate) |
 
 Not used here, unlike Flashback: pgvector (not until we own embeddings), Valkey (no working-memory
 concept), and any LLM SDK — see §10.
@@ -442,6 +443,8 @@ Full detail in `PROXY_INTEGRATION.md`. The shape:
   The proxy asserts against it at boot and refuses to start on a mismatch. Never serve these from a
   constant declared beside the route — that is a second copy, and it starts lying the moment somebody
   edits one and not the other.
+- `GET /readyz` — unauthenticated, `503` when the `svc` contract is broken. Deploy gate, not a
+  liveness signal; see `docs/OPERATIONS.md`.
 - **Every error carries the `{error:{code,message,retryable,request_id}}` envelope, including `401` and
   `422`** — plus Starlette's own `404`/`405`. `422` adds `error.details` (`loc` + `msg` only; never the
   rejected `input`, which may be the phone number `extra='forbid'` exists to reject).

@@ -24,6 +24,6 @@ resource "aws_rekognition_collection" "identity" {
 }
 
 output "collection_id" {
-  description = "Set as REKOGNITION_COLLECTION_ID."
+  description = "Set as IDENTITY_COLLECTION."
   value       = aws_rekognition_collection.identity.collection_id
 }

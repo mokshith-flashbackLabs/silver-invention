@@ -34,6 +34,57 @@ and `X-Admin-Service-Token`.
 
 ---
 
+## Health and readiness
+
+Two unauthenticated routes exist, and they answer different questions.
+
+**`GET /health`** — is the process up. Postgres reachability only; always
+`200`, even when the db is `degraded`, because the proxy reads this body and a
+degraded db must not look like "service absent" to its retry logic.
+
+**This is what the ECS health check targets**
+(`infra/ecs/imageshield-dev-services.json` polls
+`http://localhost:8081/health`), deliberately not `/readyz`. A container
+waiting on the `services` migration to create the `svc` schema is still a
+healthy, running process — killing and restarting it on a loop would not make
+that migration run any sooner, only hide that it hasn't.
+
+**`GET /readyz`** — may a deploy proceed. Checks Postgres reachability *and*
+that the four `svc` contract views (migration 0016) exist with the columns and
+types the proxy's own views join against. Returns `503` — not `/health`'s
+always-`200` — when the db is unreachable or the contract is broken, because
+this is a deploy gate, not a liveness signal, and those are different
+questions with different right answers.
+
+**Reading the `problems` array** (empty when ready), one entry per violation:
+
+- `missing_view: svc.<view>` — the view does not exist at all.
+- `missing_column: svc.<view>.<column>` — the view exists, the column is
+  missing.
+- `wrong_column_type: svc.<view>.<column> is <found>, expected <type>`.
+
+Columns may be added freely (the check is expected-subset-of-actual), so only
+a removal or a retype ever produces an entry here.
+
+**First move on `missing_view`: run the migration task** — not a rollback, not
+a redeploy. `services` migrates first and creates the `svc` schema and its four
+views; the backend cannot pass its own readiness without them
+(`DEPLOY-DEV-HANDOFF.md` §7). A freshly stood-up environment is expected to
+report `missing_view` until that task has run.
+
+**The SQS gap in dev.** Neither `imageshield-dev-identity-index` nor
+`imageshield-dev-search-runs` exists yet in the dev account (verified against
+the live account 2026-08-17), even though both URLs are already wired into the
+task definition. Config validates that an SQS URL is *shaped* like one, not
+that the queue behind it exists, and neither `/health` nor `/readyz` touches
+SQS — so the container boots healthy and reports ready, and every enqueue then
+fails at runtime. Invariant #33 makes that fail quiet rather than loud: the
+write that triggered the enqueue still succeeds, the job retries with
+backoff, and the user sees "still setting up," never a 500. If enqueues in dev
+appear to silently do nothing, this is why — create the two queues first.
+
+---
+
 ## 1. A DLQ has depth
 
 **Symptom** — `imageshield-<env>-<queue>-dlq-depth` alarm. Any depth above zero

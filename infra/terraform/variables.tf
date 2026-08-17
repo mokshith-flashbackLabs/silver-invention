@@ -4,6 +4,10 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+# The live dev account's queues are already named imageshield-dev-* (twelve of
+# them); this variable accepts only "development", which would render
+# imageshield-development-* instead — a second, divergent naming scheme.
+# Reconcile the two before `terraform apply` ever targets the dev account.
 variable "environment" {
   description = "development | staging | production. Part of every resource name."
   type        = string
