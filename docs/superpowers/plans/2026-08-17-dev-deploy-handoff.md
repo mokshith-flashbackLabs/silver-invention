@@ -728,7 +728,7 @@ carry a secret.
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `REQUIRE_DB=1 python -m pytest tests/test_readyz.py -v`
-Expected: PASS, all eight.
+Expected: PASS, all seven.
 
 - [ ] **Step 7: Verify the grep check the handoff asks for**
 
@@ -1468,6 +1468,45 @@ aws organizations list-policies-for-target --filter AISERVICES_OPT_OUT_POLICY \
   --target-id $(aws organizations describe-account --account-id 225989356895 \
   --query 'Account.Id' --output text) 2>&1 || echo "see docs/DEPLOY-DEV.md §7"
 ```
+
+- [ ] **Step 6b: Create this repo's two SQS queues — they do not exist**
+
+Verified 2026-08-17: `aws sqs list-queues` in ap-south-1 returns exactly eight
+queues, all the **backend's** (`domain-events`, `image-jobs`, `image-results`,
+`notifications`, plus a DLQ each). Neither of ours is there.
+
+The cause is a gap in the handoff, not a repo defect: its `services` env block
+(§5) lists no SQS variable at all, so the environment was built without them.
+But `Config` requires `SQS_IDENTITY_INDEX_URL` and `SQS_SEARCH_RUNS_URL`, and
+both the outbox relay and the search worker produce onto them.
+
+This failure is quiet if skipped. Config validates URL *shape*, not existence, so
+the container boots healthy and every enqueue fails at runtime — and invariant
+#33 says a failed index job surfaces as "still setting up" rather than a 500, so
+nobody sees an error.
+
+Create each main queue with a redrive policy onto its own DLQ, matching the
+existing eight queues' `-dev-` naming:
+
+```bash
+export AWS_DEFAULT_REGION=ap-south-1
+for q in identity-index search-runs; do
+  dlq_url=$(aws sqs create-queue --queue-name "imageshield-dev-$q-dlq" \
+    --query QueueUrl --output text)
+  dlq_arn=$(aws sqs get-queue-attributes --queue-url "$dlq_url" \
+    --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+  aws sqs create-queue --queue-name "imageshield-dev-$q" \
+    --attributes "{\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$dlq_arn\\\",\\\"maxReceiveCount\\\":\\\"5\\\"}\"}"
+done
+aws sqs list-queues --query 'QueueUrls' --output json
+```
+
+Expected: twelve queues, including `imageshield-dev-identity-index`,
+`imageshield-dev-search-runs` and their DLQs. Confirm the two URLs match what
+`infra/ecs/imageshield-dev-services.json` sets, exactly.
+
+Do not reuse the backend's queues. They are a different repo's messages with a
+different shape, and #33's retry semantics assume ours are ours.
 
 - [ ] **Step 7: Register both task definitions and run the migration**
 
