@@ -42,13 +42,40 @@ _ISO_DATETIME_RE = re.compile(
     r")?"
 )
 
+# The other legitimate log shape that collides with the candidate pattern: a
+# canonical UUID (request_id, user_ref, ...) is mostly digits and hyphens --
+# hex letters a-f are only 6 of 16 possible characters per position, so plenty
+# of real UUIDs have whole runs of nothing but digits, which land squarely in
+# the 7-15 "redact" band. That is exactly what turned
+# "5f8e2c03-1f2b-4c3d-9e0f-a1b2c3d4e5f6" into
+# "5f8e2c03-1f[REDACTED:phone-shaped]f[REDACTED:phone-shaped]f1f" in real
+# deployed logs, and request_id is the one field that correlates a log line
+# back to a request.
+#
+# Deliberately narrow, mirroring the ISO carve-out above: only the canonical
+# hyphenated 8-4-4-4-12 hex form is protected, matched wherever it appears in
+# the string. The group lengths are exact and not loosened -- a bare 32-hex
+# string with no hyphens gets NO protection here (see redact_string's
+# docstring), because loosening them is exactly how a phone number could hide
+# by being formatted to look UUID-ish.
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+# The two known-safe shapes, tried at every position before the candidate scan
+# runs -- see redact_string. They never overlap: a canonical UUID's hyphens
+# are 5 apart (after its 8-, 4- and 4-hex groups) and an ISO datetime's are 3
+# apart (after the 4-digit year and 2-digit month), so no span of text can
+# satisfy both alternatives starting at the same offset.
+_PROTECTED_RE = re.compile(rf"(?:{_UUID_RE.pattern})|(?:{_ISO_DATETIME_RE.pattern})")
+
 PHONE_REDACTED = "[REDACTED:phone-shaped]"
 
 
 def _redact_candidates(text: str) -> str:
-    """Phone-shaped-run scan with NO ISO-timestamp awareness. Callers must
-    only ever pass this a slice that has already had complete timestamps
-    carved out of it — see ``redact_string``."""
+    """Phone-shaped-run scan with NO awareness of timestamps or UUIDs.
+    Callers must only ever pass this a slice that has already had complete
+    timestamps and UUIDs carved out of it — see ``redact_string``."""
 
     def _replace(match: re.Match[str]) -> str:
         candidate = match.group(0)
@@ -59,23 +86,24 @@ def _redact_candidates(text: str) -> str:
 
 
 def redact_string(value: str) -> str:
-    """Preserve every complete ISO-8601 date/datetime span verbatim, then run
-    the phone-shaped candidate scan over everything in between and around
-    them.
+    """Preserve every complete ISO-8601 date/datetime span and every canonical
+    UUID span verbatim, then run the phone-shaped candidate scan over
+    everything in between and around them.
 
     DELIBERATE OVER-REDACTION, DO NOT "FIX": a bare 7-15 digit run that is NOT
-    part of a recognised ISO datetime -- e.g. an AWS account id such as
-    '225989356895' -- is still redacted by ``_redact_candidates`` below. It is
-    shape-identical to a real phone number (same digit count, ITU E.164 is
-    7-15 digits) and this module's whole premise is that over-redaction is
-    acceptable and leaking a real phone number is not. Do not add key-based or
-    shape-based allowlisting to narrow this.
+    part of a recognised ISO datetime or canonical UUID -- e.g. an AWS account
+    id such as '225989356895', or that same UUID with its hyphens stripped --
+    is still redacted by ``_redact_candidates`` below. It is shape-identical
+    to a real phone number (same digit count, ITU E.164 is 7-15 digits) and
+    this module's whole premise is that over-redaction is acceptable and
+    leaking a real phone number is not. Do not add key-based or shape-based
+    allowlisting to narrow this.
     """
     pieces: list[str] = []
     cursor = 0
-    for match in _ISO_DATETIME_RE.finditer(value):
+    for match in _PROTECTED_RE.finditer(value):
         pieces.append(_redact_candidates(value[cursor : match.start()]))
-        pieces.append(match.group(0))  # the timestamp itself, untouched
+        pieces.append(match.group(0))  # the protected span itself, untouched
         cursor = match.end()
     pieces.append(_redact_candidates(value[cursor:]))
     return "".join(pieces)

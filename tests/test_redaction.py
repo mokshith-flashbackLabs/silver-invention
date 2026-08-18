@@ -58,6 +58,23 @@ def test_bare_twelve_digit_account_id_is_still_redacted() -> None:
         "2026-08-17 17:57:23+05:30",  # space separator, colon offset
         "2026-08-17T17:57:23+0530",  # numeric offset, no colon
         "request finished at 2026-08-17T17:57:23.456789Z after one retry",  # mid-string
+        # Canonical UUIDs (request_id, user_ref, etc.) must survive -- these
+        # are the exact real-log request_ids that motivated this fix,
+        # reproduced verbatim rather than paraphrased. Digit-heavy runs inside
+        # them used to land in the 7-15 "redact" band, e.g. this first one
+        # became "5f8e2c03-1f[REDACTED:phone-shaped]f[REDACTED:phone-shaped]f1f".
+        "5f8e2c03-1f2b-4c3d-9e0f-a1b2c3d4e5f6",
+        "74e1b50b-0f0d-4a1b-8c2d-dcea2440e05d",
+        "1a2b3c4d-c90b-418a-9ebb-d95213a0290f",
+        # Worst case for the phone pattern: every group is all-digit, so
+        # there is no hex letter anywhere to break up the run.
+        "12345678-1234-1234-1234-123456789012",
+        # Upper-case hex must survive too.
+        "5F8E2C03-1F2B-4C3D-9E0F-A1B2C3D4E5F6",
+        # Embedded mid-sentence, not at position 0.
+        "completed request 5f8e2c03-1f2b-4c3d-9e0f-a1b2c3d4e5f6 without errors",
+        # Embedded in a realistic JSON-ish log line.
+        '{"request_id": "74e1b50b-0f0d-4a1b-8c2d-dcea2440e05d", "status": "ok"}',
     ],
 )
 def test_legitimate_values_survive(text: str) -> None:
@@ -71,6 +88,27 @@ def test_phone_number_immediately_after_a_timestamp_is_still_redacted() -> None:
     redacted = redact_string(text)
     assert "2026-08-17T17:57:23Z" in redacted
     assert "98765" not in redacted
+    assert PHONE_REDACTED in redacted
+
+
+def test_phone_number_immediately_after_a_uuid_is_still_redacted() -> None:
+    """Guards against the UUID fix overcorrecting: preserving a UUID span must
+    not create a blind spot for whatever follows it in the same string."""
+    text = "request_id=5f8e2c03-1f2b-4c3d-9e0f-a1b2c3d4e5f6 caller=+91 98765 43210"
+    redacted = redact_string(text)
+    assert "5f8e2c03-1f2b-4c3d-9e0f-a1b2c3d4e5f6" in redacted
+    assert "98765" not in redacted
+    assert PHONE_REDACTED in redacted
+
+
+def test_bare_32_hex_string_without_hyphens_is_not_uuid_protected() -> None:
+    """Only the canonical hyphenated 8-4-4-4-12 form is protected. A UUID with
+    its hyphens stripped must not get a free pass -- that is exactly how a
+    phone number could hide by being formatted to look UUID-ish, which is the
+    one thing redact_string's docstring says never to allow."""
+    text = "12345678123412341234123456789012"
+    redacted = redact_string(text)
+    assert redacted != text
     assert PHONE_REDACTED in redacted
 
 
