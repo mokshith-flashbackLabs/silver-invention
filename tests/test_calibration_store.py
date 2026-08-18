@@ -27,6 +27,7 @@ from tests.db import run_migrate
 
 HIVE = ProviderId("hive")
 GOOGLE = ProviderId("google")
+STUB = ProviderId("stub")  # migration 0019: seeded DISABLED, but still a row
 
 
 @pytest.fixture
@@ -121,7 +122,7 @@ async def test_malformed_score_domain_min_does_not_fail_other_providers(
     )
     policy = await _load_policy(migrated_db)
 
-    assert set(policy) == {HIVE, GOOGLE}
+    assert set(policy) == {HIVE, GOOGLE, STUB}
     assert policy[HIVE].score_domain == ScoreDomain()  # unbounded fallback
     assert policy[GOOGLE].score_domain.categories is not None  # untouched
     assert policy[HIVE].config is not None  # bands parsed fine; only domain was bad
@@ -147,6 +148,6 @@ async def test_malformed_score_domain_categories_does_not_fail_other_providers(
     )
     policy = await _load_policy(migrated_db)
 
-    assert set(policy) == {HIVE, GOOGLE}
+    assert set(policy) == {HIVE, GOOGLE, STUB}
     assert policy[GOOGLE].score_domain == ScoreDomain()  # unbounded fallback
     assert policy[HIVE].score_domain.min == Decimal("0.5")  # untouched
