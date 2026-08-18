@@ -1349,6 +1349,120 @@ def test_0015_no_role_can_edit_the_migration_ledger(throwaway_db: str) -> None:
             conn.execute("RESET ROLE")
 
 
+# ── 0019: the stub provider, registered and disabled ──────────────────────
+
+_STUB_PROVIDER_COLUMNS = (
+    "kind, enabled, calibrated, score_version, cost_per_call_usd,"
+    " score_kind, score_domain"
+)
+
+
+def _stub_provider_row(conn: psycopg.Connection[tuple[Any, ...]]) -> tuple[Any, ...] | None:
+    return conn.execute(
+        f"SELECT {_STUB_PROVIDER_COLUMNS} FROM providers WHERE provider_id = 'stub'"
+    ).fetchone()
+
+
+def test_0019_seeds_the_stub_provider_disabled_and_uncalibrated(throwaway_db: str) -> None:
+    """SEARCH_PROVIDER=stub builds StubSearchProvider (src/imageshield/search/stub.py),
+    but before this migration ``providers`` held only hive and google — a dev run
+    dispatched against the enabled ids (hive, google), found no matching adapter
+    for either under that setting, and every provider_calls row read
+    'no adapter registered for this provider'.
+
+    enabled=false is the safety-critical value here, not a placeholder: 0016's
+    ``svc.v_person_report_summary.monitored_sources`` counts providers that
+    succeeded AND are enabled, so an enabled stub would claim a source that was
+    never actually searched (CLAUDE.md §7.5). calibrated=false keeps it on the
+    §7.3 review-only path even though the adapter never produces a score to band
+    in the first place.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        row = _stub_provider_row(conn)
+
+    assert row is not None
+    (kind, enabled, calibrated, score_version, cost_per_call_usd, score_kind, score_domain) = row
+    # image_search, not face_search: matches StubSearchProvider.kind exactly
+    # (CLAUDE.md §7.1) — claiming face_search would assert coverage the stub
+    # does not provide.
+    assert kind == "image_search"
+    assert enabled is False
+    assert calibrated is False
+    # Identifies the row as the stub, never a real provider's version string,
+    # and matches StubSearchProvider.score_version so adapter and row cannot
+    # drift apart on what actually produced it.
+    assert score_version == "stub-no-op-v1"
+    assert score_kind == "numeric"
+    # No measured domain: the stub never reports a score to have one, and a
+    # fabricated range would be exactly the adapter-level fabrication
+    # CLAUDE.md §7.2 forbids, applied to the config row instead. NULL also
+    # doubles as a second guard — bands.py rule 3c ("score_domain_unknown")
+    # still refuses anything above `review` if `calibrated` were ever
+    # hand-flipped to true.
+    assert score_domain is None
+    assert cost_per_call_usd == Decimal("0")
+
+
+def test_0019_stub_cost_is_zero_not_null(throwaway_db: str) -> None:
+    """A NULL cost_per_call_usd fails the budget guard CLOSED (invariant #38):
+    a provider that cannot be priced is skipped rather than dispatched. The stub
+    makes no network call at all (search/stub.py), so 0 — not 'unknown' — is the
+    honest figure; a NULL here would make the one free provider refusable by its
+    own budget check the moment anyone set a cap."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT cost_per_call_usd FROM providers WHERE provider_id = 'stub'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] is not None
+    assert row[0] == Decimal("0")
+
+
+def test_0019_seeded_providers_are_exactly_hive_google_and_stub(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        ids = {row[0] for row in conn.execute("SELECT provider_id FROM providers").fetchall()}
+    assert ids == {"hive", "google", "stub"}
+
+
+def test_0019_down_deletes_only_the_stub_row(throwaway_db: str) -> None:
+    """The reversal must not touch 0004's hive/google rows."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    down = run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0018_"))
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        ids = {row[0] for row in conn.execute("SELECT provider_id FROM providers").fetchall()}
+    assert ids == {"hive", "google"}
+
+
+def test_0019_up_down_up_round_trip_restores_the_identical_stub_row(
+    throwaway_db: str,
+) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    first_up = run_migrate(throwaway_db, "up")
+    assert first_up.returncode == 0, first_up.stderr
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        before = _stub_provider_row(conn)
+    assert before is not None
+
+    down = run_migrate(throwaway_db, "down", "--all")
+    assert down.returncode == 0, down.stderr
+    second_up = run_migrate(throwaway_db, "up")
+    assert second_up.returncode == 0, second_up.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        after = _stub_provider_row(conn)
+    assert after == before
+
+
 # ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────
 #
 # The migration ECS task never goes through imageshield.config.Config (see
