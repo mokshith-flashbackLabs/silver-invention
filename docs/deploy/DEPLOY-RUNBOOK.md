@@ -433,25 +433,41 @@ Non-obvious choices:
 - **`desired-count 1` and it must stay 1 for the relay** only in spirit — the
   relay selects with `FOR UPDATE SKIP LOCKED`, so a second task is safe, just
   unnecessary (D3 satisfied by construction).
-- **Same env and secrets as `services`, `SEARCH_PROVIDER=stub` included.** The
-  worker is the process where `build_providers` decides whether live adapters
-  exist at all, so the stub pin matters *more* here than on the API.
+- **Same secrets as `services`, but NOT the same environment label — and that
+  is a decision on the record.** Deployed 2026-08-19 with `SEARCH_PROVIDER=stub`
+  and verified end to end; **flipped to live providers the same day, by explicit
+  direction**: `ENVIRONMENT=production`, `LOG_LEVEL=info`, `SEARCH_PROVIDER=hive`
+  (which builds Hive *and* Google — `providers.enabled` picks). `development`
+  refuses non-stub at boot, so running live means re-labelling; `production` was
+  chosen over `test` because its two gates are exactly what a money-spending
+  process wants: stub refused (silent search-nothing), debug logs refused.
+  Real Hive/Google spend now moves through this task. The API task stays
+  `development`+`stub` — it builds no adapters.
   `tests/test_ecs_task_defs.py` asserts all of this from the JSON.
 - **`recheck/worker.py` is deliberately not deployed.** It HEADs infringement
   `page_url`s weekly and dev has zero infringements; deploying it now would
   spend the one-off-task memory headroom on a no-op loop. Add it (or a third
   container) when dev has infringement rows worth rechecking.
 
-Verified 2026-08-19, first poll after start: the outbox row pending since the
-backend's test run published (`relay.poll_completed published=1`), the worker
-claimed and completed it —
+Verified 2026-08-19, first poll after start (still under stub at that point):
+the outbox row pending since the backend's test run published
+(`relay.poll_completed published=1`), the worker claimed and completed it —
 `search.run_completed providers_attempted=['stub'] providers_succeeded=['stub']
 matches_recorded=0 cost_usd=0`, `search.cadence_updated scan_tier=new
 next_scan_after=+7d` — queue drained to 0, and the §6d probe shows the run row
-`completed`. Under `SEARCH_PROVIDER=stub` with 0019's `stub` row enabled and
-`hive`/`google` disabled (§13.2), that is the *correct* terminal state: the run
-completes honestly, the provider-call row says "no search performed", and no
-money can move.
+`completed`.
+
+**Live-provider state since the same-day flip:** `hive` and `google` enabled,
+`stub` disabled — applied as SQL from a one-off migrate task, each change with
+a hand-written `audit_log` row (actor `sql_probe_via_migrator`). The admin
+routes (`/v1/admin/providers/*`) are the normal path and write the same audit
+rows themselves; use them next time. **No provider carries a daily budget:
+user-directed, "no capping", 2026-08-19, on the record.** `google` can be
+capped any time with one `UPDATE` (0009 seeds its list price); **`hive` cannot
+be capped until `cost_per_call_usd` is filled in** (a budget against an unknown
+cost fails closed and would block Hive entirely — §13.4). Until then — and by
+direction, even after — the kill switch and the breaker are the only spend
+controls on both.
 
 ---
 
@@ -624,8 +640,13 @@ the way §7.3 does, so it is a decision and not an omission.
 
 ### 13.2 Provider state
 
-Dev runs `SEARCH_PROVIDER=stub` with `stub` enabled and `hive`/`google`
-**disabled**. That is correct for dev and wrong for production:
+Dev launched with `SEARCH_PROVIDER=stub`, `stub` enabled, `hive`/`google`
+**disabled**. **Since 2026-08-19 dev runs LIVE providers** (§9a): the worker is
+`ENVIRONMENT=production` + `SEARCH_PROVIDER=hive`, `hive`/`google` enabled,
+`stub` disabled — an explicit, user-directed decision, because the backend
+needs real search results end to end. Real money moves in dev now; the stub
+notes below remain correct for any environment that wants the free
+configuration back (flip the three env values and the three provider rows):
 
 - Migration 0019 seeds `stub` **disabled**. Do not enable it in production:
   `v_person_report_summary.monitored_sources` counts providers that succeeded and

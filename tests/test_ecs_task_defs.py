@@ -313,13 +313,28 @@ def test_worker_supplies_every_required_config_field_in_both_containers() -> Non
         )
 
 
-def test_worker_declares_the_stub_provider_and_matching_regions() -> None:
-    """The search worker is the one process where ``SEARCH_PROVIDER`` decides
-    whether real adapters get built (``build_providers``) — this task
-    definition, more than any other, is where `stub` must be pinned."""
+def test_worker_runs_live_providers_under_the_production_gates() -> None:
+    """On the record, 2026-08-19: the dev worker runs LIVE providers, by
+    explicit direction, so the backend can exercise real Hive/Google search
+    end to end. Real money moves through this process.
+
+    ``ENVIRONMENT=development`` refuses non-stub at boot, so the worker is
+    deliberately labelled ``production`` — chosen over ``test`` because the
+    production label buys the two gates a money-spending process should have:
+    ``SEARCH_PROVIDER=stub`` is refused (a live worker silently searching
+    nothing answers "no matches in monitored sources" for everyone forever),
+    and ``LOG_LEVEL=debug`` is refused (debug logs carry provider payloads).
+
+    ``hive`` here means "build the whole live stack" — ``build_providers``
+    constructs Hive AND Google; which of them runs is ``providers.enabled``'s
+    job, the hot-reloadable kill switch. The API task stays development+stub:
+    it builds no adapters and spends nothing.
+    """
     for name, container in _worker_containers().items():
         env = {entry["name"]: entry["value"] for entry in container["environment"]}
-        assert env["SEARCH_PROVIDER"] == "stub", f"{name} would build live adapters"
+        assert env["ENVIRONMENT"] == "production", f"{name} loses the boot gates"
+        assert env["SEARCH_PROVIDER"] == "hive", f"{name} would search nothing, silently"
+        assert env["LOG_LEVEL"] != "debug", f"{name} would refuse to boot"
         assert env["AWS_REGION"] == env["REKOGNITION_REGION"] == "ap-south-1"
 
 
