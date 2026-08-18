@@ -20,6 +20,7 @@ from imageshield.config import Config
 ECS_DIR = Path(__file__).resolve().parents[1] / "infra" / "ecs"
 SERVICES_TASK = ECS_DIR / "imageshield-dev-services.json"
 MIGRATE_TASK = ECS_DIR / "imageshield-dev-migrate-services.json"
+WORKER_TASK = ECS_DIR / "imageshield-dev-services-worker.json"
 TASK_ROLE = ECS_DIR / "policies" / "services-task-role.json"
 
 LIVENESS_BUCKET = "imageshield-dev-liveness-225989356895"
@@ -43,7 +44,7 @@ def _actions(path: Path) -> list[str]:
     return actions
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, TASK_ROLE])
+@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, TASK_ROLE])
 def test_the_files_exist_and_parse(path: Path) -> None:
     assert path.is_file(), f"{path} is missing"
     assert _load(path)
@@ -107,7 +108,7 @@ def test_no_rekognition_action_is_unscoped() -> None:
             assert "-dev-" in resource, f"not a dev collection: {resource}"
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK])
+@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK])
 def test_no_secret_arrives_through_environment(path: Path) -> None:
     """An `environment` value is visible in describe-task-definition to anyone
     with read access. Handoff §4 and §10."""
@@ -121,7 +122,7 @@ def test_no_secret_arrives_through_environment(path: Path) -> None:
             assert "arn:aws:secretsmanager" not in entry["value"]
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK])
+@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK])
 def test_every_task_has_both_roles(path: Path) -> None:
     """Execution role pulls the image and resolves secrets before the code runs;
     task role is what the code itself uses. Two different things, both required."""
@@ -148,17 +149,20 @@ def test_services_declares_the_stub_provider_and_matching_regions() -> None:
     assert env["SEARCH_MATCH_THRESHOLD"] != "80"
 
 
-def _supplied_names(path: Path) -> set[str]:
-    """Every variable the container will actually see, from both blocks.
+def _container_supplied_names(container: dict[str, Any]) -> set[str]:
+    """Every variable one container will actually see, from both blocks.
 
     Upper-cased because pydantic-settings is case-insensitive: a field named
     ``database_url`` is fed by ``DATABASE_URL``, and comparing the two forms
     directly would report every field as missing.
     """
-    container = _load(path)["containerDefinitions"][0]
     return {entry["name"].upper() for entry in container.get("environment", [])} | {
         entry["name"].upper() for entry in container.get("secrets", [])
     }
+
+
+def _supplied_names(path: Path) -> set[str]:
+    return _container_supplied_names(_load(path)["containerDefinitions"][0])
 
 
 def test_every_required_config_field_is_supplied_by_the_task_definition() -> None:
@@ -196,7 +200,7 @@ def test_every_required_config_field_is_supplied_by_the_task_definition() -> Non
 _DATABASE_URL_PARTS = {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK])
+@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK])
 def test_database_url_is_supplied_directly_or_via_all_five_parts(path: Path) -> None:
     """The replacement for the generic check above, for exactly one field.
 
@@ -209,15 +213,17 @@ def test_database_url_is_supplied_directly_or_via_all_five_parts(path: Path) -> 
     ``scripts/migrate.py``) exits non-zero at boot naming whichever of
     DATABASE_URL/DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD is absent.
     """
-    supplied = _supplied_names(path)
-    if "DATABASE_URL" in supplied:
-        return
-    missing_parts = _DATABASE_URL_PARTS - supplied
-    assert not missing_parts, (
-        f"{path.name} supplies neither DATABASE_URL nor a complete set of DB_*"
-        f" parts — missing {sorted(missing_parts)}. The container will exit"
-        " non-zero at boot with these names in its log."
-    )
+    for container in _load(path)["containerDefinitions"]:
+        supplied = _container_supplied_names(container)
+        if "DATABASE_URL" in supplied:
+            continue
+        missing_parts = _DATABASE_URL_PARTS - supplied
+        assert not missing_parts, (
+            f"{path.name} container {container['name']!r} supplies neither"
+            " DATABASE_URL nor a complete set of DB_* parts — missing"
+            f" {sorted(missing_parts)}. The container will exit non-zero at"
+            " boot with these names in its log."
+        )
 
 
 def test_the_task_definition_sets_no_variable_config_does_not_read() -> None:
@@ -256,3 +262,75 @@ def test_the_migration_task_does_not_serve_http() -> None:
     collide with the running service on a host-mode instance."""
     container = _load(MIGRATE_TASK)["containerDefinitions"][0]
     assert "migrate" in " ".join(container["command"])
+
+
+def _worker_containers() -> dict[str, dict[str, Any]]:
+    return {c["name"]: c for c in _load(WORKER_TASK)["containerDefinitions"]}
+
+
+def test_worker_task_runs_exactly_the_relay_and_the_search_consumer() -> None:
+    """One task, two processes: the outbox relay (the only outbox→SQS path)
+    and the ``search:runs`` consumer. Both essential — if either dies, ECS
+    restarts the task rather than running a relay whose messages nothing
+    consumes, or a consumer whose queue nothing feeds."""
+    containers = _worker_containers()
+    assert set(containers) == {"relay", "search-worker"}
+    assert containers["relay"]["command"] == ["python", "-m", "imageshield.relay"]
+    assert containers["search-worker"]["command"] == [
+        "python",
+        "-m",
+        "imageshield.search.worker",
+    ]
+    for container in containers.values():
+        assert container["essential"] is True
+
+
+def test_worker_containers_serve_no_http() -> None:
+    """Neither process has an HTTP surface. On a host-network instance a bound
+    port would collide with `services` on 8081, and an HTTP health check
+    against a process that serves nothing is a restart loop."""
+    for container in _worker_containers().values():
+        assert not container.get("portMappings"), (
+            f"{container['name']} maps a port it never binds"
+        )
+        assert "healthCheck" not in container, (
+            f"{container['name']} declares a health check with nothing to probe"
+        )
+
+
+def test_worker_supplies_every_required_config_field_in_both_containers() -> None:
+    """Both processes call ``load_config()`` — the same required set as the
+    HTTP app, validated at boot, exiting non-zero on a missing name. Same
+    reasoning as the services check above, per container."""
+    required = {
+        name.upper() for name, field in Config.model_fields.items() if field.is_required()
+    }
+    for name, container in _worker_containers().items():
+        missing = required - _container_supplied_names(container)
+        assert missing == set(), (
+            f"{WORKER_TASK.name} container {name!r} omits required config:"
+            f" {sorted(missing)}. The container will exit non-zero at boot."
+        )
+
+
+def test_worker_declares_the_stub_provider_and_matching_regions() -> None:
+    """The search worker is the one process where ``SEARCH_PROVIDER`` decides
+    whether real adapters get built (``build_providers``) — this task
+    definition, more than any other, is where `stub` must be pinned."""
+    for name, container in _worker_containers().items():
+        env = {entry["name"]: entry["value"] for entry in container["environment"]}
+        assert env["SEARCH_PROVIDER"] == "stub", f"{name} would build live adapters"
+        assert env["AWS_REGION"] == env["REKOGNITION_REGION"] == "ap-south-1"
+
+
+def test_worker_sets_no_variable_config_does_not_read() -> None:
+    """Same reverse-direction check as the services task: a name Config does
+    not read is accepted in silence by ``extra='ignore'``."""
+    known = {name.upper() for name in Config.model_fields}
+    inert_by_design = {"ENROLMENT_QUALITY_FILTER"}
+    for name, container in _worker_containers().items():
+        unread = _container_supplied_names(container) - known - inert_by_design
+        assert unread == set(), (
+            f"{WORKER_TASK.name} container {name!r} sets variables this service"
+            f" does not read: {sorted(unread)}."
+        )

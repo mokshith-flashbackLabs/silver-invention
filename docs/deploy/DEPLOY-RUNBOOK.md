@@ -397,6 +397,64 @@ aws ecs wait services-stable --cluster $CLUSTER --services services
 
 ---
 
+## 9a. The worker service — relay + search consumer
+
+**Deployed 2026-08-19.** Without it the API accepts a search, writes the outbox
+row, and nothing ever moves again: `outbox.attempts` stays 0 (nothing has even
+*tried*), the SQS queue stays empty, and the run sits `queued` forever. That is
+exactly the state this environment was in for two days — invariant #33 makes the
+enqueue non-blocking, which also makes the missing consumer silent.
+
+One task definition, `infra/ecs/imageshield-dev-services-worker.json`, two
+containers on the same image as `services`:
+
+| container | command | memory |
+|---|---|---|
+| `relay` | `python -m imageshield.relay` | 160 |
+| `search-worker` | `python -m imageshield.search.worker` | 288 |
+
+```bash
+aws ecs register-task-definition \
+  --cli-input-json file://infra/ecs/imageshield-dev-services-worker.json
+aws ecs create-service --cluster $CLUSTER --service-name services-worker \
+  --task-definition imageshield-dev-services-worker --desired-count 1 --launch-type EC2 \
+  --deployment-configuration 'minimumHealthyPercent=0,maximumPercent=100'
+```
+
+Non-obvious choices:
+
+- **Memory is budgeted, not generous.** The instance had 763 MB schedulable
+  left; the two containers take 448, leaving ≥ 256 so the migrate task (and the
+  §6d probe) can still place. Growing either container past that starves
+  one-off tasks with a placement failure that names no cause.
+- **No health check.** Neither process serves HTTP; an HTTP check would be a
+  restart loop, and `essential: true` on both already restarts the task if
+  either process dies.
+- **`desired-count 1` and it must stay 1 for the relay** only in spirit — the
+  relay selects with `FOR UPDATE SKIP LOCKED`, so a second task is safe, just
+  unnecessary (D3 satisfied by construction).
+- **Same env and secrets as `services`, `SEARCH_PROVIDER=stub` included.** The
+  worker is the process where `build_providers` decides whether live adapters
+  exist at all, so the stub pin matters *more* here than on the API.
+  `tests/test_ecs_task_defs.py` asserts all of this from the JSON.
+- **`recheck/worker.py` is deliberately not deployed.** It HEADs infringement
+  `page_url`s weekly and dev has zero infringements; deploying it now would
+  spend the one-off-task memory headroom on a no-op loop. Add it (or a third
+  container) when dev has infringement rows worth rechecking.
+
+Verified 2026-08-19, first poll after start: the outbox row pending since the
+backend's test run published (`relay.poll_completed published=1`), the worker
+claimed and completed it —
+`search.run_completed providers_attempted=['stub'] providers_succeeded=['stub']
+matches_recorded=0 cost_usd=0`, `search.cadence_updated scan_tier=new
+next_scan_after=+7d` — queue drained to 0, and the §6d probe shows the run row
+`completed`. Under `SEARCH_PROVIDER=stub` with 0019's `stub` row enabled and
+`hive`/`google` disabled (§13.2), that is the *correct* terminal state: the run
+completes honestly, the provider-call row says "no search performed", and no
+money can move.
+
+---
+
 ## 10. Verify
 
 `/readyz` is on `localhost:8081` on a private interface, and Caddy only proxies to
@@ -619,6 +677,8 @@ a dev measurement (`DEPLOY-DEV-HANDOFF.md` §11); the rule that matters is
 7. Register both task definitions (§7)
 8. Run migrations; require exit 0 (§8)
 9. Create the service with `minimumHealthyPercent=0` (§9)
+9a. Create the worker service — relay + search consumer (§9a); without it every
+    search sits `queued` forever with nothing failing anywhere
 10. `/readyz` = 200 with empty `problems` (§10)
 11. Read the logs; confirm role, region, collection, and that timestamps and
     request ids survive (§11)
