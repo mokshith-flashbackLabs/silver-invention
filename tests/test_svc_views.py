@@ -784,9 +784,23 @@ def test_reverting_the_chain_revokes_membership_and_leaves_their_role_alone(
         assert run_migrate(throwaway_db, "up").returncode == 0
         assert _is_member(throwaway_db, "app_worker", "imageshield_proxy_ro")
 
-        # --steps 1 reverts the newest applied migration. If a 0018 lands, this
-        # asserts loudly rather than silently reverting the wrong one.
-        revert = run_migrate(throwaway_db, "down", "--steps", "1")
+        # Revert far enough to take 0017 with it, computed from the ledger rather
+        # than hardcoded. This test previously reverted exactly one step, which
+        # was correct only while 0017 was the newest migration; 0018 landing made
+        # one step revert 0018 and leave 0017 in place. The step count is derived
+        # so the next migration does not break this test again — the property
+        # under test is "0017's down leg revokes the membership", not "0017 is
+        # last".
+        applied_before = sorted(
+            row["filename"]
+            for row in _rows(throwaway_db, "SELECT filename FROM schema_migrations")
+        )
+        at_or_after_0017 = [name for name in applied_before if name >= "0017_"]
+        assert at_or_after_0017, "0017 is not applied — the ledger query is wrong"
+
+        revert = run_migrate(
+            throwaway_db, "down", "--steps", str(len(at_or_after_0017))
+        )
         assert revert.returncode == 0, revert.stderr
         applied = {
             row["filename"]
