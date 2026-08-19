@@ -21,7 +21,7 @@ from imageshield.recheck.loop import run_once
 from imageshield.recheck.models import DueInfringement
 from imageshield.recheck.pacer import DomainPacer
 from imageshield.recheck.policy import verdict_for_status
-from imageshield.recheck.ssrf import refusal_reason
+from imageshield.recheck.ssrf import address_refusal, refusal_reason
 
 ALLOWED = frozenset({"example.test", "other.test"})
 
@@ -205,6 +205,39 @@ def test_a_literal_private_ip_url_is_refused_by_the_allowlist_first() -> None:
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "gopher://example.test/", "not a url"])
 def test_non_http_schemes_are_refused(url: str) -> None:
     assert refusal_reason(url, ALLOWED, _public_resolver) == "not_an_http_url"
+
+
+# ── the ssrf split: address_refusal is the DNS + global-address half ────────
+#
+# recheck/ssrf.py's `refusal_reason` is now allowlist-check-then-delegate. The
+# crop fetcher (`imageshield.fetcher`) has no domain allowlist — it fetches
+# whatever URL a search provider or an infringement row names — so it calls
+# `address_refusal` directly rather than `refusal_reason`. These tests pin the
+# extracted function's own behaviour; the ordering test below pins that the
+# delegation didn't change `refusal_reason`'s existing contract.
+
+
+def test_address_refusal_is_none_for_a_global_address() -> None:
+    assert address_refusal("https://ok.example/x", resolver=_public_resolver) is None
+
+
+def test_address_refusal_refuses_a_private_address() -> None:
+    reason = address_refusal("https://ok.example/x", resolver=lambda _h: ["169.254.169.254"])
+    assert reason == "private_address"
+
+
+def test_refusal_reason_never_resolves_a_non_allowlisted_domain() -> None:
+    """Ordering, proven rather than assumed. The module docstring says the
+    allowlist runs first because it is cheap and the resolve is a network
+    round trip; a resolver that raises if it is ever called turns that claim
+    into something this test would fail if the split got the order backwards.
+    """
+
+    def _must_not_be_called(_host: str) -> list[str]:
+        raise AssertionError("resolver invoked for a non-allowlisted domain")
+
+    reason = refusal_reason("https://not-in-corpus.test/p", ALLOWED, _must_not_be_called)
+    assert reason == "domain_not_allowlisted"
 
 
 async def test_a_refused_url_is_never_fetched_and_leaves_the_row_alone() -> None:

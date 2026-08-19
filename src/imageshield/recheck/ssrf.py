@@ -60,7 +60,11 @@ def refusal_reason(
 
     Order matters only for cost: the allowlist is a set membership test and the
     resolution is a network round trip, so the cheap absolute check runs first.
-    Both must pass.
+    Both must pass. The resolve-and-check half lives in :func:`address_refusal`
+    below — this recheck loop is the only caller that also needs a domain
+    allowlist. The crop fetcher (``imageshield.fetcher``) has no such
+    allowlist (it fetches whatever URL a search provider or an infringement
+    row names) and calls :func:`address_refusal` directly.
     """
     host = host_of(url)
     if host is None:
@@ -69,7 +73,22 @@ def refusal_reason(
         # Never seen this domain in content_urls. We have no business probing it
         # — it is not a host any provider told us about.
         return "domain_not_allowlisted"
+    return address_refusal(url, resolver)
 
+
+def address_refusal(url: str, resolver: Resolver | None = None) -> RefusalReason | None:
+    """``None`` if every address ``url``'s host resolves to is globally
+    routable; otherwise why not.
+
+    No domain allowlist here — that half is ``refusal_reason``'s, above, for
+    the one caller (the recheck loop) that has a list of domains it is allowed
+    to probe. A caller with no such list (the crop fetcher) calls this
+    directly: it still must never be pointed at a link-local or private
+    address, but it has no ``content_urls`` table to check a domain against.
+    """
+    host = host_of(url)
+    if host is None:
+        return "not_an_http_url"
     resolve = resolver if resolver is not None else _resolve
     try:
         addresses = resolve(host)
