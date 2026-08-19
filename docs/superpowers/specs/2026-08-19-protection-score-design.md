@@ -70,10 +70,14 @@ threat event posted in control room ──▶ threats/ matcher (event domains �
 
 - **`score/`** — the score engine. Owns `protection_scores` (materialized, one row per
   `user_ref`) and `score_events` (append-only journal). Exactly **one** code path writes a score
-  (INVARIANTS #21 extended). Recompute triggers ride the existing outbox: hit decided, feedback
-  written, seed added, enrolment change, run completed, event created/updated/expired/retracted,
-  recommendation completed. Plus one daily tick for aging/decay. Recompute is idempotent and
-  total: compute from state, journal the diff.
+  (INVARIANTS #21 extended). Recompute runs **immediately after its trigger commits, in its own
+  short transaction** — hit decided, feedback written, seed added, enrolment change, run
+  completed, event created/retracted — not via a queue: a score-recompute queue would be a fourth
+  application queue nobody sanctioned, and recompute is cheap (a handful of indexed reads + two
+  writes). A `score/tick.py` process (recheck-style poll loop, daily interval) is the drift
+  healer: it re-runs recompute for aging/decay and for any trigger whose recompute crashed after
+  the trigger committed. Recompute is idempotent and total: compute from state, journal the diff;
+  an unchanged state journals nothing.
 - **`recommendations/`** — catalog in code (typed kinds), per-user instances in a table,
   completion **detected from data** (a seed row appeared, feedback was given, a run completed),
   never self-reported.
@@ -188,10 +192,13 @@ Worker steps per hit:
    `benign_copy`; `likely_not_subject` → bottom of queue. **Machine ordering only — nothing is
    machine-dropped** (§7.3: a real infringement in drop is invisible forever) **and nothing is
    machine-confirmed** (#19).
-6. **Cost:** `rekognition_confirm` is a `providers` row with list-price `cost_per_call_usd`,
-   governed by the existing budget/breaker/spend machinery (one transaction, fail-closed budget,
-   no silent skips). Skips land as `skipped_budget`/`skipped_breaker` triage — visible,
-   retryable.
+6. **Cost:** `rekognition_confirm` is a `providers` row (kind `classifier` — the enum value 0001
+   reserved for exactly this) with `cost_per_call_usd` priced as the **worst-case bundle**: one
+   confirm = up to 1 `DetectFaces` + N face searches (config cap) + 1 `DetectModerationLabels`,
+   so the row's per-call price is the bundle ceiling and the gate's one-row budget check stays
+   unchanged and conservative. Governed by the existing budget/breaker/spend machinery (one
+   transaction, fail-closed budget, no silent skips). Skips land as `budget_exceeded` /
+   `breaker_open` triage — visible, retryable.
 7. **CSAM tripwire:** moderation labels suggesting minors + explicit → hit status `quarantined`:
    excluded from every svc view and the default review queue, ops alarm fired, no score effect,
    bytes already discarded (URL + labels retained as the only record). v1 escalation is a manual
