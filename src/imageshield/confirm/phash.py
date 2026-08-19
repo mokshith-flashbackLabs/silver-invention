@@ -17,11 +17,13 @@ from PIL import Image, UnidentifiedImageError
 from imageshield.attribution.crop import UndecodableImage
 
 _HASH_SIZE = 8
+# Load-bearing: int.bit_count() counts bits of abs(x), not two's-complement representation,
+# so without this mask hamming(-1, 0) would return 1 instead of 64.
 _MASK = (1 << 64) - 1
 
 
 def dhash(image: bytes) -> int:
-    """Hash of horizontal gradient signs over an 9x8 grayscale downscale."""
+    """Hash of horizontal gradient signs over a 9x8 grayscale downscale."""
     try:
         with Image.open(io.BytesIO(image)) as opened:
             gray = opened.convert("L").resize(
