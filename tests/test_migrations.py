@@ -1424,12 +1424,17 @@ def test_0019_stub_cost_is_zero_not_null(throwaway_db: str) -> None:
     assert row[0] == Decimal("0")
 
 
-def test_0019_seeded_providers_are_exactly_hive_google_and_stub(throwaway_db: str) -> None:
+def test_0021_seeded_providers_are_exactly_hive_google_stub_and_rekognition_confirm(
+    throwaway_db: str,
+) -> None:
+    # Was "...exactly hive, google, and stub" until 0021 added a fourth row;
+    # renamed along with the assertion rather than left to describe a set the
+    # migrated schema no longer produces.
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         ids = {row[0] for row in conn.execute("SELECT provider_id FROM providers").fetchall()}
-    assert ids == {"hive", "google", "stub"}
+    assert ids == {"hive", "google", "stub", "rekognition_confirm"}
 
 
 def test_0019_down_deletes_only_the_stub_row(throwaway_db: str) -> None:
@@ -1461,6 +1466,59 @@ def test_0019_up_down_up_round_trip_restores_the_identical_stub_row(
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         after = _stub_provider_row(conn)
     assert after == before
+
+
+# ── 0021: confirm & review schema ─────────────────────────────────────────
+
+
+def test_0021_confirm_columns_and_review_tasks(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        cols = {
+            r[0]
+            for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name = 'infringements'"
+            ).fetchall()
+        }
+        assert {
+            "confirm_state", "severity", "confirm_decided_by", "confirm_decided_at",
+            "duplicate_of", "phash", "face_match_score", "moderation_labels",
+        } <= cols
+        # confirmed without a human is a constraint violation (INVARIANTS #19 by schema)
+        conn.execute(
+            "INSERT INTO subjects (user_ref, discovery_eligible, eligibility_reason)"
+            " VALUES ('00000000-0000-0000-0000-000000000001', true, 'adult')"
+        )
+        conn.execute(
+            "INSERT INTO content_urls (url_hash, url, source_domain) VALUES"
+            " (repeat('a', 64), 'https://x.example/a', 'x.example')"
+        )
+        conn.execute(
+            "INSERT INTO infringements (user_ref, url_hash, page_url) VALUES"
+            " ('00000000-0000-0000-0000-000000000001', repeat('a', 64), 'https://x.example/a')"
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "UPDATE infringements SET confirm_state = 'confirmed'"
+            )
+
+
+def test_0021_seeds_the_rekognition_confirm_provider(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT kind, enabled, calibrated, cost_per_call_usd FROM providers"
+            " WHERE provider_id = 'rekognition_confirm'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "classifier"
+    assert row[1] is True
+    assert row[2] is False
+    assert row[3] == Decimal("0.005")
 
 
 # ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────

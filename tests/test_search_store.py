@@ -400,6 +400,15 @@ async def test_enabled_provider_ids(store: PostgresSearchStore) -> None:
     assert set(ids) == {"hive", "google"}
 
 
+async def test_enabled_provider_ids_excludes_classifier_rows(
+    store: PostgresSearchStore, migrated_db: str
+) -> None:
+    # rekognition_confirm is seeded enabled=true by 0021 but is not a search
+    # provider; attempting it would fabricate a permanent per-run error row.
+    ids = await store.enabled_provider_ids()
+    assert ProviderId("rekognition_confirm") not in ids
+
+
 # ── Step 6: dedup, the whole point of the module ──────────────────────────
 
 

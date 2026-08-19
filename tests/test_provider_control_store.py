@@ -35,6 +35,7 @@ from tests.db import ensure_subject, run_migrate
 HIVE = ProviderId("hive")
 GOOGLE = ProviderId("google")
 STUB = ProviderId("stub")  # migration 0019: seeded DISABLED, but still a row
+REKOGNITION_CONFIRM = ProviderId("rekognition_confirm")  # migration 0021: classifier row
 THRESHOLD = 5
 COOLDOWN = 300
 CAP = 1200
@@ -106,7 +107,7 @@ async def test_runtimes_reads_the_migration_seeded_cost_and_breaker_defaults(
     control, _, _ = wired
     runtimes = await control.runtimes()
 
-    assert set(runtimes) == {HIVE, GOOGLE, STUB}
+    assert set(runtimes) == {HIVE, GOOGLE, STUB, REKOGNITION_CONFIRM}
     # Migration 0009 fills Google's list price and deliberately leaves Hive's
     # contract price NULL rather than inventing one.
     assert runtimes[GOOGLE].cost_per_call_usd == Decimal("0.003500")

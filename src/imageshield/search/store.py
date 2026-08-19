@@ -190,7 +190,17 @@ _REFUSAL_AUDIT_SQL = """
     VALUES ('service', %(action)s, %(subject_ref)s, %(run_id)s, %(metadata)s)
 """
 
-_ENABLED_PROVIDERS_SQL = "SELECT provider_id FROM providers WHERE enabled ORDER BY provider_id"
+# kind-restricted: migration 0021 seeds 'rekognition_confirm' enabled=true as
+# a 'classifier' row so the existing budget/breaker machinery governs it, but
+# it is not a search provider. Without this filter it would land in
+# search_runs.providers_attempted with no adapter registered, producing a
+# permanent per-run error row for a provider that was never meant to be
+# dispatched from here.
+_ENABLED_PROVIDERS_SQL = (
+    "SELECT provider_id FROM providers"
+    " WHERE enabled AND kind IN ('image_search', 'face_search')"
+    " ORDER BY provider_id"
+)
 
 _UPSERT_URL_SQL = """
     INSERT INTO content_urls (url_hash, url, source_domain, canonical_url,
