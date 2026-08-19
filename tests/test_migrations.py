@@ -1521,6 +1521,52 @@ def test_0021_seeds_the_rekognition_confirm_provider(throwaway_db: str) -> None:
     assert row[3] == Decimal("0.005")
 
 
+# ── 0022: protection score, recommendations, threat events ─────────────────
+
+
+def test_0022_score_tables_and_role(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT table_name FROM information_schema.tables"
+                " WHERE table_schema = 'public'"
+            ).fetchall()
+        }
+        assert {
+            "protection_scores", "score_events", "recommendations",
+            "threat_events", "threat_event_matches",
+        } <= tables
+        assert conn.execute(
+            "SELECT 1 FROM pg_roles WHERE rolname = 'score_rw'"
+        ).fetchone() is not None
+
+
+def test_0022_score_events_is_insert_only_for_score_rw(throwaway_db: str) -> None:
+    """An editable journal is not a journal — same shape as the audit_log test."""
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO subjects (user_ref, discovery_eligible, eligibility_reason)"
+            " VALUES ('00000000-0000-0000-0000-000000000002', true, 'adult')"
+        )
+        conn.execute("SET ROLE score_rw")
+        conn.execute(
+            "INSERT INTO score_events"
+            " (user_ref, delta, component, cause_kind, config_version, score_after)"
+            " VALUES ('00000000-0000-0000-0000-000000000002', 5, 'posture',"
+            "         'initialised', 'score-v1', 5)"
+        )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE score_events SET delta = 100")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM score_events")
+        conn.execute("RESET ROLE")
+
+
 # ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────
 #
 # The migration ECS task never goes through imageshield.config.Config (see
