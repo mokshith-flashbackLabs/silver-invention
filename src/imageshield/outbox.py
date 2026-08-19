@@ -26,13 +26,18 @@ import psycopg
 from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict
 
-# The two known queues (CLAUDE.md §2). They map to
-# Config.sqs_identity_index_url / Config.sqs_search_runs_url respectively —
-# that mapping is consumed by the relay (Task 4); this module only owns the
-# canonical spelling so producers and the relay can't drift apart on it.
+# The three known queues (CLAUDE.md §2). They map to
+# Config.sqs_identity_index_url / Config.sqs_search_runs_url /
+# Config.sqs_confirm_hits_url respectively — that mapping is consumed by the
+# relay (Task 4); this module only owns the canonical spelling so producers
+# and the relay can't drift apart on it.
 QUEUE_IDENTITY_INDEX = "identity:index"
 QUEUE_SEARCH_RUNS = "search:runs"
-QUEUES: frozenset[str] = frozenset({QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS})
+# The confirm pipeline (protection-score design doc §7, migration 0021):
+# review-band infringements meeting per-provider "most similar" criteria
+# enqueue here for Rekognition-based triage ahead of human review.
+QUEUE_CONFIRM_HITS = "confirm:hits"
+QUEUES: frozenset[str] = frozenset({QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS, QUEUE_CONFIRM_HITS})
 
 _INSERT_SQL = """
     INSERT INTO outbox (queue_name, payload)

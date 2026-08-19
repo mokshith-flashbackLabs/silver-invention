@@ -22,7 +22,14 @@ import psycopg
 import pytest
 from pydantic import ValidationError
 
-from imageshield.outbox import QUEUE_IDENTITY_INDEX, QUEUES, OutboxPayload, enqueue, enqueue_sync
+from imageshield.outbox import (
+    QUEUE_CONFIRM_HITS,
+    QUEUE_IDENTITY_INDEX,
+    QUEUES,
+    OutboxPayload,
+    enqueue,
+    enqueue_sync,
+)
 from tests.db import run_migrate
 
 
@@ -118,8 +125,9 @@ def test_outbox_payload_requires_event_and_id() -> None:
         OutboxPayload(id=uuid4())  # type: ignore[call-arg]
 
 
-def test_queues_contains_exactly_the_two_known_queues() -> None:
-    assert frozenset({"identity:index", "search:runs"}) == QUEUES
+def test_queues_contains_exactly_the_three_known_queues() -> None:
+    assert frozenset({"identity:index", "search:runs", "confirm:hits"}) == QUEUES
+    assert "confirm:hits" in QUEUES
 
 
 def test_outbox_payload_id_is_uuid_type() -> None:
@@ -147,6 +155,31 @@ def test_enqueue_sync_writes_and_round_trips(migrated_db: str) -> None:
     assert row is not None
     queue_name, stored_payload, published_at, attempts = row
     assert queue_name == "search:runs"
+    assert published_at is None
+    assert attempts == 0
+    assert OutboxPayload.model_validate(stored_payload) == payload
+
+
+def test_enqueue_sync_confirm_hits_round_trips(migrated_db: str) -> None:
+    """The third queue (Task 4, protection-score design doc §7) round-trips
+    exactly like the other two: same INSERT, same validation, same table."""
+    event_id = uuid4()
+    payload = OutboxPayload(event="confirm.hit_requested", id=event_id)
+
+    with psycopg.connect(migrated_db) as conn:
+        outbox_id = enqueue_sync(conn, QUEUE_CONFIRM_HITS, payload)
+        conn.commit()
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT queue_name, payload, published_at, attempts "
+            "FROM outbox WHERE outbox_id = %s",
+            (outbox_id,),
+        ).fetchone()
+
+    assert row is not None
+    queue_name, stored_payload, published_at, attempts = row
+    assert queue_name == QUEUE_CONFIRM_HITS
     assert published_at is None
     assert attempts == 0
     assert OutboxPayload.model_validate(stored_payload) == payload

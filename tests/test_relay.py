@@ -23,7 +23,13 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
-from imageshield.outbox import QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS, OutboxPayload, enqueue_sync
+from imageshield.outbox import (
+    QUEUE_CONFIRM_HITS,
+    QUEUE_IDENTITY_INDEX,
+    QUEUE_SEARCH_RUNS,
+    OutboxPayload,
+    enqueue_sync,
+)
 from imageshield.relay import (
     _RECONNECT_BASE_SECONDS,
     BackoffTracker,
@@ -183,6 +189,42 @@ def test_happy_path_publishes_once_then_stops(migrated_db: str) -> None:
         sent_url, sent_body = client.sent[0]
         assert sent_url == config.sqs_identity_index_url
         assert sent_body == {"event": "enrolment.created", "id": str(payload.id)}
+
+        published_at, attempts, last_error = _row_state(conn, outbox_id)
+        assert published_at is not None
+        assert attempts == 0
+        assert last_error is None
+
+        # Re-running the poll must publish nothing further.
+        stats_again = poll_once(conn, config, client, backoff, logger=logger)
+        assert stats_again.published == 0
+        assert stats_again.failed == 0
+        assert len(client.sent) == 1
+
+
+def test_confirm_hits_publishes_to_confirm_hits_url(migrated_db: str) -> None:
+    """Per-queue routing (Task 4): a confirm:hits row must publish to
+    config.sqs_confirm_hits_url, not one of the other two queue URLs — mirrors
+    test_happy_path_publishes_once_then_stops above, which proves the same
+    thing for identity:index."""
+    config = _relay_config()
+    payload = OutboxPayload(event="confirm.hit_requested", id=uuid4())
+
+    with psycopg.connect(migrated_db) as conn:
+        outbox_id = enqueue_sync(conn, QUEUE_CONFIRM_HITS, payload)
+        conn.commit()
+
+        client = StubSqsClient()
+        backoff = BackoffTracker()
+        logger = _RecordingLogger()
+
+        stats = poll_once(conn, config, client, backoff, logger=logger)
+        assert stats.published == 1
+        assert stats.failed == 0
+        assert len(client.sent) == 1
+        sent_url, sent_body = client.sent[0]
+        assert sent_url == config.sqs_confirm_hits_url
+        assert sent_body == {"event": "confirm.hit_requested", "id": str(payload.id)}
 
         published_at, attempts, last_error = _row_state(conn, outbox_id)
         assert published_at is not None

@@ -74,7 +74,7 @@ import structlog
 
 from imageshield.config import Config, ConfigError, load_config
 from imageshield.http.logging import configure_logging
-from imageshield.outbox import QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS
+from imageshield.outbox import QUEUE_CONFIRM_HITS, QUEUE_IDENTITY_INDEX, QUEUE_SEARCH_RUNS
 
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_CAP_SECONDS = 300.0  # ~5 minutes
@@ -85,6 +85,7 @@ _RECONNECT_CAP_SECONDS = 30.0
 _QUEUE_NAME_TO_CONFIG_FIELD = {
     QUEUE_IDENTITY_INDEX: "sqs_identity_index_url",
     QUEUE_SEARCH_RUNS: "sqs_search_runs_url",
+    QUEUE_CONFIRM_HITS: "sqs_confirm_hits_url",
 }
 
 _SELECT_NEXT_SQL = """
