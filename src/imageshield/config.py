@@ -341,6 +341,109 @@ class Config(BaseSettings):
     # Nothing is imposed across different domains.
     recheck_per_domain_interval_seconds: float = 2.0
 
+    # --- protection score / confirm pipeline (design 2026-08-19) ---
+    # docs/superpowers/specs/2026-08-19-protection-score-design.md §4 / §7.
+    # Which components exist and what they're made of is fixed in code; every
+    # NUMBER here is config, and `score_config_version` is stamped onto every
+    # `score_events` row so a historical score stays interpretable after a
+    # retune later — same reasoning as `search_runs.threshold_config`.
+    score_config_version: str = "score-v1"
+
+    # The four top-level components. Refused at boot unless they sum to 100
+    # (`_score_config_coherent` below) — the score is presented out of 100.
+    score_weight_posture: int = 40
+    score_weight_coverage: int = 25
+    score_weight_exposure: int = 25
+    score_weight_threat: int = 10
+
+    # Posture sub-weights: enrolment complete, seed portfolio at target and
+    # fresh, no confirmed hit awaiting the user's feedback, no aged-open
+    # recommendation. Must sum to SCORE_WEIGHT_POSTURE.
+    score_posture_enrolment: int = 10
+    score_posture_seeds: int = 20
+    score_posture_feedback: int = 5
+    score_posture_recommendations: int = 5
+
+    # Coverage sub-weights: a completed run within the current cadence tier
+    # (plus SCORE_SCAN_GRACE_DAYS below) and providers succeeding for this
+    # person. Must sum to SCORE_WEIGHT_COVERAGE.
+    score_coverage_scan: int = 15
+    score_coverage_providers: int = 10
+
+    # Exposure penalty per HUMAN-CONFIRMED hit, by severity — never by machine
+    # triage (INVARIANTS #19/#47). No user feedback ever raises one of these;
+    # url_dead restores it, authorised removes it. Small by design: the initial
+    # values are a judgement call the design doc flags as unvalidated (§14),
+    # not a statistical fit, and retuning is safe only because
+    # SCORE_CONFIG_VERSION is journaled alongside every movement. The heaviest
+    # of the four may not exceed SCORE_WEIGHT_EXPOSURE (`_score_config_coherent`).
+    score_exposure_weight_ncii: int = 12
+    score_exposure_weight_explicit: int = 6
+    score_exposure_weight_benign: int = 2
+    # The severity the confirm pipeline could not classify as one of the three
+    # above (e.g. likely_not_subject). Every confirmed hit moves the score by
+    # SOME amount — there is no silent fall-through to zero.
+    score_exposure_weight_default: int = 6
+
+    # Cap on a single GLOBAL threat event's penalty (one that matches no
+    # user's hit domains specifically). May not exceed SCORE_WEIGHT_THREAT — a
+    # global event alone must never zero this component (design §4).
+    score_threat_global_max_penalty: int = 2
+
+    # Target seed-portfolio size and staleness window feeding the Posture
+    # seeds sub-component above.
+    score_seed_target: int = 5
+    score_seed_fresh_days: int = 90
+    # How long an open recommendation may sit before it starts dragging
+    # Posture down (design §5's "aging" mechanic).
+    score_rec_soft_age_days: int = 14
+    # Grace window added on top of the cadence tier's own interval before a
+    # missing run counts against Coverage — the tier boundary is exact, so a
+    # run running an hour late must not read as a coverage failure.
+    score_scan_grace_days: int = 3
+    # score/tick.py's drift-healer poll interval (a recheck-style poll loop).
+    score_tick_interval_seconds: float = 3600.0
+
+    # ── Confirm pipeline (design §7) ──────────────────────────────────────
+    # Third application queue (identity:index, search:runs, confirm:hits) —
+    # a review-band infringement meeting the "most similar" criteria below is
+    # enqueued here via the outbox.
+    sqs_confirm_hits_url: str
+    # The fetcher deployable: stateless, no DB credentials, hostile-domain
+    # egress posture. The confirm worker calls it for transient image bytes;
+    # it never persists anything (design §3, §7 step 1).
+    fetcher_base_url: str
+    fetcher_token: str
+
+    # Per-provider "most similar" trigger criteria for enqueueing a hit onto
+    # confirm:hits (design §7). Hive's raw score domain is 0.5-1.0; the
+    # ceiling this validates is 1, its true maximum (see the field validator
+    # below).
+    confirm_hive_min_score: float = 0.80
+    # Comma list drawn from Google's Web Detection categories. Kept a string
+    # (not a list) so it round-trips through one env var — callers read
+    # `confirm_google_kind_set` below, not this field directly.
+    confirm_google_kinds: str = "full_match,partial_match"
+    # Face-match threshold for the confirm pipeline's attribution call — its
+    # OWN knob, distinct from FACE_MATCH_THRESHOLD (enrolment),
+    # SEARCH_MATCH_THRESHOLD (provider search) and ATTRIBUTION_MATCH_THRESHOLD
+    # (POST /v1/attribute). One threshold per purpose, INVARIANTS #1b.
+    confirm_face_match_threshold: float = 92.0
+    # MaxFaces cap on the confirm pipeline's face-match call, and the input to
+    # rekognition_confirm's worst-case-bundle pricing (design §7 step 6).
+    confirm_max_faces: int = 3
+    # Hamming distance ceiling for two 64-bit dHash values to count as the
+    # "same picture" for phash inheritance — cross-run, cross-URL duplicate
+    # detection, never cross-user (design §7 step 2).
+    confirm_phash_hamming_max: int = 8
+
+    # The CSAM tripwire's low-end age band (moderation labels suggesting a
+    # minor, design §7 step 7). Required, with NO default: the age-literal
+    # gate in tests/test_boundaries.py bans an inline age comparison in this
+    # file, and INVARIANTS #8 wants every age floor read from config, never a
+    # constant beside the route.
+    csam_age_low_threshold: int
+
     # Requested via SERVICE_TOKEN_AUTH_DISABLED=1; only takes effect in
     # development — see :attr:`auth_disabled`.
     service_token_auth_disabled: bool = False
@@ -358,7 +461,7 @@ class Config(BaseSettings):
             return value
         return _validate_postgres_url(value)
 
-    @field_validator("service_token", "admin_service_token")
+    @field_validator("service_token", "admin_service_token", "fetcher_token")
     @classmethod
     def _token(cls, value: str) -> str:
         if len(value) < 16:
@@ -395,6 +498,8 @@ class Config(BaseSettings):
         "google_vision_endpoint",
         "sqs_identity_index_url",
         "sqs_search_runs_url",
+        "sqs_confirm_hits_url",
+        "fetcher_base_url",
     )
     @classmethod
     def _http_url(cls, value: str) -> str:
@@ -406,6 +511,7 @@ class Config(BaseSettings):
         "face_match_threshold",
         "enrolment_collision_threshold",
         "search_match_threshold",
+        "confirm_face_match_threshold",
     )
     @classmethod
     def _confidence(cls, value: float) -> float:
@@ -413,7 +519,7 @@ class Config(BaseSettings):
             raise ValueError("must be between 0 and 100")
         return value
 
-    @field_validator("min_enrolment_age", "min_discovery_age")
+    @field_validator("min_enrolment_age", "min_discovery_age", "csam_age_low_threshold")
     @classmethod
     def _age(cls, value: int) -> int:
         if not 0 <= value <= 130:
@@ -443,6 +549,27 @@ class Config(BaseSettings):
         "recheck_batch_size",
         "attribution_max_inflight",
         "dev_face_ceiling",
+        "score_weight_posture",
+        "score_weight_coverage",
+        "score_weight_exposure",
+        "score_weight_threat",
+        "score_posture_enrolment",
+        "score_posture_seeds",
+        "score_posture_feedback",
+        "score_posture_recommendations",
+        "score_coverage_scan",
+        "score_coverage_providers",
+        "score_exposure_weight_ncii",
+        "score_exposure_weight_explicit",
+        "score_exposure_weight_benign",
+        "score_exposure_weight_default",
+        "score_threat_global_max_penalty",
+        "score_seed_target",
+        "score_seed_fresh_days",
+        "score_rec_soft_age_days",
+        "score_scan_grace_days",
+        "confirm_max_faces",
+        "confirm_phash_hamming_max",
     )
     @classmethod
     def _positive(cls, value: int) -> int:
@@ -459,11 +586,22 @@ class Config(BaseSettings):
         "recheck_poll_interval_seconds",
         "recheck_timeout_seconds",
         "attribution_match_threshold",
+        "score_tick_interval_seconds",
     )
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be a positive number")
+        return value
+
+    @field_validator("confirm_hive_min_score")
+    @classmethod
+    def _hive_min_score_range(cls, value: float) -> float:
+        if not 0 < value <= 1:
+            raise ValueError(
+                "must be greater than 0 and at most 1 — Hive's raw score domain"
+                " tops out at 1"
+            )
         return value
 
     @field_validator("provider_retry_jitter_fraction")
@@ -701,10 +839,64 @@ class Config(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _score_config_coherent(self) -> Config:
+        """Boot validation for the protection score (design §4): weights sum to
+        100, every sub-weight group sums to its parent, no severity weight
+        outgrows its component, and the threat cap never exceeds its own
+        weight. Checked here rather than left to the score engine because a
+        misconfigured score is presented to every user at once, silently."""
+        weights = (
+            self.score_weight_posture
+            + self.score_weight_coverage
+            + self.score_weight_exposure
+            + self.score_weight_threat
+        )
+        if weights != 100:
+            raise ValueError("SCORE_WEIGHT_* must sum to 100 — the score is out of 100")
+        posture = (
+            self.score_posture_enrolment
+            + self.score_posture_seeds
+            + self.score_posture_feedback
+            + self.score_posture_recommendations
+        )
+        if posture != self.score_weight_posture:
+            raise ValueError("SCORE_POSTURE_* sub-weights must sum to SCORE_WEIGHT_POSTURE")
+        if self.score_coverage_scan + self.score_coverage_providers != self.score_weight_coverage:
+            raise ValueError("SCORE_COVERAGE_* sub-weights must sum to SCORE_WEIGHT_COVERAGE")
+        heaviest = max(
+            self.score_exposure_weight_ncii,
+            self.score_exposure_weight_explicit,
+            self.score_exposure_weight_benign,
+            self.score_exposure_weight_default,
+        )
+        if heaviest > self.score_weight_exposure:
+            raise ValueError("SCORE_EXPOSURE_WEIGHT_* may not exceed SCORE_WEIGHT_EXPOSURE")
+        if self.score_threat_global_max_penalty > self.score_weight_threat:
+            raise ValueError(
+                "SCORE_THREAT_GLOBAL_MAX_PENALTY may not exceed SCORE_WEIGHT_THREAT"
+            )
+        known = {"full_match", "partial_match", "page_match"}
+        kinds = {part.strip() for part in self.confirm_google_kinds.split(",") if part.strip()}
+        if not kinds or not kinds <= known:
+            raise ValueError(
+                "CONFIRM_GOOGLE_KINDS must be a comma list drawn from"
+                " full_match/partial_match/page_match"
+            )
+        return self
+
     @property
     def auth_disabled(self) -> bool:
         """True only when the bypass was requested AND environment is development."""
         return self.service_token_auth_disabled and self.environment == "development"
+
+    @property
+    def confirm_google_kind_set(self) -> frozenset[str]:
+        """The parsed form of `confirm_google_kinds` — callers (the confirm
+        worker's dispatch trigger) want a set, never the raw comma string."""
+        return frozenset(
+            part.strip() for part in self.confirm_google_kinds.split(",") if part.strip()
+        )
 
 
 def load_config() -> Config:

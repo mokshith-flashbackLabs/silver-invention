@@ -75,6 +75,13 @@ VALID_ENV: dict[str, str] = {
     "GOOGLE_VISION_API_KEY": "google-key-for-tests",
     "SQS_IDENTITY_INDEX_URL": "http://localhost:14566/000000000000/imageshield-identity-index",
     "SQS_SEARCH_RUNS_URL": "http://localhost:14566/000000000000/imageshield-search-runs",
+    # Protection score / confirm pipeline (design 2026-08-19, Task 3).
+    "SQS_CONFIRM_HITS_URL": (
+        "https://sqs.ap-south-1.amazonaws.com/000000000000/imageshield-confirm-hits"
+    ),
+    "FETCHER_BASE_URL": "http://localhost:8083",
+    "FETCHER_TOKEN": "fetcher-token-for-tests-0003",
+    "CSAM_AGE_LOW_THRESHOLD": "18",
     # ENVIRONMENT is unset here, so this block loads as `production` — which is
     # the point: VALID_ENV is what a real deployed environment looks like. A
     # production config carrying the stub is now refused at boot (the stub
@@ -113,6 +120,10 @@ def make_config(**overrides: Any) -> Config:
         "google_vision_api_key": "google-key-for-tests",
         "sqs_identity_index_url": VALID_ENV["SQS_IDENTITY_INDEX_URL"],
         "sqs_search_runs_url": VALID_ENV["SQS_SEARCH_RUNS_URL"],
+        "sqs_confirm_hits_url": VALID_ENV["SQS_CONFIRM_HITS_URL"],
+        "fetcher_base_url": VALID_ENV["FETCHER_BASE_URL"],
+        "fetcher_token": VALID_ENV["FETCHER_TOKEN"],
+        "csam_age_low_threshold": 18,
     }
     values.update(overrides)
     # A production config carrying the stub is refused at boot: the stub searches

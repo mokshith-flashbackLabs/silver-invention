@@ -69,6 +69,13 @@ def test_equal_tokens_refuse_to_start(clean_env: pytest.MonkeyPatch) -> None:
         ("HIVE_BASE_URL", "not a url"),
         ("HIVE_API_KEY", "changeme"),
         ("SERVICE_TOKEN", "short"),
+        ("SQS_CONFIRM_HITS_URL", "not a url"),
+        ("FETCHER_BASE_URL", "not a url"),
+        ("FETCHER_TOKEN", "short"),
+        ("CSAM_AGE_LOW_THRESHOLD", "-5"),
+        ("CONFIRM_FACE_MATCH_THRESHOLD", "101"),
+        ("CONFIRM_HIVE_MIN_SCORE", "1.5"),
+        ("SCORE_TICK_INTERVAL_SECONDS", "0"),
     ],
 )
 def test_malformed_values_are_fatal(
@@ -488,3 +495,120 @@ def test_db_sslmode_defaults_to_require(config: Config) -> None:
     """Not cosmetic: the RDS parameter group sets rds.force_ssl = 1, so a
     connection without it is refused. Never default this to anything weaker."""
     assert config.db_sslmode == "require"
+
+
+# ── Protection score / confirm pipeline config (design 2026-08-19) ─────────
+
+
+def test_score_config_defaults() -> None:
+    cfg = make_config()
+    assert cfg.score_config_version == "score-v1"
+    assert (
+        cfg.score_weight_posture,
+        cfg.score_weight_coverage,
+        cfg.score_weight_exposure,
+        cfg.score_weight_threat,
+    ) == (40, 25, 25, 10)
+    assert cfg.confirm_hive_min_score == 0.80
+    assert cfg.confirm_google_kind_set == frozenset({"full_match", "partial_match"})
+
+
+def test_score_weights_must_sum_to_100() -> None:
+    with pytest.raises(ValidationError, match="SCORE_WEIGHT"):
+        make_config(score_weight_posture=50)  # 50+25+25+10 = 110
+
+
+def test_posture_subweights_must_sum_to_posture() -> None:
+    with pytest.raises(ValidationError, match="SCORE_POSTURE"):
+        make_config(score_posture_seeds=25)  # 10+25+5+5 = 45 != weight_posture(40)
+
+
+def test_coverage_subweights_must_sum_to_coverage() -> None:
+    with pytest.raises(ValidationError, match="SCORE_COVERAGE"):
+        make_config(score_coverage_scan=20)  # 20+10 = 30 != weight_coverage(25)
+
+
+def test_exposure_weight_cannot_exceed_component() -> None:
+    with pytest.raises(ValidationError, match="SCORE_EXPOSURE"):
+        make_config(score_exposure_weight_ncii=30)  # > weight_exposure(25)
+
+
+def test_threat_penalty_cannot_exceed_weight_threat() -> None:
+    with pytest.raises(ValidationError, match="SCORE_THREAT_GLOBAL_MAX_PENALTY"):
+        make_config(score_threat_global_max_penalty=11)  # > weight_threat(10)
+
+
+def test_a_negative_component_weight_is_rejected_even_if_the_sum_is_100() -> None:
+    """The sum-to-100 check alone would accept a negative posture weight offset
+    by a larger coverage weight; `_positive` on every weight field is what
+    actually closes that gap."""
+    with pytest.raises(ValidationError):
+        make_config(
+            score_weight_posture=-40,
+            score_weight_coverage=65,
+            score_weight_exposure=65,
+            score_weight_threat=10,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "score_exposure_weight_ncii",
+        "score_exposure_weight_explicit",
+        "score_exposure_weight_benign",
+        "score_exposure_weight_default",
+        "score_threat_global_max_penalty",
+        "score_seed_target",
+        "score_seed_fresh_days",
+        "score_rec_soft_age_days",
+        "score_scan_grace_days",
+        "confirm_max_faces",
+        "confirm_phash_hamming_max",
+    ],
+)
+def test_new_positive_int_fields_reject_zero(field: str) -> None:
+    with pytest.raises(ValidationError):
+        make_config(**{field: 0})
+
+
+def test_google_confirm_kinds_must_be_known_categories() -> None:
+    with pytest.raises(ValidationError, match="CONFIRM_GOOGLE_KINDS"):
+        make_config(confirm_google_kinds="full_match,made_up")
+
+
+def test_confirm_google_kind_set_strips_whitespace() -> None:
+    cfg = make_config(confirm_google_kinds="full_match, page_match")
+    assert cfg.confirm_google_kind_set == frozenset({"full_match", "page_match"})
+
+
+@pytest.mark.parametrize("bad_value", [0.0, 1.5, -0.1])
+def test_confirm_hive_min_score_rejects_out_of_range_values(bad_value: float) -> None:
+    with pytest.raises(ValidationError):
+        make_config(confirm_hive_min_score=bad_value)
+
+
+def test_confirm_hive_min_score_accepts_values_up_to_one() -> None:
+    assert make_config(confirm_hive_min_score=0.5).confirm_hive_min_score == 0.5
+    assert make_config(confirm_hive_min_score=1.0).confirm_hive_min_score == 1.0
+
+
+@pytest.mark.parametrize("bad_value", [-1, 131])
+def test_csam_age_low_threshold_is_bounded_like_other_ages(bad_value: int) -> None:
+    with pytest.raises(ValidationError):
+        make_config(csam_age_low_threshold=bad_value)
+
+
+@pytest.mark.parametrize(
+    "missing_key", ["SQS_CONFIRM_HITS_URL", "FETCHER_BASE_URL", "CSAM_AGE_LOW_THRESHOLD"]
+)
+def test_new_required_fields_refuse_absence(
+    clean_env: pytest.MonkeyPatch, missing_key: str
+) -> None:
+    """The three new required additions. FETCHER_TOKEN is also required but is
+    already covered by test_missing_key_is_fatal_and_named's sweep over every
+    VALID_ENV key."""
+    clean_env.delenv(missing_key)
+    with pytest.raises(ConfigError) as excinfo:
+        load_config()
+    assert missing_key in str(excinfo.value)
