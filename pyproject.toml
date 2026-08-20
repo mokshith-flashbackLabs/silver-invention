@@ -100,7 +100,7 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]
 # enqueue must land in one Postgres transaction, not a Postgres write plus a
 # same-process SendMessage. Route all producers through
 # `imageshield.outbox.enqueue` / `enqueue_sync` instead.
-"boto3" = { msg = "Direct SQS access bypasses the transactional outbox — use imageshield.outbox.enqueue() instead. Only the relay (src/imageshield/relay.py), the search:runs worker (src/imageshield/search/worker.py, SQS receive only), and the Rekognition liveness provider (src/imageshield/liveness/provider.py) may import boto3 — and NEVER for an S3 client (CLAUDE.md §3.3)." }
+"boto3" = { msg = "Direct SQS access bypasses the transactional outbox — use imageshield.outbox.enqueue() instead. Only the relay (src/imageshield/relay.py), the search:runs worker (src/imageshield/search/worker.py, SQS receive only), the confirm:hits worker (src/imageshield/confirm/worker.py, SQS receive only), the Rekognition liveness provider (src/imageshield/liveness/provider.py), and the confirm moderation client (src/imageshield/confirm/moderation.py, Rekognition only) may import boto3 — and NEVER for an S3 client (CLAUDE.md §3.3)." }
 
 [tool.ruff.lint.per-file-ignores]
 # The four sanctioned boto3 importers:
@@ -119,6 +119,10 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.Query"]
 "src/imageshield/attribution/rekognition.py" = ["TID251"]
 "src/imageshield/aws_identity.py" = ["TID251"]
 "src/imageshield/recheck/worker.py" = ["TID251"]
+# Task 9's confirm:hits worker (SQS receive only) and Task 7's moderation
+# client (Rekognition only, never S3) — see the ban message above.
+"src/imageshield/confirm/moderation.py" = ["TID251"]
+"src/imageshield/confirm/worker.py" = ["TID251"]
 # Spike/eval harnesses (CLAUDE.md §8: devtools/ is outside the numbered
 # steps). Not application code; the outbox rule protects request handlers,
 # not one-off credential/region checks.
