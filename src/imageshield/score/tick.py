@@ -48,16 +48,31 @@ async def run_once(store: ScoreStore) -> None:
 
     Factored out of ``run_forever`` so it can be exercised without the
     scheduler around it — same split as ``recheck/loop.py`` vs.
-    ``recheck/worker.py``. No per-subject error isolation: an exception here
-    aborts the pass exactly like any other, and ``run_forever``'s
-    try/except is what keeps a single bad pass from killing the process.
+    ``recheck/worker.py``. Per-subject error isolation: one subject raising
+    (a store timeout, a data anomaly unique to that person) is logged and
+    skipped, never allowed to starve every subject after it in the sweep —
+    same swallow-and-log shape as
+    ``http/routes/admin_threat_events.py::_recompute_each``. ``run_forever``'s
+    own try/except is the second, coarser net: it exists for a failure in
+    ``expire_due_threat_events`` or the subject listing itself, not for one
+    subject's recompute.
     """
     now = datetime.now(UTC)
     expired = await store.expire_due_threat_events(now=now)
     subjects = await store.all_subject_refs()
+    failed = 0
     for user_ref in subjects:
-        await store.recompute(user_ref, cause_kind="tick")
-    log.info("score.tick_pass_completed", expired_events=expired, subjects=len(subjects))
+        try:
+            await store.recompute(user_ref, cause_kind="tick")
+        except Exception:
+            failed += 1
+            log.warning("score.tick_recompute_failed", user_ref=str(user_ref))
+    log.info(
+        "score.tick_pass_completed",
+        expired_events=expired,
+        subjects=len(subjects),
+        failed=failed,
+    )
 
 
 async def run_forever(config: Config) -> None:

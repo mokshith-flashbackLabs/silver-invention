@@ -102,3 +102,36 @@ async def test_run_once_with_no_subjects_still_expires() -> None:
 
     assert len(store.expire_calls) == 1
     assert store.recompute_calls == []
+
+
+async def test_one_subjects_recompute_failing_does_not_starve_the_rest() -> None:
+    """A store timeout or data anomaly unique to one subject must not stop
+    the sweep -- every subject after the failing one still gets recomputed
+    this tick, same isolation shape as
+    ``admin_threat_events.py::_recompute_each``."""
+    subjects = (UserRef(uuid4()), UserRef(uuid4()), UserRef(uuid4()))
+    failing = subjects[1]
+
+    class FlakyStore(FakeScoreStore):
+        async def recompute(
+            self,
+            user_ref: UserRef,
+            *,
+            cause_kind: str,
+            cause_ref: str | None = None,
+            now: datetime | None = None,
+        ) -> ScoreResult | None:
+            if user_ref == failing:
+                raise RuntimeError("boom")
+            return await super().recompute(
+                user_ref, cause_kind=cause_kind, cause_ref=cause_ref, now=now
+            )
+
+    store = FlakyStore(subjects)
+
+    await run_once(store)  # must not raise
+
+    assert store.recompute_calls == [
+        (subjects[0], "tick"),
+        (subjects[2], "tick"),
+    ]
