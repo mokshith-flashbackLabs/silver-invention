@@ -67,12 +67,16 @@ def _unprivileged_login_role(db_url: str, name: str) -> Iterator[str]:
             conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(identifier))
 
 
-def test_the_four_views_are_all_declared() -> None:
+def test_the_eight_views_are_all_declared() -> None:
     assert set(EXPECTED_VIEWS) == {
         "v_person_enrolment_state",
         "v_person_report_summary",
         "v_person_hits",
         "v_person_liveness_attempts",
+        "v_person_score",
+        "v_person_score_events",
+        "v_person_recommendations",
+        "v_person_threat_context",
     }
 
 

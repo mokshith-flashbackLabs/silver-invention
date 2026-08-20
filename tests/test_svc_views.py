@@ -34,6 +34,10 @@ VIEWS = (
     "v_person_report_summary",
     "v_person_hits",
     "v_person_liveness_attempts",
+    "v_person_score",
+    "v_person_score_events",
+    "v_person_recommendations",
+    "v_person_threat_context",
 )
 
 # Derived, not transcribed: src/imageshield/http/svc_contract.py is the single
@@ -103,11 +107,52 @@ FROZEN_CONTRACT_COLUMNS: dict[str, set[str]] = {
         "resolution_note",
         "provider_count",
         "score",
+        "confirm_state",
+        "severity",
+        "decided_at",
     },
     "v_person_liveness_attempts": {
         "person_ref",
         "attempts_24h",
         "last_attempt_at",
+    },
+    "v_person_score": {
+        "person_ref",
+        "score",
+        "components",
+        "config_version",
+        "computed_at",
+    },
+    "v_person_score_events": {
+        "score_event_id",
+        "person_ref",
+        "delta",
+        "component",
+        "cause_kind",
+        "cause_ref",
+        "score_after",
+        "created_at",
+    },
+    "v_person_recommendations": {
+        "rec_id",
+        "person_ref",
+        "kind",
+        "params",
+        "status",
+        "source_event_id",
+        "created_at",
+        "completed_at",
+        "expires_at",
+    },
+    "v_person_threat_context": {
+        "person_ref",
+        "event_id",
+        "kind",
+        "title",
+        "body",
+        "severity",
+        "starts_at",
+        "expires_at",
     },
 }
 
@@ -650,6 +695,116 @@ def test_resolved_at_is_set_for_a_terminal_position_and_for_a_dead_url(
     assert open_hit is not None
 
 
+# ── 0023: confirm_state / severity / decided_at, and the quarantine/duplicate
+#          row filter on v_person_hits and v_person_report_summary ───────────
+
+
+def test_quarantined_hits_appear_in_no_view(migrated_db: str) -> None:
+    """INVARIANTS #19: nothing reaches a user surface from the review band
+    without a human decision, and quarantine is the state that says a human is
+    still deciding. A quarantined hit must disappear from the hit list AND
+    from every count the report summary derives from it -- being invisible in
+    one and still counted in the other is the same leak."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        seed = _seed(conn, user_ref)
+        run = _run(conn, user_ref, seed)
+        infringement = _infringement(conn, user_ref, run, status="new")
+
+    before = _one(
+        migrated_db,
+        "SELECT * FROM svc.v_person_report_summary WHERE person_ref = %s",
+        (user_ref,),
+    )
+    assert before["active_reports"] == 1
+    assert before["unresolved_matches"] == 1
+    assert before["live_exposure_count"] == 1
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE infringements SET confirm_state = 'quarantined'"
+            " WHERE infringement_id = %s",
+            (infringement,),
+        )
+
+    assert (
+        _rows(
+            migrated_db,
+            "SELECT * FROM svc.v_person_hits WHERE person_ref = %s",
+            (user_ref,),
+        )
+        == []
+    )
+    after = _one(
+        migrated_db,
+        "SELECT * FROM svc.v_person_report_summary WHERE person_ref = %s",
+        (user_ref,),
+    )
+    assert after["active_reports"] == 0
+    assert after["unresolved_matches"] == 0
+    assert after["live_exposure_count"] == 0
+
+
+def test_duplicates_are_collapsed_out_of_the_report(migrated_db: str) -> None:
+    """A duplicate is the same picture the user already answered, now sitting
+    under a second URL. It must not appear in the hit list and must not
+    double-count active_reports/unresolved_matches/live_exposure_count."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        seed = _seed(conn, user_ref)
+        run = _run(conn, user_ref, seed)
+        original = _infringement(conn, user_ref, run, domain="original.test")
+        mirror = _infringement(conn, user_ref, run, domain="mirror.test")
+        conn.execute(
+            "UPDATE infringements SET confirm_state = 'duplicate', duplicate_of = %s"
+            " WHERE infringement_id = %s",
+            (original, mirror),
+        )
+
+    hit_domains = {
+        row["source_domain"]
+        for row in _rows(
+            migrated_db,
+            "SELECT * FROM svc.v_person_hits WHERE person_ref = %s",
+            (user_ref,),
+        )
+    }
+    assert hit_domains == {"original.test"}
+
+    summary = _one(
+        migrated_db,
+        "SELECT * FROM svc.v_person_report_summary WHERE person_ref = %s",
+        (user_ref,),
+    )
+    assert summary["active_reports"] == 1
+    assert summary["unresolved_matches"] == 1
+    assert summary["live_exposure_count"] == 1
+
+
+def test_confirmed_severity_travels_on_v_person_hits(migrated_db: str) -> None:
+    """The three columns 0023 appends -- confirm_state, severity, decided_at
+    (confirm_decided_at) -- must be readable on the same row the rest of the
+    hit's projection comes from, not require a second query."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        seed = _seed(conn, user_ref)
+        run = _run(conn, user_ref, seed)
+        infringement = _infringement(conn, user_ref, run)
+        conn.execute(
+            "UPDATE infringements SET confirm_state = 'confirmed',"
+            " severity = 'ncii_suspected', confirm_decided_by = 'reviewer@test',"
+            " confirm_decided_at = now() WHERE infringement_id = %s",
+            (infringement,),
+        )
+
+    row = _one(
+        migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,)
+    )
+    assert row["confirm_state"] == "confirmed"
+    assert row["severity"] == "ncii_suspected"
+    assert row["decided_at"] is not None
+
+
 # ── v_person_liveness_attempts ───────────────────────────────────────────────
 
 
@@ -698,6 +853,79 @@ def test_an_unknown_infringement_status_is_refused_by_the_database(
                 " WHERE infringement_id = %s",
                 (infringement,),
             )
+
+
+# ── 0023: the score/threat surface ───────────────────────────────────────────
+#
+# The four new views are additive to the same grant target 0016 created --
+# imageshield_proxy_ro -- not a second contract with its own membership chain.
+# Direct INSERT as the migration owner, per this file's own convention
+# (fixtures thread SQL, not application code): recomputing a real score would
+# make this test about score/store.py rather than about the projection.
+
+
+def test_score_views_read_under_the_proxy_role(migrated_db: str) -> None:
+    """SELECT on all four new views must not raise under
+    ``imageshield_proxy_ro``, and none of them is writable through the view --
+    the same read-only posture as the original four (CLAUDE.md §3)."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        conn.execute(
+            "INSERT INTO protection_scores (user_ref, score, components, config_version)"
+            " VALUES (%s, 72, %s, 'score-v1')",
+            (
+                user_ref,
+                json.dumps({"posture": 20, "coverage": 20, "exposure": 20, "threat": 12}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO score_events (user_ref, delta, component, cause_kind,"
+            " cause_ref, config_version, score_after)"
+            " VALUES (%s, -5, 'exposure', 'new_hit', %s, 'score-v1', 72)",
+            (user_ref, uuid4().hex),
+        )
+        conn.execute(
+            "INSERT INTO recommendations (user_ref, kind, params)"
+            " VALUES (%s, 'add_seed_photos', '{}'::jsonb)",
+            (user_ref,),
+        )
+        event = conn.execute(
+            "INSERT INTO threat_events (kind, title, severity, is_global, penalty,"
+            " expires_at, decay_days, created_by)"
+            " VALUES ('leak', 'Test leak', 3, true, 5.00,"
+            " now() + interval '7 days', 30, 'ops') RETURNING event_id"
+        ).fetchone()
+        assert event is not None
+        conn.execute(
+            "INSERT INTO threat_event_matches (event_id, user_ref, matched_via,"
+            " penalty_applied) VALUES (%s, %s, 'global', 5.00)",
+            (event[0], user_ref),
+        )
+
+    new_views = (
+        "v_person_score",
+        "v_person_score_events",
+        "v_person_recommendations",
+        "v_person_threat_context",
+    )
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute("SET ROLE imageshield_proxy_ro")
+        for view in new_views:
+            conn.execute(f"SELECT * FROM svc.{view}")  # must not raise
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE svc.v_person_score SET score = 0")
+        conn.execute("RESET ROLE")
+
+    row = _one(
+        migrated_db, "SELECT * FROM svc.v_person_score WHERE person_ref = %s", (user_ref,)
+    )
+    assert row["score"] == 72
+    context = _one(
+        migrated_db,
+        "SELECT * FROM svc.v_person_threat_context WHERE person_ref = %s",
+        (user_ref,),
+    )
+    assert context["kind"] == "leak"
 
 
 # ── the grant chain (0017) ───────────────────────────────────────────────────

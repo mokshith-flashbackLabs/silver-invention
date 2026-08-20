@@ -1,4 +1,4 @@
-"""The expected shape of the four `svc` contract views.
+"""The expected shape of the eight `svc` contract views.
 
 This is the ONE place outside migration 0016 that names `svc.v_person_*`, which
 is what the deploy checklist's `grep svc.v_person_` check relies on.
@@ -16,7 +16,7 @@ caught.
 
 **Three things are checked, not one.** The relations exist *as views*, their
 columns are present and correctly typed, and `imageshield_proxy_ro` still holds
-SELECT on all four. The grant is half the contract and it is the half whose
+SELECT on all eight. The grant is half the contract and it is the half whose
 failure lands entirely on the other repo: revoke it and the views are still
 present, still correctly shaped, and unreadable by the only role that reads
 them. `relkind` matters for the same reason a name check is not enough —
@@ -41,7 +41,7 @@ database, and sent the operator to re-run a migration that had already succeeded
 there rather than what its own connection role happens to own.
 
 Types are ``format_type(atttypid, atttypmod)`` spellings — PostgreSQL's own
-canonical form, which is not always ``information_schema.data_type``'s. Of the 33
+canonical form, which is not always ``information_schema.data_type``'s. Of the 65
 columns here exactly one differs: ``v_person_hits.score`` reads as ``numeric``
 there and ``numeric(6,4)`` here. The narrower spelling is the better contract,
 because the precision is part of what the proxy deserialises.
@@ -119,11 +119,58 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         # the precision because that is what format_type reports; the
         # information schema flattens it to "numeric".
         "score": "numeric(6,4)",
+        # 0023: confirm pipeline state, appended at the end of the select list
+        # so the OR REPLACE stays additive. decided_at is confirm_decided_at
+        # under the proxy's naming convention (report_id-style rename).
+        "confirm_state": "text",
+        "severity": "text",
+        "decided_at": "timestamp with time zone",
     },
     "v_person_liveness_attempts": {
         "person_ref": "uuid",
         "attempts_24h": "integer",
         "last_attempt_at": "timestamp with time zone",
+    },
+    # ── 0023: the score/threat surface ────────────────────────────────────
+    "v_person_score": {
+        "person_ref": "uuid",
+        "score": "integer",
+        "components": "jsonb",
+        "config_version": "text",
+        "computed_at": "timestamp with time zone",
+    },
+    "v_person_score_events": {
+        "score_event_id": "bigint",
+        "person_ref": "uuid",
+        "delta": "integer",
+        "component": "text",
+        "cause_kind": "text",
+        # An opaque provenance id (INVARIANTS #9-adjacent: never a URL, never
+        # bytes), not a resource the proxy can dereference.
+        "cause_ref": "text",
+        "score_after": "integer",
+        "created_at": "timestamp with time zone",
+    },
+    "v_person_recommendations": {
+        "rec_id": "uuid",
+        "person_ref": "uuid",
+        "kind": "text",
+        "params": "jsonb",
+        "status": "text",
+        "source_event_id": "uuid",
+        "created_at": "timestamp with time zone",
+        "completed_at": "timestamp with time zone",
+        "expires_at": "timestamp with time zone",
+    },
+    "v_person_threat_context": {
+        "person_ref": "uuid",
+        "event_id": "uuid",
+        "kind": "text",
+        "title": "text",
+        "body": "text",
+        "severity": "smallint",
+        "starts_at": "timestamp with time zone",
+        "expires_at": "timestamp with time zone",
     },
 }
 

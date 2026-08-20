@@ -592,16 +592,36 @@ built; we built `infringements` and `attestations` instead, with different names
 The grant named a schema that was never created. That was our mistake, not yours, and it is why
 `src/services/contract/readers.ts` was written against a contract nobody here had agreed to implement.
 
-### The four `svc` views
+### The eight `svc` views
 
-The views your reader expects now exist, in an `svc` schema, owned by this repo (migration 0016).
+The views your reader expects now exist, in an `svc` schema, owned by this repo (migration 0016;
+four more in 0023).
 
 | View | Key columns |
 |---|---|
 | `svc.v_person_enrolment_state` | `person_ref`, `status`, `model_id`, `enrolled_at` |
 | `svc.v_person_report_summary` | `person_ref`, `active_reports`, `unresolved_matches`, `live_exposure_count`, `last_run_at`, `first_scan_completed_at`, `monitored_sources` |
-| `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score` |
+| `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score`, `confirm_state`, `severity`, `decided_at` |
 | `svc.v_person_liveness_attempts` | `person_ref`, `attempts_24h`, `last_attempt_at` |
+| `svc.v_person_score` *(0023)* | `person_ref`, `score`, `components`, `config_version`, `computed_at` |
+| `svc.v_person_score_events` *(0023)* | `score_event_id`, `person_ref`, `delta`, `component`, `cause_kind`, `cause_ref`, `score_after`, `created_at` |
+| `svc.v_person_recommendations` *(0023)* | `rec_id`, `person_ref`, `kind`, `params`, `status`, `source_event_id`, `created_at`, `completed_at`, `expires_at` |
+| `svc.v_person_threat_context` *(0023)* | `person_ref`, `event_id`, `kind`, `title`, `body`, `severity`, `starts_at`, `expires_at` — pre-filtered to `status = 'active' AND expires_at > now()`; a `draft` or `retracted` event never appears here |
+
+**0023 also changed two existing views, additively.** `v_person_hits` gained the three trailing
+columns above, and both `v_person_hits` and `v_person_report_summary` now exclude
+`confirm_state IN ('quarantined', 'duplicate')` from their row set — `v_person_hits` by a `WHERE` on
+the view itself, `v_person_report_summary` by the same filter inside the inner `infringements`
+aggregate that produces `active_reports`/`unresolved_matches`/`live_exposure_count`. Nothing else
+about either view's shape or semantics moved: this is a row filter, not a redefinition. Why the
+filter exists — `quarantined` means a human is still deciding this hit (INVARIANTS #19: nothing
+reaches a user surface from the review band without a human decision), and `duplicate` means the
+same picture already has an answer under a different URL; showing it again, or counting it twice,
+would misstate both the report and the score built on top of it.
+
+**`score_events.cause_ref` is an opaque provenance id, not a URL.** It is whatever `score/store.py`
+stamped a delta with — an infringement id, a run id, a threat event id — for tracing a point movement
+back to its cause. Do not render it as a link or attempt to dereference it as a resource.
 
 **Why views and not an HTTP endpoint.** Your single-source-of-truth argument for `live_exposure_count`
 is sound, but the deciding reason is a different one: **your own views JOIN against ours.**
@@ -630,9 +650,13 @@ GRANT USAGE  ON SCHEMA svc TO imageshield_proxy_ro;
 GRANT SELECT ON svc.v_person_enrolment_state, svc.v_person_report_summary,
                 svc.v_person_hits, svc.v_person_liveness_attempts
   TO imageshield_proxy_ro;
+-- 0023, same role, same idiom:
+GRANT SELECT ON svc.v_person_score, svc.v_person_score_events,
+                svc.v_person_recommendations, svc.v_person_threat_context
+  TO imageshield_proxy_ro;
 ```
 
-**`SELECT` on the four views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
+**`SELECT` on the eight views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
 view's base-table reads are checked against the view *owner*, which is what lets exactly this
 projection through while `enrolments`, `attestations` and `attributed_faces` stay closed. Verify by
 attempting `SELECT * FROM public.enrolments` as that role: it must fail with a permission error, not be
@@ -718,6 +742,10 @@ pre-check passes and our refusal fires.
 - `v_person_hits.host_page_url` — only behind the interstitial copy action (INVARIANTS #22)
 - `v_person_hits.face_bbox` — internal to crop rendering
 - `v_person_hits.match_id`, `source_photo_id` — provenance, not user-facing
+
+Nothing added by 0023. The score/threat surface is all user-safe by construction: a score, its
+components, a recommendation, and an already-filtered active threat notice — no vector, no
+`external_face_id`, no image byte, no phone number, on any of the four new views.
 
 **`v_person_hits` deliberately omits `image_url`, `thumbnail_url` and `evidence_image_url`, and it must
 stay that way.** You reached the same conclusion we did in migration 0005 and in the
