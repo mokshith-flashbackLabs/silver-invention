@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Events - ImageShield Console{% endblock %}
+{% block content %}
+<h1>New threat event</h1>
+<div class="card">
+  <form method="post" action="/events">
+    <label>Kind
+      <select name="kind">
+        <option value="leak">leak</option>
+        <option value="deepfake_wave">deepfake_wave</option>
+        <option value="platform_incident">platform_incident</option>
+        <option value="other">other</option>
+      </select>
+    </label>
+    <label>Title <input type="text" name="title" required></label>
+    <label>Body <textarea name="body" rows="2"></textarea></label>
+    <label>Severity (1-5) <input type="number" name="severity" min="1" max="5" required></label>
+    <label>Domains (comma-separated, blank if global)
+      <input type="text" name="domains" placeholder="example.com, other.example">
+    </label>
+    <label><input type="checkbox" name="is_global"> Global (applies to every subject)</label>
+    <label>Penalty <input type="text" name="penalty" placeholder="5.00" required></label>
+    <label>Expires at <input type="datetime-local" name="expires_at" required></label>
+    <label>Decay days <input type="number" name="decay_days" min="1" required></label>
+    <button type="submit">Create event</button>
+  </form>
+</div>
+
+<h1>Threat events</h1>
+<table>
+<tr>
+  <th>ID</th><th>Kind</th><th>Title</th><th>Severity</th><th>Domains</th>
+  <th>Global</th><th>Penalty</th><th>Status</th><th>Expires</th><th></th>
+</tr>
+{% for e in events %}
+<tr>
+  <td>{{ e.event_id }}</td>
+  <td>{{ e.kind }}</td>
+  <td>{{ e.title }}</td>
+  <td>{{ e.severity }}</td>
+  <td>{{ e.domains | join(", ") }}</td>
+  <td>{{ e.is_global }}</td>
+  <td>{{ e.penalty }}</td>
+  <td>{{ e.status }}</td>
+  <td>{{ e.expires_at }}</td>
+  <td>
+    {% if e.status == "active" %}
+    <form class="inline" method="post" action="/events/{{ e.event_id }}/retract">
+      <input type="text" name="reason" placeholder="reason (min 3 chars)" required minlength="3">
+      <button type="submit">Retract</button>
+    </form>
+    {% endif %}
+  </td>
+</tr>
+{% else %}
+<tr><td colspan="10" class="muted">No threat events.</td></tr>
+{% endfor %}
+</table>
+{% endblock %}

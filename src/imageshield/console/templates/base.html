@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}ImageShield Console{% endblock %}</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; margin: 0; background: #0b0d10; color: #e6e6e6; }
+  nav { display: flex; gap: 1.25rem; align-items: center; padding: 0.75rem 1.25rem; background: #14171a; border-bottom: 1px solid #2a2e33; }
+  nav a { color: #9ecbff; text-decoration: none; font-weight: 600; }
+  nav a:hover { text-decoration: underline; }
+  .operator { margin-left: auto; color: #9a9a9a; font-size: 0.9rem; }
+  main { padding: 1.5rem; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.2rem; }
+  h2 { font-size: 1rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border: 1px solid #2a2e33; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.85rem; vertical-align: top; }
+  th { background: #1c2024; }
+  form.inline { display: inline-flex; gap: 0.35rem; }
+  input, select, textarea, button { font: inherit; padding: 0.35rem 0.5rem; background: #1c2024; color: #e6e6e6; border: 1px solid #3a3f45; border-radius: 4px; }
+  button { cursor: pointer; background: #24303d; }
+  button:hover { background: #2e3d4d; }
+  .card { background: #14171a; border: 1px solid #2a2e33; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
+  .crop { max-width: 320px; display: block; margin: 0.5rem 0; border: 1px solid #3a3f45; }
+  .muted { color: #9a9a9a; }
+  label { display: block; margin: 0.4rem 0; }
+</style>
+</head>
+<body>
+<nav>
+  <a href="/">Dashboard</a>
+  <a href="/review">Review</a>
+  <a href="/events">Events</a>
+  <a href="/scores">Scores</a>
+  <span class="operator">{{ operator }}</span>
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

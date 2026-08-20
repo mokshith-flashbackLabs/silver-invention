@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - ImageShield Console{% endblock %}
+{% block content %}
+<h1>Provider health</h1>
+<table>
+<tr><th>Provider</th><th>Enabled</th><th>Breaker</th><th>Calls</th><th>Cost (USD)</th><th>Success rate</th></tr>
+{% for p in providers %}
+<tr>
+  <td>{{ p.provider_id }}</td>
+  <td>{{ p.enabled }}</td>
+  <td>{{ p.breaker_state }}</td>
+  <td>{{ p.call_count }}</td>
+  <td>{{ p.cost_usd }}</td>
+  <td>{{ p.success_rate }}</td>
+</tr>
+{% else %}
+<tr><td colspan="6" class="muted">No providers configured.</td></tr>
+{% endfor %}
+</table>
+
+<h1>Review queue depths</h1>
+<table>
+<tr><th>Severity</th><th>Pending</th></tr>
+{% for severity, count in queue.items() %}
+<tr><td>{{ severity }}</td><td>{{ count }}</td></tr>
+{% else %}
+<tr><td colspan="2" class="muted">Queue is empty.</td></tr>
+{% endfor %}
+</table>
+{% endblock %}

@@ -34,6 +34,8 @@ dependencies = [
     "httpx>=0.27.2",
     # attribution/crop.py ONLY -- see the note above.
     "pillow>=11.0.0,<12.0",
+    # console only -- server-rendered templates for the control-room console.
+    "jinja2>=3.1,<4.0",
 ]
 
 [project.optional-dependencies]
@@ -55,7 +57,7 @@ where = ["src"]
 include = ["imageshield*"]
 
 [tool.setuptools.package-data]
-imageshield = ["py.typed"]
+imageshield = ["py.typed", "console/templates/*.html"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"
