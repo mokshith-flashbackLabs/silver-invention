@@ -3,7 +3,7 @@
   "networkMode": "host",
   "requiresCompatibilities": ["EC2"],
   "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-exec",
-  "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-services",
+  "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-no-aws",
   "containerDefinitions": [
     {
       "name": "fetcher",

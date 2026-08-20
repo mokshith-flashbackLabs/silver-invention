@@ -430,6 +430,26 @@ def test_confirm_uses_the_narrower_db_pool(name: str = "DB_POOL_MAX_SIZE") -> No
         assert env[name] == "2", f"{container['name']} does not use the narrower pool"
 
 
+def test_fetcher_and_console_do_not_hold_the_services_task_role() -> None:
+    """Both processes were carrying ``imageshield-dev-services`` -- the role
+    with Rekognition, S3, SQS and KMS grants meant for the API/worker/confirm
+    processes -- for no reason: neither one calls AWS at all (fetcher does
+    outbound HTTP fetches, console is an HTTP client of two other services).
+    They must point at a distinct role with no attached policy, so that a
+    future bug in either process cannot reach an AWS credential it should
+    never have held.
+    """
+    services_role = _load(SERVICES_TASK)["taskRoleArn"]
+    for path in (FETCHER_TASK, CONSOLE_TASK):
+        role = _load(path)["taskRoleArn"]
+        assert role != services_role, (
+            f"{path.name} still carries the over-privileged services task role"
+        )
+        assert role.endswith("/imageshield-dev-no-aws"), (
+            f"{path.name} taskRoleArn is {role!r}, expected the no-aws role"
+        )
+
+
 def test_fetcher_and_console_hold_no_database_access() -> None:
     """The fetcher and console are the no-DB-access property in deployable
     form (ARCHITECTURE.md §3.7, console/config.py, fetcher/config.py): neither

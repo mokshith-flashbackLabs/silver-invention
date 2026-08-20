@@ -513,6 +513,28 @@ aws secretsmanager get-secret-value \
 # must include FETCHER_TOKEN and CONSOLE_OPERATORS alongside the pre-existing "token" key
 ```
 
+### The no-AWS task role, before registering fetcher or console
+
+Both new task definitions carried `taskRoleArn: imageshield-dev-services` in an earlier draft of
+this deploy -- the role with Rekognition, S3, SQS and KMS grants meant for the API, worker and
+confirm processes. Neither the fetcher (outbound HTTP fetches only) nor the console (an HTTP client
+of the services API and the fetcher, §17) calls any AWS API, so that grant was pure over-privilege:
+a bug in either process would have reached credentials it never needed. `tests/test_ecs_task_defs.py
+::test_fetcher_and_console_do_not_hold_the_services_task_role` makes that a build-time check now.
+
+Create the role once, before registering `imageshield-dev-fetcher.json` or
+`imageshield-dev-console.json` -- both files' `taskRoleArn` already points at it:
+
+```bash
+# Same ecs-tasks.amazonaws.com trust document as imageshield-dev-exec / imageshield-dev-services
+# above (§ Task role) -- this role differs from those only in having no attached policy at all.
+aws iam create-role --role-name imageshield-dev-no-aws \
+  --assume-role-policy-document file:///tmp/ecs-trust.json \
+  --tags Key=Env,Value=dev Key=Project,Value=imageshield
+# Deliberately no `put-role-policy` call: this role's entire purpose is to hold nothing. A task
+# using it that somehow calls an AWS API gets an explicit AccessDenied, not a working credential.
+```
+
 ### Register and create the three services
 
 Same pattern as §9a — register, then create with `minimumHealthyPercent=0, maximumPercent=100` (still
