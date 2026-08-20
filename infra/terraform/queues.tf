@@ -1,4 +1,4 @@
-# Two queues, a DLQ each, a redrive policy and a depth alarm.
+# Three queues, a DLQ each, a redrive policy and a depth alarm.
 #
 # identity:index is reserved and unused in v1 (step 4 indexes synchronously
 # inside the enrolment transaction). It exists because the outbox already
@@ -11,6 +11,8 @@ locals {
     # per-provider rate limit, so a claim can legitimately be held for minutes.
     # The store's stale-claim window (15 min) is the backstop above this.
     "search-runs" = { visibility_timeout = 600 }
+    # Confirm bundle: one fetch + up to five Rekognition calls with retries.
+    "confirm-hits" = { visibility_timeout = 300 }
   }
 }
 
@@ -75,6 +77,6 @@ resource "aws_cloudwatch_metric_alarm" "queue_age" {
 }
 
 output "queue_urls" {
-  description = "Set as SQS_IDENTITY_INDEX_URL and SQS_SEARCH_RUNS_URL."
+  description = "Set as SQS_IDENTITY_INDEX_URL, SQS_SEARCH_RUNS_URL and SQS_CONFIRM_HITS_URL."
   value       = { for key, queue in aws_sqs_queue.main : key => queue.url }
 }

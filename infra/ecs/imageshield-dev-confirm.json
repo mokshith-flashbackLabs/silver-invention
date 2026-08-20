@@ -1,16 +1,16 @@
 {
-  "family": "imageshield-dev-services-worker",
+  "family": "imageshield-dev-confirm",
   "networkMode": "host",
   "requiresCompatibilities": ["EC2"],
   "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-exec",
   "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-services",
   "containerDefinitions": [
     {
-      "name": "relay",
+      "name": "confirm-worker",
       "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:70eb211",
       "essential": true,
-      "memory": 160,
-      "command": ["python", "-m", "imageshield.relay"],
+      "memory": 192,
+      "command": ["python", "-m", "imageshield.confirm.worker"],
       "environment": [
         { "name": "ENVIRONMENT", "value": "production" },
         { "name": "LOG_LEVEL", "value": "info" },
@@ -30,7 +30,7 @@
         { "name": "LIVENESS_MIN_CONFIDENCE", "value": "90" },
         { "name": "LIVENESS_SESSION_TTL_SECONDS", "value": "600" },
         { "name": "LIVENESS_MAX_ATTEMPTS_24H", "value": "5" },
-        { "name": "DB_POOL_MAX_SIZE", "value": "3" },
+        { "name": "DB_POOL_MAX_SIZE", "value": "2" },
         { "name": "DB_SSLMODE", "value": "require" },
         { "name": "HIVE_BASE_URL", "value": "https://api.thehive.ai" },
         { "name": "SQS_IDENTITY_INDEX_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-identity-index" },
@@ -56,16 +56,16 @@
         "options": {
           "awslogs-group": "/imageshield/dev",
           "awslogs-region": "ap-south-1",
-          "awslogs-stream-prefix": "relay"
+          "awslogs-stream-prefix": "confirm-worker"
         }
       }
     },
     {
-      "name": "search-worker",
+      "name": "score-tick",
       "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:70eb211",
       "essential": true,
-      "memory": 288,
-      "command": ["python", "-m", "imageshield.search.worker"],
+      "memory": 96,
+      "command": ["python", "-m", "imageshield.score.tick"],
       "environment": [
         { "name": "ENVIRONMENT", "value": "production" },
         { "name": "LOG_LEVEL", "value": "info" },
@@ -85,7 +85,7 @@
         { "name": "LIVENESS_MIN_CONFIDENCE", "value": "90" },
         { "name": "LIVENESS_SESSION_TTL_SECONDS", "value": "600" },
         { "name": "LIVENESS_MAX_ATTEMPTS_24H", "value": "5" },
-        { "name": "DB_POOL_MAX_SIZE", "value": "3" },
+        { "name": "DB_POOL_MAX_SIZE", "value": "2" },
         { "name": "DB_SSLMODE", "value": "require" },
         { "name": "HIVE_BASE_URL", "value": "https://api.thehive.ai" },
         { "name": "SQS_IDENTITY_INDEX_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-identity-index" },
@@ -111,7 +111,7 @@
         "options": {
           "awslogs-group": "/imageshield/dev",
           "awslogs-region": "ap-south-1",
-          "awslogs-stream-prefix": "search-worker"
+          "awslogs-stream-prefix": "score-tick"
         }
       }
     }

@@ -1,0 +1,35 @@
+{
+  "family": "imageshield-dev-fetcher",
+  "networkMode": "host",
+  "requiresCompatibilities": ["EC2"],
+  "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-exec",
+  "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-services",
+  "containerDefinitions": [
+    {
+      "name": "fetcher",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:70eb211",
+      "essential": true,
+      "memory": 192,
+      "command": ["sh", "-c", "uvicorn imageshield.fetcher.app:create_app --factory --host 0.0.0.0 --port 8083"],
+      "environment": [],
+      "secrets": [
+        { "name": "FETCHER_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:FETCHER_TOKEN::" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8083/health').status==200 else 1)\""],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/imageshield/dev",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "fetcher"
+        }
+      }
+    }
+  ]
+}

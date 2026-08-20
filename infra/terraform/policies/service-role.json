@@ -26,7 +26,7 @@
     {
       "Sid": "FaceDetectionIsNotCollectionScoped",
       "Effect": "Allow",
-      "Action": ["rekognition:DetectFaces"],
+      "Action": ["rekognition:DetectFaces", "rekognition:DetectModerationLabels"],
       "Resource": "*"
     },
     {
@@ -42,8 +42,10 @@
       "Resource": [
         "${identity_index_queue_arn}",
         "${search_runs_queue_arn}",
+        "${confirm_hits_queue_arn}",
         "${identity_index_dlq_arn}",
-        "${search_runs_dlq_arn}"
+        "${search_runs_dlq_arn}",
+        "${confirm_hits_dlq_arn}"
       ]
     },
     {

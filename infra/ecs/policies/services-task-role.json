@@ -28,6 +28,12 @@
       "Resource": "*"
     },
     {
+      "Sid": "DetectionIsNotCollectionScoped",
+      "Effect": "Allow",
+      "Action": ["rekognition:DetectFaces", "rekognition:DetectModerationLabels"],
+      "Resource": "*"
+    },
+    {
       "Sid": "ReadLivenessReferenceImagesOnly",
       "Effect": "Allow",
       "Action": "s3:GetObject",
@@ -44,7 +50,8 @@
       ],
       "Resource": [
         "arn:aws:sqs:ap-south-1:225989356895:imageshield-dev-identity-index",
-        "arn:aws:sqs:ap-south-1:225989356895:imageshield-dev-search-runs"
+        "arn:aws:sqs:ap-south-1:225989356895:imageshield-dev-search-runs",
+        "arn:aws:sqs:ap-south-1:225989356895:imageshield-dev-confirm-hits"
       ]
     },
     {

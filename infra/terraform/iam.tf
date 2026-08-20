@@ -39,8 +39,10 @@ resource "aws_iam_policy" "service" {
     collection_id            = var.collection_id
     identity_index_queue_arn = aws_sqs_queue.main["identity-index"].arn
     search_runs_queue_arn    = aws_sqs_queue.main["search-runs"].arn
+    confirm_hits_queue_arn   = aws_sqs_queue.main["confirm-hits"].arn
     identity_index_dlq_arn   = aws_sqs_queue.dlq["identity-index"].arn
     search_runs_dlq_arn      = aws_sqs_queue.dlq["search-runs"].arn
+    confirm_hits_dlq_arn     = aws_sqs_queue.dlq["confirm-hits"].arn
     environment              = var.environment
   })
 }

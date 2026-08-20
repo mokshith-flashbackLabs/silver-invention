@@ -91,6 +91,8 @@ def test_no_statement_is_a_deny_that_could_mask_a_grant() -> None:
         # Attribution (task 05, INVARIANTS #1a).
         "rekognition:DetectFaces",
         "rekognition:SearchFacesByImage",
+        # The CSAM tripwire (design §7 step 7, task 18).
+        "rekognition:DetectModerationLabels",
         # The outbox relay and the search worker.
         "sqs:SendMessage",
         "sqs:ReceiveMessage",

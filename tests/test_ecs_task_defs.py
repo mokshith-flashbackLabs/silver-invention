@@ -21,6 +21,9 @@ ECS_DIR = Path(__file__).resolve().parents[1] / "infra" / "ecs"
 SERVICES_TASK = ECS_DIR / "imageshield-dev-services.json"
 MIGRATE_TASK = ECS_DIR / "imageshield-dev-migrate-services.json"
 WORKER_TASK = ECS_DIR / "imageshield-dev-services-worker.json"
+CONFIRM_TASK = ECS_DIR / "imageshield-dev-confirm.json"
+FETCHER_TASK = ECS_DIR / "imageshield-dev-fetcher.json"
+CONSOLE_TASK = ECS_DIR / "imageshield-dev-console.json"
 TASK_ROLE = ECS_DIR / "policies" / "services-task-role.json"
 
 LIVENESS_BUCKET = "imageshield-dev-liveness-225989356895"
@@ -44,7 +47,18 @@ def _actions(path: Path) -> list[str]:
     return actions
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, TASK_ROLE])
+@pytest.mark.parametrize(
+    "path",
+    [
+        SERVICES_TASK,
+        MIGRATE_TASK,
+        WORKER_TASK,
+        CONFIRM_TASK,
+        FETCHER_TASK,
+        CONSOLE_TASK,
+        TASK_ROLE,
+    ],
+)
 def test_the_files_exist_and_parse(path: Path) -> None:
     assert path.is_file(), f"{path} is missing"
     assert _load(path)
@@ -81,6 +95,10 @@ _UNSCOPABLE_REKOGNITION_ACTIONS = {
     "rekognition:createfacelivenesssession",
     "rekognition:startfacelivenesssession",
     "rekognition:getfacelivenesssessionresults",
+    # DetectFaces and DetectModerationLabels take no resource type in IAM
+    # either — same reasoning as the three liveness actions above.
+    "rekognition:detectfaces",
+    "rekognition:detectmoderationlabels",
 }
 
 
@@ -108,7 +126,10 @@ def test_no_rekognition_action_is_unscoped() -> None:
             assert "-dev-" in resource, f"not a dev collection: {resource}"
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK])
+@pytest.mark.parametrize(
+    "path",
+    [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, CONFIRM_TASK, FETCHER_TASK, CONSOLE_TASK],
+)
 def test_no_secret_arrives_through_environment(path: Path) -> None:
     """An `environment` value is visible in describe-task-definition to anyone
     with read access. Handoff §4 and §10."""
@@ -122,7 +143,10 @@ def test_no_secret_arrives_through_environment(path: Path) -> None:
             assert "arn:aws:secretsmanager" not in entry["value"]
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK])
+@pytest.mark.parametrize(
+    "path",
+    [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, CONFIRM_TASK, FETCHER_TASK, CONSOLE_TASK],
+)
 def test_every_task_has_both_roles(path: Path) -> None:
     """Execution role pulls the image and resolves secrets before the code runs;
     task role is what the code itself uses. Two different things, both required."""
@@ -200,7 +224,7 @@ def test_every_required_config_field_is_supplied_by_the_task_definition() -> Non
 _DATABASE_URL_PARTS = {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}
 
 
-@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK])
+@pytest.mark.parametrize("path", [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, CONFIRM_TASK])
 def test_database_url_is_supplied_directly_or_via_all_five_parts(path: Path) -> None:
     """The replacement for the generic check above, for exactly one field.
 
@@ -349,3 +373,88 @@ def test_worker_sets_no_variable_config_does_not_read() -> None:
             f"{WORKER_TASK.name} container {name!r} sets variables this service"
             f" does not read: {sorted(unread)}."
         )
+
+
+def _confirm_containers() -> dict[str, dict[str, Any]]:
+    return {c["name"]: c for c in _load(CONFIRM_TASK)["containerDefinitions"]}
+
+
+def test_confirm_task_runs_exactly_the_confirm_worker_and_the_tick() -> None:
+    """One task, two processes: the confirm pipeline consumer
+    (``confirm:hits``) and the score drift-healer tick. Both essential, same
+    reasoning as the search worker's pairing above."""
+    containers = _confirm_containers()
+    assert set(containers) == {"confirm-worker", "score-tick"}
+    assert containers["confirm-worker"]["command"] == [
+        "python",
+        "-m",
+        "imageshield.confirm.worker",
+    ]
+    assert containers["score-tick"]["command"] == ["python", "-m", "imageshield.score.tick"]
+    for container in containers.values():
+        assert container["essential"] is True
+
+
+def test_confirm_containers_serve_no_http() -> None:
+    """Neither process has an HTTP surface, same reasoning as the search
+    worker's pairing: a bound port would collide on the host-network
+    instance, and a health check against nothing is a restart loop."""
+    for container in _confirm_containers().values():
+        assert not container.get("portMappings"), (
+            f"{container['name']} maps a port it never binds"
+        )
+        assert "healthCheck" not in container, (
+            f"{container['name']} declares a health check with nothing to probe"
+        )
+
+
+def test_confirm_supplies_every_required_config_field_in_both_containers() -> None:
+    """Both processes call ``load_config()`` — same required set, same
+    per-container reasoning as the search worker's equivalent check."""
+    required = {
+        name.upper() for name, field in Config.model_fields.items() if field.is_required()
+    }
+    for name, container in _confirm_containers().items():
+        missing = required - _container_supplied_names(container)
+        assert missing == set(), (
+            f"{CONFIRM_TASK.name} container {name!r} omits required config:"
+            f" {sorted(missing)}. The container will exit non-zero at boot."
+        )
+
+
+def test_confirm_uses_the_narrower_db_pool(name: str = "DB_POOL_MAX_SIZE") -> None:
+    """The confirm bundle is two low-throughput background processes on a
+    memory-budgeted host — 2 connections each, not the worker's 3."""
+    for container in _confirm_containers().values():
+        env = {entry["name"]: entry["value"] for entry in container["environment"]}
+        assert env[name] == "2", f"{container['name']} does not use the narrower pool"
+
+
+def test_fetcher_and_console_hold_no_database_access() -> None:
+    """The fetcher and console are the no-DB-access property in deployable
+    form (ARCHITECTURE.md §3.7, console/config.py, fetcher/config.py): neither
+    process's config class even has a ``database_url`` field, so neither task
+    definition may carry DATABASE_URL or any DB_* secret or environment
+    entry — the property this test exists to make mechanically checkable
+    rather than trusted to a docstring.
+    """
+    for path in (FETCHER_TASK, CONSOLE_TASK):
+        for container in _load(path)["containerDefinitions"]:
+            supplied = _container_supplied_names(container)
+            db_names = {
+                name for name in supplied if name == "DATABASE_URL" or name.startswith("DB_")
+            }
+            assert db_names == set(), (
+                f"{path.name} container {container['name']!r} carries database"
+                f" access it must never have: {sorted(db_names)}"
+            )
+
+
+def test_fetcher_serves_8083_and_console_8082() -> None:
+    """Each deployable binds its own dedicated port on the shared host-network
+    instance — 8081 is `services`, so the new ones must not collide with it
+    or each other."""
+    fetcher = _load(FETCHER_TASK)["containerDefinitions"][0]
+    console = _load(CONSOLE_TASK)["containerDefinitions"][0]
+    assert "8083" in " ".join(fetcher["command"])
+    assert "8082" in " ".join(console["command"])

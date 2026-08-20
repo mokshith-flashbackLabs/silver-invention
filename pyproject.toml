@@ -36,6 +36,12 @@ dependencies = [
     "pillow>=11.0.0,<12.0",
     # console only -- server-rendered templates for the control-room console.
     "jinja2>=3.1,<4.0",
+    # console's Form handlers need this at runtime to parse
+    # application/x-www-form-urlencoded bodies; devtools/harness (file-upload
+    # form parsing for the local test UI) uses it too, but the console is why
+    # it can no longer be dev-only -- without it the console image 500s on
+    # every form post in production.
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
@@ -48,8 +54,6 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "mypy>=1.13",
     "ruff>=0.7",
-    # devtools/harness only: file-upload form parsing for the local test UI.
-    "python-multipart>=0.0.9",
 ]
 
 [tool.setuptools.packages.find]
