@@ -60,6 +60,7 @@ class WorkerFakeStore:
         providers_succeeded: Sequence[ProviderId],
         *,
         retier: Any,
+        confirm: Any = None,
     ) -> Any:
         if self.fail_execution:
             raise RuntimeError("db went away")
@@ -121,7 +122,7 @@ async def test_valid_message_claims_executes_and_reports_handled() -> None:
     store._claim = _claim(run_id, store.seed)
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None
     )
 
     assert handled is True
@@ -135,7 +136,7 @@ async def test_unclaimable_run_is_handled_without_execution() -> None:
     store = WorkerFakeStore(claim=None)
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None
     )
 
     assert handled is True
@@ -153,12 +154,13 @@ async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
             calibration_store,
             control(),
             CADENCE,
+            None,
         )
         is True
     )
     assert (
         await handle_message(
-            "not json at all", store, {}, calibration_store, control(), CADENCE
+            "not json at all", store, {}, calibration_store, control(), CADENCE, None
         )
         is True
     )
@@ -170,6 +172,7 @@ async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
             calibration_store,
             control(),
             CADENCE,
+            None,
         )
         is True
     )
@@ -183,7 +186,7 @@ async def test_execution_failure_keeps_message_for_redelivery() -> None:
     store.fail_execution = True
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None
     )
 
     assert handled is False  # not deleted -> SQS visibility timeout redelivers

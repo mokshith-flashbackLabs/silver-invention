@@ -29,6 +29,15 @@ only when at least one provider actually succeeded. A run where everything was
 skipped or timed out produced no evidence, and demoting a user's cadence because
 our own integration was down would take the cost saving out of exactly the wrong
 place.
+
+``confirm`` (design doc §7) is the per-provider "most similar" criteria that
+decides whether a hit this run wrote gets enqueued onto ``confirm:hits`` for
+Rekognition-based triage ahead of human review. It is built once in
+``search/worker.py:run_forever`` from config and threaded through every call
+here unchanged; ``None`` disables the enqueue for that run (e.g. a caller that
+does not want the confirm pipeline touched at all). The enqueue itself lives in
+``store.complete_run`` so it commits in the same transaction as completion and
+the cadence update.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict
 
 from imageshield.calibration.models import BandingPolicy
+from imageshield.confirm.models import ConfirmCriteria
 from imageshield.providers.gate import decide
 from imageshield.providers.models import Dispatch, Skip
 from imageshield.providers.store import ProviderControlStore, utc_spend_date
@@ -102,6 +112,7 @@ async def execute_run(
     control: ProviderControlStore,
     cadence: CadencePolicy,
     *,
+    confirm: ConfirmCriteria | None,
     now: datetime | None = None,
 ) -> RunOutcome:
     moment = now if now is not None else datetime.now(UTC)
@@ -216,7 +227,7 @@ async def execute_run(
             reason="no provider succeeded — this run is not evidence of an empty scan",
         )
     update = await store.complete_run(
-        claim.run_id, claim.seed_id, succeeded, retier=retier
+        claim.run_id, claim.seed_id, succeeded, retier=retier, confirm=confirm
     )
     if update is not None:
         log.info(

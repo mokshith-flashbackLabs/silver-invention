@@ -30,6 +30,7 @@ import asyncio
 import json
 import signal
 import sys
+from decimal import Decimal
 from typing import Any, Protocol
 
 import structlog
@@ -38,6 +39,7 @@ from pydantic import ValidationError
 
 from imageshield.calibration.store import CalibrationStore, PostgresCalibrationStore
 from imageshield.config import Config, ConfigError, load_config
+from imageshield.confirm.models import ConfirmCriteria
 from imageshield.db.connection import make_async_pool
 from imageshield.http.logging import configure_logging
 from imageshield.outbox import OutboxPayload
@@ -139,6 +141,7 @@ async def handle_message(
     calibration_store: CalibrationStore,
     control: ProviderControlStore,
     cadence: CadencePolicy,
+    confirm: ConfirmCriteria | None,
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
 ) -> bool:
@@ -171,7 +174,9 @@ async def handle_message(
         # and a config activated mid-run must not split that run's results
         # across two rulesets.
         policy = await calibration_store.load_active_policy()
-        await execute_run(claim, providers, store, policy, control, cadence)
+        await execute_run(
+            claim, providers, store, policy, control, cadence, confirm=confirm
+        )
     except Exception as exc:  # broad on purpose: crash = leave for redelivery
         log.error("worker.run_execution_failed", run_id=str(payload.id), error=str(exc))
         return False
@@ -194,6 +199,13 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
     calibration_store = PostgresCalibrationStore(pool)
     control = build_control_store(config, pool)
     cadence = cadence_policy_from_config(config)
+    # Built once, not once per message: a config edited mid-run must not split
+    # one run's confirm decisions across two rulesets, same reasoning as the
+    # calibration policy snapshot in handle_message.
+    confirm = ConfirmCriteria(
+        hive_min_score=Decimal(str(config.confirm_hive_min_score)),
+        google_kinds=config.confirm_google_kind_set,
+    )
 
     stop_requested = False
 
@@ -222,6 +234,7 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
                     calibration_store,
                     control,
                     cadence,
+                    confirm,
                     logger=log,
                 )
                 if handled:

@@ -238,6 +238,7 @@ class FakeSeedStore:
         self.completed: list[tuple[UUID, tuple[ProviderId, ...]]] = []
         self.cadence_updates: list[tuple[UUID, CadenceUpdate]] = []
         self.refusals: list[tuple[UUID, UserRef, str]] = []
+        self.confirm_criteria: list[Any] = []
 
     async def get_seed(self, seed_id: UUID) -> SeedRow | None:
         return self.seed if seed_id == self.seed.seed_id else None
@@ -265,11 +266,18 @@ class FakeSeedStore:
         providers_succeeded: Sequence[ProviderId],
         *,
         retier: CadenceInput | None,
+        confirm: Any = None,
     ) -> CadenceUpdate | None:
         """Mirrors the real store: completion and re-tiering are ONE call, so a
         test cannot accidentally assert a cadence write that the production path
-        could not have made independently of the completion."""
+        could not have made independently of the completion.
+
+        ``confirm`` is accepted and recorded but not acted on — this fake has no
+        Postgres to enqueue against, and no runner test in this module asserts
+        on the confirm-queue enqueue (that lives in tests/test_search_store.py,
+        against the real store)."""
         self.completed.append((run_id, tuple(providers_succeeded)))
+        self.confirm_criteria.append(confirm)
         if retier is None:
             return None
         update = update_for(
