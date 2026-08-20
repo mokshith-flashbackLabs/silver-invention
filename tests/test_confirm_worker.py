@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import random
 from uuid import UUID, uuid4
 
 from PIL import Image
@@ -41,6 +42,36 @@ def _tiny_jpeg() -> bytes:
 
 
 IMAGE_BYTES = _tiny_jpeg()
+# A solid colour: every dHash gradient bit is 0 (no left/right difference
+# anywhere), so IMAGE_BYTES's own hash is the degenerate low case by
+# construction -- population 0. Fine for every test that does not care about
+# the exact hash value; the dedup-specific tests below need control over
+# degeneracy, so they use fixtures picked (and pinned by assertion) for that.
+
+
+def _textured_jpeg() -> bytes:
+    """A genuinely non-degenerate image -- fixed-seed noise, so the dHash has
+    a mixed bit population rather than the near-uniform 0 or -1 a solid
+    colour or a monotonic gradient produces (both tried and rejected while
+    writing this fixture: a plain gradient's dHash is -1, all 64 bits set,
+    which is itself the degenerate HIGH case)."""
+    rng = random.Random(42)
+    image = Image.new("L", (64, 64))
+    image.putdata([rng.randint(0, 255) for _ in range(64 * 64)])
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
+
+
+def _degenerate_high_jpeg() -> bytes:
+    """Every row strictly increasing left-to-right -> every gradient bit is
+    1 -> dHash == -1 (all 64 bits set): the degenerate HIGH case, the mirror
+    of IMAGE_BYTES's degenerate LOW (0)."""
+    image = Image.new("L", (64, 64))
+    image.putdata([(x * 4) % 256 for _y in range(64) for x in range(64)])
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
 
 _UNSET = object()
 
@@ -286,12 +317,19 @@ async def test_fetch_failure_records_unfetchable() -> None:
 
 
 async def test_duplicate_short_circuits_before_provider_is_touched() -> None:
+    # Textured, not IMAGE_BYTES: a normal (non-degenerate) hash is the case
+    # under test here -- the degenerate ones get their own tests below.
+    textured = _textured_jpeg()
+    existing_phash = dhash(textured)
+
+    async def _fetch_textured(url: str) -> bytes | None:
+        return textured
+
     ctx = _ctx()
-    existing_phash = dhash(IMAGE_BYTES)
     existing_id = uuid4()
     store = FakeConfirmStore(ctx, decided=((existing_id, existing_phash),))
     provider = FakeAttributionProvider()
-    deps = _deps(store=store, provider=provider)
+    deps = _deps(store=store, provider=provider, fetch=_fetch_textured)
 
     handled = await handle_message(_body(ctx.infringement_id), deps)
 
@@ -299,6 +337,52 @@ async def test_duplicate_short_circuits_before_provider_is_touched() -> None:
     assert provider.calls == 0
     assert store.duplicates == [(ctx.infringement_id, existing_id, existing_phash)]
     assert store.triages == []
+
+
+async def test_degenerate_low_hash_skips_dedup_even_with_a_decided_match() -> None:
+    """IMAGE_BYTES's own hash is 0 (population 0) by construction -- a solid
+    colour has no gradient anywhere. A decided entry at that same hash would
+    dedup under a plain Hamming-distance check, but the low-texture guard
+    must skip dedup entirely rather than machine-hide a real new hit against
+    a coincidentally-identical degenerate hash (CLAUDE.md §7.3)."""
+    ctx = _ctx()
+    decided_id = uuid4()
+    store = FakeConfirmStore(ctx, decided=((decided_id, 0),))
+    provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
+    deps = _deps(store=store, provider=provider)
+
+    handled = await handle_message(_body(ctx.infringement_id), deps)
+
+    assert handled is True
+    assert store.duplicates == []
+    assert provider.calls > 0  # dedup was skipped; the bundle actually ran
+    assert len(store.triages) == 1
+    assert store.triages[0]["triage"]["phash_degenerate"] is True
+
+
+async def test_degenerate_high_hash_skips_dedup_even_with_a_decided_match() -> None:
+    """The mirror case: population 64 (hash -1), a monotonic gradient with no
+    sign flips anywhere."""
+    degenerate_bytes = _degenerate_high_jpeg()
+    degenerate_hash = dhash(degenerate_bytes)
+    assert degenerate_hash == -1, "fixture assumption: this image hashes to all-ones"
+
+    async def _fetch_degenerate(url: str) -> bytes | None:
+        return degenerate_bytes
+
+    ctx = _ctx()
+    decided_id = uuid4()
+    store = FakeConfirmStore(ctx, decided=((decided_id, -1),))
+    provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
+    deps = _deps(store=store, provider=provider, fetch=_fetch_degenerate)
+
+    handled = await handle_message(_body(ctx.infringement_id), deps)
+
+    assert handled is True
+    assert store.duplicates == []
+    assert provider.calls > 0
+    assert len(store.triages) == 1
+    assert store.triages[0]["triage"]["phash_degenerate"] is True
 
 
 async def test_budget_skip_records_skip_and_leaves_state_untouched() -> None:
@@ -404,6 +488,27 @@ async def test_confirm_unavailable_from_moderation_records_error_outcome() -> No
     assert handled is False
     assert len(control.outcomes) == 1
     assert control.outcomes[0][1].status == "error"
+
+
+async def test_unexpected_store_exception_is_caught_by_the_outer_net() -> None:
+    """CRITICAL 1(c): none of steps 2-9's specific `except` clauses anticipate
+    an arbitrary store failure. Without the outer net this raises out of
+    ``handle_message`` and crash-loops the process on hostile or merely
+    unlucky input; with it, the message is left for redelivery like any other
+    crash-shaped failure (same contract as ``search/worker.py``)."""
+
+    class ExplodingStore(FakeConfirmStore):
+        async def record_triage(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("store exploded mid-flow")
+
+    ctx = _ctx()
+    store = ExplodingStore(ctx)
+    provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
+    deps = _deps(store=store, provider=provider)
+
+    handled = await handle_message(_body(ctx.infringement_id), deps)
+
+    assert handled is False
 
 
 async def test_undecodable_image_records_unfetchable() -> None:

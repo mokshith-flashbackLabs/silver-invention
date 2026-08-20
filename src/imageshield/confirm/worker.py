@@ -80,7 +80,7 @@ from imageshield.confirm.moderation import (
     ModerationSignal,
     RekognitionModeration,
 )
-from imageshield.confirm.phash import dhash
+from imageshield.confirm.phash import bit_population, dhash
 from imageshield.confirm.store import ConfirmStore, PostgresConfirmStore
 from imageshield.confirm.triage import classify, csam_quarantine, find_duplicate, is_explicit
 from imageshield.db.connection import make_async_pool
@@ -97,6 +97,14 @@ log = structlog.get_logger("imageshield.confirm.worker")
 
 _WAIT_TIME_SECONDS = 10  # SQS long poll
 _MAX_MESSAGES = 1
+
+# A 64-bit dHash with <=4 or >=60 bits set is degenerate: a near-uniform image
+# (a solid colour, a plain banner) produces one regardless of content, so a
+# small Hamming distance between two such hashes is a property of the hash
+# space, not evidence the two images are the same. See the dedup guard in
+# handle_message step 4.
+_PHASH_DEGENERATE_LOW_BITS = 4
+_PHASH_DEGENERATE_HIGH_BITS = 60
 
 # Fetching bytes over the fetcher's HTTP API is a different failure mode from
 # a Rekognition call: never crash-shaped. `None` (a non-200, or a body that
@@ -272,191 +280,219 @@ async def handle_message(
         worker_log.error("confirm.unknown_event", payload_event=payload.event)
         return True
 
-    ctx = await deps.store.load_context(payload.id)
-    if ctx is None or ctx.confirm_state not in ("unconfirmed", "machine_triaged"):
-        worker_log.info(
-            "confirm.already_decided",
-            infringement_id=str(payload.id),
-            confirm_state=None if ctx is None else ctx.confirm_state,
-        )
-        return True
-
-    # ── 2. No image_url on the hit ───────────────────────────────────────
-    if ctx.image_url is None:
-        await deps.store.record_unfetchable(
-            ctx.infringement_id, detail="no image_url recorded"
-        )
-        return True
-
-    # ── 3. Fetch through the fetcher deployable ──────────────────────────
     try:
-        image_bytes = await deps.fetch(ctx.image_url)
-    except Exception as exc:
-        worker_log.warning("confirm.fetch_failed", error=str(exc))
-        await deps.store.record_unfetchable(
-            ctx.infringement_id, detail=f"fetch failed: {exc}"
-        )
-        return True
-    if image_bytes is None:
-        await deps.store.record_unfetchable(
-            ctx.infringement_id, detail="fetcher returned no image"
-        )
-        return True
-
-    # ── 4. pHash + dedup, BEFORE any AWS spend ───────────────────────────
-    try:
-        new_phash = dhash(image_bytes)
-    except UndecodableImage:
-        await deps.store.record_unfetchable(ctx.infringement_id, detail="undecodable")
-        return True
-
-    decided = await deps.store.decided_phashes(ctx.user_ref)
-    duplicate_of = find_duplicate(new_phash, decided, deps.phash_hamming_max)
-    if duplicate_of is not None:
-        await deps.store.record_duplicate(
-            ctx.infringement_id, duplicate_of=duplicate_of, phash=new_phash
-        )
-        return True
-
-    # ── 5. The provider gate ─────────────────────────────────────────────
-    now = datetime.now(UTC)
-    runtimes = await deps.control.runtimes()
-    decision = await decide(
-        REKOGNITION_CONFIRM_ID,
-        runtime=runtimes.get(REKOGNITION_CONFIRM_ID),
-        store=deps.control,
-        now=now,
-    )
-    if isinstance(decision, Skip):
-        if ctx.run_id is not None:
-            await deps.control.record_skip(
-                ctx.run_id, REKOGNITION_CONFIRM_ID, decision.reason, decision.detail
+        ctx = await deps.store.load_context(payload.id)
+        if ctx is None or ctx.confirm_state not in ("unconfirmed", "machine_triaged"):
+            worker_log.info(
+                "confirm.already_decided",
+                infringement_id=str(payload.id),
+                confirm_state=None if ctx is None else ctx.confirm_state,
             )
-        else:
-            worker_log.warning(
-                "confirm.no_run_id_for_skip",
-                infringement_id=str(ctx.infringement_id),
-                reason=decision.reason,
+            return True
+
+        # ── 2. No image_url on the hit ───────────────────────────────────
+        if ctx.image_url is None:
+            await deps.store.record_unfetchable(
+                ctx.infringement_id, detail="no image_url recorded"
             )
-        await deps.store.record_skipped(
-            ctx.infringement_id, reason=decision.reason, detail=decision.detail
+            return True
+
+        # ── 3. Fetch through the fetcher deployable ──────────────────────
+        try:
+            image_bytes = await deps.fetch(ctx.image_url)
+        except Exception as exc:
+            worker_log.warning("confirm.fetch_failed", error=str(exc))
+            await deps.store.record_unfetchable(
+                ctx.infringement_id, detail=f"fetch failed: {exc}"
+            )
+            return True
+        if image_bytes is None:
+            await deps.store.record_unfetchable(
+                ctx.infringement_id, detail="fetcher returned no image"
+            )
+            return True
+
+        # ── 4. pHash + dedup, BEFORE any AWS spend ────────────────────────
+        try:
+            new_phash = dhash(image_bytes)
+        except UndecodableImage:
+            await deps.store.record_unfetchable(ctx.infringement_id, detail="undecodable")
+            return True
+
+        # A near-0 or near-all-1s population is a low-texture image (a solid
+        # background, a plain banner) rather than a real perceptual match:
+        # every such image collides with every other one at a tiny Hamming
+        # distance regardless of content. Skipping dedup entirely for these
+        # is deliberate over "just widen the threshold" -- a collision against
+        # an already-REJECTED hit would machine-hide a real new hit, which is
+        # the worse edge (CLAUDE.md §7.3). Recorded on the triage row so a
+        # reviewer can see why dedup was bypassed.
+        phash_degenerate = (
+            bit_population(new_phash) <= _PHASH_DEGENERATE_LOW_BITS
+            or bit_population(new_phash) >= _PHASH_DEGENERATE_HIGH_BITS
         )
-        return True
+        if not phash_degenerate:
+            decided = await deps.store.decided_phashes(ctx.user_ref)
+            duplicate_of = find_duplicate(new_phash, decided, deps.phash_hamming_max)
+            if duplicate_of is not None:
+                await deps.store.record_duplicate(
+                    ctx.infringement_id, duplicate_of=duplicate_of, phash=new_phash
+                )
+                return True
 
-    # decision is now known to be Dispatch (Skip returned above).
-    dispatch: Dispatch = decision
-
-    # ── 6. The Rekognition bundle ─────────────────────────────────────────
-    started_at = time.monotonic()
-    try:
-        faces = await deps.provider.detect_faces(image_bytes)
-        ranked_faces = sorted(faces, key=_face_area, reverse=True)[: deps.max_faces]
-        attributed: list[AttributedFace] = []
-        for face in ranked_faces:
-            matches = await deps.provider.search_face(
-                image_bytes,
-                face,
-                collection_id=deps.identity_collection,
-                match_threshold=deps.face_match_threshold,
-                max_candidates=deps.attribution_max_candidates,
+        # ── 5. The provider gate ───────────────────────────────────────────
+        now = datetime.now(UTC)
+        runtimes = await deps.control.runtimes()
+        decision = await decide(
+            REKOGNITION_CONFIRM_ID,
+            runtime=runtimes.get(REKOGNITION_CONFIRM_ID),
+            store=deps.control,
+            now=now,
+        )
+        if isinstance(decision, Skip):
+            if ctx.run_id is not None:
+                await deps.control.record_skip(
+                    ctx.run_id, REKOGNITION_CONFIRM_ID, decision.reason, decision.detail
+                )
+            else:
+                worker_log.warning(
+                    "confirm.no_run_id_for_skip",
+                    infringement_id=str(ctx.infringement_id),
+                    reason=decision.reason,
+                )
+            await deps.store.record_skipped(
+                ctx.infringement_id, reason=decision.reason, detail=decision.detail
             )
-            attributed.append(resolve_face(face, matches, (ctx.user_ref,)))
-        moderation = await deps.moderation.assess(image_bytes)
-    except (AttributionUnavailable, ConfirmUnavailable) as exc:
-        failed = ProviderResult(
+            return True
+
+        # decision is now known to be Dispatch (Skip returned above).
+        dispatch: Dispatch = decision
+
+        # ── 6. The Rekognition bundle ──────────────────────────────────────
+        started_at = time.monotonic()
+        try:
+            faces = await deps.provider.detect_faces(image_bytes)
+            ranked_faces = sorted(faces, key=_face_area, reverse=True)[: deps.max_faces]
+            attributed: list[AttributedFace] = []
+            for face in ranked_faces:
+                matches = await deps.provider.search_face(
+                    image_bytes,
+                    face,
+                    collection_id=deps.identity_collection,
+                    match_threshold=deps.face_match_threshold,
+                    max_candidates=deps.attribution_max_candidates,
+                )
+                attributed.append(resolve_face(face, matches, (ctx.user_ref,)))
+            moderation = await deps.moderation.assess(image_bytes)
+        except (AttributionUnavailable, ConfirmUnavailable) as exc:
+            failed = ProviderResult(
+                provider_id=REKOGNITION_CONFIRM_ID,
+                status="error",
+                matches=[],
+                raw_response={},
+                http_status=None,
+                latency_ms=_elapsed_ms(started_at),
+                attempts=1,
+                error_detail=str(exc),
+            )
+            await _record_outcome_guarded(
+                deps,
+                ctx.run_id,
+                ctx.infringement_id,
+                failed,
+                cost_usd=dispatch.cost_usd,
+                spend_date=utc_spend_date(now),
+                probe=dispatch.probe,
+            )
+            return False
+
+        best_score: float | None = None
+        best_bbox: BoundingBox | None = None
+        for face_result in attributed:
+            if face_result.match_score is not None and (
+                best_score is None or face_result.match_score > best_score
+            ):
+                best_score = face_result.match_score
+                best_bbox = face_result.bbox
+
+        # ── 7. Record the successful outcome ────────────────────────────────
+        ok_result = ProviderResult(
             provider_id=REKOGNITION_CONFIRM_ID,
-            status="error",
+            status="ok",
             matches=[],
-            raw_response={},
+            raw_response={
+                "faces_searched": len(ranked_faces),
+                "face_match_score": best_score,
+                "moderation_label_count": len(moderation.labels),
+                "min_age_low": moderation.min_age_low,
+            },
             http_status=None,
             latency_ms=_elapsed_ms(started_at),
             attempts=1,
-            error_detail=str(exc),
         )
         await _record_outcome_guarded(
             deps,
             ctx.run_id,
             ctx.infringement_id,
-            failed,
+            ok_result,
             cost_usd=dispatch.cost_usd,
             spend_date=utc_spend_date(now),
             probe=dispatch.probe,
         )
-        return False
 
-    best_score: float | None = None
-    best_bbox: BoundingBox | None = None
-    for face_result in attributed:
-        if face_result.match_score is not None and (
-            best_score is None or face_result.match_score > best_score
-        ):
-            best_score = face_result.match_score
-            best_bbox = face_result.bbox
-
-    # ── 7. Record the successful outcome ─────────────────────────────────
-    ok_result = ProviderResult(
-        provider_id=REKOGNITION_CONFIRM_ID,
-        status="ok",
-        matches=[],
-        raw_response={
-            "faces_searched": len(ranked_faces),
-            "face_match_score": best_score,
-            "moderation_label_count": len(moderation.labels),
-            "min_age_low": moderation.min_age_low,
-        },
-        http_status=None,
-        latency_ms=_elapsed_ms(started_at),
-        attempts=1,
-    )
-    await _record_outcome_guarded(
-        deps,
-        ctx.run_id,
-        ctx.infringement_id,
-        ok_result,
-        cost_usd=dispatch.cost_usd,
-        spend_date=utc_spend_date(now),
-        probe=dispatch.probe,
-    )
-
-    # ── 8. CSAM tripwire ──────────────────────────────────────────────────
-    explicit = is_explicit(moderation.labels)
-    moderation_label_dicts = [label.model_dump() for label in moderation.labels]
-    if csam_quarantine(
-        explicit=explicit,
-        min_age_low=moderation.min_age_low,
-        age_low_threshold=deps.csam_age_low_threshold,
-    ):
-        await deps.store.record_quarantine(
-            ctx.infringement_id,
-            phash=new_phash,
-            moderation_labels=moderation_label_dicts,
+        # ── 8. CSAM tripwire ─────────────────────────────────────────────────
+        explicit = is_explicit(moderation.labels)
+        moderation_label_dicts = [label.model_dump() for label in moderation.labels]
+        if csam_quarantine(
+            explicit=explicit,
             min_age_low=moderation.min_age_low,
+            age_low_threshold=deps.csam_age_low_threshold,
+        ):
+            await deps.store.record_quarantine(
+                ctx.infringement_id,
+                phash=new_phash,
+                moderation_labels=moderation_label_dicts,
+                min_age_low=moderation.min_age_low,
+            )
+            worker_log.error(
+                "confirm.quarantined", infringement_id=str(ctx.infringement_id)
+            )
+            return True
+
+        # ── 9. Severity classification + machine triage ──────────────────────
+        severity = classify(
+            explicit=explicit,
+            face_match_score=best_score,
+            face_match_threshold=deps.face_match_threshold,
         )
-        worker_log.error(
-            "confirm.quarantined", infringement_id=str(ctx.infringement_id)
+        await deps.store.record_triage(
+            ctx.infringement_id,
+            severity=severity,
+            phash=new_phash,
+            face_match_score=best_score,
+            moderation_labels=moderation_label_dicts,
+            triage={
+                "image_url": ctx.image_url,
+                "best_face_bbox": best_bbox.as_dict() if best_bbox is not None else None,
+                "face_match_score": best_score,
+                "moderation_labels": [label.name for label in moderation.labels],
+                "phash_degenerate": phash_degenerate,
+            },
         )
         return True
-
-    # ── 9. Severity classification + machine triage ──────────────────────
-    severity = classify(
-        explicit=explicit,
-        face_match_score=best_score,
-        face_match_threshold=deps.face_match_threshold,
-    )
-    await deps.store.record_triage(
-        ctx.infringement_id,
-        severity=severity,
-        phash=new_phash,
-        face_match_score=best_score,
-        moderation_labels=moderation_label_dicts,
-        triage={
-            "image_url": ctx.image_url,
-            "best_face_bbox": best_bbox.as_dict() if best_bbox is not None else None,
-            "face_match_score": best_score,
-            "moderation_labels": [label.name for label in moderation.labels],
-        },
-    )
-    return True
+    except Exception as exc:  # broad on purpose: the outer net, same shape as
+        # search/worker.py's handle_message. Every specific outcome above
+        # (unfetchable, duplicate, skipped, quarantined, triaged) already
+        # returns before reaching here; this only catches what none of them
+        # anticipated -- a store method raising, an unexpected exception from
+        # a dependency -- so the process survives to redeliver rather than
+        # crash-looping on hostile or merely unlucky input.
+        worker_log.error(
+            "confirm.handle_message_failed",
+            infringement_id=str(payload.id),
+            error=str(exc),
+        )
+        return False
 
 
 async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) -> None:

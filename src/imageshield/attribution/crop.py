@@ -28,6 +28,7 @@ from __future__ import annotations
 import io
 
 from PIL import Image, UnidentifiedImageError
+from PIL.Image import DecompressionBombError
 
 from imageshield.attribution.models import BoundingBox
 
@@ -74,7 +75,12 @@ def crop_to_face(image: bytes, bbox: BoundingBox) -> bytes:
             buffer = io.BytesIO()
             cropped.save(buffer, format="JPEG", quality=_JPEG_QUALITY)
             return buffer.getvalue()
-    except (UnidentifiedImageError, OSError) as exc:
+    except (UnidentifiedImageError, OSError, DecompressionBombError) as exc:
+        # DecompressionBombError is not a subclass of either of the other two
+        # -- it is Pillow's own guard against a small file that decompresses
+        # into an enormous pixel buffer. Without this, a bomb POSTed to the
+        # fetcher's /v1/crop is an unhandled 500 instead of the same
+        # undecodable-image outcome every other bad input takes.
         raise UndecodableImage(str(exc)) from exc
 
 
