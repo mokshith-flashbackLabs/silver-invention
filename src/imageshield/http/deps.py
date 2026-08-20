@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from imageshield.liveness.uploader import ObjectUploader
     from imageshield.providers.observability import ProviderObservability
     from imageshield.providers.store import ProviderControlStore
+    from imageshield.review.store import ReviewStore
     from imageshield.score.store import ScoreStore
     from imageshield.search.store import SearchStore
     from imageshield.subjects.store import SubjectStore
@@ -133,4 +134,9 @@ def get_score_store(request: Request) -> ScoreStore:
 
 def get_threat_store(request: Request) -> ThreatStore:
     store: ThreatStore = _required_state(request, "threat_store")  # type: ignore[assignment]
+    return store
+
+
+def get_review_store(request: Request) -> ReviewStore:
+    store: ReviewStore = _required_state(request, "review_store")  # type: ignore[assignment]
     return store

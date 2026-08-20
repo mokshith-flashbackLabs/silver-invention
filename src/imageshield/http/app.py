@@ -35,6 +35,8 @@ from imageshield.enrolment.store import PostgresEnrolmentStore
 from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
 from imageshield.http.routes.admin_providers import router as admin_providers_router
+from imageshield.http.routes.admin_review import router as admin_review_router
+from imageshield.http.routes.admin_scores import router as admin_scores_router
 from imageshield.http.routes.admin_threat_events import router as admin_threat_events_router
 from imageshield.http.routes.attribution import router as attribution_router
 from imageshield.http.routes.config_floors import router as config_floors_router
@@ -50,6 +52,7 @@ from imageshield.liveness.store import PostgresLivenessStore
 from imageshield.liveness.uploader import HttpxObjectUploader
 from imageshield.providers.observability import PostgresProviderObservability
 from imageshield.providers.store import PostgresProviderControlStore
+from imageshield.review.store import PostgresReviewStore
 from imageshield.score.engine import ScoreWeights
 from imageshield.score.store import PostgresScoreStore
 from imageshield.search.store import PostgresSearchStore
@@ -112,6 +115,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     if getattr(app.state, "threat_store", None) is None:
         app.state.threat_store = PostgresThreatStore(pool)
+    if getattr(app.state, "review_store", None) is None:
+        app.state.review_store = PostgresReviewStore(pool)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     # Which AWS account and region, before anything touches Rekognition.
@@ -161,4 +166,6 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(admin_router)
     app.include_router(admin_providers_router)
     app.include_router(admin_threat_events_router)
+    app.include_router(admin_review_router)
+    app.include_router(admin_scores_router)
     return app

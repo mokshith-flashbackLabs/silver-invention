@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -507,3 +507,71 @@ class ThreatEventItem(BaseModel):
 
 class ThreatEventsResponse(BaseModel):
     events: list[ThreatEventItem]
+
+
+# ── review (Task 15) ────────────────────────────────────────────────────
+
+# The 0021 severity vocabulary, restated as a Literal so a bogus value is a
+# 422 at the boundary rather than a 500 from the database CHECK.
+ReviewSeverity = Literal[
+    "ncii_suspected", "explicit_unmatched", "unassessed", "benign_copy", "likely_not_subject"
+]
+
+
+class ReviewDecisionRequest(ServiceModel):
+    """``severity`` is an override: omitted, the infringement keeps whatever
+    severity the machine triage assigned. ``uncertain`` is representable here
+    but never reaches ``review_tasks.decision`` — see
+    ``imageshield.review.store`` for why."""
+
+    decision: Literal["confirmed", "rejected", "uncertain"]
+    operator: str = Field(min_length=1)
+    severity: ReviewSeverity | None = None
+
+
+class ReviewDecisionResponse(BaseModel):
+    infringement_id: UUID
+    user_ref: UserRef
+    decision: str
+    severity: str | None
+
+
+class ReviewTaskResponse(BaseModel):
+    """One console card's worth of context for the highest-priority pending
+    task — everything a reviewer needs without a second round trip."""
+
+    task_id: UUID
+    infringement_id: UUID
+    user_ref: UserRef
+    severity: str
+    triage: dict[str, Any]
+    image_url: str | None
+    page_url: str
+    face_match_score: float | None
+    source_domain: str
+
+
+# ── scores (Task 15) ─────────────────────────────────────────────────────
+
+
+class ScoreDetailResponse(BaseModel):
+    score: int
+    components: dict[str, int]
+    config_version: str
+    computed_at: datetime
+
+
+class ScoreEventItem(BaseModel):
+    score_event_id: int
+    delta: int
+    component: str
+    cause_kind: str
+    cause_ref: str | None
+    config_version: str
+    score_after: int
+    created_at: datetime
+
+
+class ScoreResponse(BaseModel):
+    score: ScoreDetailResponse
+    events: list[ScoreEventItem]
