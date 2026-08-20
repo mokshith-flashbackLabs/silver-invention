@@ -8,11 +8,12 @@ the typed-identifier discipline (CLAUDE.md §10).
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
 from imageshield.search.feedback import FeedbackSignal
@@ -436,3 +437,73 @@ class ProviderHealthResponse(BaseModel):
     as_of: datetime
     window_hours: int
     providers: list[ProviderHealthItem]
+
+
+class ThreatEventCreateRequest(ServiceModel):
+    """Console input for a new threat event. ``penalty`` crosses as a decimal
+    STRING (pydantic coerces to ``Decimal``), same convention as every other
+    money-shaped value at this boundary — a float round-trip is exactly the
+    drift ``NUMERIC(5,2)`` exists to avoid.
+    """
+
+    kind: Literal["leak", "deepfake_wave", "platform_incident", "other"]
+    title: str = Field(min_length=1)
+    body: str = ""
+    severity: int = Field(ge=1, le=5)
+    domains: tuple[str, ...] = ()
+    is_global: bool = False
+    penalty: Decimal = Field(gt=0)
+    expires_at: datetime
+    decay_days: int = Field(gt=0)
+    operator: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _domains_or_global(self) -> ThreatEventCreateRequest:
+        # Mirrors 0022's own CHECK (is_global OR cardinality(domains) > 0) so
+        # the obviously-wrong request fails as a 422 here rather than as an
+        # opaque database constraint violation.
+        if not self.is_global and not self.domains:
+            raise ValueError(
+                "domains must name at least one domain unless is_global is true"
+            )
+        return self
+
+
+class ThreatEventCreateResponse(BaseModel):
+    event_id: UUID
+    matched_count: int
+
+
+class ThreatEventRetractRequest(ServiceModel):
+    operator: str = Field(min_length=1)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ThreatEventRetractResponse(BaseModel):
+    event_id: UUID
+    matched_count: int
+    status: Literal["retracted"] = "retracted"
+
+
+class ThreatEventItem(BaseModel):
+    event_id: UUID
+    kind: str
+    title: str
+    body: str
+    severity: int
+    domains: list[str]
+    is_global: bool
+    # Decimal-as-string, same convention as penalty above and as
+    # ProviderHealthItem's cost fields.
+    penalty: str
+    starts_at: datetime
+    expires_at: datetime
+    decay_days: int
+    status: str
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ThreatEventsResponse(BaseModel):
+    events: list[ThreatEventItem]

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from imageshield.score.store import ScoreStore
     from imageshield.search.store import SearchStore
     from imageshield.subjects.store import SubjectStore
+    from imageshield.threats.store import ThreatStore
 
 DbCheck = Callable[[], Awaitable[None]]
 
@@ -127,4 +128,9 @@ def get_provider_observability(request: Request) -> ProviderObservability:
 
 def get_score_store(request: Request) -> ScoreStore:
     store: ScoreStore = _required_state(request, "score_store")  # type: ignore[assignment]
+    return store
+
+
+def get_threat_store(request: Request) -> ThreatStore:
+    store: ThreatStore = _required_state(request, "threat_store")  # type: ignore[assignment]
     return store

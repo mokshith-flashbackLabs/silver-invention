@@ -35,6 +35,7 @@ from imageshield.enrolment.store import PostgresEnrolmentStore
 from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
 from imageshield.http.routes.admin_providers import router as admin_providers_router
+from imageshield.http.routes.admin_threat_events import router as admin_threat_events_router
 from imageshield.http.routes.attribution import router as attribution_router
 from imageshield.http.routes.config_floors import router as config_floors_router
 from imageshield.http.routes.enrolments import router as enrolments_router
@@ -53,6 +54,7 @@ from imageshield.score.engine import ScoreWeights
 from imageshield.score.store import PostgresScoreStore
 from imageshield.search.store import PostgresSearchStore
 from imageshield.subjects.store import PostgresSubjectStore
+from imageshield.threats.store import PostgresThreatStore
 
 
 @asynccontextmanager
@@ -108,6 +110,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             weights=ScoreWeights.from_config(cfg),
             config_version=cfg.score_config_version,
         )
+    if getattr(app.state, "threat_store", None) is None:
+        app.state.threat_store = PostgresThreatStore(pool)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     # Which AWS account and region, before anything touches Rekognition.
@@ -156,4 +160,5 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(config_floors_router)
     app.include_router(admin_router)
     app.include_router(admin_providers_router)
+    app.include_router(admin_threat_events_router)
     return app
