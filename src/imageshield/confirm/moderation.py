@@ -10,9 +10,13 @@ same way ``attribution/rekognition.py`` does. ``DetectModerationLabels``
 answers "is this explicit"; ``DetectFaces`` with ``AGE_RANGE`` answers "how
 old does the youngest face in it look" — the second call is the CSAM
 tripwire's other half (``triage.csam_quarantine``), and it must never be
-skipped just because the first call came back clean: an operator with no
-moderation labels but a young-looking face is exactly the case the tripwire
-exists for.
+skipped just because the first call came back clean. To be precise about what
+that tripwire actually requires: ``csam_quarantine`` fires on explicit content
+AND a young-looking face together, never on age alone — a clean moderation
+call with no explicit label does not quarantine regardless of the age
+estimate. What must never be skipped is *this call*, because an explicit
+result paired with a face this call never assessed would silently drop the
+age half of that AND.
 """
 
 from __future__ import annotations

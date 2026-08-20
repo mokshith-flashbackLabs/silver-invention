@@ -101,5 +101,21 @@ def test_crop_returns_blurred_jpeg_by_default() -> None:
     assert blurred.size[0] < 64  # cropped, not the whole frame
 
 
+def test_crop_with_blur_false_reveals_unblurred_bytes() -> None:
+    """The reveal path: ``review.html``'s reveal link re-requests the same
+    crop with ``blur=0``, and the two responses must actually differ -- a
+    ``blur`` flag that is accepted but silently ignored would make "reveal"
+    a no-op button that still shows the blurred crop."""
+    client = _client(_image_handler)
+    body = {"url": "https://x.example/a.png", "bbox": {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}}
+
+    blurred = client.post("/v1/crop", json=body, headers=AUTH)
+    revealed = client.post("/v1/crop", json={**body, "blur": False}, headers=AUTH)
+
+    assert blurred.status_code == revealed.status_code == 200
+    assert blurred.headers["content-type"] == revealed.headers["content-type"] == "image/jpeg"
+    assert blurred.content != revealed.content
+
+
 def test_health_needs_no_token() -> None:
     assert _client(_image_handler).get("/health").status_code == 200

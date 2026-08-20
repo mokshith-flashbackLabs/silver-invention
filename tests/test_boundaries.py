@@ -353,8 +353,16 @@ def test_no_phone_shaped_literal_in_src() -> None:
 # INVARIANTS #21 extended: a materialized score with a journal that can drift
 # from it is worse than no journal at all. score/store.py is the only module
 # permitted to write either table — enforced here rather than trusted, the
-# same reasoning as the face-search and S3 gates above.
-SCORE_WRITE = re.compile(r"INSERT\s+INTO\s+(protection_scores|score_events)", re.IGNORECASE)
+# same reasoning as the face-search and S3 gates above. UPDATE is included
+# alongside INSERT INTO: an UPDATE bypassing score/store.py would drift the
+# materialized row from its journal exactly as badly as a second INSERT path
+# would. score/store.py's own upsert stays clean of this gate — its INSERT
+# INTO already matches and is the allowed file, and its ON CONFLICT ... DO
+# UPDATE never spells "UPDATE protection_scores" contiguously, so it does not
+# double-match the new UPDATE branch either.
+SCORE_WRITE = re.compile(
+    r"(INSERT\s+INTO|UPDATE)\s+(protection_scores|score_events)", re.IGNORECASE
+)
 
 
 def test_only_the_score_store_writes_the_score() -> None:
