@@ -12,10 +12,17 @@ richer panel replaces or sits beside it; the API does not change either way.
 
 ## 1. Hard rules — read before designing anything
 
-1. **This surface is operator-facing, never user-facing.** It must be reachable only on the
-   private network / VPN. It is NOT routed through the proxy, and no end user, browser session,
-   or public DNS name may ever reach it. The client-never-talks-to-services rule (CLAUDE.md §3)
-   is about end users; operators are the one sanctioned audience, and only privately.
+0. **Topology (owner's decision, 2026-08-20): nothing external talks to the services — the
+   panel goes through the backend.** The admin panel's browser frontend talks ONLY to the
+   backend (the Node/proxy repo); the backend holds `X-Service-Token`, `X-Admin-Service-Token`
+   and `X-Fetcher-Token` and proxies these admin calls over the private network. Every endpoint
+   below is therefore a contract between the BACKEND and the services; the frontend's contract
+   is whatever admin routes the backend exposes on top of it. The only direct-to-services
+   client is the co-located ops console shipped in this repo (`console/`, same box, private) —
+   the reference implementation of the proxying pattern, not a license for external callers.
+1. **This surface is operator-facing, never user-facing.** Reachable only on the private
+   network / VPN; no end user, end-user session, or public DNS name may ever reach it — and per
+   rule 0, not even an operator's browser reaches the services directly.
 2. **Two machine tokens on every request:** `X-Service-Token` and `X-Admin-Service-Token`
    (they must differ; the service refuses to boot otherwise). These identify the *panel*, not
    the person.
@@ -185,6 +192,9 @@ URL context" rather than an error page, because unfetchable hits are still decid
 > Build an internal admin panel ("control room") for ImageShield operators against the API
 > contract in `docs/ADMIN_PANEL_INTEGRATION.md` of the `image_flashbacklabs` repo — read that
 > file first; it is the requirements document and its §1 hard rules are non-negotiable.
+> Topology is fixed: the browser frontend talks ONLY to the backend (the Node/proxy repo);
+> you implement admin routes in the backend that proxy to the services API and the fetcher
+> over the private network, holding all three machine tokens server-side.
 >
 > Screens: (1) **Review** — poll `GET /v1/admin/review/next`, render the task card with a
 > blurred face crop fetched server-side via the fetcher `/v1/crop` (reveal on explicit click),
