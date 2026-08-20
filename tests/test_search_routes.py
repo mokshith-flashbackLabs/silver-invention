@@ -188,6 +188,11 @@ class FakeScoreStore:
     def __init__(self, *, raise_error: bool = False) -> None:
         self._raise_error = raise_error
         self.calls: list[tuple[UserRef, str]] = []
+        # A second, richer log alongside `calls` -- kept separate so the many
+        # existing 2-tuple assertions elsewhere in this file (unrelated
+        # routes, e.g. feedback) do not all need a third element just because
+        # one trigger started passing a readable cause_ref (INVARIANTS #44).
+        self.calls_with_ref: list[tuple[UserRef, str, str | None]] = []
 
     async def recompute(
         self,
@@ -200,6 +205,7 @@ class FakeScoreStore:
         if self._raise_error:
             raise RuntimeError("score store unavailable")
         self.calls.append((user_ref, cause_kind))
+        self.calls_with_ref.append((user_ref, cause_kind, cause_ref))
         return None
 
     async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
@@ -281,6 +287,10 @@ def test_create_seed_201() -> None:
     # score.recompute fires exactly once, with the seed-registered cause.
     assert client.app.state.score_store.calls == [
         (UserRef(user_ref), "seed_registered")
+    ]
+    # INVARIANTS #44: the cause is readable -- the seed that triggered it.
+    assert client.app.state.score_store.calls_with_ref == [
+        (UserRef(user_ref), "seed_registered", str(seed_id))
     ]
 
 

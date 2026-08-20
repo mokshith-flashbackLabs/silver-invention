@@ -74,7 +74,9 @@ async def create_seed(
         ) from exc
     log.info("search.seed_created", seed_id=str(seed_id), seed_kind=body.seed_kind)
     try:
-        await score_store.recompute(body.user_ref, cause_kind="seed_registered")
+        await score_store.recompute(
+            body.user_ref, cause_kind="seed_registered", cause_ref=str(seed_id)
+        )
     except Exception:  # deliberate: the trigger already committed; tick will heal
         log.warning(
             "score.recompute_failed", user_ref=str(body.user_ref), cause="seed_registered"

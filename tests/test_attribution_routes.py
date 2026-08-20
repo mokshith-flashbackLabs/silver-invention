@@ -108,6 +108,9 @@ class FakeScoreStore:
     def __init__(self, *, raise_error: bool = False) -> None:
         self._raise_error = raise_error
         self.calls: list[tuple[UserRef, str]] = []
+        # Kept alongside `calls` rather than replacing it, same reasoning as
+        # test_search_routes.py's fake: existing 2-tuple assertions stay put.
+        self.calls_with_ref: list[tuple[UserRef, str, str | None]] = []
 
     async def recompute(
         self,
@@ -120,6 +123,7 @@ class FakeScoreStore:
         if self._raise_error:
             raise RuntimeError("score store unavailable")
         self.calls.append((user_ref, cause_kind))
+        self.calls_with_ref.append((user_ref, cause_kind, cause_ref))
         return None
 
     async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
@@ -198,6 +202,11 @@ def test_one_enrolled_face_among_two_strangers_registers_one_seed() -> None:
     assert all(f["bbox"] == {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4} for f in payload["faces"])
     # score.recompute fires exactly once, with the seed-registered cause.
     assert client.app.state.score_store.calls == [(UserRef(owner), "seed_registered")]
+    # INVARIANTS #44: the cause is readable -- the attribution run that
+    # registered the seed, the natural id this route has in scope.
+    assert client.app.state.score_store.calls_with_ref == [
+        (UserRef(owner), "seed_registered", payload["run_id"])
+    ]
 
 
 def test_two_household_members_register_two_seeds() -> None:
@@ -219,6 +228,11 @@ def test_two_household_members_register_two_seeds() -> None:
         (UserRef(bob), "seed_registered"),
     }
     assert len(client.app.state.score_store.calls) == 2
+    # Same attribution run for both -- one outcome, two registered seeds.
+    assert set(client.app.state.score_store.calls_with_ref) == {
+        (UserRef(alice), "seed_registered", payload["run_id"]),
+        (UserRef(bob), "seed_registered", payload["run_id"]),
+    }
 
 
 def test_no_enrolled_faces_registers_no_seeds_and_recomputes_nothing() -> None:

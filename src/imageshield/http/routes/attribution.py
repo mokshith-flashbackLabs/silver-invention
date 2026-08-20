@@ -77,7 +77,11 @@ async def attribute(
 
     for seed_user_ref in dict.fromkeys(seed.user_ref for seed in outcome.seeds):
         try:
-            await score_store.recompute(seed_user_ref, cause_kind="seed_registered")
+            await score_store.recompute(
+                seed_user_ref,
+                cause_kind="seed_registered",
+                cause_ref=str(outcome.run_id),
+            )
         except Exception:  # deliberate: the trigger already committed; tick will heal
             log.warning(
                 "score.recompute_failed",
