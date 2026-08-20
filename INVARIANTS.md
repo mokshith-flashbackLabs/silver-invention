@@ -548,3 +548,55 @@ the proxy can render it.
 A missing subject row reads as **ineligible**, via `LEFT JOIN` + `COALESCE(..., false)`. An inner join
 would return no row, which `claim_run` reports as "not claimable" — indistinguishable from a duplicate
 delivery, so the run would be retried forever instead of refused once.
+
+---
+
+## G. Protection score, confirm pipeline, threat events *(2026-08-19 push)*
+
+**44. Every score movement is journaled with a user-readable cause.**
+`score_events` is append-only: migration 0022 grants `score_rw` `SELECT, INSERT` on it and nothing
+else — no `UPDATE`, no `DELETE` — so an editable journal cannot exist even as a bug. The materialized
+`protection_scores.score` always equals the sum of that user's `score_events.delta`, and no delta is
+ever written without a `cause_kind` (`feedback`, `enrolment`, `seed_registered`, `run_completed`,
+`review_decision`, `threat_event`, `threat_retracted`, `tick`). `score/store.py` is the **only** writer
+of either table (INVARIANTS #21 extended) — enforced by grep, not trusted, the same shape as the
+face-search and S3 boundary tests.
+
+Check: `tests/test_boundaries.py::test_only_the_score_store_writes_the_score`;
+`tests/test_score_store.py::test_journal_sums_to_the_materialized_score`; the INSERT-only grant is
+`tests/test_migrations.py::test_0022_score_events_is_insert_only_for_score_rw`.
+
+**45. Reporting abuse never worsens any user-facing number.**
+Generalises the `live_exposure_count` rule (`SCHEMA.md` §2b) to the score and everything downstream of
+it: no feedback signal a user gives — `not_me`, `uncertain`, `confirmed`, `authorised`, a `rejected` or
+`uncertain` review decision — may ever lower `protection_scores.score` or any of its four components.
+The old system's −18-per-active-report divergence (§D above) is exactly the failure this rule exists to
+stop from recurring in the new score.
+
+Check: `tests/test_score_store.py::test_user_feedback_never_lowers_the_score`.
+
+**46. Threat penalties are bounded, decaying, relevance-scoped, and reversible on retraction.**
+A `threat_events` row only touches a user's score if the event is global or the user's own **live** hit
+domains intersect the event's `domains[]` — never a domain the user has no hit under, and never a hit
+whose URL is already dead. The penalty applied is capped by config (a global event by
+`SCORE_THREAT_GLOBAL_MAX_PENALTY`, the component overall by `SCORE_WEIGHT_THREAT`, boot-validated
+against the other weights), decays over the event's `decay_days`, and **retraction reverses through the
+journal**, restoring exactly what the event took rather than an approximation. `threat_events.status`
+has no path back out of `retracted`, so a second retraction is a no-op rather than a double credit.
+
+Check: `tests/test_threats.py::test_event_retraction_restores_exactly_the_pre_event_score`;
+`tests/test_threats.py::test_a_dead_url_on_a_matching_domain_is_not_matched`.
+
+**47. Machine triage orders review but can neither confirm nor drop.**
+The `confirm/` worker's severity classification (`ncii_suspected`, `explicit_unmatched`, `unassessed`,
+`benign_copy`, `likely_not_subject`) only orders `review_tasks` by priority — it never writes
+`infringements.confirm_state = 'confirmed'`, and nothing machine-writes a dropped/invisible state
+either (§7.3's reasoning applies unchanged: a real infringement made invisible is worse than one left
+in front of a human late). `confirmed` requires a human by construction: migration 0021's
+`infringements_confirmed_needs_human` CHECK enforces `confirm_state <> 'confirmed' OR
+(confirm_decided_by IS NOT NULL AND confirm_decided_at IS NOT NULL)` at the database — the same
+schema-over-discipline shape #19 already takes for the (unbuilt) match module's review band.
+`review/store.py::decide` is the only writer of a `confirmed` transition and always supplies
+`decided_by` from the authenticated operator baked into the request.
+
+Check: `tests/test_review.py::test_decide_never_trips_the_infringements_confirmed_needs_human_check`.

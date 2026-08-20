@@ -15,7 +15,8 @@ while invisible.
 
 ## Orientation
 
-Four processes, all from one image:
+Eight processes, all from one image except where noted. The first four are v1; the last four are the
+2026-08-19 protection-score push (`imageshield-dev-confirm`, `-fetcher`, `-console` task defs).
 
 | Process | Command | What it does |
 |---|---|---|
@@ -23,6 +24,10 @@ Four processes, all from one image:
 | Outbox relay | `python -m imageshield.relay` | Postgres outbox → SQS |
 | Search worker | `python -m imageshield.search.worker` | Consumes `search:runs`, dispatches providers |
 | Recheck worker | `python -m imageshield.recheck.worker` | Weekly HEAD sweep setting `url_alive` |
+| Confirm worker | `python -m imageshield.confirm.worker` | Consumes `confirm:hits`: fetch → pHash → face-match (via `attribution/`) → moderation → severity triage into `review_tasks` |
+| Score tick | `python -m imageshield.score.tick` | Daily drift-healer: re-runs score recompute for aging effects and any trigger whose recompute crashed after commit |
+| Fetcher | `uvicorn imageshield.fetcher.app:create_app --factory --port 8083` | Standalone deployable, no DB credentials. Hands the confirm worker image bytes; renders blurred face crops live for review |
+| Console | `uvicorn imageshield.console.app:create_app --factory --port 8082` | Standalone deployable, no DB credentials. Control-room UI: review queue, threat events, provider health, score inspector; HTTP Basic per operator |
 
 The API logs the AWS **account, region and collection** at startup as a
 `WARNING` (`event: aws.identity`). If you are unsure which environment a
@@ -396,7 +401,156 @@ followed by a proxy-driven re-assertion of `subject_is_adult`.
 
 ---
 
-## 9. Who to call, and about what
+## 9. The `confirm-hits` DLQ has depth
+
+**Symptom** — `imageshield-<env>-confirm-hits-dlq-depth` alarm. Same rule as scenario 1: any depth
+above zero fires, because a message here already failed every retry.
+
+**What is in it.** Same convention as every other queue — the body is `{"event": ...,
+"infringement_id": ...}`, never a payload. Read the real state from Postgres:
+
+```sql
+SELECT infringement_id, confirm_state, severity, confirm_decided_by, created_at
+FROM infringements WHERE infringement_id = '<id from the message>';
+```
+
+**Common causes, in the order to check them:**
+
+1. **The fetcher is down or unreachable.** The confirm worker calls `FETCHER_BASE_URL` for every hit;
+   if the fetcher task isn't running (or crash-looped, or the placement never happened — see scenario
+   12), every confirm job fails identically. Check the fetcher's own health:
+
+   ```bash
+   curl -s http://localhost:8083/health   # from a host-network task, same posture as /readyz checks
+   ```
+
+2. **`rekognition_confirm` hit its budget or breaker.** It is a normal `providers` row and goes
+   through the same gate chain as Hive/Google (INVARIANTS #37–#41). A `budget_exceeded` or
+   `breaker_open` skip does **not** DLQ the message on its own — it lands as a triage state and the
+   hit stays `unconfirmed`, retryable — so a DLQ'd message alongside a healthy-looking provider row
+   usually points at cause 1 or 3, not this one. Still worth ruling out:
+
+   ```sql
+   SELECT provider_id, enabled, breaker_state, breaker_reason FROM providers
+   WHERE provider_id = 'rekognition_confirm';
+   ```
+
+3. **A genuinely unfetchable or oversized image** exhausted retries. Expected and not alarming on its
+   own — the hit lands `unfetchable`/`unassessed` and stays reviewable URL-only. A DLQ message for
+   this cause is a sign the *retry* path (not the fetch itself) is broken, since a normal unfetchable
+   result should have resolved to a triage state, not a redelivery loop.
+
+**How to replay.** Same as every other queue — every consumer is idempotent, so replay is safe:
+
+```bash
+aws sqs start-message-move-task \
+  --source-arn "$CONFIRM_HITS_DLQ_ARN" --destination-arn "$CONFIRM_HITS_QUEUE_ARN"
+```
+
+**Do not** replay before fixing cause 1 (a down fetcher) — it will refill immediately.
+
+---
+
+## 10. A hit was quarantined
+
+**Symptom** — a log line `confirm.quarantined` from the confirm worker. **This is the ops alarm hook
+for the CSAM tripwire** (`ARCHITECTURE.md` §3.8 step 7) — there is no separate alarm resource; the
+log line itself is what a human is expected to be watching for.
+
+**What it means.** Rekognition's `DetectModerationLabels` returned labels suggesting the subject may
+be a minor, combined with explicit content. The confirm worker set
+`infringements.confirm_state = 'quarantined'` and stopped: no score effect, no `review_tasks` row (or
+an existing one is pulled), and the hit is excluded from **every** `svc` view — the proxy's UI cannot
+surface it even by accident, because `v_person_hits` and `v_person_report_summary` filter
+`confirm_state NOT IN ('quarantined', 'duplicate')` at the query level (`SCHEMA.md` §2d, migration
+0023).
+
+**What is retained.** The URL and the moderation label text only. **The image bytes were already
+discarded** by the fetcher before the worker ever wrote a row — there is nothing to "not look at"
+because nothing holding pixels exists past the in-memory classification step.
+
+**What to do:**
+
+1. **Do not download the URL. Do not open it. Do not attach it to a ticket or paste it into chat.**
+   Same rule as `docs/OPERATIONS.md` §9's existing CSAM guidance — treat this exactly like that
+   scenario, because it is that scenario, just discovered through a different path (an automated
+   moderation call instead of a human reviewer's judgement).
+2. **Escalate to the engineering lead and legal counsel the same hour.** v1 has **no automated
+   reporting pipeline** (NCMEC or otherwise) — this is a known, documented gap (`docs/OPERATIONS.md`
+   §9's "CSAM path has no owner" box applies verbatim here). Escalation from a quarantine is a
+   **manual legal process**, not a system action.
+3. **Do not manually flip `confirm_state` back** to get the hit "out of quarantine" without legal
+   sign-off. The state is doing exactly what it is for.
+4. **Confirm the subject's discovery eligibility is what you expect.** A quarantine on an enrolled
+   *adult's* scan surfacing a third party who appears to be a minor is a different (and still
+   serious) situation from a minor somehow reaching discovery at all (INVARIANTS #8b) — check
+   `subjects.discovery_eligible` for the user the hit belongs to as part of the same escalation, not
+   as a substitute for it.
+
+**Frequency expectation.** This should be rare. If it is firing often, that is itself something to
+raise with product/legal — it may mean the corpus or a seed source needs review, separate from any
+individual quarantine's handling.
+
+---
+
+## 11. The score looks wrong
+
+**Symptom** — a user's protection score doesn't match what support or a reviewer expects, or jumped
+by an amount nobody can explain.
+
+**The journal is the source of truth, never the materialized row.** Read it first, always:
+
+```sql
+SELECT score_event_id, delta, component, cause_kind, cause_ref, config_version, score_after, created_at
+FROM score_events
+WHERE user_ref = '<user_ref>'
+ORDER BY score_event_id DESC
+LIMIT 20;
+```
+
+Every row explains itself: `component` (which of Posture/Coverage/Exposure/Threat moved),
+`cause_kind` (`feedback` / `enrolment` / `seed_registered` / `run_completed` / `review_decision` /
+`threat_event` / `threat_retracted` / `tick`), and `cause_ref` (the infringement, run, or threat event
+that triggered it). `config_version` on each row matters if weights have since been retuned — a score
+computed under an old config is not wrong, it is historical.
+
+**Sanity check the row against the journal**, since `protection_scores` should always equal the sum:
+
+```sql
+SELECT p.score AS materialized, (
+  SELECT sum(delta) FROM score_events WHERE user_ref = p.user_ref
+) AS summed
+FROM protection_scores p WHERE p.user_ref = '<user_ref>';
+```
+
+These two columns must match (INVARIANTS #44, `tests/test_score_store.py::test_journal_sums_to_the_materialized_score`
+is the permanent regression test). If they do not on a real environment, that is a bug in
+`score/store.py`, not a config problem — stop and escalate rather than trying to patch the row by
+hand; there is no writer other than `score/store.py` and hand-editing `protection_scores` directly
+creates exactly the drift the journal exists to prevent.
+
+**If the journal is internally consistent but the *number itself* looks wrong** (e.g. a user insists a
+confirmed hit should have cost more, or a stale seed shouldn't be dinging Posture as much as it is),
+that is very likely a **config/weights** question, not a bug — check `SCORE_WEIGHT_*` and the severity
+sub-weights currently loaded, and remember `config_version` on the affected `score_events` rows tells
+you which config produced the number being questioned.
+
+**If a change should have moved the score and nothing did** (no new journal row after an action that
+should trigger a recompute): the trigger path runs synchronously after commit, so a missing row means
+either the trigger call didn't fire (a bug worth filing) or it hit an exception after its own commit —
+the daily **score tick** (`python -m imageshield.score.tick`) is the designed healer for exactly this
+case and will pick it up on its next run; you do not need to force anything by hand. If it's urgent,
+the tick's `run_once()` can be invoked out-of-band rather than waiting for the interval — check
+`score/tick.py` for the entry point.
+
+**Never write directly to `protection_scores` or `score_events` to "fix" a number.** Any writer other
+than `score/store.py` is exactly the boundary violation `tests/test_boundaries.py::test_only_the_score_store_writes_the_score`
+exists to catch, and a hand-edited materialized row with no journal entry breaks the invariant that
+lets support trust the history feed at all.
+
+---
+
+## 12. Who to call, and about what
 
 | Situation | Who |
 |---|---|

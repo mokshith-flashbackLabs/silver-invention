@@ -10,10 +10,13 @@ handoff brief for the proxy).
 > implemented here.
 
 > **⚠ Specified ≠ in scope.** This document describes the whole system. **v1 of this repo is liveness
-> + third-party search provider integration only.** The match module, adjudication queue, report
-> surface, crop fetcher, and partner ingest adapter are designed here but **not built yet**. See
-> `CLAUDE.md` §6 for the scope table and `NEAR-TERM-BUILD.md` for the authoritative task list. Do not
-> build a component because this document describes it.
+> + third-party search provider integration only.** The match module and the partner ingest adapter
+> are designed here but **not built**. The crop fetcher (§3.7) and a minimal adjudication queue
+> (§3.4/§3.8) were pulled into scope by the 2026-08-19 protection-score push, alongside four pieces
+> this document did not originally describe at all — the confirm pipeline, the score engine, threat
+> events, and the control-room console (§3.8–§3.11). See `CLAUDE.md` §6 for the current scope table
+> and `NEAR-TERM-BUILD.md` for the v1 task list. Do not build the match module or partner ingest
+> because this document describes them.
 
 ---
 
@@ -40,7 +43,10 @@ number.** `user_ref` maps 1:1 onto what becomes `user_id` in v2, so the two name
 value at different stages of the migration.
 
 Services run five loops: Enrolment (synchronous), Forward Match (async), Backfill (async, long),
-Adjudication (human-in-loop), and Periodic (recheck + digest).
+Adjudication (human-in-loop), and Periodic (recheck + digest). The 2026-08-19 protection-score push
+adds a sixth, the **Confirm** loop (async, `confirm:hits`) — §3.8 — sitting between a completed search
+run and the adjudication loop, plus a continuously-recomputed **score** that reacts to all of the
+above (§3.9).
 
 ---
 
@@ -97,13 +103,17 @@ A new enrolment searches the entire content index. Rate-limited per user and pri
 ten signups would otherwise saturate the cluster. **Separate queue and separate worker pool from
 forward** (INVARIANTS #18) — a backfill must never delay live ingest.
 
-### 2.4 Adjudication loop (human)
+### 2.4 Adjudication loop (human) — **built, minimal, as of 2026-08-19**
 
-`review`-band candidates become `review_tasks`. A trained reviewer sees a **face crop only**, rendered
-live by the crop fetcher, and decides `confirmed` / `rejected` / `uncertain`.
+Originally specified against the (still unbuilt) match module's `review`-band candidates. What
+actually ships against the provider-search pipeline is narrower and described in §3.8/§3.10: a
+review-band infringement's most-similar hits are enqueued to `confirm:hits`, machine-triaged
+(severity, face-match, pHash dedup, moderation), and land in `review_tasks` for a human in the
+control-room console. The reviewer sees a **face crop only**, rendered live by the crop fetcher, and
+decides `confirmed` / `rejected` / `uncertain`.
 
-There is no timeout that auto-promotes a review-band candidate (INVARIANTS #19). If the queue backs
-up, the queue backs up.
+There is no timeout that auto-promotes a review-band candidate or a triaged hit (INVARIANTS #19, #47).
+If the queue backs up, the queue backs up.
 
 ### 2.5 Periodic loop (cron)
 
@@ -146,11 +156,13 @@ Never joins to any user table — it holds `user_id` as an opaque value and noth
 `search_runs.threshold_config` records the exact bands used per run, so retuning doesn't orphan the
 meaning of historical scores.
 
-### 3.4 Adjudication module
+### 3.4 Adjudication module — **built, minimal (2026-08-19)**
 
-Review queue, reviewer tooling, decisions. Crop-only display. Budget for reviewer welfare — this is an
-operating cost people forget, and crop-only rather than full-image is the cheapest mitigation
-available.
+The shape actually built is `src/imageshield/review/` — see §3.10 for the full description. This
+paragraph's original claim (review queue, reviewer tooling, decisions, crop-only display, reviewer
+welfare as a budgeted operating cost) all held true of what shipped; only the schema underneath it
+changed from the match-module sketch in `SCHEMA.md` §3 to the confirm-pipeline shape in `SCHEMA.md`
+§2d.
 
 ### 3.5 Report module
 
@@ -298,19 +310,124 @@ only on a definite verdict, while `last_attempted_at` (migration 0013) moves on 
 what the due-queue orders by — otherwise a permanently unreachable host pins the front of every batch
 and the loop silently stops draining.
 
-### 3.7 Crop fetcher
+### 3.7 Crop fetcher — **built** (2026-08-19)
 
-Its own deployable, on its own egress path, with **no VPC access to any internal service**.
+Its own deployable (`src/imageshield/fetcher/`, `uvicorn imageshield.fetcher.app:create_app`, port
+8083), on its own egress path, with **no VPC access to any internal service** and **no database
+credentials of any kind** — `FetcherConfig` has no `database_url` field and cannot be given one without
+a code change, which is the cheapest way to make the "no internal access" property hold even under a
+future misconfiguration.
 
-- Domain allowlist sourced from `content_items.source_domain`
-- SSRF guards applied **after** DNS resolution, not before
-- 5s timeout, 20MB cap, 2 redirects
-- Crops to `face_bbox` + 15% margin, returns the crop, discards everything else
+- Domain allowlist sourced from `content_items.source_domain` / `content_urls.source_domain`
+- SSRF guards applied **after** DNS resolution, not before, on every redirect hop
+- 5s timeout, 10MB cap (`fetch_max_bytes`), 2 redirects
+- `POST /v1/fetch` returns raw bytes to the confirm worker (transient, in-memory only); `POST /v1/crop`
+  crops to `face_bbox` + 15% margin and **blurs by default** (Pillow `ImageFilter`, radius 12, JPEG
+  quality 80) — reveal-on-request is the caller's job, not the fetcher's
 - `Cache-Control: no-store, private`. No CDN, no disk, no temp file
-- Runs on a read-only filesystem so a disk write fails loudly
+- Both routes are gated on `X-Fetcher-Token` (`hmac.compare_digest`); `GET /health` is not, matching
+  every other deployable's rule that a load-balancer probe cannot carry a secret
 
 The full image exists only as a local variable inside the fetcher process and is never returned to the
-caller, even on error paths.
+caller, even on error paths. Two jobs, one process: hand the confirm worker bytes, and render blurred
+crops live for the review screen — the same isolated path serves both callers, so there is exactly one
+place in the whole system that touches a hostile image byte.
+
+### 3.8 Confirm pipeline — **built** (2026-08-19)
+
+`src/imageshield/confirm/` — a worker (`python -m imageshield.confirm.worker`) consuming `confirm:hits`
+(the third application queue, via the outbox — same idiom as `identity:index` and `search:runs`;
+messages carry IDs only, the worker re-reads Postgres). Triggered after a search run's attestations
+land: each new/updated review-band infringement meeting a per-provider "most similar" threshold
+(`CONFIRM_HIVE_MIN_SCORE`, `CONFIRM_GOOGLE_KINDS`) is enqueued.
+
+Per hit, in order:
+
+1. **Fetch** the image via the fetcher deployable (§3.7). Unfetchable → triage `unfetchable`
+   (`unassessed` severity), the hit stays reviewable URL-only; retries with backoff, then DLQ. A
+   failed confirm never blocks anything else (INVARIANTS #33's spirit).
+2. **Perceptual hash** — `confirm/phash.py`, a 64-bit dHash via Pillow, stored as `infringements.phash
+   BIGINT` (SCHEMA.md §2d; INVARIANTS #9 unaffected — a hash, not bytes). If it matches, within a
+   Hamming-distance threshold, a prior image **for the same user** that **a human already decided**,
+   the new URL inherits that decision as `duplicate_of`: no re-review, no second score movement. This
+   is the cross-run, cross-URL "same picture, we already answered this" case, and the dedup lookup
+   never crosses users (`tests/test_confirm_store.py::test_decided_phashes_is_isolated_per_user`).
+3. **Face-match** through `attribution/` — never a direct `SearchFacesByImage` call — against
+   `identity-v1`, candidate list = the hit's own owner only. Recorded as a triage score, never an
+   identity (INVARIANTS #1/#1a hold; the CI face-search grep gate is unchanged: `confirm/` imports
+   `attribution/`, it does not call face search itself).
+4. **Moderation** — Rekognition `DetectModerationLabels` on the same in-memory bytes. Labels stored as
+   text (`infringements.moderation_labels JSONB`); pixels discarded immediately after.
+5. **Severity** — `confirm/triage.py` classifies into `ncii_suspected` (face matched + explicit, top
+   of queue) / `explicit_unmatched` (explicit, face not matched — a possible embedding miss) /
+   `unassessed` / `benign_copy` / `likely_not_subject` (bottom of queue). **Machine ordering only** —
+   nothing here is machine-confirmed or machine-dropped (INVARIANTS #47).
+6. **Cost** — governed by the existing budget/breaker/spend machinery (§3.6b) via the
+   `rekognition_confirm` provider row, priced as the worst-case bundle so the one-row budget check
+   stays conservative. Skips land as `budget_exceeded` / `breaker_open` triage states — visible,
+   retryable, never silent (INVARIANTS #41).
+7. **CSAM tripwire** — moderation labels suggesting minors + explicit routes the hit to
+   `confirm_state = 'quarantined'`: excluded from every `svc` view and the default review queue, an
+   ops alarm logged (`docs/OPERATIONS.md`), no score effect, bytes already discarded. v1 escalation is
+   a **manual legal process** — a reporting pipeline (NCMEC) does not exist and is out of scope,
+   consistent with the existing minor-discovery gate (INVARIANTS #8b).
+
+### 3.9 Score engine — **built** (2026-08-19)
+
+`src/imageshield/score/` owns `protection_scores` (materialized, one row per `user_ref`) and
+`score_events` (append-only journal) — exactly **one** code path writes either (`score/store.py`,
+INVARIANTS #21 extended, #44). A 0–100 integer across four components — Posture, Coverage, Exposure,
+Threat — computed from config-driven weights (`score_config_version` stamped on every journal row, so
+a later retune does not make historical scores uninterpretable, the same reasoning as
+`search_runs.threshold_config`).
+
+Recompute (`score/engine.py`, pure) runs **immediately after its trigger commits, in its own short
+transaction** — a hit decided, feedback written, a seed added, an enrolment change, a run completed, a
+threat event created or retracted — never via a queue, because a score-recompute queue would be a
+fourth application queue nobody sanctioned and recompute itself is cheap (a handful of indexed reads
+plus two writes). Idempotent and total: compute from state, journal the diff; an unchanged state
+journals nothing (`tests/test_score_store.py::test_recompute_twice_writes_nothing_new`).
+
+`score/tick.py` is a separate process (`python -m imageshield.score.tick`, daily interval by default)
+— the drift healer. It re-runs recompute for aging effects (stale seeds, aged-open recommendations,
+decaying threat penalties) and for any trigger whose recompute crashed after the trigger itself
+committed. It is not the primary path; it is what keeps a score from silently going stale if a
+recompute call is ever missed.
+
+`recommendations/catalog.py` is the companion: typed kinds in code
+(`complete_enrolment`/`add_seed_photos`/`refresh_seeds`/`respond_to_hits`/`run_priority_scan`),
+per-user instances in a table, completion **detected from data**, never self-reported by the proxy.
+
+**No feedback signal a user gives ever lowers the score** (INVARIANTS #45) — the direct fix for the
+old system's −18-per-active-report bug that made reporting abuse worsen a user's own number.
+
+### 3.10 Threat events and review — **built** (2026-08-19)
+
+`src/imageshield/threats/` — `threat_events` + a relevance matcher (event `domains[]` ∩ the user's own
+**live** hit domains, or `is_global`) + `threat_event_matches`. Admin CRUD under the existing
+`/v1/admin/*` auth. A relevant event both drops the affected user's score directly (bounded, decaying,
+reversible — INVARIANTS #46) and spawns the recommendations that restore it, even while the event
+stays live. Retraction reverses through the score journal, exactly.
+
+`src/imageshield/review/` — `review_tasks` + `/v1/admin/review/*`. A human decision
+(`confirmed(severity)` / `rejected` / `uncertain`) is the only way an infringement's `confirm_state`
+becomes `'confirmed'`, enforced at the database (migration 0021's `infringements_confirmed_needs_human`
+CHECK, INVARIANTS #47) rather than trusted from the route. An `uncertain` decision returns the task to
+`pending` in place — no timeout, no auto-promotion (INVARIANTS #19).
+
+### 3.11 Control room console — **built** (2026-08-19)
+
+Its own deployable (`src/imageshield/console/`, `uvicorn imageshield.console.app:create_app`, port
+8082), its own internal ingress, **never routed through the proxy** — the client-never-talks-to-us rule
+(§CLAUDE.md §3) is untouched, because this is an operator surface, not a user one. No database
+credentials; it talks to the services API and the fetcher over HTTP only, same boundary discipline as
+the fetcher itself.
+
+Server-rendered (Jinja2) over the existing admin API: threat events CRUD, the review queue, provider
+spend/breaker health (existing admin reads, §3.6b), and a per-user score journal inspector. Operator
+auth is HTTP Basic against `CONSOLE_OPERATORS` (`console/auth.py`); the authenticated operator name
+flows into every write (`decide`, `create_event`, `retract_event`) so `audit_log` names a person, not
+"whoever holds the token."
 
 ---
 
@@ -326,9 +443,14 @@ caller, even on error paths.
 | Liveness sessions, enrolments, vectors | **Services** | Postgres (identity DB) |
 | Consent records + signed artifacts | **Proxy** | Proxy tables + DocuSeal. Services hold only `enrolments.consent_ref` and the hash the proxy computed |
 | Content index, candidates, search runs | **Services** | Postgres |
-| Review queue and decisions | **Services** | Postgres |
+| Review queue and decisions | **Services** | Postgres (`review_tasks`, migration 0021 — §3.10) |
 | Reports, hits, recheck state | **Services** | Postgres |
-| Report reads for the UI | **Proxy** | Postgres (read-only) |
+| Protection score, journal, recommendations | **Services** | Postgres (`score_rw`, migration 0022 — §3.9). Journal is `INSERT`-only for the role |
+| Threat events + matches | **Services** | Postgres (admin-curated — §3.10) |
+| Confirm-pipeline triage (severity, pHash, moderation labels) | **Services** | Postgres, on `infringements` (migration 0021 — §3.8). No image bytes; text and a 64-bit hash only |
+| Hostile-image fetch + live crop render | **Services** | Nothing persisted — the fetcher deployable (§3.7) holds no DB credentials at all |
+| Report reads for the UI | **Proxy** | Postgres (read-only, `svc` views — migrations 0016 + 0023) |
+| Control-room console reads/writes | **Services** (operator-facing, not user-facing) | Over HTTP to the services API + fetcher; no DB access of its own (§3.11) |
 | Pushing onto any queue | **Services** | SQS (via outbox) |
 
 Services receive `user_ref` on every request and trust that the proxy has authorised the caller. **If the
@@ -359,14 +481,19 @@ column matching `image|thumbnail|blob|photo|local_path` in match, adjudication, 
 
 ## 6. Queues
 
-Three SQS queues, Standard (not FIFO — ordering is irrelevant here and the FIFO throughput ceiling
-isn't worth it). Each has its own worker and its own DLQ.
+This table is the original match-module-era design (`match:forward`, `match:backfill`) and predates
+the provider-search pivot; it is kept for the design reasoning, not as the current queue list. **The
+three queues actually built and running are `identity:index`, `search:runs`, and — since the
+2026-08-19 protection-score push — `confirm:hits`** (`src/imageshield/confirm/worker.py`, §3.8), each
+Standard (not FIFO — ordering is irrelevant here and the FIFO throughput ceiling isn't worth it), each
+with its own worker and its own DLQ, each fed through the same outbox described below.
 
 | Queue | Producer | Message | Latency budget |
 |---|---|---|---|
 | `identity:index` | Enrolment handler | `{enrolment_id}` | Seconds |
-| `match:forward` | Ingest adapter | `{content_face_id}` | Minutes |
-| `match:backfill` | `enrolment_complete` | `{user_id, page_from, page_to}` | Hours |
+| `match:forward` *(unbuilt)* | Ingest adapter | `{content_face_id}` | Minutes |
+| `match:backfill` *(unbuilt)* | `enrolment_complete` | `{user_id, page_from, page_to}` | Hours |
+| `confirm:hits` *(built, 2026-08-19)* | Search-run completion, via the outbox | `{infringement_id}` | Minutes |
 
 ### The outbox is mandatory
 

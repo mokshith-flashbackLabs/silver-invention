@@ -52,13 +52,20 @@ copyable rather than re-derived.
 | HTTP client | httpx |
 | Liveness | AWS Rekognition Face Liveness |
 | Face index | AWS Rekognition collections (`identity-v1`) |
-| Queues | AWS SQS — `identity:index`, `search:runs` — with a transactional outbox |
+| Queues | AWS SQS — `identity:index`, `search:runs`, `confirm:hits` — with a transactional outbox |
+| Templating | Jinja2 — **console deployable only**; the API and fetcher return JSON and never render HTML |
 | Tests | pytest, pytest-postgresql, pytest-asyncio, httpx |
 | Local dev | docker compose — Postgres + LocalStack (SQS) |
 | Health / readiness | `GET /health` — always `200`, db reachability only; `GET /readyz` — `503` when the `svc` contract is broken (deploy gate) |
 
 Not used here, unlike Flashback: pgvector (not until we own embeddings), Valkey (no working-memory
 concept), and any LLM SDK — see §10.
+
+**Pillow has three call sites, and no more.** `attribution/crop.py` (cropping a candidate face before
+`SearchFacesByImage`, so three faces in one photo are never searched as the same "largest face"),
+`confirm/phash.py` (the 64-bit dHash used for cross-URL duplicate detection), and `fetcher/app.py`
+(the blur applied to every face crop before it leaves the process). All three operate on bytes already
+in memory and never write a file — see INVARIANTS #9 and #12.
 
 External dependencies we **call** but do not own: the proxy (REST), Rekognition, Hive, Postgres, SQS.
 
@@ -231,6 +238,11 @@ code being written **now**, carrying the same numbers.
 43. **A run refused at dispatch is `refused`, never `completed`.** A completed run with zero results
    reads as "we looked and found nothing", which about a search that never ran is a false
    reassurance. Same reasoning as #8b's "no run row at all" for a refusal at the route.
+44–47. **Protection score, threat events and machine triage** *(2026-08-19 push)* — the score journal
+   is append-only and the only writer is `score/store.py`; no feedback signal ever lowers the score;
+   threat penalties are bounded, decaying, relevance-scoped, and reverse exactly on retraction; and
+   machine triage orders the review queue but a `confirmed` state requires a human by schema CHECK.
+   Full text in `INVARIANTS.md` §G, #44–47.
 
 ---
 
@@ -254,30 +266,46 @@ Full DDL in `SCHEMA.md`.
 
 **v1 of this repo is liveness + third-party search provider integration. Nothing else.**
 
-`ARCHITECTURE.md` describes the full system, including a match module, an adjudication queue, a report
-surface, and a crop fetcher. **Those are specified, not built, and not in scope.** Do not build them
-because the architecture doc describes them.
+`ARCHITECTURE.md` describes the full system, including a match module and a partner ingest adapter.
+**Those remain specified, not built, and not in scope.** Do not build them because the architecture doc
+describes them.
+
+The 2026-08-19 protection-score push (see the dated note under §8) pulled a **minimal** adjudication
+queue and the crop fetcher out of "specified, do not build yet" and into scope, alongside four
+entirely new pieces (protection score, recommendations, threat events, the control-room console) that
+`ARCHITECTURE.md`'s original scope table never listed at all. The table below is the current state,
+not the v1-launch state — see `docs/superpowers/specs/2026-08-19-protection-score-design.md` for the
+decisions behind the new rows.
 
 | Build now | Specified, do not build yet |
 |---|---|
 | Liveness sessions + enrolment | Match module (forward + backfill) |
-| `DeleteFaces` path | Adjudication queue and reviewer tooling |
-| Provider adapter interface | Report surface, hits, evidence export |
-| Score calibration + banding | Crop fetcher deployable |
-| URL normalisation + dedup | Digests |
-| Cost tracking + circuit breakers | Partner ingest adapter |
-| Subject eligibility (step 8) | CSAM screening + mandatory reporting |
-| Adaptive cadence mechanism | The scheduler that reads `next_scan_after` |
-| Infringement feedback (`not_me` / `authorised`) | |
-| URL recheck loop (`url_alive`) | |
-| Attribution: face → seed (`/v1/attribute`) | `discovered-v1`, clustering, cluster claims |
+| `DeleteFaces` path | Report surface, hits, evidence export *(superseded in practice by `infringements`/`attestations` + the `svc` views, §SCHEMA.md 2b/2c)* |
+| Provider adapter interface | Digests (delivery is the proxy's side; this repo only computes what would go in one) |
+| Score calibration + banding | Partner ingest adapter |
+| URL normalisation + dedup | CSAM screening + mandatory reporting |
+| Cost tracking + circuit breakers | The cadence scheduler that reads `next_scan_after` |
+| Subject eligibility (step 8) | `discovered-v1`, clustering, cluster claims |
+| Adaptive cadence mechanism | The shield rule / photo protection / coverage arithmetic |
+| Infringement feedback (`not_me` / `authorised`) | Automated threat-event feeds (v1 threat events are admin-curated only) |
+| URL recheck loop (`url_alive`) | Takedown, of any kind |
+| Attribution: face → seed (`/v1/attribute`) | |
 | The four `svc` contract views (0016) | |
 | `GET /v1/config/floors` | |
-| | The shield rule / photo protection / coverage arithmetic |
+| **Adjudication queue + reviewer tooling (minimal)** — `review/`, `review_tasks`, `/v1/admin/review/*`, the control-room review screen. Human-only `confirmed`/`rejected`/`uncertain`; no auto-promotion (INVARIANTS #19, #47) | |
+| **Crop fetcher deployable** — `ARCHITECTURE.md` §3.7, pulled into scope; hands the confirm worker image bytes and renders blurred review crops live; no DB credentials | |
+| **Confirm pipeline** — `confirm/` worker on `confirm:hits`: fetch → pHash dedup → face-match (through `attribution/`, never a direct Rekognition search call) → moderation → severity triage | |
+| **Protection score + recommendations** — `score/` (engine, journaled store, `tick` drift-healer), `recommendations/` catalog. Journal is the product surface (INVARIANTS #44) | |
+| **Threat events** — `threats/`, admin-curated via `/v1/admin/threat-events`, bounded/decaying/reversible score effect (INVARIANTS #46) | |
+| **Control room console** — its own deployable (`console/`, port 8082), HTTP Basic per-operator, server-rendered; review queue, threat events CRUD, provider health, score inspector | |
 
 Two notes on that right-hand column. **CSAM screening and reporting are what gate minor
 discovery** — `MINOR_DISCOVERY_SUPPORTED` stays `False` until both exist, and flipping it without them
-raises. And **"recheck" now means two different things — do not confuse them:**
+raises. This is unchanged by the confirm pipeline: `confirm/`'s CSAM tripwire (moderation labels
+suggesting minors + explicit) *quarantines* a hit — excluded from every `svc` view, ops-alarmed, no
+score effect — it does not build a reporting pipeline, and escalation from a quarantine is a manual
+legal process (see `docs/OPERATIONS.md`). And **"recheck" now means two different things — do not
+confuse them:**
 
 | | What it does | State |
 |---|---|---|
@@ -452,6 +480,14 @@ Do not start step 5 before step 4 is verified end-to-end on a real device.
 Spike work — throwaway harnesses, vendor evaluation, credential and region checks — belongs in
 `devtools/`, outside the numbered steps. It does not advance the build order, and it should not be
 reported as a step being complete.
+
+**2026-08-19 — post-v1 scope, sanctioned.** The protection-score push (confirm pipeline, score engine,
+threat events, minimal review, the fetcher and console deployables — §6) is **not** part of this
+numbered build order and does not renumber it. It was scoped and approved in
+`docs/superpowers/specs/2026-08-19-protection-score-design.md` as deliberate post-v1 work, built on an
+in-place branch (`protection-score-push`) rather than as steps 10+. Treat the two as separate
+timelines: "what step are we on" still answers against 1–9 above; "is the score push done" is answered
+by that spec and this section's dated note.
 
 ---
 

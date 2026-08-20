@@ -822,7 +822,252 @@ the proxy team, not decided unilaterally.
 
 ---
 
+## 2d. Confirm pipeline, protection score, recommendations, threat events — **built** (migrations
+0021–0023)
+
+The 2026-08-19 protection-score push. Design:
+`docs/superpowers/specs/2026-08-19-protection-score-design.md`. This is the section §3 and §4 below
+point at when they say "the real, built shape lives elsewhere" — read this before either.
+
+### Confirm state on `infringements` (migration 0021)
+
+Six new columns on the existing `infringements` table, plus `review_tasks`. `confirm_state` is
+**distinct from `infringements.status`** (the user's own position — `new`/`acknowledged`/etc., §2b)
+and from `band` (calibration, §2b): it is the machine/human lifecycle of *whether this hit has been
+looked at and by whom*.
+
+```sql
+ALTER TABLE infringements
+  ADD COLUMN confirm_state TEXT NOT NULL DEFAULT 'unconfirmed'
+    CHECK (confirm_state IN
+      ('unconfirmed', 'machine_triaged', 'confirmed', 'rejected', 'duplicate', 'quarantined')),
+  ADD COLUMN severity TEXT
+    CHECK (severity IN
+      ('ncii_suspected', 'explicit_unmatched', 'unassessed', 'benign_copy', 'likely_not_subject')),
+  ADD COLUMN confirm_decided_by TEXT,
+  ADD COLUMN confirm_decided_at TIMESTAMPTZ,
+  ADD COLUMN duplicate_of UUID REFERENCES infringements(infringement_id),
+  ADD COLUMN phash BIGINT,
+  ADD COLUMN face_match_score NUMERIC(5,2),
+  ADD COLUMN moderation_labels JSONB;
+
+ALTER TABLE infringements
+  ADD CONSTRAINT infringements_confirmed_needs_human CHECK (
+    confirm_state <> 'confirmed'
+    OR (confirm_decided_by IS NOT NULL AND confirm_decided_at IS NOT NULL)
+  ),
+  ADD CONSTRAINT infringements_duplicate_needs_source CHECK (
+    (confirm_state = 'duplicate') = (duplicate_of IS NOT NULL)
+  );
+```
+
+**The `confirm_state` lifecycle is six values**, and the transitions are one-directional except for
+the retry path:
+
+| State | Reached from | Meaning |
+|---|---|---|
+| `unconfirmed` | (default) | Enqueued to `confirm:hits` or not yet even that |
+| `machine_triaged` | worker triage step | Fetched, hashed, face-matched, moderated; sitting in `review_tasks` |
+| `confirmed` | a human `review/store.py::decide` | User-visible, scores Exposure. **Requires `confirm_decided_by`/`confirm_decided_at` by CHECK — not by application discipline** |
+| `rejected` | a human decision | Reviewed and dismissed; never reaches a user, never scores |
+| `duplicate` | pHash match against an already-decided row for the same user | Inherits `duplicate_of`'s decision; no second review, no second score movement |
+| `quarantined` | the CSAM tripwire (moderation labels suggesting minors + explicit) | Excluded from every `svc` view and the default review queue; no score effect; escalation is a manual legal process (`docs/OPERATIONS.md`) |
+
+`unconfirmed` is also the record-a-skip state: a confirm worker skip (`budget_exceeded`,
+`breaker_open`, `provider_disabled` on the `rekognition_confirm` provider row) leaves `confirm_state`
+at `unconfirmed` rather than inventing a seventh value — the row is simply eligible to be picked up
+again, which is the retry path (progress ledger, Task 1).
+
+**`phash` is a `BIGINT`, not bytes.** It is the 64-bit dHash (`confirm/phash.py`) of the fetched image
+— a hash, computed once, in memory, and stored as a signed integer (Python converts with two's
+complement). This passes both parts of the schema lint that matter here: no `bytea` column exists, and
+`phash` does not match the name gate's `/_(data|blob|bytes|b64)$|thumbnail|local_path/` pattern.
+INVARIANTS #9 stands untouched — the pixels themselves are never written anywhere, only a 64-bit
+fingerprint of them. `infringements_decided_phash_idx` is a partial index scoped to
+`WHERE phash IS NOT NULL AND confirm_state IN ('confirmed', 'rejected')` — "has a human already
+decided this picture for this user" — and the lookup is always scoped by `user_ref`, so a duplicate
+can never be inherited across users (`tests/test_confirm_store.py::test_decided_phashes_is_isolated_per_user`).
+
+`review_tasks` (new table, distinct from — and replacing the intent of — the unbuilt §3 sketch below):
+
+```sql
+CREATE TABLE review_tasks (
+  task_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  infringement_id  UUID NOT NULL REFERENCES infringements(infringement_id) ON DELETE CASCADE,
+  user_ref         UUID NOT NULL,
+  severity         TEXT NOT NULL CHECK (severity IN
+    ('ncii_suspected', 'explicit_unmatched', 'unassessed', 'benign_copy', 'likely_not_subject')),
+  triage           JSONB NOT NULL,   -- face_match_score, moderation labels, fetched image_url,
+                                     -- best-face bbox, unfetchable detail. Text ABOUT the image.
+  status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','decided','quarantined')),
+  decision         TEXT CHECK (decision IN ('confirmed', 'rejected')),
+  decided_by       TEXT,
+  decided_at       TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (infringement_id),
+  CONSTRAINT review_tasks_decided_shape CHECK (
+    (status = 'decided') = (decision IS NOT NULL AND decided_by IS NOT NULL AND decided_at IS NOT NULL)
+  )
+);
+```
+
+One live task per hit (`UNIQUE (infringement_id)`): an `uncertain` decision keeps the same row
+`pending` rather than spawning a new one, so no queue depth metric double-counts a hit under repeated
+review. Ordered by a `CASE severity ... END, created_at` partial index so `ncii_suspected` always
+sorts first without a numeric column to keep in sync with the text enum.
+
+`rekognition_confirm` is inserted as a `providers` row (`kind = 'classifier'`) so the confirm pass runs
+under the **existing** budget/breaker/spend machinery unmodified (INVARIANTS #37–#41):
+`cost_per_call_usd = 0.005`, priced as the worst-case bundle (1 `DetectFaces` + up to N
+`SearchFacesByImage` calls, capped by config + 1 `DetectModerationLabels`) so the one-row budget check
+stays conservative without special-casing a multi-call unit of work.
+
+### Protection score, recommendations, threat events (migration 0022)
+
+New role `score_rw`, granted `SELECT, INSERT, UPDATE` on `protection_scores`, `recommendations`,
+`threat_events`, `threat_event_matches` — and **`SELECT, INSERT` only** (no `UPDATE`, no `DELETE`) on
+`score_events`. That grant shape is the enforcement mechanism for INVARIANTS #44: an editable journal
+is not a journal, and this makes it true at the database rather than by convention.
+
+```sql
+CREATE TABLE protection_scores (
+  user_ref       UUID PRIMARY KEY REFERENCES subjects(user_ref),
+  score          INT NOT NULL CHECK (score BETWEEN 0 AND 100),
+  components     JSONB NOT NULL,     -- {"posture": int, "coverage": int, "exposure": int, "threat": int}
+  config_version TEXT NOT NULL,
+  computed_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE score_events (          -- append-only. BIGSERIAL like audit_log: an ordered
+  score_event_id BIGSERIAL PRIMARY KEY,   -- journal, not an addressable resource.
+  user_ref       UUID NOT NULL REFERENCES subjects(user_ref),
+  delta          INT NOT NULL,
+  component      TEXT NOT NULL CHECK (component IN ('posture', 'coverage', 'exposure', 'threat')),
+  cause_kind     TEXT NOT NULL,      -- feedback | enrolment | seed_registered | run_completed |
+                                     -- review_decision | threat_event | threat_retracted | tick
+  cause_ref      TEXT,
+  config_version TEXT NOT NULL,
+  score_after    INT NOT NULL CHECK (score_after BETWEEN 0 AND 100),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+`protection_scores` is one row per `user_ref`, materialized and re-written on every recompute.
+`score_events` is the history: every movement, its component, its cause, and the resulting score, so
+the proxy can render "−6 — confirmed match found on {domain}" style history without recomputing
+anything. `score/store.py` is the **only** module that writes either table
+(`tests/test_boundaries.py::test_only_the_score_store_writes_the_score`, INVARIANTS #44). Both tables
+FK to `subjects`, not to a `users` table that does not exist here — the same pattern §2b's `subjects`
+table already establishes.
+
+```sql
+CREATE TABLE threat_events (
+  event_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind        TEXT NOT NULL CHECK (kind IN ('leak', 'deepfake_wave', 'platform_incident', 'other')),
+  title       TEXT NOT NULL CHECK (title <> ''),
+  body        TEXT NOT NULL DEFAULT '',
+  severity    SMALLINT NOT NULL CHECK (severity BETWEEN 1 AND 5),
+  domains     TEXT[] NOT NULL DEFAULT '{}',   -- flattened relevance matcher: hit domains
+  is_global   BOOLEAN NOT NULL DEFAULT false,
+  penalty     NUMERIC(5,2) NOT NULL CHECK (penalty > 0),
+  starts_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at  TIMESTAMPTZ NOT NULL,
+  decay_days  INT NOT NULL CHECK (decay_days > 0),
+  status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft','active','expired','retracted')),
+  created_by  TEXT NOT NULL CHECK (created_by <> ''),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (expires_at > starts_at),
+  CHECK (is_global OR cardinality(domains) > 0)   -- an event that matches nothing is a typo
+);
+
+CREATE TABLE threat_event_matches (
+  event_id        UUID NOT NULL REFERENCES threat_events(event_id) ON DELETE CASCADE,
+  user_ref        UUID NOT NULL REFERENCES subjects(user_ref),
+  matched_via     TEXT NOT NULL,     -- the matching domain, or 'global'
+  penalty_applied NUMERIC(5,2) NOT NULL,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (event_id, user_ref)
+);
+```
+
+Relevance matching (`threats/store.py`) intersects an event's `domains[]` against the `source_domain`
+of the user's own **live** hits — a dead URL under a matching domain does not match
+(`tests/test_threats.py::test_a_dead_url_on_a_matching_domain_is_not_matched`). Retraction flips
+`status` to `'retracted'` once — a second retraction on an already-retracted event is a no-op — and
+reverses the applied penalty through `score_events`, restoring exactly what was taken
+(`tests/test_threats.py::test_event_retraction_restores_exactly_the_pre_event_score`, INVARIANTS #46).
+
+```sql
+CREATE TABLE recommendations (
+  rec_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_ref        UUID NOT NULL REFERENCES subjects(user_ref),
+  kind            TEXT NOT NULL CHECK (kind IN
+    ('complete_enrolment', 'add_seed_photos', 'refresh_seeds', 'respond_to_hits', 'run_priority_scan')),
+  params          JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','completed','expired','dismissed')),
+  source_event_id UUID REFERENCES threat_events(event_id),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at    TIMESTAMPTZ,
+  expires_at      TIMESTAMPTZ
+);
+```
+
+`recommendations_open_uniq` is a partial unique index on `(user_ref, kind, COALESCE(source_event_id,
+'00000000-0000-0000-0000-000000000000'))` `WHERE status = 'open'` — one open instance per person per
+kind per triggering event, with the sentinel UUID collapsing the non-event-linked kinds into one
+bucket. Completion is detected from data (a seed row appeared, feedback was given, a run completed) —
+the proxy never writes to this table.
+
+### The `svc` contract, v2 (migration 0023)
+
+Four **new** views, additive, same grant pattern as 0016:
+
+```sql
+GRANT SELECT ON svc.v_person_score, svc.v_person_score_events,
+                svc.v_person_recommendations, svc.v_person_threat_context
+  TO imageshield_proxy_ro;
+```
+
+| View | Base | Purpose |
+|---|---|---|
+| `v_person_score` | `protection_scores` | `score`, `components`, `config_version`, `computed_at` |
+| `v_person_score_events` | `score_events` | The history feed, read-only here as everywhere else |
+| `v_person_recommendations` | `recommendations` | Open/completed/expired/dismissed, per person |
+| `v_person_threat_context` | `threat_event_matches` JOIN `threat_events` | **Only** `status = 'active' AND expires_at > now()` — a draft or retracted event must never reach a user surface |
+
+And two **existing** views change, via `CREATE OR REPLACE` (append-only column discipline, same rule
+0016 established — a replace may only append columns and add row filters, never remove or retype one):
+
+- **`v_person_hits`** appends `confirm_state`, `severity`, `decided_at` (`confirm_decided_at`) to the
+  select list, and its `WHERE` gains `i.confirm_state NOT IN ('quarantined', 'duplicate')`. Before
+  0023 both states were invisible to application code but still counted and displayed by this view,
+  because it predates `confirm_state` entirely — a quarantined hit reaching a user surface is exactly
+  the harm the review queue exists to prevent (INVARIANTS #19), and a duplicate would otherwise inflate
+  every count for a picture the user already has a single answer for.
+- **`v_person_report_summary`** gains the same exclusion, applied *inside* the `infringements`
+  aggregate subquery (`WHERE confirm_state NOT IN ('quarantined', 'duplicate')`) rather than after —
+  so `active_reports`, `unresolved_matches` and `live_exposure_count` are computed only over hits a
+  user may actually see.
+
+Both replaced views' down-migration restores 0016's text **exactly** (`DROP` + `CREATE`, not `OR
+REPLACE`, mirroring 0016's own down-leg precedent for the same reason: `OR REPLACE` cannot drop
+trailing columns) — a down that cannot reproduce the pre-0023 projection would break `/readyz` on
+rollback.
+
+---
+
 ## 3. Adjudication service
+
+⚠ **This section is the original match-module-era sketch and was never built as written.** It predates
+`match_candidates`/`search_run` being provider-search tables rather than partner-embedding ones, and
+its `review_tasks` (keyed on `candidate_id`, a `task_status`/`review_decision` enum pair, a separate
+`review_decisions` table) is a **different, unbuilt shape** from the `review_tasks` actually shipped in
+migration 0021 — see §2d above, which documents the real columns (`infringement_id`-keyed, plain
+`TEXT` + `CHECK` rather than enums, no separate decisions table — the decision lives on the row).
+Kept here for the historical design reasoning ("reviewers see a crop, never the full image" — still
+true, and still how the fetcher deployable and the control-room console behave); do not build against
+the SQL below.
 
 ```sql
 CREATE TYPE task_status AS ENUM ('queued','assigned','decided','expired');

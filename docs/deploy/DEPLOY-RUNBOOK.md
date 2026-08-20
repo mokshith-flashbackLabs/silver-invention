@@ -471,6 +471,122 @@ controls on both.
 
 ---
 
+## 9b. The protection-score push — confirm, fetcher, console
+
+**Deployed 2026-08-19+, after §9a.** Three new task definitions in `infra/ecs/`:
+`imageshield-dev-confirm.json` (two containers: `confirm-worker` +
+`python -m imageshield.confirm.worker`, 192 MB; `score-tick` +
+`python -m imageshield.score.tick`, 96 MB), `imageshield-dev-fetcher.json` (one container, port 8083),
+`imageshield-dev-console.json` (one container, port 8082).
+
+### Secrets keys to add first
+
+Two **new keys on the existing** `imageshield/<env>/service-token/backend-to-services` secret
+container — not new secret containers, new keys inside the one that already exists. Terraform creates
+containers only, never values (§1), and that rule applies here too: add the keys by hand in Secrets
+Manager **before** registering any of the three task definitions below, or the tasks fail at launch
+with `ResourceInitializationError` and no application logs (§12.4 — the same failure mode, a different
+cause).
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id imageshield/dev/service-token/backend-to-services \
+  --query SecretString --output text
+# add FETCHER_TOKEN and CONSOLE_OPERATORS to the JSON, then:
+aws secretsmanager put-secret-value \
+  --secret-id imageshield/dev/service-token/backend-to-services \
+  --secret-string '<the merged JSON, all existing keys plus the two new ones>'
+```
+
+| Key | Consumed by | Shape |
+|---|---|---|
+| `FETCHER_TOKEN` | confirm-worker, fetcher, console | A random token ≥16 chars — the fetcher checks it with `hmac.compare_digest`. Same value on all three consumers; it is the shared secret between them, not a per-service one |
+| `CONSOLE_OPERATORS` | console only | `"name:token,name:token,..."` — `console/auth.py`'s parser rejects a malformed roster at **boot**, not on first login, so a typo here crash-loops the console task rather than locking out one operator |
+
+Verify both keys exist before moving on:
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id imageshield/dev/service-token/backend-to-services \
+  --query SecretString --output text \
+  | python -c 'import sys,json;print(sorted(json.load(sys.stdin)))'
+# must include FETCHER_TOKEN and CONSOLE_OPERATORS alongside the pre-existing "token" key
+```
+
+### Register and create the three services
+
+Same pattern as §9a — register, then create with `minimumHealthyPercent=0, maximumPercent=100` (still
+one instance, still fixed host ports for fetcher/console; the confirm task has no health check and no
+port, same reasoning as the worker task in §9a: neither process serves HTTP, and `essential: true`
+already restarts a dead one).
+
+```bash
+aws ecs register-task-definition --cli-input-json file://infra/ecs/imageshield-dev-confirm.json
+aws ecs register-task-definition --cli-input-json file://infra/ecs/imageshield-dev-fetcher.json
+aws ecs register-task-definition --cli-input-json file://infra/ecs/imageshield-dev-console.json
+
+aws ecs create-service --cluster $CLUSTER --service-name fetcher \
+  --task-definition imageshield-dev-fetcher --desired-count 1 --launch-type EC2 \
+  --deployment-configuration 'minimumHealthyPercent=0,maximumPercent=100'
+aws ecs wait services-stable --cluster $CLUSTER --services fetcher
+
+aws ecs create-service --cluster $CLUSTER --service-name confirm \
+  --task-definition imageshield-dev-confirm --desired-count 1 --launch-type EC2 \
+  --deployment-configuration 'minimumHealthyPercent=0,maximumPercent=100'
+aws ecs wait services-stable --cluster $CLUSTER --services confirm
+
+aws ecs create-service --cluster $CLUSTER --service-name console \
+  --task-definition imageshield-dev-console --desired-count 1 --launch-type EC2 \
+  --deployment-configuration 'minimumHealthyPercent=0,maximumPercent=100'
+aws ecs wait services-stable --cluster $CLUSTER --services console
+```
+
+### Deploy order, and why it is an order
+
+**Fetcher → confirm → console.** Not arbitrary:
+
+1. **Fetcher first.** The confirm worker calls `FETCHER_BASE_URL` (`http://localhost:8083`) for every
+   hit it processes; if confirm starts before the fetcher is reachable, its first batch of jobs fails
+   identically and heads for the DLQ for a cause that isn't really a failure (see
+   `docs/OPERATIONS.md` §9's DLQ scenario). Confirming the fetcher's own `/health` is green before
+   starting confirm avoids manufacturing a false alarm.
+2. **Confirm second.** It is the thing actually consuming `confirm:hits` and writing triage state;
+   nothing downstream needs it up first.
+3. **Console last.** It is a pure read/write client of the services API and the fetcher — nothing
+   breaks by starting it last, and starting it last means an operator opening the console for the
+   first time sees a fully-live backend rather than a console reporting upstream errors while the
+   other two are still coming up.
+
+### Placement caveat — read before assuming a `create-service` failure is a bug
+
+**The dev instance is one burstable `t4g.medium`, and headroom is not guaranteed.** §9a's worker
+service already budgets memory carefully (448 MB of the ~763 MB schedulable, leaving ≥256 for one-off
+tasks); the three new services here (192 + 96 + 192 + 160 = 640 MB more) can push total scheduled
+memory past what the instance actually has free at the moment you deploy, especially if a one-off
+migrate task or the §6d probe is mid-flight.
+
+**Symptom:** `create-service` succeeds (it just registers the desired state) but the task never
+reaches `RUNNING` — `aws ecs describe-services` shows an event like
+`(service X) was unable to place a task because no container instance met all of its requirements`.
+This is not a bug in the task definition; it is arithmetic.
+
+**This is an operator decision, not a code fix.** Options, in the order to consider them:
+
+1. Confirm nothing else schedulable is idle and can be stopped (an old revision, a leftover one-off
+   task).
+2. **Resize the instance** (or add a second one) if dev is expected to run all seven processes
+   concurrently going forward — a `t4g.medium` was sized for the original four-process v1 footprint,
+   not eight.
+3. As a temporary measure only, reduce `desired-count` on a lower-priority service (console is the
+   safest candidate — it has no consumers waiting on it) to free headroom, but treat this as a
+   stopgap and raise the sizing question rather than leaving it that way.
+
+Do not "fix" a placement failure by trimming a container's `memory` value below what the process
+actually needs — that trades a visible placement failure for an invisible OOM kill later, which is a
+worse failure mode because it looks like the process crashing for no reason.
+
+---
+
 ## 10. Verify
 
 `/readyz` is on `localhost:8081` on a private interface, and Caddy only proxies to

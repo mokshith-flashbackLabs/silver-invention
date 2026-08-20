@@ -1,7 +1,7 @@
 # Protection score, confirm pipeline, threat events, review & control room — design
 
 **Date:** 2026-08-19
-**Status:** approved in brainstorming (all four sections), pending spec review
+**Status:** implemented (branch protection-score-push); see git log
 **Delivery:** one push (approach C) — score engine + confirm pipeline + events + console ship together
 
 ---
