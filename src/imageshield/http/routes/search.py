@@ -20,7 +20,12 @@ from fastapi import APIRouter, Depends, Query
 
 from imageshield.config import Config
 from imageshield.http.auth import require_service_token
-from imageshield.http.deps import get_config, get_search_store, get_subject_store
+from imageshield.http.deps import (
+    get_config,
+    get_score_store,
+    get_search_store,
+    get_subject_store,
+)
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
     AttestationItem,
@@ -32,6 +37,7 @@ from imageshield.http.models import (
     SeedCreateRequest,
     SeedCreateResponse,
 )
+from imageshield.score.store import ScoreStore
 from imageshield.search.store import SearchStore, UnknownSubject
 from imageshield.subjects.store import SubjectStore
 from imageshield.types import ProviderId, UserRef, parse_provider_id
@@ -45,6 +51,7 @@ router = APIRouter(prefix="/v1", dependencies=[Depends(require_service_token)])
 async def create_seed(
     body: SeedCreateRequest,
     store: SearchStore = Depends(get_search_store),
+    score_store: ScoreStore = Depends(get_score_store),
 ) -> SeedCreateResponse:
     # No eligibility check here, deliberately — only an existence one, enforced
     # by migration 0008's FK and surfaced as UnknownSubject. A minor may hold
@@ -66,6 +73,12 @@ async def create_seed(
             retryable=False,
         ) from exc
     log.info("search.seed_created", seed_id=str(seed_id), seed_kind=body.seed_kind)
+    try:
+        await score_store.recompute(body.user_ref, cause_kind="seed_registered")
+    except Exception:  # deliberate: the trigger already committed; tick will heal
+        log.warning(
+            "score.recompute_failed", user_ref=str(body.user_ref), cause="seed_registered"
+        )
     return SeedCreateResponse(seed_id=seed_id)
 
 

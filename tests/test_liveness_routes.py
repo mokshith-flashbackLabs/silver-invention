@@ -50,6 +50,7 @@ from imageshield.liveness.models import (
     ProviderResult,
     UploadError,
 )
+from imageshield.score.store import ScoreResult
 from imageshield.subjects.models import Eligibility
 from imageshield.types import UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
@@ -323,17 +324,55 @@ class FakeFaceIndex:
         return tuple(face_id for face_id in face_ids if face_id in self.faces)
 
 
+class FakeScoreStore:
+    """Records every ``recompute`` call. ``raise_error`` proves the
+    swallow-and-log wrapper never changes the route's response."""
+
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self._raise_error = raise_error
+        self.calls: list[tuple[UserRef, str]] = []
+
+    async def recompute(
+        self,
+        user_ref: UserRef,
+        *,
+        cause_kind: str,
+        cause_ref: str | None = None,
+        now: Any = None,
+    ) -> ScoreResult | None:
+        if self._raise_error:
+            raise RuntimeError("score store unavailable")
+        self.calls.append((user_ref, cause_kind))
+        return None
+
+    async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    async def list_events(
+        self, user_ref: UserRef, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def all_subject_refs(self) -> tuple[UserRef, ...]:
+        raise NotImplementedError
+
+    async def expire_due_threat_events(self, *, now: Any) -> int:
+        raise NotImplementedError
+
+
 class Harness:
-    def __init__(self, **config_overrides: Any) -> None:
+    def __init__(self, *, raising_score_store: bool = False, **config_overrides: Any) -> None:
         self.store = FakeLivenessStore()
         self.provider = FakeLivenessProvider()
         self.uploader = FakeUploader()
         self.face_index = FakeFaceIndex()
+        self.score_store = FakeScoreStore(raise_error=raising_score_store)
         app = create_app(config=make_config(**config_overrides))
         app.state.liveness_store = self.store
         app.state.liveness_provider = self.provider
         app.state.object_uploader = self.uploader
         app.state.face_index = self.face_index
+        app.state.score_store = self.score_store
         self.client = TestClient(app)
 
     # -- convenience -------------------------------------------------------
@@ -865,6 +904,39 @@ def test_passed_session_enrols_and_consumes() -> None:
         True,
         "adult",
     )
+    # score.recompute fires exactly once, with the enrolment cause.
+    assert h.score_store.calls == [(UserRef(row.user_ref), "enrolment")]
+
+
+def test_response_is_unchanged_when_score_recompute_raises_on_enrolment() -> None:
+    """The swallow-and-log wrapper: a broken score store must never turn a
+    successful enrolment into a failed request."""
+    h = Harness(raising_score_store=True)
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 200
+    assert response.json()["enrolled"] is True
+    stored = h.store.rows[row.session_id]
+    assert stored.status == "consumed" and stored.consumed_at is not None
+
+
+def test_a_failed_liveness_result_never_recomputes_the_score() -> None:
+    """No enrolment happened, so there is nothing to recompute — the failure
+    paths must not call the score store at all."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.provider.results[row.provider_session_id] = ProviderResult(
+        status="failed", confidence=40.0, reference_image=None, audit_images=()
+    )
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 200
+    assert response.json()["enrolled"] is False
+    assert h.score_store.calls == []
 
 
 # ── Step 8: subject_is_adult is required, with no default ────────────────

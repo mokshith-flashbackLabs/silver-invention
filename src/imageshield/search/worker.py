@@ -49,6 +49,8 @@ from imageshield.providers.store import (
     ProviderControlStore,
 )
 from imageshield.relay import _localstack_endpoint_url
+from imageshield.score.engine import ScoreWeights
+from imageshield.score.store import PostgresScoreStore, ScoreStore
 from imageshield.search.cadence import CadencePolicy
 from imageshield.search.cadence import policy_from_config as cadence_policy_from_config
 from imageshield.search.google import GoogleWebDetectionProvider
@@ -142,6 +144,7 @@ async def handle_message(
     control: ProviderControlStore,
     cadence: CadencePolicy,
     confirm: ConfirmCriteria | None,
+    score_store: ScoreStore,
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
 ) -> bool:
@@ -180,6 +183,14 @@ async def handle_message(
     except Exception as exc:  # broad on purpose: crash = leave for redelivery
         log.error("worker.run_execution_failed", run_id=str(payload.id), error=str(exc))
         return False
+    try:
+        await score_store.recompute(
+            claim.user_ref, cause_kind="run_completed", cause_ref=str(claim.run_id)
+        )
+    except Exception:  # deliberate: the trigger already committed; tick will heal
+        log.warning(
+            "score.recompute_failed", user_ref=str(claim.user_ref), cause="run_completed"
+        )
     return True
 
 
@@ -199,6 +210,11 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
     calibration_store = PostgresCalibrationStore(pool)
     control = build_control_store(config, pool)
     cadence = cadence_policy_from_config(config)
+    score_store = PostgresScoreStore(
+        pool,
+        weights=ScoreWeights.from_config(config),
+        config_version=config.score_config_version,
+    )
     # Built once, not once per message: a config edited mid-run must not split
     # one run's confirm decisions across two rulesets, same reasoning as the
     # calibration policy snapshot in handle_message.
@@ -235,6 +251,7 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
                     control,
                     cadence,
                     confirm,
+                    score_store,
                     logger=log,
                 )
                 if handled:

@@ -10,9 +10,10 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
+from imageshield.score.store import ScoreResult
 from imageshield.search.models import ClaimedRun
 from imageshield.search.worker import handle_message
-from imageshield.types import ProviderId
+from imageshield.types import ProviderId, UserRef
 from tests.providers_fakes import (
     CADENCE,
     RUN_SEED_URL,
@@ -98,6 +99,43 @@ def _claim(run_id: UUID, seed: Any) -> ClaimedRun:
     )
 
 
+class FakeScoreStore:
+    """Records every ``recompute`` call; ``raise_error`` lets a test prove the
+    worker's swallow-and-log wrapper never turns a completed run into a
+    redelivery."""
+
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self._raise_error = raise_error
+        self.calls: list[tuple[UserRef, str, str | None]] = []
+
+    async def recompute(
+        self,
+        user_ref: UserRef,
+        *,
+        cause_kind: str,
+        cause_ref: str | None = None,
+        now: Any = None,
+    ) -> ScoreResult | None:
+        if self._raise_error:
+            raise RuntimeError("score store unavailable")
+        self.calls.append((user_ref, cause_kind, cause_ref))
+        return None
+
+    async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    async def list_events(
+        self, user_ref: UserRef, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def all_subject_refs(self) -> tuple[UserRef, ...]:
+        raise NotImplementedError
+
+    async def expire_due_threat_events(self, *, now: Any) -> int:
+        raise NotImplementedError
+
+
 class FakeCalibrationStore:
     """Empty policy: rule 1 fires and every band is 'review' — this module
     doesn't exercise banding, only the claim/execute/delete contract."""
@@ -120,32 +158,54 @@ async def test_valid_message_claims_executes_and_reports_handled() -> None:
     run_id = uuid4()
     store = WorkerFakeStore(None)
     store._claim = _claim(run_id, store.seed)
+    score_store = FakeScoreStore()
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
     )
 
     assert handled is True
     assert store.claim_requests == [run_id]
     assert store.completed == [run_id]  # executed (no adapters -> error calls, still completes)
+    # run_completed recompute fires exactly once, after execute_run succeeded.
+    assert score_store.calls == [(store.seed.user_ref, "run_completed", str(run_id))]
+
+
+async def test_a_raising_score_store_does_not_flip_the_handled_result() -> None:
+    """The swallow-and-log wrapper: a broken score store must never turn a
+    successfully executed run into a redelivery."""
+    run_id = uuid4()
+    store = WorkerFakeStore(None)
+    store._claim = _claim(run_id, store.seed)
+    score_store = FakeScoreStore(raise_error=True)
+
+    handled = await handle_message(
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
+    )
+
+    assert handled is True
+    assert store.completed == [run_id]
 
 
 async def test_unclaimable_run_is_handled_without_execution() -> None:
     """Duplicate delivery of an already-completed run: ack and move on."""
     run_id = uuid4()
     store = WorkerFakeStore(claim=None)
+    score_store = FakeScoreStore()
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
     )
 
     assert handled is True
     assert store.completed == []
+    assert score_store.calls == []  # no execution, no recompute
 
 
 async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
     store = WorkerFakeStore(claim=None)
     calibration_store = FakeCalibrationStore()
+    score_store = FakeScoreStore()
     assert (
         await handle_message(
             _body(uuid4(), event="something.else"),
@@ -155,12 +215,20 @@ async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
             control(),
             CADENCE,
             None,
+            score_store,
         )
         is True
     )
     assert (
         await handle_message(
-            "not json at all", store, {}, calibration_store, control(), CADENCE, None
+            "not json at all",
+            store,
+            {},
+            calibration_store,
+            control(),
+            CADENCE,
+            None,
+            score_store,
         )
         is True
     )
@@ -173,10 +241,12 @@ async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
             control(),
             CADENCE,
             None,
+            score_store,
         )
         is True
     )
     assert store.claim_requests == []  # never even attempted a claim
+    assert score_store.calls == []
 
 
 async def test_execution_failure_keeps_message_for_redelivery() -> None:
@@ -184,10 +254,12 @@ async def test_execution_failure_keeps_message_for_redelivery() -> None:
     store = WorkerFakeStore(None)
     store._claim = _claim(run_id, store.seed)
     store.fail_execution = True
+    score_store = FakeScoreStore()
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
     )
 
     assert handled is False  # not deleted -> SQS visibility timeout redelivers
     assert store.completed == []
+    assert score_store.calls == []  # execution never succeeded; no recompute

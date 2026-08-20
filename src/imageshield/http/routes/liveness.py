@@ -60,6 +60,7 @@ from imageshield.http.deps import (
     get_liveness_provider,
     get_liveness_store,
     get_object_uploader,
+    get_score_store,
 )
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
@@ -78,6 +79,7 @@ from imageshield.liveness.models import (
 from imageshield.liveness.provider import LivenessProvider
 from imageshield.liveness.store import LivenessStore
 from imageshield.liveness.uploader import ObjectUploader
+from imageshield.score.store import ScoreStore
 from imageshield.subjects.eligibility import eligibility_for
 from imageshield.types import SessionId, UserRef
 
@@ -208,6 +210,7 @@ async def post_liveness_result(
     provider: LivenessProvider = Depends(get_liveness_provider),
     uploader: ObjectUploader = Depends(get_object_uploader),
     face_index: FaceIndex = Depends(get_face_index),
+    score_store: ScoreStore = Depends(get_score_store),
 ) -> LivenessResultResponse:
     if idempotency_key is None:
         raise ServiceError(
@@ -451,6 +454,12 @@ async def post_liveness_result(
         model_id=enrolment.model_id,
         quality_score=enrolment.quality_score,
     )
+    try:
+        await score_store.recompute(UserRef(row.user_ref), cause_kind="enrolment")
+    except Exception:  # deliberate: the trigger already committed; tick will heal
+        log.warning(
+            "score.recompute_failed", user_ref=str(row.user_ref), cause="enrolment"
+        )
     return _finish(final, cfg)
 
 

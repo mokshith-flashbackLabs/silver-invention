@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
+from imageshield.score.store import ScoreResult
 from imageshield.search.feedback import status_for
 from imageshield.search.models import (
     AttestationRow,
@@ -178,12 +179,53 @@ class FakeSubjectStore:
         self.refusals.append((user_ref, outcome, dict(metadata)))
 
 
-def make_client() -> tuple[TestClient, FakeSearchStore, FakeSubjectStore]:
+class FakeScoreStore:
+    """Records every ``recompute`` call, keyed on ``app.state`` so it needs no
+    change to ``make_client``'s callers: fetch it back via
+    ``client.app.state.score_store``. ``raise_error`` proves the
+    swallow-and-log wrapper never changes a route's response."""
+
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self._raise_error = raise_error
+        self.calls: list[tuple[UserRef, str]] = []
+
+    async def recompute(
+        self,
+        user_ref: UserRef,
+        *,
+        cause_kind: str,
+        cause_ref: str | None = None,
+        now: Any = None,
+    ) -> ScoreResult | None:
+        if self._raise_error:
+            raise RuntimeError("score store unavailable")
+        self.calls.append((user_ref, cause_kind))
+        return None
+
+    async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    async def list_events(
+        self, user_ref: UserRef, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def all_subject_refs(self) -> tuple[UserRef, ...]:
+        raise NotImplementedError
+
+    async def expire_due_threat_events(self, *, now: Any) -> int:
+        raise NotImplementedError
+
+
+def make_client(
+    *, raising_score_store: bool = False
+) -> tuple[TestClient, FakeSearchStore, FakeSubjectStore]:
     app = create_app(config=make_config())
     store = FakeSearchStore()
     subjects = FakeSubjectStore()
     app.state.search_store = store
     app.state.subject_store = subjects
+    app.state.score_store = FakeScoreStore(raise_error=raising_score_store)
     return TestClient(app), store, subjects
 
 
@@ -236,6 +278,23 @@ def test_create_seed_201() -> None:
     seed_id = UUID(response.json()["seed_id"])
     assert store.seeds[seed_id].user_ref == user_ref
     assert store.seeds[seed_id].seed_kind == "user_supplied"
+    # score.recompute fires exactly once, with the seed-registered cause.
+    assert client.app.state.score_store.calls == [
+        (UserRef(user_ref), "seed_registered")
+    ]
+
+
+def test_create_seed_201_even_when_score_recompute_raises() -> None:
+    """The swallow-and-log wrapper: a broken score store must never turn a
+    successful seed creation into a failed request."""
+    client, store, _subjects = make_client(raising_score_store=True)
+    user_ref = uuid4()
+
+    response = client.post("/v1/seeds", json=_seed_body(user_ref), headers=AUTH)
+
+    assert response.status_code == 201
+    seed_id = UUID(response.json()["seed_id"])
+    assert store.seeds[seed_id].user_ref == user_ref
 
 
 @pytest.mark.parametrize(
@@ -774,6 +833,21 @@ def test_feedback_returns_the_resulting_status(signal: str, expected: str) -> No
     assert response.status_code == 200
     assert response.json() == {"status": expected}
     assert store.feedback == [(infringement_id, UserRef(owner), signal)]
+    # score.recompute fires exactly once, with the feedback cause.
+    assert client.app.state.score_store.calls == [(UserRef(owner), "feedback")]
+
+
+def test_feedback_returns_200_even_when_score_recompute_raises() -> None:
+    """The swallow-and-log wrapper: a broken score store must never turn a
+    recorded feedback into a failed request."""
+    client, store, _subjects = make_client(raising_score_store=True)
+    owner = uuid4()
+    infringement_id = _an_infringement(store, owner)
+
+    response = _feedback(client, infringement_id, owner, "confirmed")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "acknowledged"}
 
 
 def test_feedback_rejects_an_unknown_signal_with_422() -> None:

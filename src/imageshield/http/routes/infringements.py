@@ -29,9 +29,10 @@ import structlog
 from fastapi import APIRouter, Depends
 
 from imageshield.http.auth import require_service_token
-from imageshield.http.deps import get_search_store
+from imageshield.http.deps import get_score_store, get_search_store
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import FeedbackRequest, FeedbackResponse
+from imageshield.score.store import ScoreStore
 from imageshield.search.store import SearchStore
 
 log = structlog.get_logger("imageshield.infringements")
@@ -44,6 +45,7 @@ async def record_feedback(
     infringement_id: UUID,
     body: FeedbackRequest,
     store: SearchStore = Depends(get_search_store),
+    score_store: ScoreStore = Depends(get_score_store),
 ) -> FeedbackResponse:
     status = await store.record_feedback(infringement_id, body.user_ref, body.signal)
     if status is None:
@@ -62,4 +64,12 @@ async def record_feedback(
         signal=body.signal,
         status=status,
     )
+    try:
+        await score_store.recompute(
+            body.user_ref, cause_kind="feedback", cause_ref=str(infringement_id)
+        )
+    except Exception:  # deliberate: the trigger already committed; tick will heal
+        log.warning(
+            "score.recompute_failed", user_ref=str(body.user_ref), cause="feedback"
+        )
     return FeedbackResponse(status=status)

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from imageshield.liveness.uploader import ObjectUploader
     from imageshield.providers.observability import ProviderObservability
     from imageshield.providers.store import ProviderControlStore
+    from imageshield.score.store import ScoreStore
     from imageshield.search.store import SearchStore
     from imageshield.subjects.store import SubjectStore
 
@@ -122,3 +123,8 @@ def get_provider_control_store(request: Request) -> ProviderControlStore:
 def get_provider_observability(request: Request) -> ProviderObservability:
     obs: ProviderObservability = _required_state(request, "provider_observability")  # type: ignore[assignment]
     return obs
+
+
+def get_score_store(request: Request) -> ScoreStore:
+    store: ScoreStore = _required_state(request, "score_store")  # type: ignore[assignment]
+    return store

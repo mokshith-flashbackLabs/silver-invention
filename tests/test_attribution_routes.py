@@ -22,6 +22,8 @@ from imageshield.attribution.models import (
     RegisteredSeed,
 )
 from imageshield.http.app import create_app
+from imageshield.score.store import ScoreResult
+from imageshield.types import UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
 
 AUTH = {"X-Service-Token": SERVICE_TOKEN}
@@ -97,12 +99,51 @@ class FakeStore:
         return uuid4()
 
 
+class FakeScoreStore:
+    """Records every ``recompute`` call, keyed on ``app.state`` so it needs no
+    change to ``make_client``'s callers: fetch it back via
+    ``client.app.state.score_store``. ``raise_error`` proves the
+    swallow-and-log wrapper never changes the route's response."""
+
+    def __init__(self, *, raise_error: bool = False) -> None:
+        self._raise_error = raise_error
+        self.calls: list[tuple[UserRef, str]] = []
+
+    async def recompute(
+        self,
+        user_ref: UserRef,
+        *,
+        cause_kind: str,
+        cause_ref: str | None = None,
+        now: Any = None,
+    ) -> ScoreResult | None:
+        if self._raise_error:
+            raise RuntimeError("score store unavailable")
+        self.calls.append((user_ref, cause_kind))
+        return None
+
+    async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
+        raise NotImplementedError
+
+    async def list_events(
+        self, user_ref: UserRef, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    async def all_subject_refs(self) -> tuple[UserRef, ...]:
+        raise NotImplementedError
+
+    async def expire_due_threat_events(self, *, now: Any) -> int:
+        raise NotImplementedError
+
+
 def make_client(
     faces: tuple[DetectedFace, ...] = (),
     matches: dict[int, tuple[FaceMatch, ...]] | None = None,
     *,
     provider_error: Exception | None = None,
     fetch_error: Exception | None = None,
+    raising_score_store: bool = False,
     **config_overrides: Any,
 ) -> tuple[TestClient, FakeProvider, FakeStore, FakeFetcher]:
     app = create_app(config=make_config(**config_overrides))
@@ -112,6 +153,7 @@ def make_client(
     app.state.attribution_provider = provider
     app.state.attribution_store = store
     app.state.photo_fetcher = fetcher
+    app.state.score_store = FakeScoreStore(raise_error=raising_score_store)
     return TestClient(app), provider, store, fetcher
 
 
@@ -154,6 +196,8 @@ def test_one_enrolled_face_among_two_strangers_registers_one_seed() -> None:
     assert [f["face_index"] for f in payload["faces"]] == [0, 1, 2]
     assert [f["resolved_user_ref"] for f in payload["faces"]] == [None, str(owner), None]
     assert all(f["bbox"] == {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4} for f in payload["faces"])
+    # score.recompute fires exactly once, with the seed-registered cause.
+    assert client.app.state.score_store.calls == [(UserRef(owner), "seed_registered")]
 
 
 def test_two_household_members_register_two_seeds() -> None:
@@ -169,6 +213,42 @@ def test_two_household_members_register_two_seeds() -> None:
     payload = _post(client, _body([alice, bob])).json()
 
     assert {s["user_ref"] for s in payload["seeds_registered"]} == {str(alice), str(bob)}
+    # Once per DISTINCT registered seed user_ref.
+    assert set(client.app.state.score_store.calls) == {
+        (UserRef(alice), "seed_registered"),
+        (UserRef(bob), "seed_registered"),
+    }
+    assert len(client.app.state.score_store.calls) == 2
+
+
+def test_no_enrolled_faces_registers_no_seeds_and_recomputes_nothing() -> None:
+    owner, stranger = uuid4(), uuid4()
+    client, _p, _s, _f = make_client(
+        faces=(_face(0),),
+        matches={0: (FaceMatch(external_image_id=str(stranger), similarity=99.9),)},
+    )
+
+    response = _post(client, _body([owner]))
+
+    assert response.status_code == 200
+    assert client.app.state.score_store.calls == []
+
+
+def test_response_is_unchanged_when_score_recompute_raises() -> None:
+    """The swallow-and-log wrapper: a broken score store must never turn a
+    successful attribution into a failed request."""
+    owner = uuid4()
+    client, _p, _s, _f = make_client(
+        faces=(_face(0),),
+        matches={0: (FaceMatch(external_image_id=str(owner), similarity=95.0),)},
+        raising_score_store=True,
+    )
+
+    response = _post(client, _body([owner]))
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["seeds_registered"]) == 1
 
 
 def test_no_enrolled_faces_returns_200_with_zero_seeds() -> None:

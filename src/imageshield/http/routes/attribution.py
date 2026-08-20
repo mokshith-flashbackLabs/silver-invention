@@ -26,6 +26,7 @@ from imageshield.http.deps import (
     get_attribution_store,
     get_config,
     get_photo_fetcher,
+    get_score_store,
 )
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
@@ -34,6 +35,7 @@ from imageshield.http.models import (
     AttributeResponse,
     RegisteredSeedItem,
 )
+from imageshield.score.store import ScoreStore
 
 log = structlog.get_logger("imageshield.attribution")
 
@@ -47,6 +49,7 @@ async def attribute(
     fetcher: PhotoFetcher = Depends(get_photo_fetcher),
     provider: FaceAttributionProvider = Depends(get_attribution_provider),
     store: AttributionStore = Depends(get_attribution_store),
+    score_store: ScoreStore = Depends(get_score_store),
 ) -> AttributeResponse:
     try:
         outcome = await attribute_photo(
@@ -71,6 +74,16 @@ async def attribute(
             "Face attribution is temporarily unavailable; retry.",
             retryable=True,
         ) from exc
+
+    for seed_user_ref in dict.fromkeys(seed.user_ref for seed in outcome.seeds):
+        try:
+            await score_store.recompute(seed_user_ref, cause_kind="seed_registered")
+        except Exception:  # deliberate: the trigger already committed; tick will heal
+            log.warning(
+                "score.recompute_failed",
+                user_ref=str(seed_user_ref),
+                cause="seed_registered",
+            )
 
     return AttributeResponse(
         run_id=outcome.run_id,

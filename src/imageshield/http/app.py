@@ -49,6 +49,8 @@ from imageshield.liveness.store import PostgresLivenessStore
 from imageshield.liveness.uploader import HttpxObjectUploader
 from imageshield.providers.observability import PostgresProviderObservability
 from imageshield.providers.store import PostgresProviderControlStore
+from imageshield.score.engine import ScoreWeights
+from imageshield.score.store import PostgresScoreStore
 from imageshield.search.store import PostgresSearchStore
 from imageshield.subjects.store import PostgresSubjectStore
 
@@ -100,6 +102,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Closed in the lifespan's teardown below, with the pool.
         app.state.photo_http_client = make_photo_client()
         app.state.photo_fetcher = HttpxPhotoFetcher(app.state.photo_http_client)
+    if getattr(app.state, "score_store", None) is None:
+        app.state.score_store = PostgresScoreStore(
+            pool,
+            weights=ScoreWeights.from_config(cfg),
+            config_version=cfg.score_config_version,
+        )
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     # Which AWS account and region, before anything touches Rekognition.
