@@ -348,6 +348,26 @@ def test_no_phone_shaped_literal_in_src() -> None:
     assert offenders == []
 
 
+# ── Task 12: the score store is the ONE writer ──────────────────────────────
+#
+# INVARIANTS #21 extended: a materialized score with a journal that can drift
+# from it is worse than no journal at all. score/store.py is the only module
+# permitted to write either table — enforced here rather than trusted, the
+# same reasoning as the face-search and S3 gates above.
+SCORE_WRITE = re.compile(r"INSERT\s+INTO\s+(protection_scores|score_events)", re.IGNORECASE)
+
+
+def test_only_the_score_store_writes_the_score() -> None:
+    """INVARIANTS #21 extended: exactly one code path writes a score."""
+    allowed = SRC / "imageshield" / "score" / "store.py"
+    offenders = [
+        str(path)
+        for path in _source_files()
+        if path != allowed and SCORE_WRITE.search(path.read_text(encoding="utf-8"))
+    ]
+    assert offenders == []
+
+
 def test_no_phone_shaped_literal_in_migrations() -> None:
     """Migrations get their own check: a column DEFAULT or a backfill literal is
     where a real number would hide. It is not code anybody reads twice, and it
