@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import hmac
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -104,3 +105,36 @@ def require_operator(
     if not _constant_time_equal(token, expected):
         raise _unauthorized()
     return name
+
+
+def make_csrf_token(cfg: ConsoleConfig, operator: str) -> str:
+    """A double-submit CSRF token for one operator's session.
+
+    HMAC-SHA256 of the operator's name, keyed on ``admin_service_token`` --
+    no new config, since that token is already a secret this process holds
+    and never exposes. Binding the token to the operator name (rather than
+    using one fixed value for everyone) means one operator's rendered form
+    cannot be replayed under another operator's Basic credentials; binding it
+    to a secret this console alone knows means an off-site page cannot
+    compute a valid token to embed in a forged cross-site form post.
+    """
+    return hmac.new(
+        cfg.admin_service_token.encode("utf-8"),
+        operator.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_csrf_token(cfg: ConsoleConfig, operator: str, token: str) -> None:
+    """Raise 403 on a missing or mismatched CSRF token.
+
+    FastAPI's default ``HTTPException`` handler renders ``{"detail": ...}``
+    as JSON, which is the "small JSON error" this is meant to produce --  no
+    bespoke exception class needed for a single call site pattern used from
+    three routes.
+    """
+    expected = make_csrf_token(cfg, operator)
+    if not _constant_time_equal(token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="invalid or missing csrf token"
+        )

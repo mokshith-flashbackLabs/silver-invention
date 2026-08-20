@@ -4,6 +4,7 @@
 <h1>New threat event</h1>
 <div class="card">
   <form method="post" action="/events">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>Kind
       <select name="kind">
         <option value="leak">leak</option>
@@ -46,6 +47,7 @@
   <td>
     {% if e.status == "active" %}
     <form class="inline" method="post" action="/events/{{ e.event_id }}/retract">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="text" name="reason" placeholder="reason (min 3 chars)" required minlength="3">
       <button type="submit">Retract</button>
     </form>

@@ -29,7 +29,12 @@ from fastapi import APIRouter, Depends, FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from imageshield.console.auth import require_operator
+from imageshield.console.auth import (
+    get_console_config,
+    make_csrf_token,
+    require_operator,
+    verify_csrf_token,
+)
 from imageshield.console.client import ConsoleUpstreamError, FetcherClient, ServicesClient
 from imageshield.console.config import ConsoleConfig, load_console_config
 
@@ -84,6 +89,7 @@ async def review_get(
     request: Request,
     operator: str = Depends(require_operator),
     services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
 ) -> HTMLResponse:
     task = await services_client.review_next()
     bbox: dict[str, Any] | None = None
@@ -93,7 +99,12 @@ async def review_get(
     return _templates.TemplateResponse(
         request,
         "review.html",
-        {"operator": operator, "task": task, "bbox": bbox},
+        {
+            "operator": operator,
+            "task": task,
+            "bbox": bbox,
+            "csrf_token": make_csrf_token(cfg, operator),
+        },
     )
 
 
@@ -102,9 +113,12 @@ async def review_decide(
     task_id: UUID,
     decision: str = Form(...),
     severity: str = Form(""),
+    csrf_token: str = Form(""),
     operator: str = Depends(require_operator),
     services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
 ) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
     await services_client.decide(
         task_id, decision=decision, operator=operator, severity=severity or None
     )
@@ -135,10 +149,17 @@ async def events_get(
     request: Request,
     operator: str = Depends(require_operator),
     services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
 ) -> HTMLResponse:
     events = await services_client.list_events()
     return _templates.TemplateResponse(
-        request, "events.html", {"operator": operator, "events": events}
+        request,
+        "events.html",
+        {
+            "operator": operator,
+            "events": events,
+            "csrf_token": make_csrf_token(cfg, operator),
+        },
     )
 
 
@@ -153,9 +174,12 @@ async def events_create(
     penalty: str = Form(...),
     expires_at: str = Form(...),
     decay_days: int = Form(...),
+    csrf_token: str = Form(""),
     operator: str = Depends(require_operator),
     services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
 ) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
     domain_tuple = tuple(d.strip() for d in domains.split(",") if d.strip())
     payload: dict[str, Any] = {
         "kind": kind,
@@ -177,9 +201,12 @@ async def events_create(
 async def events_retract(
     event_id: UUID,
     reason: str = Form(...),
+    csrf_token: str = Form(""),
     operator: str = Depends(require_operator),
     services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
 ) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
     await services_client.retract_event(event_id, operator=operator, reason=reason)
     return RedirectResponse(url="/events", status_code=303)
 

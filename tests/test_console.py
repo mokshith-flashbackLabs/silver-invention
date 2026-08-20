@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.console.app import create_app
-from imageshield.console.auth import parse_operators
+from imageshield.console.auth import make_csrf_token, parse_operators
 from imageshield.console.config import ConsoleConfig
 
 ALICE = ("alice", "token-a")
@@ -95,6 +95,10 @@ def _config() -> ConsoleConfig:
         fetcher_base_url="http://localhost:8090",
         fetcher_token="fetcher-token-for-tests-0003",
     )
+
+
+def _csrf(operator: str) -> str:
+    return make_csrf_token(_config(), operator)
 
 
 def _client(
@@ -182,7 +186,7 @@ def test_post_decision_calls_decide_with_the_logged_in_operator_and_redirects() 
 
     response = client.post(
         f"/review/{_TASK_ID}",
-        data={"decision": "confirmed", "severity": ""},
+        data={"decision": "confirmed", "severity": "", "csrf_token": _csrf("alice")},
         auth=ALICE,
         follow_redirects=False,
     )
@@ -203,7 +207,7 @@ def test_post_uncertain_decision_carries_no_severity() -> None:
 
     response = client.post(
         f"/review/{_TASK_ID}",
-        data={"decision": "uncertain"},
+        data={"decision": "uncertain", "csrf_token": _csrf("bob")},
         auth=BOB,
         follow_redirects=False,
     )
@@ -241,6 +245,55 @@ def test_crop_requires_credentials() -> None:
     assert response.status_code == 401
 
 
+# ── csrf ─────────────────────────────────────────────────────────────────
+
+
+def test_post_without_csrf_token_is_403() -> None:
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+
+    response = client.post(
+        f"/review/{_TASK_ID}",
+        data={"decision": "confirmed", "severity": ""},
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert fake.decide_calls == []
+
+
+def test_post_with_wrong_csrf_token_is_403() -> None:
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+
+    response = client.post(
+        f"/review/{_TASK_ID}",
+        data={"decision": "confirmed", "severity": "", "csrf_token": "not-the-right-token"},
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert fake.decide_calls == []
+
+
+def test_post_with_another_operators_csrf_token_is_403() -> None:
+    """Bound to the operator name: alice cannot replay bob's token."""
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+
+    response = client.post(
+        f"/review/{_TASK_ID}",
+        data={"decision": "confirmed", "severity": "", "csrf_token": _csrf("bob")},
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert fake.decide_calls == []
+
+
 # ── events ───────────────────────────────────────────────────────────────
 
 
@@ -259,6 +312,7 @@ def test_events_create_posts_through_and_redirects() -> None:
             "penalty": "5.00",
             "expires_at": "2026-09-01T00:00",
             "decay_days": "30",
+            "csrf_token": _csrf("alice"),
         },
         auth=ALICE,
         follow_redirects=False,
@@ -286,7 +340,7 @@ def test_events_retract_posts_through_and_redirects() -> None:
 
     response = client.post(
         f"/events/{event_id}/retract",
-        data={"reason": "false alarm"},
+        data={"reason": "false alarm", "csrf_token": _csrf("alice")},
         auth=ALICE,
         follow_redirects=False,
     )

@@ -25,6 +25,7 @@
   <h2>Decision</h2>
 
   <form method="post" action="/review/{{ task.task_id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="decision" value="confirmed">
     <label>Severity override
       <select name="severity">
@@ -40,11 +41,13 @@
   </form>
 
   <form method="post" action="/review/{{ task.task_id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="decision" value="rejected">
     <button type="submit">Rejected</button>
   </form>
 
   <form method="post" action="/review/{{ task.task_id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="decision" value="uncertain">
     <button type="submit">Uncertain</button>
   </form>
