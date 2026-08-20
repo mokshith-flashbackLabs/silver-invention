@@ -140,3 +140,8 @@ LEFT JOIN latest_feedback fb ON fb.infringement_id = i.infringement_id
 LEFT JOIN search_runs run ON run.run_id = rep.last_run_id
 LEFT JOIN search_seeds seed ON seed.seed_id = run.seed_id
 LEFT JOIN attributed_faces af ON af.face_id = seed.attributed_face_id;
+
+-- DROP destroys the ACL along with the object; 0016's grant to the proxy's
+-- read role must be restored here or a rollback that stops at 0023 leaves
+-- v_person_hits existing but unreadable by imageshield_proxy_ro.
+GRANT SELECT ON svc.v_person_hits TO imageshield_proxy_ro;

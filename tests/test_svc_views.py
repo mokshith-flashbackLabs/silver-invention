@@ -928,6 +928,35 @@ def test_score_views_read_under_the_proxy_role(migrated_db: str) -> None:
     assert context["kind"] == "leak"
 
 
+def test_0023_only_rollback_leaves_v_person_hits_readable_by_the_proxy(
+    migrated_db: str,
+) -> None:
+    """A partial rollback that stops at 0023 must not silently strip the
+    proxy's read access to ``v_person_hits``.
+
+    0023's down leg DROPs and recreates ``v_person_hits`` (not ``CREATE OR
+    REPLACE`` -- Postgres refuses to drop trailing columns from a view), and a
+    DROP takes the object's ACL with it. Without an explicit re-grant in the
+    down file, a rollback that stops exactly here -- one step, not `--all` --
+    leaves the view existing but unreadable by ``imageshield_proxy_ro``, which
+    is a live-outage shape for the proxy's report surface and not the shape a
+    reviewer would expect from "reverted one migration".
+    """
+    revert = run_migrate(migrated_db, "down", "--steps", "1")
+    assert revert.returncode == 0, revert.stderr
+
+    applied = {
+        row["filename"]
+        for row in _rows(migrated_db, "SELECT filename FROM schema_migrations")
+    }
+    assert "0023_svc_score_views.up.sql" not in applied
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute("SET ROLE imageshield_proxy_ro")
+        conn.execute("SELECT * FROM svc.v_person_hits")  # must not raise
+        conn.execute("RESET ROLE")
+
+
 # ── the grant chain (0017) ───────────────────────────────────────────────────
 #
 # 0016 grants SELECT to `imageshield_proxy_ro`, which is NOLOGIN, and nothing
