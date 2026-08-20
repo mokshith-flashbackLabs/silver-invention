@@ -1,7 +1,9 @@
 {
   "family": "imageshield-dev-confirm",
   "networkMode": "host",
-  "requiresCompatibilities": ["EC2"],
+  "requiresCompatibilities": [
+    "EC2"
+  ],
   "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-exec",
   "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-dev-services",
   "containerDefinitions": [
@@ -10,46 +12,158 @@
       "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:486c1b2",
       "essential": true,
       "memory": 192,
-      "command": ["python", "-m", "imageshield.confirm.worker"],
+      "command": [
+        "python",
+        "-m",
+        "imageshield.confirm.worker"
+      ],
       "environment": [
-        { "name": "ENVIRONMENT", "value": "production" },
-        { "name": "LOG_LEVEL", "value": "info" },
-        { "name": "AWS_REGION", "value": "ap-south-1" },
-        { "name": "REKOGNITION_REGION", "value": "ap-south-1" },
-        { "name": "IDENTITY_COLLECTION", "value": "identity-dev-v1" },
-        { "name": "DISCOVERED_COLLECTION", "value": "discovered-dev-v1" },
-        { "name": "ENROLMENT_QUALITY_FILTER", "value": "HIGH" },
-        { "name": "SEARCH_PROVIDER", "value": "hive" },
-        { "name": "DEV_FACE_CEILING", "value": "50" },
-        { "name": "ATTRIBUTION_MAX_INFLIGHT", "value": "4" },
-        { "name": "SEARCH_MATCH_THRESHOLD", "value": "95" },
-        { "name": "FACE_MATCH_THRESHOLD", "value": "95" },
-        { "name": "ENROLMENT_COLLISION_THRESHOLD", "value": "99" },
-        { "name": "MIN_ENROLMENT_AGE", "value": "13" },
-        { "name": "MIN_DISCOVERY_AGE", "value": "18" },
-        { "name": "LIVENESS_MIN_CONFIDENCE", "value": "90" },
-        { "name": "LIVENESS_SESSION_TTL_SECONDS", "value": "600" },
-        { "name": "LIVENESS_MAX_ATTEMPTS_24H", "value": "5" },
-        { "name": "DB_POOL_MAX_SIZE", "value": "2" },
-        { "name": "DB_SSLMODE", "value": "require" },
-        { "name": "HIVE_BASE_URL", "value": "https://api.thehive.ai" },
-        { "name": "SQS_IDENTITY_INDEX_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-identity-index" },
-        { "name": "SQS_SEARCH_RUNS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-search-runs" },
-        { "name": "SQS_CONFIRM_HITS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-confirm-hits" },
-        { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" },
-        { "name": "CSAM_AGE_LOW_THRESHOLD", "value": "18" }
+        {
+          "name": "ENVIRONMENT",
+          "value": "production"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "info"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "ap-south-1"
+        },
+        {
+          "name": "REKOGNITION_REGION",
+          "value": "ap-south-1"
+        },
+        {
+          "name": "IDENTITY_COLLECTION",
+          "value": "identity-dev-v1"
+        },
+        {
+          "name": "DISCOVERED_COLLECTION",
+          "value": "discovered-dev-v1"
+        },
+        {
+          "name": "ENROLMENT_QUALITY_FILTER",
+          "value": "HIGH"
+        },
+        {
+          "name": "SEARCH_PROVIDER",
+          "value": "hive"
+        },
+        {
+          "name": "DEV_FACE_CEILING",
+          "value": "50"
+        },
+        {
+          "name": "ATTRIBUTION_MAX_INFLIGHT",
+          "value": "4"
+        },
+        {
+          "name": "SEARCH_MATCH_THRESHOLD",
+          "value": "95"
+        },
+        {
+          "name": "FACE_MATCH_THRESHOLD",
+          "value": "95"
+        },
+        {
+          "name": "ENROLMENT_COLLISION_THRESHOLD",
+          "value": "99"
+        },
+        {
+          "name": "MIN_ENROLMENT_AGE",
+          "value": "13"
+        },
+        {
+          "name": "MIN_DISCOVERY_AGE",
+          "value": "18"
+        },
+        {
+          "name": "LIVENESS_MIN_CONFIDENCE",
+          "value": "90"
+        },
+        {
+          "name": "LIVENESS_SESSION_TTL_SECONDS",
+          "value": "600"
+        },
+        {
+          "name": "LIVENESS_MAX_ATTEMPTS_24H",
+          "value": "5"
+        },
+        {
+          "name": "DB_POOL_MAX_SIZE",
+          "value": "2"
+        },
+        {
+          "name": "DB_SSLMODE",
+          "value": "require"
+        },
+        {
+          "name": "HIVE_BASE_URL",
+          "value": "https://api.thehive.ai"
+        },
+        {
+          "name": "SQS_IDENTITY_INDEX_URL",
+          "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-identity-index"
+        },
+        {
+          "name": "SQS_SEARCH_RUNS_URL",
+          "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-search-runs"
+        },
+        {
+          "name": "SQS_CONFIRM_HITS_URL",
+          "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-confirm-hits"
+        },
+        {
+          "name": "FETCHER_BASE_URL",
+          "value": "http://localhost:8083"
+        },
+        {
+          "name": "CSAM_AGE_LOW_THRESHOLD",
+          "value": "18"
+        }
       ],
       "secrets": [
-        { "name": "DB_HOST", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:host::" },
-        { "name": "DB_PORT", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:port::" },
-        { "name": "DB_NAME", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:dbname::" },
-        { "name": "DB_USER", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:username::" },
-        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:password::" },
-        { "name": "SERVICE_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:token::" },
-        { "name": "ADMIN_SERVICE_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/admin-Omv7uR:token::" },
-        { "name": "HIVE_API_KEY", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/hive-9fk5ly:api_key::" },
-        { "name": "GOOGLE_VISION_API_KEY", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/google-vision-tT1xu2:api_key::" },
-        { "name": "FETCHER_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:FETCHER_TOKEN::" }
+        {
+          "name": "DB_HOST",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:host::"
+        },
+        {
+          "name": "DB_PORT",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:port::"
+        },
+        {
+          "name": "DB_NAME",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:dbname::"
+        },
+        {
+          "name": "DB_USER",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:username::"
+        },
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:password::"
+        },
+        {
+          "name": "SERVICE_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:token::"
+        },
+        {
+          "name": "ADMIN_SERVICE_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/admin-Omv7uR:token::"
+        },
+        {
+          "name": "HIVE_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/hive-9fk5ly:api_key::"
+        },
+        {
+          "name": "GOOGLE_VISION_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/google-vision-tT1xu2:api_key::"
+        },
+        {
+          "name": "FETCHER_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:FETCHER_TOKEN::"
+        }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -58,53 +172,166 @@
           "awslogs-region": "ap-south-1",
           "awslogs-stream-prefix": "confirm-worker"
         }
-      }
+      },
+      "memoryReservation": 160
     },
     {
       "name": "score-tick",
       "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:486c1b2",
       "essential": true,
       "memory": 96,
-      "command": ["python", "-m", "imageshield.score.tick"],
+      "command": [
+        "python",
+        "-m",
+        "imageshield.score.tick"
+      ],
       "environment": [
-        { "name": "ENVIRONMENT", "value": "production" },
-        { "name": "LOG_LEVEL", "value": "info" },
-        { "name": "AWS_REGION", "value": "ap-south-1" },
-        { "name": "REKOGNITION_REGION", "value": "ap-south-1" },
-        { "name": "IDENTITY_COLLECTION", "value": "identity-dev-v1" },
-        { "name": "DISCOVERED_COLLECTION", "value": "discovered-dev-v1" },
-        { "name": "ENROLMENT_QUALITY_FILTER", "value": "HIGH" },
-        { "name": "SEARCH_PROVIDER", "value": "hive" },
-        { "name": "DEV_FACE_CEILING", "value": "50" },
-        { "name": "ATTRIBUTION_MAX_INFLIGHT", "value": "4" },
-        { "name": "SEARCH_MATCH_THRESHOLD", "value": "95" },
-        { "name": "FACE_MATCH_THRESHOLD", "value": "95" },
-        { "name": "ENROLMENT_COLLISION_THRESHOLD", "value": "99" },
-        { "name": "MIN_ENROLMENT_AGE", "value": "13" },
-        { "name": "MIN_DISCOVERY_AGE", "value": "18" },
-        { "name": "LIVENESS_MIN_CONFIDENCE", "value": "90" },
-        { "name": "LIVENESS_SESSION_TTL_SECONDS", "value": "600" },
-        { "name": "LIVENESS_MAX_ATTEMPTS_24H", "value": "5" },
-        { "name": "DB_POOL_MAX_SIZE", "value": "2" },
-        { "name": "DB_SSLMODE", "value": "require" },
-        { "name": "HIVE_BASE_URL", "value": "https://api.thehive.ai" },
-        { "name": "SQS_IDENTITY_INDEX_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-identity-index" },
-        { "name": "SQS_SEARCH_RUNS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-search-runs" },
-        { "name": "SQS_CONFIRM_HITS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-confirm-hits" },
-        { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" },
-        { "name": "CSAM_AGE_LOW_THRESHOLD", "value": "18" }
+        {
+          "name": "ENVIRONMENT",
+          "value": "production"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "value": "info"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "ap-south-1"
+        },
+        {
+          "name": "REKOGNITION_REGION",
+          "value": "ap-south-1"
+        },
+        {
+          "name": "IDENTITY_COLLECTION",
+          "value": "identity-dev-v1"
+        },
+        {
+          "name": "DISCOVERED_COLLECTION",
+          "value": "discovered-dev-v1"
+        },
+        {
+          "name": "ENROLMENT_QUALITY_FILTER",
+          "value": "HIGH"
+        },
+        {
+          "name": "SEARCH_PROVIDER",
+          "value": "hive"
+        },
+        {
+          "name": "DEV_FACE_CEILING",
+          "value": "50"
+        },
+        {
+          "name": "ATTRIBUTION_MAX_INFLIGHT",
+          "value": "4"
+        },
+        {
+          "name": "SEARCH_MATCH_THRESHOLD",
+          "value": "95"
+        },
+        {
+          "name": "FACE_MATCH_THRESHOLD",
+          "value": "95"
+        },
+        {
+          "name": "ENROLMENT_COLLISION_THRESHOLD",
+          "value": "99"
+        },
+        {
+          "name": "MIN_ENROLMENT_AGE",
+          "value": "13"
+        },
+        {
+          "name": "MIN_DISCOVERY_AGE",
+          "value": "18"
+        },
+        {
+          "name": "LIVENESS_MIN_CONFIDENCE",
+          "value": "90"
+        },
+        {
+          "name": "LIVENESS_SESSION_TTL_SECONDS",
+          "value": "600"
+        },
+        {
+          "name": "LIVENESS_MAX_ATTEMPTS_24H",
+          "value": "5"
+        },
+        {
+          "name": "DB_POOL_MAX_SIZE",
+          "value": "2"
+        },
+        {
+          "name": "DB_SSLMODE",
+          "value": "require"
+        },
+        {
+          "name": "HIVE_BASE_URL",
+          "value": "https://api.thehive.ai"
+        },
+        {
+          "name": "SQS_IDENTITY_INDEX_URL",
+          "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-identity-index"
+        },
+        {
+          "name": "SQS_SEARCH_RUNS_URL",
+          "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-search-runs"
+        },
+        {
+          "name": "SQS_CONFIRM_HITS_URL",
+          "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-confirm-hits"
+        },
+        {
+          "name": "FETCHER_BASE_URL",
+          "value": "http://localhost:8083"
+        },
+        {
+          "name": "CSAM_AGE_LOW_THRESHOLD",
+          "value": "18"
+        }
       ],
       "secrets": [
-        { "name": "DB_HOST", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:host::" },
-        { "name": "DB_PORT", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:port::" },
-        { "name": "DB_NAME", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:dbname::" },
-        { "name": "DB_USER", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:username::" },
-        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:password::" },
-        { "name": "SERVICE_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:token::" },
-        { "name": "ADMIN_SERVICE_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/admin-Omv7uR:token::" },
-        { "name": "HIVE_API_KEY", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/hive-9fk5ly:api_key::" },
-        { "name": "GOOGLE_VISION_API_KEY", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/google-vision-tT1xu2:api_key::" },
-        { "name": "FETCHER_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:FETCHER_TOKEN::" }
+        {
+          "name": "DB_HOST",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:host::"
+        },
+        {
+          "name": "DB_PORT",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:port::"
+        },
+        {
+          "name": "DB_NAME",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:dbname::"
+        },
+        {
+          "name": "DB_USER",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:username::"
+        },
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:password::"
+        },
+        {
+          "name": "SERVICE_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:token::"
+        },
+        {
+          "name": "ADMIN_SERVICE_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/admin-Omv7uR:token::"
+        },
+        {
+          "name": "HIVE_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/hive-9fk5ly:api_key::"
+        },
+        {
+          "name": "GOOGLE_VISION_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/google-vision-tT1xu2:api_key::"
+        },
+        {
+          "name": "FETCHER_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:FETCHER_TOKEN::"
+        }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -113,7 +340,8 @@
           "awslogs-region": "ap-south-1",
           "awslogs-stream-prefix": "score-tick"
         }
-      }
+      },
+      "memoryReservation": 64
     }
   ]
 }
