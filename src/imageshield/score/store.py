@@ -68,10 +68,30 @@ from imageshield.types import UserRef, parse_user_ref
 _GET_SUBJECT_SQL = "SELECT 1 FROM subjects WHERE user_ref = %(user_ref)s"
 
 # ── step 2 ────────────────────────────────────────────────────────────────
+# Seed a zero row before the lock below, so `FOR UPDATE` always has something
+# to lock: locking a row that does not exist locks nothing, which is exactly
+# the gap that let two concurrent first-recomputes for a never-scored subject
+# both read baseline zero and both journal the same diff (invariant #44). The
+# ON CONFLICT DO NOTHING makes this idempotent -- whichever of two concurrent
+# transactions inserts first wins the row, and Postgres blocks the second's
+# INSERT on that conflicting key until the first commits, which is what turns
+# the FOR UPDATE below into a real serialization point instead of a no-op.
+# Components are literally zero, not parametrised: this row is a placeholder
+# baseline, never a real score, and step 5 below diffs against it exactly as
+# it already diffs against the in-memory zero `Components` when `existing is
+# None` -- that branch stays as a defensive fallback, not the primary path.
+_SEED_ZERO_SCORE_SQL = """
+    INSERT INTO protection_scores (user_ref, score, components, config_version)
+    VALUES (%(user_ref)s, 0, '{"posture":0,"coverage":0,"exposure":0,"threat":0}'::jsonb,
+            %(config_version)s)
+    ON CONFLICT (user_ref) DO NOTHING
+"""
+
 # FOR UPDATE: two concurrent recomputes for the same person (a tick sweep
 # overlapping a hit-driven recompute) must not both read the same baseline and
 # both write a diff against it — the same reasoning as search/store.py's
-# _LOCK_SEED_FOR_CADENCE_SQL.
+# _LOCK_SEED_FOR_CADENCE_SQL. Reachable only because the seed above guarantees
+# a row exists by the time this runs.
 _LOCK_SCORE_SQL = """
     SELECT score, components FROM protection_scores
     WHERE user_ref = %(user_ref)s
@@ -328,6 +348,10 @@ class PostgresScoreStore:
                 return None
 
             # Step 2.
+            await conn.execute(
+                _SEED_ZERO_SCORE_SQL,
+                {"user_ref": user_ref, "config_version": self._config_version},
+            )
             cur = await conn.execute(_LOCK_SCORE_SQL, {"user_ref": user_ref})
             existing = await cur.fetchone()
             if existing is None:

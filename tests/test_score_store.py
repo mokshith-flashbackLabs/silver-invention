@@ -11,6 +11,7 @@ another module's write, not re-deriving what that write does.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import UUID, uuid4
@@ -223,6 +224,43 @@ async def test_recompute_twice_writes_nothing_new(
     assert events_after == events_before
     assert recs_after == recs_before
     assert score_row_after == score_row_before  # computed_at untouched too
+
+
+async def test_concurrent_first_recomputes_journal_the_diff_exactly_once(
+    migrated_db: str, store: PostgresScoreStore, pool: AsyncConnectionPool
+) -> None:
+    """Invariant #44 regression: a subject that has never been scored has no
+    ``protection_scores`` row, and locking a row that does not exist locks
+    nothing -- so two concurrent recomputes could both read baseline zero and
+    both journal the same diff, doubling the score in ``score_events`` while
+    the materialized row (an idempotent upsert) looked correct. The step-2
+    zero-row seed turns the ``FOR UPDATE`` into a real serialization point
+    even on the very first recompute, which is the case that previously had
+    no row for it to lock.
+    """
+    user_ref = _user()
+    await ensure_subject(pool, user_ref)
+
+    first, second = await asyncio.gather(
+        store.recompute(user_ref, cause_kind="test"),
+        store.recompute(user_ref, cause_kind="test"),
+    )
+
+    # Whichever transaction ran second is serialized behind the first and
+    # sees the state it already wrote reflected in its own read -- no change,
+    # nothing journaled. Exactly one of the two must have written anything.
+    changed = [r for r in (first, second) if r is not None and r.changed]
+    assert len(changed) == 1
+
+    events = _rows(
+        migrated_db,
+        "SELECT delta FROM score_events WHERE user_ref = %s",
+        (user_ref,),
+    )
+    stored = _row(
+        migrated_db, "SELECT score FROM protection_scores WHERE user_ref = %s", (user_ref,)
+    )
+    assert sum(row["delta"] for row in events) == stored["score"]
 
 
 async def test_config_version_stamped_on_every_journal_row(
