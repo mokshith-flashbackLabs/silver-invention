@@ -453,9 +453,11 @@ aws sqs start-message-move-task \
 
 ## 10. A hit was quarantined
 
-**Symptom** — a log line `confirm.quarantined` from the confirm worker. **This is the ops alarm hook
-for the CSAM tripwire** (`ARCHITECTURE.md` §3.8 step 7) — there is no separate alarm resource; the
-log line itself is what a human is expected to be watching for.
+**Symptom** — a log line `confirm.quarantined` from the confirm worker, **and, since `alarms.tf`'s
+`confirm_quarantined` metric filter/alarm, a page** — a log metric filter over the same event, firing
+on `>= 1` in a 5-minute window. This is the ops alarm for the CSAM tripwire (`ARCHITECTURE.md` §3.8
+step 7); the log line is still the source of truth, the alarm just means a human no longer has to be
+tailing logs to catch it.
 
 **What it means.** Rekognition's `DetectModerationLabels` returned labels suggesting the subject may
 be a minor, combined with explicit content. The confirm worker set

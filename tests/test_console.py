@@ -9,6 +9,7 @@ The console is a standalone FastAPI app with no database access of its own
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -16,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.console.app import create_app
-from imageshield.console.auth import make_csrf_token, parse_operators
+from imageshield.console.auth import _csrf_token_for_date, make_csrf_token, parse_operators
 from imageshield.console.config import ConsoleConfig
 
 ALICE = ("alice", "token-a")
@@ -260,6 +261,9 @@ def test_post_without_csrf_token_is_403() -> None:
     )
 
     assert response.status_code == 403
+    assert response.json() == {
+        "error": {"code": "csrf_rejected", "message": "invalid or missing csrf token"}
+    }
     assert fake.decide_calls == []
 
 
@@ -286,6 +290,43 @@ def test_post_with_another_operators_csrf_token_is_403() -> None:
     response = client.post(
         f"/review/{_TASK_ID}",
         data={"decision": "confirmed", "severity": "", "csrf_token": _csrf("bob")},
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert fake.decide_calls == []
+
+
+def test_post_with_yesterdays_csrf_token_is_accepted() -> None:
+    """The daily-rotation grace window: a form open across UTC midnight
+    still submits successfully."""
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+    yesterday = dt.datetime.now(dt.UTC).date() - dt.timedelta(days=1)
+    token = _csrf_token_for_date(_config(), "alice", yesterday)
+
+    response = client.post(
+        f"/review/{_TASK_ID}",
+        data={"decision": "confirmed", "severity": "", "csrf_token": token},
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert len(fake.decide_calls) == 1
+
+
+def test_post_with_a_two_day_old_csrf_token_is_403() -> None:
+    """Outside the one-day grace window: rejected, unlike yesterday's."""
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+    two_days_ago = dt.datetime.now(dt.UTC).date() - dt.timedelta(days=2)
+    token = _csrf_token_for_date(_config(), "alice", two_days_ago)
+
+    response = client.post(
+        f"/review/{_TASK_ID}",
+        data={"decision": "confirmed", "severity": "", "csrf_token": token},
         auth=ALICE,
         follow_redirects=False,
     )

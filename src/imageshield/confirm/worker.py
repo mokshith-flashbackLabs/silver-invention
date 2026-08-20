@@ -103,6 +103,10 @@ _MAX_MESSAGES = 1
 # small Hamming distance between two such hashes is a property of the hash
 # space, not evidence the two images are the same. See the dedup guard in
 # handle_message step 4.
+#
+# Semantics-bearing: changing either bound changes triage/score semantics --
+# bump SCORE_CONFIG_VERSION (config) in the same commit so historical journal
+# rows stay interpretable.
 _PHASH_DEGENERATE_LOW_BITS = 4
 _PHASH_DEGENERATE_HIGH_BITS = 60
 

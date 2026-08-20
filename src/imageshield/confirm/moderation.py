@@ -63,6 +63,9 @@ class RekognitionModeration:
 
     async def assess(self, image: bytes) -> ModerationSignal:
         try:
+            # Semantics-bearing: changing MinConfidence changes triage/score
+            # semantics -- bump SCORE_CONFIG_VERSION (config) in the same
+            # commit so historical journal rows stay interpretable.
             moderation_response = await asyncio.to_thread(
                 self._client.detect_moderation_labels,
                 Image={"Bytes": image},

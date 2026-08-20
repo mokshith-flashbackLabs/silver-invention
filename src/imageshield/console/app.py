@@ -30,6 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.templating import Jinja2Templates
 
 from imageshield.console.auth import (
+    CsrfRejected,
     get_console_config,
     make_csrf_token,
     require_operator,
@@ -240,6 +241,13 @@ async def scores_get(
 
 
 def _install_error_handlers(app: FastAPI) -> None:
+    # Both handlers render the repo's {"error": {"code", "message"}} envelope
+    # (CLAUDE.md §9) rather than FastAPI's default {"detail": ...} shape.
+    # §9's envelope also carries `retryable` and `request_id`, but that is a
+    # proxy-contract rule -- this console is operator-only, with no proxy
+    # caller parsing the body, so the two fields that matter for a human
+    # reading an error page (what happened, in one sentence) are kept and the
+    # rest is deliberately omitted rather than faked with placeholder values.
     @app.exception_handler(ConsoleUpstreamError)
     async def _upstream_error_handler(
         request: Request, exc: ConsoleUpstreamError
@@ -250,6 +258,13 @@ def _install_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=502,
             content={"error": {"code": "upstream_error", "message": exc.detail}},
+        )
+
+    @app.exception_handler(CsrfRejected)
+    async def _csrf_rejected_handler(request: Request, exc: CsrfRejected) -> JSONResponse:
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"code": "csrf_rejected", "message": exc.detail}},
         )
 
 

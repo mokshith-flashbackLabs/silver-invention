@@ -16,6 +16,19 @@ long body, so the byte cap has to apply WHILE reading, not after. The
 connection is closed the moment the running total exceeds ``max_bytes``,
 before the rest of the body is ever pulled off the wire.
 
+**Known limitation, stated rather than hidden (same DNS-rebinding window
+``recheck/ssrf.py`` documents):** ``address_refusal`` resolves the host and
+checks every address it returns, but the underlying ``httpx`` connection
+resolves the name again to actually connect -- a DNS answer that changes
+between those two resolutions can slip a private address past the check.
+There is no allowlist layer here to fall back on -- by design, since this
+fetcher is hostile-URL universal rather than scoped to a known corpus like
+the recheck loop. The mitigations are the same two the recheck loop leans on
+for its own third line: ``address_refusal`` still closes off the wide-open
+case (a name that resolves to a private/link-local/loopback address at all),
+and this deployable's no-VPC egress posture (INVARIANTS #11) means a
+successful rebind still reaches nothing worth reaching from here.
+
 ``FetchedImage`` holds bytes **in memory only, for the lifetime of one
 request**. Nothing here writes to disk, a column, or a log (INVARIANTS #9) —
 the caller (``fetcher/app.py``) streams it straight into the HTTP response (or

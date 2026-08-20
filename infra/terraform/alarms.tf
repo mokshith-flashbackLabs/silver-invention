@@ -64,6 +64,40 @@ resource "aws_cloudwatch_metric_alarm" "no_successful_provider_calls" {
   alarm_description  = "No provider has succeeded in 24h. Users may be being told they are clear when nothing looked. See docs/OPERATIONS.md."
 }
 
+# The CSAM tripwire (docs/OPERATIONS.md §10). Until now the "ops alarm" for a
+# quarantined hit was the log line itself -- a human watching, with no paging
+# path. Same pattern as provider_success above: a metric filter over the
+# confirm worker's structured logs, so it fires even if nobody is tailing
+# CloudWatch Logs Insights.
+resource "aws_cloudwatch_log_metric_filter" "confirm_quarantined" {
+  name           = "${local.name}-confirm-quarantined"
+  log_group_name = aws_cloudwatch_log_group.service.name
+  pattern        = "{ $.event = \"confirm.quarantined\" }"
+
+  metric_transformation {
+    name          = "ConfirmQuarantined"
+    namespace     = "ImageShield/${var.environment}"
+    value         = "1"
+    default_value = 0
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "confirm_quarantined" {
+  count = var.alarm_topic_arn == "" ? 0 : 1
+
+  alarm_name          = "${local.name}-confirm-quarantined"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  threshold           = 1
+  period              = 300
+  statistic           = "Sum"
+  namespace           = "ImageShield/${var.environment}"
+  metric_name         = "ConfirmQuarantined"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [var.alarm_topic_arn]
+  alarm_description   = "A hit was quarantined. See docs/OPERATIONS.md §10."
+}
+
 # The outbox failing silently: enrolments are not triggering searches, and
 # nothing else would tell you. Emitted by the relay.
 resource "aws_cloudwatch_log_metric_filter" "outbox_lag" {

@@ -44,6 +44,10 @@ SEVERITY_RANK: dict[str, int] = {
 # Genitalia") under a parent ("Explicit Nudity"); some responses report the
 # parent itself as a top-level label with no parent of its own, hence the
 # `parent_name` check also matching `name`.
+#
+# Semantics-bearing: changing either constant below changes triage/score
+# semantics -- bump SCORE_CONFIG_VERSION (config) in the same commit so
+# historical journal rows stay interpretable.
 EXPLICIT_LABEL_PARENTS = frozenset({"Explicit Nudity", "Explicit"})
 EXPLICIT_MIN_CONFIDENCE = 80.0
 
