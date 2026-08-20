@@ -7,7 +7,7 @@
   "containerDefinitions": [
     {
       "name": "fetcher",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:70eb211",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:486c1b2",
       "essential": true,
       "memory": 192,
       "command": ["sh", "-c", "uvicorn imageshield.fetcher.app:create_app --factory --host 0.0.0.0 --port 8083"],

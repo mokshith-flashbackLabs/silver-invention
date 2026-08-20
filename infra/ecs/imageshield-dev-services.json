@@ -7,9 +7,9 @@
   "containerDefinitions": [
     {
       "name": "services",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:70eb211",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:486c1b2",
       "essential": true,
-      "memory": 768,
+      "memory": 576,
       "environment": [
         { "name": "ENVIRONMENT", "value": "development" },
         { "name": "LOG_LEVEL", "value": "debug" },
