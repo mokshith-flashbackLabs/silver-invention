@@ -142,6 +142,11 @@ Body `{user_ref, decision: "confirmed" | "rejected"}` (pydantic, `extra='forbid'
   rows, newest first, `limit` param (default 50) — decision, severity, source_domain, decided_at,
   infringement id. The console gets a panel off it; `ncii_suspected`/`explicit_unmatched` rows are
   flagged prominently as takedown-campaign candidates (campaigns spec, 2026-08-20, still unbuilt).
+- New `GET /v1/admin/review/open-hits` (admin token): every hit still awaiting an answer
+  (`confirm_state IN ('unconfirmed','machine_triaged')`), listed per person — `user_ref`, severity,
+  source_domain, detected/first_seen time, confirm_state. **The control room always sees *that* a
+  person has a hit** (owner requirement, 2026-08-21) — what it never sees is the hit's pixels.
+  Metadata only, same console page.
 
 ## 7. Amendments written in the same PR
 
