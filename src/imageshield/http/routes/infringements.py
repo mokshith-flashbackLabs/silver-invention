@@ -32,13 +32,20 @@ from imageshield.http.deps import (
     get_config,
     get_crop_client,
     get_preview_store,
+    get_review_store,
     get_score_store,
     get_search_store,
 )
 from imageshield.http.errors import ServiceError
-from imageshield.http.models import FeedbackRequest, FeedbackResponse
+from imageshield.http.models import (
+    FeedbackRequest,
+    FeedbackResponse,
+    SubjectDecisionRequest,
+    SubjectDecisionResponse,
+)
 from imageshield.preview.client import CropUnavailable, FetcherCropClient
 from imageshield.preview.store import PreviewStore
+from imageshield.review.store import ReviewStore
 from imageshield.score.store import ScoreStore
 from imageshield.search.store import SearchStore
 from imageshield.types import parse_user_ref
@@ -148,4 +155,55 @@ async def preview(
         content=content,
         media_type="image/jpeg",
         headers={"Cache-Control": "no-store, private"},
+    )
+
+
+@router.post("/infringements/{infringement_id}/decision")
+async def subject_decision(
+    infringement_id: UUID,
+    body: SubjectDecisionRequest,
+    review_store: ReviewStore = Depends(get_review_store),
+    score_store: ScoreStore = Depends(get_score_store),
+) -> SubjectDecisionResponse:
+    """The answer IS the decision (spec 2026-08-21 §5): the subject is the
+    deciding human for their own likeness. 'confirmed' moves Exposure exactly
+    as an operator confirm would (the decision lane, not feedback — INVARIANTS
+    #45 as amended); 'rejected' retires the hit from their counts and can only
+    ever raise the score."""
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=body.user_ref, decision=body.decision
+    )
+    if outcome is None:
+        raise _not_found()
+    if outcome.outcome == "conflict":
+        raise ServiceError(
+            409,
+            "decision_conflict",
+            "This hit already carries a different decision.",
+            retryable=False,
+        )
+    log.info(
+        "infringement.subject_decided",
+        infringement_id=str(infringement_id),
+        decision=outcome.decision,
+        replay=outcome.outcome == "replay",
+    )
+    if outcome.outcome == "decided":
+        try:
+            await score_store.recompute(
+                body.user_ref,
+                cause_kind="subject_decision",
+                cause_ref=str(infringement_id),
+            )
+        except Exception:  # deliberate: the decision already committed; tick will heal
+            log.warning(
+                "score.recompute_failed",
+                user_ref=str(body.user_ref),
+                cause="subject_decision",
+            )
+    return SubjectDecisionResponse(
+        infringement_id=infringement_id,
+        decision=outcome.decision,
+        severity=outcome.severity,
+        idempotent_replay=outcome.outcome == "replay",
     )
