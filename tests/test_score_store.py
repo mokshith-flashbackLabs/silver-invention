@@ -410,3 +410,36 @@ async def test_recommendation_lifecycle(
     assert "completed" in statuses_by_kind["add_seed_photos"]
     # Still exactly the one dismissed row -- never re-inserted as 'open'.
     assert statuses_by_kind["complete_enrolment"] == ["dismissed"]
+
+
+async def test_a_subject_decision_is_not_awaiting_their_feedback(
+    migrated_db: str, store: PostgresScoreStore, pool: AsyncConnectionPool
+) -> None:
+    """INVARIANTS #45, subject-decision lane (spec 2026-08-21).
+
+    A subject who answers "yes, this is my photo" writes `confirm_state =
+    'confirmed'` with `confirm_decided_by = 'subject'` and NO
+    `infringement_feedback` row -- the decision lane and the feedback lane are
+    deliberately separate. Without this, `awaiting_feedback_count` counts the
+    hit they just answered: they lose `SCORE_POSTURE_FEEDBACK` for answering
+    (a #45 violation on top of the intended Exposure move) and the app asks
+    them to respond to a hit they have already responded to.
+
+    The Exposure drop is expected and correct -- only the Posture penalty is
+    the bug -- so this asserts on the component, not the total.
+    """
+    subject_user = _user()
+    operator_user = _user()
+    await ensure_subject(pool, subject_user)
+    await ensure_subject(pool, operator_user)
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _infringement(conn, subject_user, confirm_decided_by="subject")
+        _infringement(conn, operator_user, confirm_decided_by="test-reviewer")
+
+    decided_by_subject = await store.recompute(subject_user, cause_kind="test")
+    decided_by_operator = await store.recompute(operator_user, cause_kind="test")
+    assert decided_by_subject is not None and decided_by_operator is not None
+
+    # The operator-decided hit legitimately awaits the user's feedback; the
+    # subject-decided one does not -- they already said it.
+    assert decided_by_subject.components.posture > decided_by_operator.components.posture

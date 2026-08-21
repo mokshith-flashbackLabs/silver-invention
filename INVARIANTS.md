@@ -588,7 +588,13 @@ reality. The no-lowering rule binds the four feedback signals; the decision lane
 operator's, not under this rule. A subject's `rejected` retires the hit from their counts and can
 only ever raise the score.
 
-Check: `tests/test_score_store.py::test_user_feedback_never_lowers_the_score`.
+**Exposure is the only component a subject decision may move.** A hit the subject decided is not
+"awaiting their feedback" — even though the decision lane writes no `infringement_feedback` row —
+so it must never cost them `SCORE_POSTURE_FEEDBACK`, and the `respond_to_hits` recommendation must
+not fire for it. Answering the question is not a reason to be told to answer the question.
+
+Check: `tests/test_score_store.py::test_user_feedback_never_lowers_the_score`;
+`tests/test_score_store.py::test_a_subject_decision_is_not_awaiting_their_feedback`.
 
 **46. Threat penalties are bounded, decaying, relevance-scoped, and reversible on retraction.**
 A `threat_events` row only touches a user's score if the event is global or the user's own **live** hit

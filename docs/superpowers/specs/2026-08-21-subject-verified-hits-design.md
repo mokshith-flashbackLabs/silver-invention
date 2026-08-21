@@ -133,6 +133,15 @@ Body `{user_ref, decision: "confirmed" | "rejected"}` (pydantic, `extra='forbid'
    subject's `confirmed` moves Exposure exactly as an operator confirm would; see §7 for the #45
    amendment.
 
+**Exposure is the only component a subject decision may move.** `_CONFIRMED_HITS_SQL`'s
+`no_feedback` flag drives both `SCORE_POSTURE_FEEDBACK` and the `respond_to_hits` recommendation off
+"this confirmed hit has zero `infringement_feedback` rows" — and the decision lane writes none. Left
+alone, answering *"yes, this is my photo"* would cost the subject Posture points (a #45 violation on
+top of the intended Exposure move) and immediately prompt them to respond to the hit they had just
+responded to. `no_feedback` therefore excludes hits where `confirm_decided_by = 'subject'`. Found by
+review of the branch, not by the plan — recorded here because the interaction is invisible from
+either module alone.
+
 ## 6. Control room becomes observer
 
 - Console `/crop` route, its `FetcherClient`, `review.html`'s crop/reveal block, and the console's
