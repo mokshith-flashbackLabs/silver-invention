@@ -706,3 +706,51 @@ async def test_open_hits_lists_only_hits_awaiting_an_answer(
     assert row["confirm_state"] == "machine_triaged"
     assert row["severity"] == "benign_copy"
     assert row["source_domain"] == "open.example"
+
+
+async def test_a_redelivered_machine_triage_cannot_clobber_a_subject_decision(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """SQS is at-least-once, and since the 2026-08-21 enqueue gate opened
+    EVERY hit rides the queue -- so a triage message redelivered after the
+    subject already answered is a normal event, not an exotic one. The
+    confirm store's guarded UPDATE (confirm_state IN ('unconfirmed',
+    'machine_triaged')) is what stops the machine overwriting a human, and
+    its early return is what leaves the decided review_tasks row alone.
+    """
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+    assert outcome is not None and outcome.outcome == "decided"
+
+    # The redelivery: same hit, same worker path, after the decision.
+    await confirm_store.record_triage(
+        infringement_id,
+        severity="likely_not_subject",
+        phash=99,
+        face_match_score=None,
+        moderation_labels=[],
+        triage={"redelivered": True},
+    )
+
+    infringement = _row(
+        migrated_db,
+        "SELECT confirm_state, confirm_decided_by, severity FROM infringements"
+        " WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infringement["confirm_state"] == "confirmed"
+    assert infringement["confirm_decided_by"] == "subject"
+    assert infringement["severity"] == "benign_copy"  # not re-classified
+    task = _row(
+        migrated_db,
+        "SELECT status, decided_by, triage FROM review_tasks WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert task["status"] == "decided"
+    assert task["decided_by"] == "subject"
+    assert "redelivered" not in task["triage"]  # the decided task was not reopened
