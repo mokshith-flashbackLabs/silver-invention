@@ -18,7 +18,11 @@ import pytest
 
 from imageshield.confirm.store import PostgresConfirmStore
 from imageshield.db.connection import make_async_pool
-from imageshield.review.store import REVIEW_DECIDED_ACTION, PostgresReviewStore
+from imageshield.review.store import (
+    REVIEW_DECIDED_ACTION,
+    SUBJECT_DECIDED_ACTION,
+    PostgresReviewStore,
+)
 from imageshield.types import UserRef
 from tests.db import run_migrate
 
@@ -429,3 +433,214 @@ async def test_decide_never_trips_the_infringements_confirmed_needs_human_check(
             " WHERE infringement_id = %s",
             (outcome.infringement_id,),
         )
+
+
+# ── subject_decide (spec 2026-08-21 §5) ─────────────────────────────────────
+
+
+async def test_subject_confirm_writes_the_transition_and_audit(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy", source_domain="salon.example"
+    )
+
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+
+    assert outcome is not None
+    assert outcome.outcome == "decided"
+    assert outcome.decision == "confirmed"
+    assert outcome.severity == "benign_copy"  # machine severity untouched
+    infringement = _row(
+        migrated_db,
+        "SELECT confirm_state, confirm_decided_by, confirm_decided_at, severity, status"
+        " FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infringement["confirm_state"] == "confirmed"
+    assert infringement["confirm_decided_by"] == "subject"
+    assert infringement["confirm_decided_at"] is not None
+    assert infringement["severity"] == "benign_copy"
+    assert infringement["status"] == "new"  # confirming does not retire the hit
+    task = _row(
+        migrated_db,
+        "SELECT status, decision, decided_by FROM review_tasks WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert task == {"status": "decided", "decision": "confirmed", "decided_by": "subject"}
+    audit = _row(
+        migrated_db,
+        "SELECT actor_type, subject_ref, resource_id, metadata FROM audit_log"
+        " WHERE action = %s",
+        (SUBJECT_DECIDED_ACTION,),
+    )
+    assert audit["actor_type"] == "subject"
+    assert audit["subject_ref"] == user_ref
+    assert audit["resource_id"] == infringement_id
+    assert audit["metadata"] == {
+        "decision": "confirmed",
+        "severity": "benign_copy",
+        "source_domain": "salon.example",
+    }
+
+
+async def test_subject_reject_retires_the_hit_from_their_counts(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="likely_not_subject"
+    )
+
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+
+    assert outcome is not None and outcome.outcome == "decided"
+    infringement = _row(
+        migrated_db,
+        "SELECT confirm_state, status FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infringement == {"confirm_state": "rejected", "status": "dismissed_not_me"}
+
+
+async def test_repeat_of_the_same_decision_is_an_idempotent_replay(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    first = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+    assert first is not None and first.outcome == "decided"
+
+    replay = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+
+    assert replay is not None
+    assert replay.outcome == "replay"
+    assert replay.severity == "benign_copy"
+    audits = _rows(
+        migrated_db,
+        "SELECT audit_id FROM audit_log WHERE action = %s",
+        (SUBJECT_DECIDED_ACTION,),
+    )
+    assert len(audits) == 1  # the replay wrote nothing
+
+
+async def test_a_different_decision_after_the_first_is_a_conflict(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+
+    conflict = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+
+    assert conflict is not None
+    assert conflict.outcome == "conflict"
+    infringement = _row(
+        migrated_db,
+        "SELECT confirm_state FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infringement["confirm_state"] == "confirmed"  # nothing overwritten
+
+
+async def test_a_subject_cannot_overturn_an_operator_decision(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="ncii_suspected"
+    )
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE infringements SET confirm_state = 'rejected',"
+            " confirm_decided_by = 'ops@imageshield', confirm_decided_at = now()"
+            " WHERE infringement_id = %s",
+            (infringement_id,),
+        )
+
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+
+    assert outcome is not None
+    assert outcome.outcome == "conflict"  # even the SAME decision: not theirs to replay
+
+
+async def test_wrong_user_and_missing_hit_are_one_answer(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    _owner, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+
+    not_yours = await review_store.subject_decide(
+        infringement_id, user_ref=_user(), decision="confirmed"
+    )
+    not_there = await review_store.subject_decide(
+        uuid4(), user_ref=_user(), decision="confirmed"
+    )
+
+    assert not_yours is None
+    assert not_there is None
+
+
+async def test_quarantined_is_invisible_to_the_subject(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE infringements SET confirm_state = 'quarantined'"
+            " WHERE infringement_id = %s",
+            (infringement_id,),
+        )
+
+    assert (
+        await review_store.subject_decide(
+            infringement_id, user_ref=user_ref, decision="confirmed"
+        )
+        is None
+    )
+
+
+async def test_deciding_an_untriaged_hit_works_without_a_review_task(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """A hit still 'unconfirmed' (never triaged) is decidable — the app falls
+    back to domain + no preview and the subject can still answer."""
+    _confirm_store, review_store = stores
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _subject(conn, user_ref)
+        seed_id = _seed(conn, user_ref)
+        run_id = _run(conn, user_ref, seed_id)
+        infringement_id = _infringement(conn, user_ref, run_id)
+
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+
+    assert outcome is not None
+    assert outcome.outcome == "decided"
+    assert outcome.severity is None  # never triaged, so no machine severity
