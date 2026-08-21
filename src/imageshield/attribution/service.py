@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import structlog
 
+from imageshield.attribution.crop import UndecodableImage, to_rekognition_jpeg
 from imageshield.attribution.models import (
     AttributedFace,
     AttributionOutcome,
     AttributionUnavailable,
 )
-from imageshield.attribution.crop import UndecodableImage, to_rekognition_jpeg
 from imageshield.attribution.provider import FaceAttributionProvider, PhotoFetcher
 from imageshield.attribution.resolve import distinct_attributed, resolve_face
 from imageshield.attribution.store import AttributionStore
