@@ -465,12 +465,23 @@ team raised.
 **Presentation rule, as of 2026-08-21 (supersedes the "only confirmed presents as a finding" rule in
 `docs/prompts/BACKEND-SCORE-SURFACE.md`):** a hit whose `confirm_state` is `machine_triaged` carries
 the **ask-card** — the blurred preview (when available) plus "is this your photo?", posting to the
-decision endpoint. Copy is keyed on the machine outcome: `severity = 'likely_not_subject'` (face-match
-below threshold or no face) reads *"we found a similar photo — is this you?"*, never "we found you".
-`unconfirmed` (not yet triaged) renders "being checked", ask-able URL-only. `confirmed` presents as a
-finding with severity-driven urgency copy. `rejected` and `dismissed_not_me` retire from default
-views. Quarantined and duplicate rows never appear anywhere. Scope discipline (#26) still applies to
-every state's copy.
+decision endpoint. Copy is keyed on the machine outcome, and `severity` is **not** a single scale:
+
+- `ncii_suspected` / `explicit_unmatched` / `benign_copy` — a face-match ran and matched:
+  *"we found a photo that appears to be you"*.
+- `likely_not_subject` — a face-match ran and did **not** match: *"we found a similar photo — is
+  this you?"*, never "we found you".
+- `unassessed` — **no check ever ran** (unfetchable, undecodable, or no `image_url`; set by
+  `record_unfetchable`, never by the triage classifier). There is no bbox, so the preview 404s.
+  Copy must not assert a match: *"we found a photo we could not check"*. Defaulting this into the
+  matched-copy branch would claim a match the system never made.
+
+`unconfirmed` (not yet triaged, or the spend gate skipped it) renders "being checked", ask-able
+without an image — it may stay there indefinitely and must not time out or auto-promote.
+`confirmed` presents as a finding with severity-driven urgency copy; note `severity` can be `null`
+on a hit decided before triage ran. `rejected` and `dismissed_not_me` retire from default views.
+Quarantined and duplicate rows never appear anywhere. Scope discipline (#26) still applies to every
+state's copy.
 
 `url_alive` is set false **only** by a 404 or 410 from the weekly recheck loop. A timeout, a 5xx, or a
 403 leaves it alone — 403 in particular is *gated, not gone*. Read the pair together: `url_alive:
