@@ -30,7 +30,6 @@ import asyncio
 import json
 import signal
 import sys
-from decimal import Decimal
 from typing import Any, Protocol
 
 import structlog
@@ -39,7 +38,6 @@ from pydantic import ValidationError
 
 from imageshield.calibration.store import CalibrationStore, PostgresCalibrationStore
 from imageshield.config import Config, ConfigError, load_config
-from imageshield.confirm.models import ConfirmCriteria
 from imageshield.db.connection import make_async_pool
 from imageshield.http.logging import configure_logging
 from imageshield.outbox import OutboxPayload
@@ -143,7 +141,6 @@ async def handle_message(
     calibration_store: CalibrationStore,
     control: ProviderControlStore,
     cadence: CadencePolicy,
-    confirm: ConfirmCriteria | None,
     score_store: ScoreStore,
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
@@ -177,8 +174,11 @@ async def handle_message(
         # and a config activated mid-run must not split that run's results
         # across two rulesets.
         policy = await calibration_store.load_active_policy()
+        # Spec 2026-08-21 §1: every still-unconfirmed hit of a completed run
+        # enqueues for triage — the gate is deliberately wide, and the
+        # rekognition_confirm provider row is the spend control.
         await execute_run(
-            claim, providers, store, policy, control, cadence, confirm=confirm
+            claim, providers, store, policy, control, cadence, enqueue_confirm=True
         )
     except Exception as exc:  # broad on purpose: crash = leave for redelivery
         log.error("worker.run_execution_failed", run_id=str(payload.id), error=str(exc))
@@ -215,14 +215,6 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
         weights=ScoreWeights.from_config(config),
         config_version=config.score_config_version,
     )
-    # Built once, not once per message: a config edited mid-run must not split
-    # one run's confirm decisions across two rulesets, same reasoning as the
-    # calibration policy snapshot in handle_message.
-    confirm = ConfirmCriteria(
-        hive_min_score=Decimal(str(config.confirm_hive_min_score)),
-        google_kinds=config.confirm_google_kind_set,
-    )
-
     stop_requested = False
 
     def _handle_stop(signum: int, _frame: object) -> None:
@@ -250,7 +242,6 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
                     calibration_store,
                     control,
                     cadence,
-                    confirm,
                     score_store,
                     logger=log,
                 )

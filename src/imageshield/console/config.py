@@ -35,14 +35,14 @@ class ConsoleConfig(BaseSettings):
     # login attempt.
     console_operators: str
 
+    # The services admin API is the console's ONLY upstream. No fetcher
+    # fields: staff never see hit imagery (spec 2026-08-21 §0.2), so this
+    # process deliberately cannot reach the pixels path at all.
     services_base_url: str
     service_token: str
     admin_service_token: str
 
-    fetcher_base_url: str
-    fetcher_token: str
-
-    @field_validator("service_token", "admin_service_token", "fetcher_token")
+    @field_validator("service_token", "admin_service_token")
     @classmethod
     def _token(cls, value: str) -> str:
         if len(value) < 16:
@@ -58,7 +58,7 @@ class ConsoleConfig(BaseSettings):
             raise ValueError("must name at least one operator (name:token,...)")
         return value
 
-    @field_validator("services_base_url", "fetcher_base_url")
+    @field_validator("services_base_url")
     @classmethod
     def _base_url(cls, value: str) -> str:
         if not value.strip():

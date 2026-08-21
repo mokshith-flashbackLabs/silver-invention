@@ -1,7 +1,5 @@
-"""User feedback on a hit.
-
-One endpoint. The proxy's report surface had nowhere to put "that is not me",
-so a user looking at a match of their own face could read it and do nothing.
+"""The subject's surface for one hit: feedback, the blurred preview, and (in
+``subject_decide``'s route, below) the decision itself — spec 2026-08-21.
 
 Two properties are worth stating before the code, because both are easy to
 undo by accident.
@@ -26,18 +24,47 @@ from __future__ import annotations
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query, Response
 
+from imageshield.config import Config
 from imageshield.http.auth import require_service_token
-from imageshield.http.deps import get_score_store, get_search_store
+from imageshield.http.deps import (
+    get_config,
+    get_crop_client,
+    get_preview_store,
+    get_review_store,
+    get_score_store,
+    get_search_store,
+)
 from imageshield.http.errors import ServiceError
-from imageshield.http.models import FeedbackRequest, FeedbackResponse
+from imageshield.http.models import (
+    FeedbackRequest,
+    FeedbackResponse,
+    SubjectDecisionRequest,
+    SubjectDecisionResponse,
+)
+from imageshield.preview.client import CropUnavailable, FetcherCropClient
+from imageshield.preview.store import PreviewStore
+from imageshield.review.store import ReviewStore
 from imageshield.score.store import ScoreStore
 from imageshield.search.store import SearchStore
+from imageshield.types import parse_user_ref
 
 log = structlog.get_logger("imageshield.infringements")
 
 router = APIRouter(prefix="/v1", dependencies=[Depends(require_service_token)])
+
+
+def _not_found() -> ServiceError:
+    # Not there, or not theirs (or invisible: quarantined/duplicate). One
+    # answer for all — see the module docstring. Do not add a distinguishing
+    # message, a distinguishing code, or a log line the caller can time.
+    return ServiceError(
+        404,
+        "infringement_not_found",
+        "No such infringement for this user_ref.",
+        retryable=False,
+    )
 
 
 @router.post("/infringements/{infringement_id}/feedback")
@@ -49,15 +76,7 @@ async def record_feedback(
 ) -> FeedbackResponse:
     status = await store.record_feedback(infringement_id, body.user_ref, body.signal)
     if status is None:
-        # Not there, or not theirs. One answer for both — see the module
-        # docstring. Do not add a distinguishing message, a distinguishing
-        # code, or a log line the caller can time.
-        raise ServiceError(
-            404,
-            "infringement_not_found",
-            "No such infringement for this user_ref.",
-            retryable=False,
-        )
+        raise _not_found()
     log.info(
         "infringement.feedback_recorded",
         infringement_id=str(infringement_id),
@@ -73,3 +92,118 @@ async def record_feedback(
             "score.recompute_failed", user_ref=str(body.user_ref), cause="feedback"
         )
     return FeedbackResponse(status=status)
+
+
+@router.get("/infringements/{infringement_id}/preview")
+async def preview(
+    infringement_id: UUID,
+    user_ref: UUID = Query(...),
+    reveal: bool = Query(False),
+    store: PreviewStore = Depends(get_preview_store),
+    crop_client: FetcherCropClient = Depends(get_crop_client),
+    cfg: Config = Depends(get_config),
+) -> Response:
+    """The subject's blurred face crop — the only path by which a hit's pixels
+    ever reach a user (spec 2026-08-21 §4). Blurred unless ``reveal=true`` (the
+    app's per-item explicit tap, INVARIANTS #23); every render is audited
+    before it happens (#31) and rate-ceilinged per user (#32); the JPEG is
+    streamed with ``no-store`` and persisted nowhere (#9/#10). The bbox and
+    image_url are looked up server-side and never reach the client (#13)."""
+    subject = parse_user_ref(user_ref)
+    target = await store.target(infringement_id, subject)
+    if target is None:
+        raise _not_found()
+    if target.image_url is None or target.bbox is None:
+        # Only reachable once ownership passed, so the distinct code leaks
+        # nothing cross-user. The app falls back to domain + "no preview";
+        # the subject can still decide.
+        raise ServiceError(
+            404,
+            "preview_unavailable",
+            "No renderable crop for this hit yet.",
+            retryable=False,
+        )
+    if await store.renders_last_24h(subject) >= cfg.preview_daily_render_ceiling:
+        raise ServiceError(
+            429,
+            "preview_rate_limited",
+            "Preview render ceiling reached for this user.",
+            retryable=True,
+        )
+    # Audit BEFORE the render (INVARIANTS #31): a render that then fails
+    # upstream still shows an attempt, and still counts against the ceiling.
+    await store.record_render(subject, infringement_id, reveal=reveal)
+    try:
+        content = await crop_client.crop(
+            url=target.image_url, bbox=target.bbox, blur=not reveal
+        )
+    except CropUnavailable as exc:
+        if exc.unrenderable:
+            raise ServiceError(
+                404,
+                "preview_unavailable",
+                "No renderable crop for this hit.",
+                retryable=False,
+            ) from exc
+        raise ServiceError(
+            502,
+            "preview_unavailable_upstream",
+            "Crop render failed upstream.",
+            retryable=True,
+        ) from exc
+    return Response(
+        content=content,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store, private"},
+    )
+
+
+@router.post("/infringements/{infringement_id}/decision")
+async def subject_decision(
+    infringement_id: UUID,
+    body: SubjectDecisionRequest,
+    review_store: ReviewStore = Depends(get_review_store),
+    score_store: ScoreStore = Depends(get_score_store),
+) -> SubjectDecisionResponse:
+    """The answer IS the decision (spec 2026-08-21 §5): the subject is the
+    deciding human for their own likeness. 'confirmed' moves Exposure exactly
+    as an operator confirm would (the decision lane, not feedback — INVARIANTS
+    #45 as amended); 'rejected' retires the hit from their counts and can only
+    ever raise the score."""
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=body.user_ref, decision=body.decision
+    )
+    if outcome is None:
+        raise _not_found()
+    if outcome.outcome == "conflict":
+        raise ServiceError(
+            409,
+            "decision_conflict",
+            "This hit already carries a different decision.",
+            retryable=False,
+        )
+    log.info(
+        "infringement.subject_decided",
+        infringement_id=str(infringement_id),
+        decision=outcome.decision,
+        replay=outcome.outcome == "replay",
+    )
+    if outcome.outcome == "decided":
+        try:
+            await score_store.recompute(
+                body.user_ref,
+                cause_kind="subject_decision",
+                cause_ref=str(infringement_id),
+            )
+        except Exception:  # deliberate: the decision already committed; tick will heal
+            log.warning(
+                "score.recompute_failed",
+                user_ref=str(body.user_ref),
+                cause="subject_decision",
+            )
+    return SubjectDecisionResponse(
+        infringement_id=infringement_id,
+        decision=outcome.decision,
+        severity=outcome.severity,
+        idempotent_replay=outcome.outcome == "replay",
+    )

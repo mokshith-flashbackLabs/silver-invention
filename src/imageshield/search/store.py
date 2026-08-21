@@ -43,7 +43,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.calibration.bands import band_for_attestation, roll_up
 from imageshield.calibration.models import BandingPolicy
-from imageshield.confirm.models import CONFIRM_REQUESTED_EVENT, ConfirmCriteria
+from imageshield.confirm.models import CONFIRM_REQUESTED_EVENT
 from imageshield.outbox import QUEUE_CONFIRM_HITS, QUEUE_SEARCH_RUNS, OutboxPayload, enqueue
 from imageshield.search.cadence import CadenceInput, CadenceUpdate, update_for
 from imageshield.search.feedback import status_for
@@ -267,9 +267,12 @@ _COMPLETE_RUN_SQL = """
     WHERE run_id = %(run_id)s
 """
 
-# Design doc §7: a review-band hit whose attestation clears its provider's
-# "most similar" bar gets a Rekognition-based triage pass ahead of human
-# review. ``queue`` / ``event`` are bound parameters from
+# Spec 2026-08-21 §1: EVERY new hit gets a Rekognition triage pass — the gate
+# is deliberately wide, because the subject's crop-and-decide surface starves
+# on any hit that never triages, and the rekognition_confirm provider row's
+# budget/breaker/kill-switch machinery (#37-42) is the spend control. The
+# per-provider "most similar" criteria that used to live here died with that
+# spec. ``queue`` / ``event`` are bound parameters from
 # ``imageshield.outbox.QUEUE_CONFIRM_HITS`` / ``imageshield.confirm.models.
 # CONFIRM_REQUESTED_EVENT`` — never spelled out here — so the relay's routing
 # string and this producer's string can never drift apart.
@@ -279,7 +282,7 @@ _COMPLETE_RUN_SQL = """
 # the seed. ``confirm_state = 'unconfirmed'`` is the re-enqueue guard: a hit
 # already ``machine_triaged`` has a pending review task, and re-running
 # Rekognition on it is pure spend for no new information. DISTINCT collapses
-# a hit that clears BOTH providers' bars to one outbox row, not two.
+# a hit both providers found to one outbox row, not two.
 _ENQUEUE_CONFIRM_HITS_SQL = """
     INSERT INTO outbox (queue_name, payload)
     SELECT DISTINCT %(queue)s::text,
@@ -288,13 +291,6 @@ _ENQUEUE_CONFIRM_HITS_SQL = """
     JOIN attestations a ON a.infringement_id = i.infringement_id
     WHERE a.last_run_id = %(run_id)s
       AND i.confirm_state = 'unconfirmed'
-      AND (
-            (a.provider_id = 'hive'
-             AND a.provider_score IS NOT NULL
-             AND a.provider_score >= %(hive_min)s)
-         OR (a.provider_id = 'google'
-             AND a.provider_category = ANY(%(google_kinds)s))
-      )
 """
 
 # An infringement with no attestation cannot exist (the write path always
@@ -435,7 +431,7 @@ class SearchStore(Protocol):
         providers_succeeded: Sequence[ProviderId],
         *,
         retier: CadenceInput | None,
-        confirm: ConfirmCriteria | None,
+        enqueue_confirm: bool,
     ) -> CadenceUpdate | None: ...
 
     async def list_infringements(
@@ -686,10 +682,10 @@ class PostgresSearchStore:
         providers_succeeded: Sequence[ProviderId],
         *,
         retier: CadenceInput | None,
-        confirm: ConfirmCriteria | None,
+        enqueue_confirm: bool,
     ) -> CadenceUpdate | None:
-        """Complete the run, re-tier its seed, and enqueue any qualifying
-        confirm jobs — all in ONE transaction.
+        """Complete the run, re-tier its seed, and enqueue this run's
+        still-unconfirmed hits for triage — all in ONE transaction.
 
         Two separate transactions was wrong in both directions:
 
@@ -708,8 +704,9 @@ class PostgresSearchStore:
         ``retier=None`` means this run is not evidence about the seed — no
         provider succeeded — so the run completes and the tier is left alone.
 
-        ``confirm=None`` skips the confirm-queue enqueue entirely (design doc
-        §7). When given, it commits alongside completion and re-tiering — a
+        ``enqueue_confirm=False`` skips the confirm-queue enqueue entirely
+        (tests and callers that complete runs outside the triage flow). When
+        True, the enqueue commits alongside completion and re-tiering — a
         confirm job for a hit whose run never actually completed would send
         the pipeline chasing something that, from the run's own record, never
         happened.
@@ -744,15 +741,13 @@ class PostgresSearchStore:
                         "next_scan_after": update.next_scan_after,
                     },
                 )
-            if confirm is not None:
+            if enqueue_confirm:
                 await conn.execute(
                     _ENQUEUE_CONFIRM_HITS_SQL,
                     {
                         "queue": QUEUE_CONFIRM_HITS,
                         "event": CONFIRM_REQUESTED_EVENT,
                         "run_id": run_id,
-                        "hive_min": confirm.hive_min_score,
-                        "google_kinds": list(confirm.google_kinds),
                     },
                 )
         return update

@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 import structlog
 from fastapi import FastAPI
 
@@ -50,6 +51,8 @@ from imageshield.http.routes.subjects import router as subjects_router
 from imageshield.liveness.provider import RekognitionLivenessProvider
 from imageshield.liveness.store import PostgresLivenessStore
 from imageshield.liveness.uploader import HttpxObjectUploader
+from imageshield.preview.client import FetcherCropClient
+from imageshield.preview.store import PostgresPreviewStore
 from imageshield.providers.observability import PostgresProviderObservability
 from imageshield.providers.store import PostgresProviderControlStore
 from imageshield.review.store import PostgresReviewStore
@@ -117,6 +120,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.threat_store = PostgresThreatStore(pool)
     if getattr(app.state, "review_store", None) is None:
         app.state.review_store = PostgresReviewStore(pool)
+    if getattr(app.state, "preview_store", None) is None:
+        app.state.preview_store = PostgresPreviewStore(pool)
+    if getattr(app.state, "crop_client", None) is None:
+        # Closed in the lifespan's teardown below, with the pool.
+        app.state.crop_http_client = httpx.AsyncClient(timeout=15.0)
+        app.state.crop_client = FetcherCropClient(
+            app.state.crop_http_client,
+            base_url=cfg.fetcher_base_url,
+            token=cfg.fetcher_token,
+        )
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     # Which AWS account and region, before anything touches Rekognition.
@@ -137,6 +150,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         client = getattr(app.state, "photo_http_client", None)
         if client is not None:
             await client.aclose()
+        crop_client = getattr(app.state, "crop_http_client", None)
+        if crop_client is not None:
+            await crop_client.aclose()
         await pool.close()
 
 

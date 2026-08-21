@@ -166,7 +166,18 @@ _CONFIRMED_HITS_SQL = """
         AND i.status NOT IN ('dismissed_not_me', 'authorised')
         AND (lf.signal IS DISTINCT FROM 'not_me')
       ) AS counts,
-      COALESCE(fc.n, 0) = 0 AS no_feedback
+      -- A hit the SUBJECT decided (subject-verified-hits spec) has already
+      -- been answered by the only person we were waiting on, even though the
+      -- decision lane writes no `infringement_feedback` row. Without this
+      -- clause answering "yes, this is my photo" costs them
+      -- SCORE_POSTURE_FEEDBACK — a #45 violation on top of the intended
+      -- Exposure move — and the app asks them to respond to a hit they have
+      -- just responded to. The literal matches `review/store.py`'s
+      -- `confirm_decided_by = 'subject'`; both sides are pinned by tests.
+      (
+        COALESCE(fc.n, 0) = 0
+        AND i.confirm_decided_by IS DISTINCT FROM 'subject'
+      ) AS no_feedback
     FROM infringements i
     LEFT JOIN latest_feedback lf ON lf.infringement_id = i.infringement_id
     LEFT JOIN feedback_counts fc ON fc.infringement_id = i.infringement_id

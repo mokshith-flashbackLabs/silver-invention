@@ -388,6 +388,27 @@ class FeedbackResponse(BaseModel):
     status: str
 
 
+class SubjectDecisionRequest(ServiceModel):
+    """The subject's own answer to "is this your photo?" (spec 2026-08-21 §5).
+
+    A closed two-value vocabulary on purpose: 'uncertain' is a feedback
+    signal, not a decision — an unsure subject leaves the hit pending (and the
+    operator override path exists for corrections)."""
+
+    user_ref: UserRef
+    decision: Literal["confirmed", "rejected"]
+
+
+class SubjectDecisionResponse(BaseModel):
+    """``idempotent_replay`` is true when this exact decision was already
+    committed by the subject — the proxy may retry safely."""
+
+    infringement_id: UUID
+    decision: str
+    severity: str | None
+    idempotent_replay: bool = False
+
+
 class ProviderReasonRequest(ServiceModel):
     """A reason is mandatory on every admin write.
 

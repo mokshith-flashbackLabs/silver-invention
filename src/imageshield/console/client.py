@@ -1,12 +1,12 @@
-"""HTTP clients the console uses to reach its two upstreams: the services
-admin API and the crop fetcher.
+"""The console's one upstream client: the services admin API.
 
-Every console write flows through one of these -- the console holds NO
-database access of any kind (module docstring, ``imageshield.console``).
-Both classes take an injected ``httpx.AsyncClient`` rather than building
-their own, so tests can swap in a ``httpx.MockTransport`` (or a fake object
-entirely, via ``app.state.services_client`` / ``app.state.fetcher_client``)
-without a network.
+Every console write flows through this -- the console holds NO database
+access of any kind (module docstring, ``imageshield.console``), and since
+spec 2026-08-21 §0.2 it holds no fetcher client either: staff never see hit
+imagery, so there is nothing for the console to render pixels with. The class
+takes an injected ``httpx.AsyncClient`` rather than building its own, so
+tests can swap in a ``httpx.MockTransport`` (or a fake object entirely, via
+``app.state.services_client``) without a network.
 """
 
 from __future__ import annotations
@@ -131,22 +131,22 @@ class ServicesClient:
         data: dict[str, Any] = response.json()
         return data
 
-
-class FetcherClient:
-    """Talks to the crop fetcher -- the ONLY pixels path this console has,
-    live-rendered on every call, never stored (``GET /crop`` in ``app.py``)."""
-
-    def __init__(self, client: httpx.AsyncClient, *, base_url: str, token: str) -> None:
-        self._client = client
-        self._base_url = base_url.rstrip("/")
-        self._token = token
-
-    async def crop(self, *, url: str, bbox: dict[str, float], blur: bool) -> tuple[bytes, str]:
-        response = await self._client.post(
-            f"{self._base_url}/v1/crop",
-            json={"url": url, "bbox": bbox, "blur": blur},
-            headers={"X-Fetcher-Token": self._token},
+    async def subject_decisions(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        response = await self._client.get(
+            f"{self._base_url}/v1/admin/review/subject-decisions",
+            params={"limit": limit},
+            headers=self._headers,
         )
-        if response.status_code >= 400:
-            raise ConsoleUpstreamError(response.status_code, response.text)
-        return response.content, response.headers.get("content-type", "image/jpeg")
+        self._raise_for_status(response)
+        data: dict[str, Any] = response.json()
+        return list(data.get("decisions", []))
+
+    async def open_hits(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        response = await self._client.get(
+            f"{self._base_url}/v1/admin/review/open-hits",
+            params={"limit": limit},
+            headers=self._headers,
+        )
+        self._raise_for_status(response)
+        data: dict[str, Any] = response.json()
+        return list(data.get("hits", []))

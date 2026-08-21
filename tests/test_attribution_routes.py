@@ -7,11 +7,13 @@ and the real SQL is proven in ``tests/test_attribution_store.py``.
 
 from __future__ import annotations
 
+import io
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from imageshield.attribution.models import (
     AttributionOutcome,
@@ -31,16 +33,26 @@ PRESIGNED = "https://proxy-s3.example/photo.jpg?X-Amz-Signature=abc"
 BOX = BoundingBox(x=0.1, y=0.2, w=0.3, h=0.4)
 
 
+def _encoded(fmt: str) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), (10, 120, 60)).save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
 class FakeFetcher:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, payload: bytes | None = None) -> None:
         self.urls: list[str] = []
         self._error = error
+        # A real (tiny) JPEG: the service now normalises bytes for Rekognition
+        # before detect_faces, so an undecodable placeholder would divert every
+        # test down the unavailable path.
+        self._payload = payload if payload is not None else _encoded("JPEG")
 
     async def fetch(self, presigned_get_url: str) -> bytes:
         self.urls.append(presigned_get_url)
         if self._error is not None:
             raise self._error
-        return b"photo-bytes"
+        return self._payload
 
 
 class FakeProvider:
@@ -60,8 +72,10 @@ class FakeProvider:
         self._matches = matches or {}
         self._error = error
         self.searches: list[tuple[int, str, float, int]] = []
+        self.detect_bytes: list[bytes] = []
 
     async def detect_faces(self, image: bytes) -> tuple[DetectedFace, ...]:
+        self.detect_bytes.append(image)
         if self._error is not None:
             raise self._error
         return self._faces
@@ -147,13 +161,14 @@ def make_client(
     *,
     provider_error: Exception | None = None,
     fetch_error: Exception | None = None,
+    fetch_payload: bytes | None = None,
     raising_score_store: bool = False,
     **config_overrides: Any,
 ) -> tuple[TestClient, FakeProvider, FakeStore, FakeFetcher]:
     app = create_app(config=make_config(**config_overrides))
     provider = FakeProvider(faces, matches, provider_error)
     store = FakeStore()
-    fetcher = FakeFetcher(fetch_error)
+    fetcher = FakeFetcher(fetch_error, fetch_payload)
     app.state.attribution_provider = provider
     app.state.attribution_store = store
     app.state.photo_fetcher = fetcher
@@ -417,6 +432,36 @@ def test_a_provider_failure_is_503_and_records_a_failed_run() -> None:
     assert store.runs == []
     assert len(store.failed) == 1
     assert "Throttling" in store.failed[0]["error_detail"]
+
+
+def test_a_webp_photo_reaches_rekognition_as_jpeg() -> None:
+    """The proxy's presigned photo can be WebP/HEIC; Rekognition takes
+    JPEG/PNG only (spec 2026-08-21 §2)."""
+    owner = uuid4()
+    client, provider, _store, _fetcher = make_client(
+        (_face(0),),
+        {0: (FaceMatch(external_image_id=str(owner), similarity=97.0),)},
+        fetch_payload=_encoded("WEBP"),
+    )
+
+    response = _post(client, _body([owner]))
+
+    assert response.status_code == 200
+    with Image.open(io.BytesIO(provider.detect_bytes[0])) as opened:
+        assert opened.format == "JPEG"
+
+
+def test_undecodable_photo_bytes_are_503_and_record_a_failed_run() -> None:
+    owner = uuid4()
+    client, provider, store, _fetcher = make_client(fetch_payload=b"not an image")
+
+    response = _post(client, _body([owner]))
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "attribution_unavailable"
+    assert provider.detect_bytes == []  # never reaches Rekognition
+    assert len(store.failed) == 1
+    assert "undecodable" in store.failed[0]["error_detail"]
 
 
 def test_the_photo_is_fetched_through_the_presigned_url_only() -> None:

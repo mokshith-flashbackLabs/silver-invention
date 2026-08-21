@@ -15,7 +15,12 @@ import pytest
 from botocore.exceptions import ClientError
 from PIL import Image
 
-from imageshield.attribution.crop import CropTooSmall, UndecodableImage, crop_to_face
+from imageshield.attribution.crop import (
+    CropTooSmall,
+    UndecodableImage,
+    crop_to_face,
+    to_rekognition_jpeg,
+)
 from imageshield.attribution.models import (
     AttributionUnavailable,
     BoundingBox,
@@ -33,6 +38,41 @@ def _photo(width: int = 800, height: int = 600, colour: str = "white") -> bytes:
 def _size(image: bytes) -> tuple[int, int]:
     with Image.open(io.BytesIO(image)) as opened:
         return opened.size
+
+
+# ── the Rekognition transcode ────────────────────────────────────────────────
+
+
+def _image_bytes(fmt: str) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (128, 40, 200)).save(buffer, format=fmt)
+    return buffer.getvalue()
+
+
+def test_jpeg_passes_through_byte_identical() -> None:
+    original = _image_bytes("JPEG")
+    assert to_rekognition_jpeg(original) is original
+
+
+def test_png_passes_through_byte_identical() -> None:
+    original = _image_bytes("PNG")
+    assert to_rekognition_jpeg(original) is original
+
+
+def test_webp_is_reencoded_to_jpeg() -> None:
+    """The 2026-08-20 weibook hit died five times on DetectFaces ->
+    InvalidImageFormatException over a .webp — the motivating case."""
+    converted = to_rekognition_jpeg(_image_bytes("WEBP"))
+    with Image.open(io.BytesIO(converted)) as opened:
+        assert opened.format == "JPEG"
+        # Geometry preserved: normalised bboxes computed against the
+        # re-encode stay valid for the original image.
+        assert opened.size == (64, 64)
+
+
+def test_undecodable_bytes_raise_for_transcode() -> None:
+    with pytest.raises(UndecodableImage):
+        to_rekognition_jpeg(b"not an image at all")
 
 
 # ── the crop ─────────────────────────────────────────────────────────────────

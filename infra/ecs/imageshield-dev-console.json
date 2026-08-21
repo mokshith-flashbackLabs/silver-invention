@@ -21,10 +21,6 @@
         {
           "name": "SERVICES_BASE_URL",
           "value": "http://localhost:8081"
-        },
-        {
-          "name": "FETCHER_BASE_URL",
-          "value": "http://localhost:8083"
         }
       ],
       "secrets": [
@@ -35,10 +31,6 @@
         {
           "name": "ADMIN_SERVICE_TOKEN",
           "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/admin-Omv7uR:token::"
-        },
-        {
-          "name": "FETCHER_TOKEN",
-          "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:FETCHER_TOKEN::"
         },
         {
           "name": "CONSOLE_OPERATORS",

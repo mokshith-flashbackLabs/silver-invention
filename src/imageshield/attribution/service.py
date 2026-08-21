@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import structlog
 
+from imageshield.attribution.crop import UndecodableImage, to_rekognition_jpeg
 from imageshield.attribution.models import (
     AttributedFace,
     AttributionOutcome,
@@ -54,6 +55,15 @@ async def attribute_photo(
     model_id = provider.model_id
     try:
         image = await fetcher.fetch(presigned_get_url)
+        try:
+            # Rekognition accepts JPEG/PNG only; the proxy's photo can be
+            # WebP/HEIC (spec 2026-08-21 §2). Undecodable bytes take the same
+            # caller-visible path as a fetch that yielded no usable photo.
+            image = to_rekognition_jpeg(image)
+        except UndecodableImage as undecodable:
+            raise AttributionUnavailable(
+                f"photo bytes undecodable: {undecodable}"
+            ) from undecodable
         detected = await provider.detect_faces(image)
     except AttributionUnavailable as exc:
         await store.record_failed_run(

@@ -63,7 +63,7 @@ import structlog
 from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
 
-from imageshield.attribution.crop import UndecodableImage
+from imageshield.attribution.crop import UndecodableImage, to_rekognition_jpeg
 from imageshield.attribution.models import (
     AttributedFace,
     AttributionUnavailable,
@@ -372,22 +372,34 @@ async def handle_message(
         # decision is now known to be Dispatch (Skip returned above).
         dispatch: Dispatch = decision
 
+        # Rekognition accepts JPEG/PNG only; the web serves WebP (the
+        # 2026-08-20 weibook DLQ message is the proof). pHash above reads the
+        # ORIGINAL bytes on purpose — re-encoding first would shift historical
+        # phash comparability for no gain.
+        try:
+            rek_bytes = to_rekognition_jpeg(image_bytes)
+        except UndecodableImage:
+            await deps.store.record_unfetchable(
+                ctx.infringement_id, detail="undecodable for rekognition"
+            )
+            return True
+
         # ── 6. The Rekognition bundle ──────────────────────────────────────
         started_at = time.monotonic()
         try:
-            faces = await deps.provider.detect_faces(image_bytes)
+            faces = await deps.provider.detect_faces(rek_bytes)
             ranked_faces = sorted(faces, key=_face_area, reverse=True)[: deps.max_faces]
             attributed: list[AttributedFace] = []
             for face in ranked_faces:
                 matches = await deps.provider.search_face(
-                    image_bytes,
+                    rek_bytes,
                     face,
                     collection_id=deps.identity_collection,
                     match_threshold=deps.face_match_threshold,
                     max_candidates=deps.attribution_max_candidates,
                 )
                 attributed.append(resolve_face(face, matches, (ctx.user_ref,)))
-            moderation = await deps.moderation.assess(image_bytes)
+            moderation = await deps.moderation.assess(rek_bytes)
         except (AttributionUnavailable, ConfirmUnavailable) as exc:
             failed = ProviderResult(
                 provider_id=REKOGNITION_CONFIRM_ID,
@@ -418,6 +430,13 @@ async def handle_message(
             ):
                 best_score = face_result.match_score
                 best_bbox = face_result.bbox
+
+        # A failed match still needs a crop target: the subject decides
+        # "similar photo — is this you?" from the largest DETECTED face
+        # (spec 2026-08-21 §3). face_match_score stays None in that case, so
+        # matched-vs-similar remains distinguishable downstream.
+        if best_bbox is None and ranked_faces:
+            best_bbox = ranked_faces[0].bbox
 
         # ── 7. Record the successful outcome ────────────────────────────────
         ok_result = ProviderResult(

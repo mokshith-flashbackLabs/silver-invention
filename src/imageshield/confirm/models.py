@@ -10,32 +10,20 @@ one of these.
 
 from __future__ import annotations
 
-from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
 from imageshield.types import ProviderId, UserRef
 
-# Emitted onto imageshield.outbox.QUEUE_CONFIRM_HITS when a review-band
-# infringement meets its provider's "most similar" criteria (design doc §7).
+# Emitted onto imageshield.outbox.QUEUE_CONFIRM_HITS for every
+# still-unconfirmed hit a completed run touched (spec 2026-08-21 §1 — the
+# gate is deliberately wide; the provider row is the spend control).
 CONFIRM_REQUESTED_EVENT = "confirm.hit_requested"
 
 # Registered as a providers row in migration 0021 so the existing
 # budget/breaker/spend machinery governs the confirm pass (INVARIANTS #37-41).
 REKOGNITION_CONFIRM_ID = ProviderId("rekognition_confirm")
-
-
-class ConfirmCriteria(BaseModel):
-    """Per-provider "most similar" thresholds that decide whether a hit gets
-    enqueued for confirmation (design doc §7: ``CONFIRM_HIVE_MIN_SCORE`` /
-    ``CONFIRM_GOOGLE_KINDS``, read from config by the caller — this model
-    just carries the resolved values)."""
-
-    model_config = ConfigDict(frozen=True)
-
-    hive_min_score: Decimal
-    google_kinds: frozenset[str]
 
 
 class ConfirmContext(BaseModel):

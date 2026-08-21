@@ -169,9 +169,11 @@ class FakeAttributionProvider:
         self._matches = matches
         self._detect_error = detect_error
         self.calls = 0
+        self.detect_bytes: list[bytes] = []
 
     async def detect_faces(self, image: bytes) -> tuple[DetectedFace, ...]:
         self.calls += 1
+        self.detect_bytes.append(image)
         if self._detect_error is not None:
             raise self._detect_error
         return self._faces
@@ -518,9 +520,69 @@ async def test_undecodable_image_records_unfetchable() -> None:
     async def _fetch_garbage(url: str) -> bytes | None:
         return b"not an image"
 
-    deps = _deps(store=store, fetch=_fetch_garbage)
+    provider = FakeAttributionProvider()
+    deps = _deps(store=store, provider=provider, fetch=_fetch_garbage)
 
     handled = await handle_message(_body(ctx.infringement_id), deps)
 
     assert handled is True
     assert store.unfetchable == [(ctx.infringement_id, "undecodable")]
+    assert provider.calls == 0  # never reaches Rekognition
+
+
+def _webp_bytes() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (128, 40, 200)).save(buffer, format="WEBP")
+    return buffer.getvalue()
+
+
+async def test_rekognition_bundle_receives_jpeg_for_webp_hit() -> None:
+    """The live 2026-08-20 failure: a .webp image_url reached DetectFaces raw
+    and died with InvalidImageFormatException five times, then dead-lettered.
+    The bundle must always receive JPEG/PNG."""
+    webp = _webp_bytes()
+
+    async def _fetch_webp(url: str) -> bytes | None:
+        return webp
+
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+    provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
+    deps = _deps(store=store, provider=provider, fetch=_fetch_webp)
+
+    handled = await handle_message(_body(ctx.infringement_id), deps)
+
+    assert handled is True
+    assert len(store.triages) == 1
+    with Image.open(io.BytesIO(provider.detect_bytes[0])) as opened:
+        assert opened.format == "JPEG"
+
+
+async def test_failed_match_persists_largest_detected_bbox() -> None:
+    """Spec 2026-08-21 §3: a failed match still needs a crop target — the
+    subject decides "similar photo — is this you?" from the largest DETECTED
+    face. face_match_score stays None so matched-vs-similar is distinguishable."""
+    small = DetectedFace(
+        face_index=0,
+        bbox=BoundingBox(x=0.6, y=0.6, w=0.2, h=0.2),
+        detect_confidence=99.0,
+    )
+    big = DetectedFace(
+        face_index=1,
+        bbox=BoundingBox(x=0.1, y=0.1, w=0.3, h=0.3),
+        detect_confidence=99.0,
+    )
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+    # No matches at all: resolve_face yields match_score=None for both faces.
+    provider = FakeAttributionProvider(faces=(small, big), matches=())
+    deps = _deps(store=store, provider=provider)
+
+    handled = await handle_message(_body(ctx.infringement_id), deps)
+
+    assert handled is True
+    assert len(store.triages) == 1
+    triage = store.triages[0]["triage"]
+    assert isinstance(triage, dict)
+    assert triage["best_face_bbox"] == {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3}
+    assert store.triages[0]["face_match_score"] is None

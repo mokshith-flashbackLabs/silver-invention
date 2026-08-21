@@ -208,7 +208,8 @@ Full shapes in `docs/services/identity.md`. Summary:
 | `GET /v1/liveness/{sid}` | Read session status, `enrolled`, and `consent_ref` (built, steps 3–4). Pure read — no side effects; enrolment is triggered by the result call |
 | `DELETE /v1/enrolments/{user_ref}` | `DeleteFaces` → verify via `ListFaces` → tombstone (built, step 4). Idempotent 204; nothing calls it in v1. Full user deletion (`DELETE /v1/users/{id}`) remains specified-not-built — this is the enrolment-owning piece of it |
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |
-| `GET /v1/hits/{hit_id}/crop` | Blurred face crop, streamed. `Cache-Control: no-store` |
+| `GET /v1/infringements/{id}/preview` | **Built (2026-08-21; supersedes the `GET /v1/hits/{hit_id}/crop` entry that was specified here earlier).** The subject's blurred face crop, streamed `image/jpeg`, `Cache-Control: no-store, private`. Query: `user_ref` (required), `reveal` (bool, default false — the per-item explicit tap unblurs). Errors: `404 infringement_not_found` (absent/not-yours/invisible — one indistinguishable answer), `404 preview_unavailable` (no crop renderable yet — render domain + "no preview"; the subject can still decide), `429 preview_rate_limited` (per-user daily ceiling, retryable), `502 preview_unavailable_upstream` (retryable). Every render is audit-logged |
+| `POST /v1/infringements/{id}/decision` | **Built (2026-08-21).** Body `{user_ref, decision: "confirmed"\|"rejected"}`. The subject's answer IS the confirm/reject (`decided_by='subject'`). Idempotent: the same decision repeated → `200` with `idempotent_replay: true`; a different one, or one against an operator decision → `409 decision_conflict` (no re-decide in v1). `rejected` also sets `status='dismissed_not_me'`. Triggers a score recompute (`cause_kind='subject_decision'`) — a subject's `confirmed` moves Exposure like an operator confirm |
 | `POST /v1/admin/backfill` | Trigger a backfill run. Admin token required |
 
 Step 8 adds five and changes one:
@@ -457,8 +458,19 @@ proxy-side suppression on top of it either.
 `image_url` is **gone from this response**. It was handing any caller of a user-facing list read a
 direct link to the infringing image. Rendering a report list needs the domain, the dates, the band and
 the status — not a way to load the picture. Showing the image at all is a face crop, blurred by
-default, behind its own gated call; that endpoint is specified and not built. The column survives on
-`infringements` as evidence. This closes a contradiction your team raised.
+default, behind its own gated call: `GET /v1/infringements/{id}/preview` (built 2026-08-21, route
+table above). The column survives on `infringements` as evidence. This closes a contradiction your
+team raised.
+
+**Presentation rule, as of 2026-08-21 (supersedes the "only confirmed presents as a finding" rule in
+`docs/prompts/BACKEND-SCORE-SURFACE.md`):** a hit whose `confirm_state` is `machine_triaged` carries
+the **ask-card** — the blurred preview (when available) plus "is this your photo?", posting to the
+decision endpoint. Copy is keyed on the machine outcome: `severity = 'likely_not_subject'` (face-match
+below threshold or no face) reads *"we found a similar photo — is this you?"*, never "we found you".
+`unconfirmed` (not yet triaged) renders "being checked", ask-able URL-only. `confirmed` presents as a
+finding with severity-driven urgency copy. `rejected` and `dismissed_not_me` retire from default
+views. Quarantined and duplicate rows never appear anywhere. Scope discipline (#26) still applies to
+every state's copy.
 
 `url_alive` is set false **only** by a 404 or 410 from the weekly recheck loop. A timeout, a 5xx, or a
 403 leaves it alone — 403 in particular is *gated, not gone*. Read the pair together: `url_alive:

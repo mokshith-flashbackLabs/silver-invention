@@ -49,6 +49,7 @@ from pydantic import BaseModel, ConfigDict
 from imageshield.types import UserRef, parse_user_ref
 
 REVIEW_DECIDED_ACTION = "review.decided"
+SUBJECT_DECIDED_ACTION = "review.subject_decided"
 
 # 0021's severity vocabulary, in the same worst-to-least order as the
 # review_tasks_queue_idx CASE expression — repeated here (rather than
@@ -122,6 +123,69 @@ _AUDIT_SQL = """
     VALUES ('operator', %(action)s, %(subject_ref)s, %(resource_id)s, %(metadata)s)
 """
 
+# ── the subject's own decision (spec 2026-08-21 §5) ──────────────────────────
+#
+# ``user_ref`` in the WHERE, same 404-oracle discipline as feedback: absent and
+# not-yours are one indistinguishable None. quarantined/duplicate are filtered
+# in Python off the locked row — to the subject those rows do not exist either.
+_LOCK_INFRINGEMENT_SUBJECT_SQL = """
+    SELECT i.confirm_state, i.confirm_decided_by, i.severity, cu.source_domain
+    FROM infringements i
+    JOIN content_urls cu ON cu.url_hash = i.url_hash
+    WHERE i.infringement_id = %(infringement_id)s AND i.user_ref = %(user_ref)s
+    FOR UPDATE OF i
+"""
+
+# severity is deliberately untouched: it stays whatever machine triage
+# assigned. 'rejected' also retires the hit from the user's own counts via the
+# same status value the not_me feedback signal uses.
+_SUBJECT_DECIDE_INFRINGEMENT_SQL = """
+    UPDATE infringements
+    SET confirm_state = %(confirm_state)s,
+        confirm_decided_by = 'subject',
+        confirm_decided_at = now(),
+        status = CASE WHEN %(confirm_state)s = 'rejected'
+                      THEN 'dismissed_not_me' ELSE status END
+    WHERE infringement_id = %(infringement_id)s
+    RETURNING severity
+"""
+
+_SUBJECT_DECIDE_TASK_SQL = """
+    UPDATE review_tasks
+    SET status = 'decided', decision = %(decision)s,
+        decided_by = 'subject', decided_at = now()
+    WHERE infringement_id = %(infringement_id)s AND status = 'pending'
+"""
+
+_SUBJECT_AUDIT_SQL = """
+    INSERT INTO audit_log (actor_type, action, subject_ref, resource_id, metadata)
+    VALUES ('subject', %(action)s, %(subject_ref)s, %(resource_id)s, %(metadata)s)
+"""
+
+# The console observer feed (spec 2026-08-21 §6): what subjects decided, off
+# the denormalised audit metadata — one read, no joins. An operator page with
+# tiny N; no index until it hurts.
+_SUBJECT_DECISIONS_SQL = """
+    SELECT occurred_at, subject_ref, resource_id, metadata
+    FROM audit_log
+    WHERE action = 'review.subject_decided'
+    ORDER BY occurred_at DESC
+    LIMIT %(limit)s
+"""
+
+# The control room always sees THAT a person has a hit (owner requirement,
+# 2026-08-21) — what it never sees is the hit's pixels. Every hit still
+# awaiting an answer, metadata only.
+_OPEN_HITS_SQL = """
+    SELECT i.user_ref, i.infringement_id, i.confirm_state, i.severity,
+           cu.source_domain, i.first_seen_at
+    FROM infringements i
+    JOIN content_urls cu ON cu.url_hash = i.url_hash
+    WHERE i.confirm_state IN ('unconfirmed', 'machine_triaged')
+    ORDER BY i.first_seen_at DESC
+    LIMIT %(limit)s
+"""
+
 
 class DecisionOutcome(BaseModel):
     """What one ``decide`` call produced. For ``uncertain``, ``severity`` is
@@ -136,6 +200,20 @@ class DecisionOutcome(BaseModel):
     severity: str | None
 
 
+class SubjectDecisionOutcome(BaseModel):
+    """What one ``subject_decide`` call produced. ``outcome`` is the route's
+    dispatch key: ``decided`` wrote the transition, ``replay`` found the same
+    subject decision already committed (idempotent no-op), ``conflict`` found a
+    different or operator-made decision (409, no re-decide in v1)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    infringement_id: UUID
+    decision: str
+    severity: str | None
+    outcome: str  # 'decided' | 'replay' | 'conflict'
+
+
 class ReviewStore(Protocol):
     async def next_task(self) -> dict[str, Any] | None: ...
 
@@ -144,6 +222,14 @@ class ReviewStore(Protocol):
     async def decide(
         self, task_id: UUID, *, decision: str, operator: str, severity: str | None
     ) -> DecisionOutcome | None: ...
+
+    async def subject_decide(
+        self, infringement_id: UUID, *, user_ref: UserRef, decision: str
+    ) -> SubjectDecisionOutcome | None: ...
+
+    async def subject_decisions(self, *, limit: int) -> tuple[dict[str, Any], ...]: ...
+
+    async def open_hits(self, *, limit: int) -> tuple[dict[str, Any], ...]: ...
 
 
 class PostgresReviewStore:
@@ -258,5 +344,125 @@ class PostgresReviewStore:
             severity=final_severity,
         )
 
+    async def subject_decide(
+        self, infringement_id: UUID, *, user_ref: UserRef, decision: str
+    ) -> SubjectDecisionOutcome | None:
+        """The subject's own confirm/reject — one transaction, mirroring
+        ``decide``. Spec 2026-08-21 §0.1: the subject is a valid deciding
+        human (INVARIANTS #19 as amended); the 0021 CHECK is satisfied by
+        ``confirm_decided_by = 'subject'``. A subject can never overturn an
+        operator, and v1 has no re-decide — changes go through the team."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                _LOCK_INFRINGEMENT_SUBJECT_SQL,
+                {"infringement_id": infringement_id, "user_ref": user_ref},
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            confirm_state, decided_by, severity, source_domain = row
+            if confirm_state in ("quarantined", "duplicate"):
+                # To the subject these rows do not exist — same answer as
+                # absent, so the response can never confirm a quarantined hit.
+                return None
+            if confirm_state in ("confirmed", "rejected"):
+                if decided_by == "subject" and confirm_state == decision:
+                    return SubjectDecisionOutcome(
+                        infringement_id=infringement_id,
+                        decision=decision,
+                        severity=severity,
+                        outcome="replay",
+                    )
+                return SubjectDecisionOutcome(
+                    infringement_id=infringement_id,
+                    decision=confirm_state,
+                    severity=severity,
+                    outcome="conflict",
+                )
 
-__all__ = ["REVIEW_DECIDED_ACTION", "DecisionOutcome", "PostgresReviewStore", "ReviewStore"]
+            cur = await conn.execute(
+                _SUBJECT_DECIDE_INFRINGEMENT_SQL,
+                {"infringement_id": infringement_id, "confirm_state": decision},
+            )
+            infr_row = await cur.fetchone()
+            assert infr_row is not None
+            final_severity: str | None = infr_row[0]
+            await conn.execute(
+                _SUBJECT_DECIDE_TASK_SQL,
+                {"infringement_id": infringement_id, "decision": decision},
+            )
+            await conn.execute(
+                _SUBJECT_AUDIT_SQL,
+                {
+                    "action": SUBJECT_DECIDED_ACTION,
+                    "subject_ref": user_ref,
+                    "resource_id": infringement_id,
+                    # source_domain denormalised in so the console observer
+                    # feed is one indexed read of audit_log, no joins.
+                    "metadata": Jsonb(
+                        {
+                            "decision": decision,
+                            "severity": final_severity,
+                            "source_domain": source_domain,
+                        }
+                    ),
+                },
+            )
+        return SubjectDecisionOutcome(
+            infringement_id=infringement_id,
+            decision=decision,
+            severity=final_severity,
+            outcome="decided",
+        )
+
+    async def subject_decisions(self, *, limit: int) -> tuple[dict[str, Any], ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_SUBJECT_DECISIONS_SQL, {"limit": limit})
+            rows = await cur.fetchall()
+        decisions = []
+        for occurred_at, subject_ref, resource_id, metadata in rows:
+            meta = metadata if isinstance(metadata, dict) else {}
+            decisions.append(
+                {
+                    "occurred_at": occurred_at,
+                    "user_ref": parse_user_ref(subject_ref),
+                    "infringement_id": resource_id,
+                    "decision": meta.get("decision"),
+                    "severity": meta.get("severity"),
+                    "source_domain": meta.get("source_domain"),
+                }
+            )
+        return tuple(decisions)
+
+    async def open_hits(self, *, limit: int) -> tuple[dict[str, Any], ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_OPEN_HITS_SQL, {"limit": limit})
+            rows = await cur.fetchall()
+        return tuple(
+            {
+                "user_ref": parse_user_ref(user_ref),
+                "infringement_id": infringement_id,
+                "confirm_state": confirm_state,
+                "severity": severity,
+                "source_domain": source_domain,
+                "first_seen_at": first_seen_at,
+            }
+            for (
+                user_ref,
+                infringement_id,
+                confirm_state,
+                severity,
+                source_domain,
+                first_seen_at,
+            ) in rows
+        )
+
+
+__all__ = [
+    "REVIEW_DECIDED_ACTION",
+    "SUBJECT_DECIDED_ACTION",
+    "DecisionOutcome",
+    "PostgresReviewStore",
+    "ReviewStore",
+    "SubjectDecisionOutcome",
+]

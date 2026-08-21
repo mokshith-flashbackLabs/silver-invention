@@ -29,11 +29,16 @@ class FakeReviewStore:
         task: dict[str, Any] | None = None,
         depths: dict[str, int] | None = None,
         outcome: DecisionOutcome | Exception | None = None,
+        decisions: tuple[dict[str, Any], ...] = (),
+        hits: tuple[dict[str, Any], ...] = (),
     ) -> None:
         self._task = task
         self._depths = depths if depths is not None else {}
         self._outcome = outcome
+        self._decisions = decisions
+        self._hits = hits
         self.decide_calls: list[dict[str, Any]] = []
+        self.limits: list[tuple[str, int]] = []
 
     async def next_task(self) -> dict[str, Any] | None:
         return self._task
@@ -51,6 +56,14 @@ class FakeReviewStore:
         if isinstance(self._outcome, Exception):
             raise self._outcome
         return self._outcome
+
+    async def subject_decisions(self, *, limit: int) -> tuple[dict[str, Any], ...]:
+        self.limits.append(("decisions", limit))
+        return self._decisions
+
+    async def open_hits(self, *, limit: int) -> tuple[dict[str, Any], ...]:
+        self.limits.append(("hits", limit))
+        return self._hits
 
 
 class FakeScoreStore:
@@ -108,9 +121,13 @@ def make_client(
     depths: dict[str, int] | None = None,
     outcome: DecisionOutcome | Exception | None = None,
     raising_score_store: bool = False,
+    decisions: tuple[dict[str, Any], ...] = (),
+    hits: tuple[dict[str, Any], ...] = (),
 ) -> tuple[TestClient, FakeReviewStore, FakeScoreStore]:
     app = create_app(config=make_config())
-    review = FakeReviewStore(task=task, depths=depths, outcome=outcome)
+    review = FakeReviewStore(
+        task=task, depths=depths, outcome=outcome, decisions=decisions, hits=hits
+    )
     score = FakeScoreStore(raise_error=raising_score_store)
     app.state.review_store = review
     app.state.score_store = score
@@ -304,3 +321,64 @@ def test_a_raising_score_store_does_not_change_the_decide_response() -> None:
 
     assert response.status_code == 200
     assert response.json()["decision"] == "confirmed"
+
+
+# -- the observer feed (spec 2026-08-21 s6) ----------------------------------
+
+
+def test_subject_decisions_feed_returns_the_store_rows() -> None:
+    row = {
+        "occurred_at": "2026-08-21T10:00:00+00:00",
+        "user_ref": str(uuid4()),
+        "infringement_id": str(uuid4()),
+        "decision": "confirmed",
+        "severity": "ncii_suspected",
+        "source_domain": "salon.example",
+    }
+    client, review, _score = make_client(decisions=(row,))
+
+    response = client.get("/v1/admin/review/subject-decisions", headers=ADMIN)
+
+    assert response.status_code == 200
+    assert response.json() == {"decisions": [row]}
+    assert review.limits == [("decisions", 50)]
+
+
+def test_subject_decisions_limit_is_clamped() -> None:
+    client, _review, _score = make_client()
+
+    assert (
+        client.get(
+            "/v1/admin/review/subject-decisions", params={"limit": 501}, headers=ADMIN
+        ).status_code
+        == 422
+    )
+
+
+def test_open_hits_shows_that_a_person_has_a_hit() -> None:
+    """Owner requirement 2026-08-21: the control room always sees THAT a
+    person has a hit -- metadata only, never pixels."""
+    row = {
+        "user_ref": str(uuid4()),
+        "infringement_id": str(uuid4()),
+        "confirm_state": "machine_triaged",
+        "severity": "benign_copy",
+        "source_domain": "salon.example",
+        "first_seen_at": "2026-08-20T12:48:21+00:00",
+    }
+    client, review, _score = make_client(hits=(row,))
+
+    response = client.get(
+        "/v1/admin/review/open-hits", params={"limit": 10}, headers=ADMIN
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"hits": [row]}
+    assert review.limits == [("hits", 10)]
+
+
+def test_the_new_feeds_need_both_tokens() -> None:
+    client, _review, _score = make_client()
+
+    assert client.get("/v1/admin/review/subject-decisions").status_code == 401
+    assert client.get("/v1/admin/review/open-hits", headers=AUTH).status_code == 401

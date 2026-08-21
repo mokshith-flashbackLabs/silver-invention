@@ -18,10 +18,11 @@ recomputing on a no-op write would just be a wasted read.
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 
 from imageshield.http.auth import require_admin_service_token, require_service_token
 from imageshield.http.deps import get_review_store, get_score_store
@@ -68,6 +69,28 @@ async def next_task(
 @router.get("/queue")
 async def queue_depth(store: ReviewStore = Depends(get_review_store)) -> dict[str, int]:
     return await store.queue_depth()
+
+
+@router.get("/subject-decisions")
+async def subject_decisions(
+    limit: int = Query(50, ge=1, le=500),
+    store: ReviewStore = Depends(get_review_store),
+) -> dict[str, list[dict[str, Any]]]:
+    """The observer feed (spec 2026-08-21 §6): what subjects decided about
+    their own hits — metadata only, newest first. Explicit-severity
+    confirmations are the takedown-campaign candidates."""
+    return {"decisions": list(await store.subject_decisions(limit=limit))}
+
+
+@router.get("/open-hits")
+async def open_hits(
+    limit: int = Query(50, ge=1, le=500),
+    store: ReviewStore = Depends(get_review_store),
+) -> dict[str, list[dict[str, Any]]]:
+    """Every hit still awaiting the subject's answer. The control room always
+    sees THAT a person has a hit (owner requirement, 2026-08-21) — what it
+    never sees is the hit's pixels."""
+    return {"hits": list(await store.open_hits(limit=limit))}
 
 
 @router.post("/{task_id}/decision")

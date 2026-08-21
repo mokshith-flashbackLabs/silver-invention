@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Subject decisions - ImageShield Console{% endblock %}
+{% block content %}
+<h1>Subject decisions</h1>
+<p class="muted">Hits are decided by the person themselves. Staff see metadata only — never
+imagery (spec 2026-08-21 §0.2). Explicit-severity confirmations are takedown-campaign candidates.</p>
+
+<div class="card">
+  <h2>Open hits — awaiting the subject</h2>
+  {% if open_hits %}
+  <table>
+    <tr><th>Found</th><th>Person</th><th>State</th><th>Severity</th><th>Domain</th></tr>
+    {% for h in open_hits %}
+    <tr>
+      <td>{{ h.first_seen_at }}</td>
+      <td>{{ h.user_ref }}</td>
+      <td>{{ h.confirm_state }}</td>
+      <td>{{ h.severity if h.severity else "—" }}</td>
+      <td>{{ h.source_domain }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">No hits are waiting on an answer.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Decided</h2>
+  {% if decisions %}
+  <table>
+    <tr><th>When</th><th>Person</th><th>Decision</th><th>Severity</th><th>Domain</th></tr>
+    {% for d in decisions %}
+    <tr{% if d.severity in ("ncii_suspected", "explicit_unmatched") %} class="flag"{% endif %}>
+      <td>{{ d.occurred_at }}</td>
+      <td>{{ d.user_ref }}</td>
+      <td>{{ d.decision }}</td>
+      <td>{{ d.severity if d.severity else "—" }}</td>
+      <td>{{ d.source_domain }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">No subject decisions yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

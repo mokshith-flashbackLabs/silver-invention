@@ -937,12 +937,25 @@ def test_0023_only_rollback_leaves_v_person_hits_readable_by_the_proxy(
     0023's down leg DROPs and recreates ``v_person_hits`` (not ``CREATE OR
     REPLACE`` -- Postgres refuses to drop trailing columns from a view), and a
     DROP takes the object's ACL with it. Without an explicit re-grant in the
-    down file, a rollback that stops exactly here -- one step, not `--all` --
-    leaves the view existing but unreadable by ``imageshield_proxy_ro``, which
-    is a live-outage shape for the proxy's report surface and not the shape a
-    reviewer would expect from "reverted one migration".
+    down file, a rollback that stops exactly here -- not `--all` -- leaves the
+    view existing but unreadable by ``imageshield_proxy_ro``, which is a
+    live-outage shape for the proxy's report surface and not the shape a
+    reviewer would expect from "reverted to before 0023".
+
+    The step count is DERIVED, never hardcoded: ``down`` reverts newest-first
+    by filename, so "roll back through 0023" is however many migrations sit at
+    or above it. Written as ``--steps 1`` this test silently changed meaning
+    the moment 0024 landed -- it reverted 0024 instead and asserted nothing
+    about 0023's ACL.
     """
-    revert = run_migrate(migrated_db, "down", "--steps", "1")
+    before = sorted(
+        row["filename"]
+        for row in _rows(migrated_db, "SELECT filename FROM schema_migrations")
+    )
+    steps = sum(1 for name in before if name >= "0023_svc_score_views.up.sql")
+    assert steps >= 1, "0023 must be applied for this test to mean anything"
+
+    revert = run_migrate(migrated_db, "down", "--steps", str(steps))
     assert revert.returncode == 0, revert.stderr
 
     applied = {

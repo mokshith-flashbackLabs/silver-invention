@@ -26,8 +26,8 @@ Eight processes, all from one image except where noted. The first four are v1; t
 | Recheck worker | `python -m imageshield.recheck.worker` | Weekly HEAD sweep setting `url_alive` |
 | Confirm worker | `python -m imageshield.confirm.worker` | Consumes `confirm:hits`: fetch → pHash → face-match (via `attribution/`) → moderation → severity triage into `review_tasks` |
 | Score tick | `python -m imageshield.score.tick` | Daily drift-healer: re-runs score recompute for aging effects and any trigger whose recompute crashed after commit |
-| Fetcher | `uvicorn imageshield.fetcher.app:create_app --factory --port 8083` | Standalone deployable, no DB credentials. Hands the confirm worker image bytes; renders blurred face crops live for review |
-| Console | `uvicorn imageshield.console.app:create_app --factory --port 8082` | Standalone deployable, no DB credentials. Control-room UI: review queue, threat events, provider health, score inspector; HTTP Basic per operator |
+| Fetcher | `uvicorn imageshield.fetcher.app:create_app --factory --port 8083` | Standalone deployable, no DB credentials. Hands the confirm worker image bytes; renders the subject's blurred face crops live (services preview endpoint — the console's crop access was removed 2026-08-21: staff never see hit imagery) |
+| Console | `uvicorn imageshield.console.app:create_app --factory --port 8082` | Standalone deployable, no DB credentials, no fetcher client. Control-room UI: review queue (metadata-only), subject-decisions observer (`/decisions` — open hits show THAT a person has a hit; explicit-severity confirmations are takedown-campaign candidates), threat events, provider health, score inspector; HTTP Basic per operator |
 
 The API logs the AWS **account, region and collection** at startup as a
 `WARNING` (`event: aws.identity`). If you are unsure which environment a
