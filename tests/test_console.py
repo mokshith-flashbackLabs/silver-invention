@@ -1,9 +1,10 @@
-"""Tests for the control-room console (Task 17).
+"""Tests for the control-room console (Task 17; spec 2026-08-21 §6).
 
 The console is a standalone FastAPI app with no database access of its own
--- every read and write flows through two injected clients
-(``ServicesClient`` / ``FetcherClient``). Tests pre-wire fakes on
-``app.state`` before constructing ``TestClient``, the same convention
+-- every read and write flows through one injected ``ServicesClient``. Since
+spec 2026-08-21 §0.2 there is NO fetcher client and NO pixels path: staff
+never see hit imagery. Tests pre-wire fakes on ``app.state`` before
+constructing ``TestClient``, the same convention
 ``imageshield.console.app._lifespan``'s getattr guards exist for.
 """
 
@@ -42,8 +43,16 @@ _TASK: dict[str, Any] = {
 
 
 class FakeServicesClient:
-    def __init__(self, task: dict[str, Any] | None = _TASK) -> None:
+    def __init__(
+        self,
+        task: dict[str, Any] | None = _TASK,
+        *,
+        open_hits: list[dict[str, Any]] | None = None,
+        decisions: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._task = task
+        self._open_hits = open_hits if open_hits is not None else []
+        self._decisions = decisions if decisions is not None else []
         self.decide_calls: list[dict[str, Any]] = []
         self.create_event_calls: list[dict[str, Any]] = []
         self.retract_calls: list[dict[str, Any]] = []
@@ -77,14 +86,11 @@ class FakeServicesClient:
     async def score(self, user_ref: str) -> dict[str, Any] | None:
         return None
 
+    async def subject_decisions(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._decisions
 
-class FakeFetcherClient:
-    def __init__(self) -> None:
-        self.crop_calls: list[dict[str, Any]] = []
-
-    async def crop(self, *, url: str, bbox: dict[str, float], blur: bool) -> tuple[bytes, str]:
-        self.crop_calls.append({"url": url, "bbox": bbox, "blur": blur})
-        return b"fake-jpeg-bytes", "image/jpeg"
+    async def open_hits(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._open_hits
 
 
 def _config() -> ConsoleConfig:
@@ -93,8 +99,6 @@ def _config() -> ConsoleConfig:
         services_base_url="http://localhost:8081",
         service_token="service-token-for-tests-0001",
         admin_service_token="admin-token-for-tests-0002",
-        fetcher_base_url="http://localhost:8090",
-        fetcher_token="fetcher-token-for-tests-0003",
     )
 
 
@@ -102,13 +106,9 @@ def _csrf(operator: str) -> str:
     return make_csrf_token(_config(), operator)
 
 
-def _client(
-    services: FakeServicesClient | None = None,
-    fetcher: FakeFetcherClient | None = None,
-) -> TestClient:
+def _client(services: FakeServicesClient | None = None) -> TestClient:
     app = create_app(config=_config())
     app.state.services_client = services if services is not None else FakeServicesClient()
-    app.state.fetcher_client = fetcher if fetcher is not None else FakeFetcherClient()
     return TestClient(app)
 
 
@@ -219,31 +219,63 @@ def test_post_uncertain_decision_carries_no_severity() -> None:
     assert fake.decide_calls[0]["severity"] is None
 
 
-# ── crop ─────────────────────────────────────────────────────────────────
+# ── no pixels, anywhere (spec 2026-08-21 §0.2) ───────────────────────────
 
 
-def test_crop_streams_the_fake_fetchers_bytes_and_media_type() -> None:
-    fake_fetcher = FakeFetcherClient()
-    client = _client(fetcher=fake_fetcher)
-
-    response = client.get(
+def test_the_crop_route_is_gone() -> None:
+    """Staff never see hit imagery: the console's only pixels path was
+    removed with the 2026-08-21 decision."""
+    response = _client().get(
         "/crop",
         params={"url": "https://img.example/a.jpg", "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
         auth=ALICE,
     )
+    assert response.status_code == 404
+
+
+def test_review_page_renders_no_images_at_all() -> None:
+    response = _client().get("/review", auth=ALICE)
 
     assert response.status_code == 200
-    assert response.content == b"fake-jpeg-bytes"
-    assert response.headers["content-type"] == "image/jpeg"
-    assert fake_fetcher.crop_calls[0]["blur"] is True
+    assert b"<img" not in response.content
 
 
-def test_crop_requires_credentials() -> None:
-    response = _client().get(
-        "/crop",
-        params={"url": "https://img.example/a.jpg", "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
-    )
-    assert response.status_code == 401
+# ── the observer page ─────────────────────────────────────────────────────
+
+
+def test_decisions_page_shows_open_hits_and_decided_answers() -> None:
+    """Owner requirement 2026-08-21: the control room always sees THAT a
+    person has a hit — and what its subject decided — metadata only."""
+    open_hit = {
+        "user_ref": str(uuid4()),
+        "infringement_id": str(uuid4()),
+        "confirm_state": "machine_triaged",
+        "severity": "benign_copy",
+        "source_domain": "open-hit.example",
+        "first_seen_at": "2026-08-20T12:48:21+00:00",
+    }
+    decided = {
+        "occurred_at": "2026-08-21T09:00:00+00:00",
+        "user_ref": str(uuid4()),
+        "infringement_id": str(uuid4()),
+        "decision": "confirmed",
+        "severity": "ncii_suspected",
+        "source_domain": "decided-hit.example",
+    }
+    client = _client(FakeServicesClient(open_hits=[open_hit], decisions=[decided]))
+
+    response = client.get("/decisions", auth=ALICE)
+
+    assert response.status_code == 200
+    assert "open-hit.example" in response.text
+    assert "decided-hit.example" in response.text
+    # Explicit-severity confirmations are flagged as campaign candidates.
+    assert 'class="flag"' in response.text
+    assert b"<img" not in response.content
+
+
+def test_decisions_page_requires_credentials() -> None:
+    assert _client().get("/decisions").status_code == 401
 
 
 # ── csrf ─────────────────────────────────────────────────────────────────

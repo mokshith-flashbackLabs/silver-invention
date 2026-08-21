@@ -1,8 +1,14 @@
 """The control-room console's FastAPI app -- a standalone deployable,
 separate from ``imageshield.http.app`` and from ``imageshield.fetcher.app``,
 with no path to Postgres of any kind. Server-rendered Jinja2 over the
-services admin API and the fetcher; every write it makes flows through one
-of those two HTTP clients.
+services admin API only; every write it makes flows through that one HTTP
+client.
+
+**No pixels, anywhere.** Spec 2026-08-21 §0.2: staff never see hit imagery --
+the console's fetcher client and ``/crop`` route were removed with that
+decision, and the review screen is metadata-only. The control room always
+sees THAT a person has a hit (the ``/decisions`` observer page); the only
+eyes that ever see a hit's pixels are the subject's own.
 
 ``GET /health`` is tokenless -- the ECS health-check target, same rule as
 every other deployable in this repo: a load-balancer probe cannot carry a
@@ -26,7 +32,7 @@ from uuid import UUID
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from imageshield.console.auth import (
@@ -36,7 +42,7 @@ from imageshield.console.auth import (
     require_operator,
     verify_csrf_token,
 )
-from imageshield.console.client import ConsoleUpstreamError, FetcherClient, ServicesClient
+from imageshield.console.client import ConsoleUpstreamError, ServicesClient
 from imageshield.console.config import ConsoleConfig, load_console_config
 
 log = structlog.get_logger("imageshield.console")
@@ -46,11 +52,6 @@ _templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 def get_services_client(request: Request) -> ServicesClient:
     client: ServicesClient = request.app.state.services_client
-    return client
-
-
-def get_fetcher_client(request: Request) -> FetcherClient:
-    client: FetcherClient = request.app.state.fetcher_client
     return client
 
 
@@ -93,17 +94,12 @@ async def review_get(
     cfg: ConsoleConfig = Depends(get_console_config),
 ) -> HTMLResponse:
     task = await services_client.review_next()
-    bbox: dict[str, Any] | None = None
-    if task is not None:
-        triage = task.get("triage") or {}
-        bbox = triage.get("best_face_bbox")
     return _templates.TemplateResponse(
         request,
         "review.html",
         {
             "operator": operator,
             "task": task,
-            "bbox": bbox,
             "csrf_token": make_csrf_token(cfg, operator),
         },
     )
@@ -126,23 +122,26 @@ async def review_decide(
     return RedirectResponse(url="/review", status_code=303)
 
 
-@router.get("/crop")
-async def crop(
-    url: str = Query(...),
-    x: float = Query(...),
-    y: float = Query(...),
-    w: float = Query(...),
-    h: float = Query(...),
-    blur: bool = Query(True),
-    fetcher_client: FetcherClient = Depends(get_fetcher_client),
-) -> Response:
-    """The ONLY pixels path this console has -- live-rendered on every call,
-    never stored (module docstring). Blurred by default; the reveal link in
-    ``review.html`` re-requests the same crop with ``blur=0``."""
-    content, media_type = await fetcher_client.crop(
-        url=url, bbox={"x": x, "y": y, "w": w, "h": h}, blur=blur
+@router.get("/decisions")
+async def decisions_get(
+    request: Request,
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+) -> HTMLResponse:
+    """The observer page (spec 2026-08-21 §6): every hit awaiting the
+    subject's answer, and every answer given -- metadata only, never pixels.
+    Explicit-severity confirmations are the takedown-campaign candidates."""
+    open_hits = await services_client.open_hits()
+    decided = await services_client.subject_decisions()
+    return _templates.TemplateResponse(
+        request,
+        "decisions.html",
+        {
+            "operator": operator,
+            "open_hits": open_hits,
+            "decisions": decided,
+        },
     )
-    return Response(content=content, media_type=media_type)
 
 
 @router.get("/events")
@@ -273,9 +272,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg: ConsoleConfig = app.state.config
     # getattr guards let a caller (tests, a local harness) pre-wire fakes
     # before startup without being overwritten -- same convention as
-    # imageshield.http.app and imageshield.fetcher.app. One httpx.AsyncClient
-    # per upstream, since the two live at different base URLs with different
-    # tokens.
+    # imageshield.http.app and imageshield.fetcher.app.
     if getattr(app.state, "services_client", None) is None:
         app.state._services_http_client = httpx.AsyncClient(timeout=30.0)
         app.state.services_client = ServicesClient(
@@ -284,21 +281,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             service_token=cfg.service_token,
             admin_service_token=cfg.admin_service_token,
         )
-    if getattr(app.state, "fetcher_client", None) is None:
-        app.state._fetcher_http_client = httpx.AsyncClient(timeout=30.0)
-        app.state.fetcher_client = FetcherClient(
-            app.state._fetcher_http_client,
-            base_url=cfg.fetcher_base_url,
-            token=cfg.fetcher_token,
-        )
     log.info("console.started")
     try:
         yield
     finally:
-        for attr in ("_services_http_client", "_fetcher_http_client"):
-            client = getattr(app.state, attr, None)
-            if client is not None:
-                await client.aclose()
+        client = getattr(app.state, "_services_http_client", None)
+        if client is not None:
+            await client.aclose()
 
 
 def create_app(config: ConsoleConfig | None = None) -> FastAPI:

@@ -10,15 +10,8 @@
   <p><strong>Face match score:</strong> {{ task.face_match_score if task.face_match_score is not none else "n/a" }}</p>
   <p><strong>Triage:</strong> {{ task.triage }}</p>
 
-  {% if task.image_url and bbox %}
-  <img class="crop"
-       src="/crop?url={{ task.image_url | urlencode }}&x={{ bbox.x }}&y={{ bbox.y }}&w={{ bbox.w }}&h={{ bbox.h }}&blur=1"
-       alt="blurred face crop">
-  <p><a href="/crop?url={{ task.image_url | urlencode }}&x={{ bbox.x }}&y={{ bbox.y }}&w={{ bbox.w }}&h={{ bbox.h }}&blur=0"
-        target="_blank" rel="noopener noreferrer">reveal (opens unblurred, new tab)</a></p>
-  {% else %}
-  <p class="muted">No face crop available for this task.</p>
-  {% endif %}
+  <p class="muted">Imagery is subject-only (spec 2026-08-21): staff never see
+  hit pictures. Decide from the metadata above, or leave it for the subject.</p>
 </div>
 
 <div class="card">
