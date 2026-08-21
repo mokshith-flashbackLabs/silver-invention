@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from imageshield.liveness.provider import LivenessProvider
     from imageshield.liveness.store import LivenessStore
     from imageshield.liveness.uploader import ObjectUploader
+    from imageshield.preview.client import FetcherCropClient
+    from imageshield.preview.store import PreviewStore
     from imageshield.providers.observability import ProviderObservability
     from imageshield.providers.store import ProviderControlStore
     from imageshield.review.store import ReviewStore
@@ -140,3 +142,13 @@ def get_threat_store(request: Request) -> ThreatStore:
 def get_review_store(request: Request) -> ReviewStore:
     store: ReviewStore = _required_state(request, "review_store")  # type: ignore[assignment]
     return store
+
+
+def get_preview_store(request: Request) -> PreviewStore:
+    store: PreviewStore = _required_state(request, "preview_store")  # type: ignore[assignment]
+    return store
+
+
+def get_crop_client(request: Request) -> FetcherCropClient:
+    client: FetcherCropClient = _required_state(request, "crop_client")  # type: ignore[assignment]
+    return client

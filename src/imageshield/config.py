@@ -428,6 +428,12 @@ class Config(BaseSettings):
     # detection, never cross-user (design §7 step 2).
     confirm_phash_hamming_max: int = 8
 
+    # Per-user_ref crop renders per rolling 24h on the subject preview
+    # endpoint (INVARIANTS #32; spec 2026-08-21 §4). An abuse brake against a
+    # compromised account replaying the preview as a search console — not a
+    # product quota.
+    preview_daily_render_ceiling: int = 200
+
     # The CSAM tripwire's low-end age band (moderation labels suggesting a
     # minor, design §7 step 7). Required, with NO default: the age-literal
     # gate in tests/test_boundaries.py bans an inline age comparison in this
@@ -561,6 +567,7 @@ class Config(BaseSettings):
         "score_scan_grace_days",
         "confirm_max_faces",
         "confirm_phash_hamming_max",
+        "preview_daily_render_ceiling",
     )
     @classmethod
     def _positive(cls, value: int) -> int:
