@@ -162,6 +162,30 @@ _SUBJECT_AUDIT_SQL = """
     VALUES ('subject', %(action)s, %(subject_ref)s, %(resource_id)s, %(metadata)s)
 """
 
+# The console observer feed (spec 2026-08-21 §6): what subjects decided, off
+# the denormalised audit metadata — one read, no joins. An operator page with
+# tiny N; no index until it hurts.
+_SUBJECT_DECISIONS_SQL = """
+    SELECT occurred_at, subject_ref, resource_id, metadata
+    FROM audit_log
+    WHERE action = 'review.subject_decided'
+    ORDER BY occurred_at DESC
+    LIMIT %(limit)s
+"""
+
+# The control room always sees THAT a person has a hit (owner requirement,
+# 2026-08-21) — what it never sees is the hit's pixels. Every hit still
+# awaiting an answer, metadata only.
+_OPEN_HITS_SQL = """
+    SELECT i.user_ref, i.infringement_id, i.confirm_state, i.severity,
+           cu.source_domain, i.first_seen_at
+    FROM infringements i
+    JOIN content_urls cu ON cu.url_hash = i.url_hash
+    WHERE i.confirm_state IN ('unconfirmed', 'machine_triaged')
+    ORDER BY i.first_seen_at DESC
+    LIMIT %(limit)s
+"""
+
 
 class DecisionOutcome(BaseModel):
     """What one ``decide`` call produced. For ``uncertain``, ``severity`` is
@@ -202,6 +226,10 @@ class ReviewStore(Protocol):
     async def subject_decide(
         self, infringement_id: UUID, *, user_ref: UserRef, decision: str
     ) -> SubjectDecisionOutcome | None: ...
+
+    async def subject_decisions(self, *, limit: int) -> tuple[dict[str, Any], ...]: ...
+
+    async def open_hits(self, *, limit: int) -> tuple[dict[str, Any], ...]: ...
 
 
 class PostgresReviewStore:
@@ -385,6 +413,48 @@ class PostgresReviewStore:
             decision=decision,
             severity=final_severity,
             outcome="decided",
+        )
+
+    async def subject_decisions(self, *, limit: int) -> tuple[dict[str, Any], ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_SUBJECT_DECISIONS_SQL, {"limit": limit})
+            rows = await cur.fetchall()
+        decisions = []
+        for occurred_at, subject_ref, resource_id, metadata in rows:
+            meta = metadata if isinstance(metadata, dict) else {}
+            decisions.append(
+                {
+                    "occurred_at": occurred_at,
+                    "user_ref": parse_user_ref(subject_ref),
+                    "infringement_id": resource_id,
+                    "decision": meta.get("decision"),
+                    "severity": meta.get("severity"),
+                    "source_domain": meta.get("source_domain"),
+                }
+            )
+        return tuple(decisions)
+
+    async def open_hits(self, *, limit: int) -> tuple[dict[str, Any], ...]:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_OPEN_HITS_SQL, {"limit": limit})
+            rows = await cur.fetchall()
+        return tuple(
+            {
+                "user_ref": parse_user_ref(user_ref),
+                "infringement_id": infringement_id,
+                "confirm_state": confirm_state,
+                "severity": severity,
+                "source_domain": source_domain,
+                "first_seen_at": first_seen_at,
+            }
+            for (
+                user_ref,
+                infringement_id,
+                confirm_state,
+                severity,
+                source_domain,
+                first_seen_at,
+            ) in rows
         )
 
 

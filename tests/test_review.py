@@ -644,3 +644,65 @@ async def test_deciding_an_untriaged_hit_works_without_a_review_task(
     assert outcome is not None
     assert outcome.outcome == "decided"
     assert outcome.severity is None  # never triaged, so no machine severity
+
+
+async def test_subject_decisions_feed_unpacks_newest_first(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    confirm_store, review_store = stores
+    user_a, hit_a = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy", source_domain="a.example"
+    )
+    user_b, hit_b = await _seeded_infringement(
+        migrated_db, confirm_store, severity="ncii_suspected", source_domain="b.example"
+    )
+    await review_store.subject_decide(hit_a, user_ref=user_a, decision="rejected")
+    await review_store.subject_decide(hit_b, user_ref=user_b, decision="confirmed")
+
+    feed = await review_store.subject_decisions(limit=10)
+
+    assert [d["infringement_id"] for d in feed] == [hit_b, hit_a]
+    newest = feed[0]
+    assert newest["user_ref"] == user_b
+    assert newest["decision"] == "confirmed"
+    assert newest["severity"] == "ncii_suspected"
+    assert newest["source_domain"] == "b.example"
+    assert newest["occurred_at"] is not None
+
+
+async def test_open_hits_lists_only_hits_awaiting_an_answer(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """Owner requirement 2026-08-21: the control room always sees THAT a
+    person has a hit. Decided and quarantined rows leave the list."""
+    confirm_store, review_store = stores
+    user_open, hit_open = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy", source_domain="open.example"
+    )
+    user_decided, hit_decided = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    await review_store.subject_decide(
+        hit_decided, user_ref=user_decided, decision="rejected"
+    )
+    _user_q, hit_quarantined = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE infringements SET confirm_state = 'quarantined'"
+            " WHERE infringement_id = %s",
+            (hit_quarantined,),
+        )
+
+    hits = await review_store.open_hits(limit=10)
+
+    listed = {h["infringement_id"] for h in hits}
+    assert hit_open in listed
+    assert hit_decided not in listed
+    assert hit_quarantined not in listed
+    [row] = [h for h in hits if h["infringement_id"] == hit_open]
+    assert row["user_ref"] == user_open
+    assert row["confirm_state"] == "machine_triaged"
+    assert row["severity"] == "benign_copy"
+    assert row["source_domain"] == "open.example"
