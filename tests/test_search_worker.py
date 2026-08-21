@@ -61,7 +61,7 @@ class WorkerFakeStore:
         providers_succeeded: Sequence[ProviderId],
         *,
         retier: Any,
-        confirm: Any = None,
+        enqueue_confirm: bool = False,
     ) -> Any:
         if self.fail_execution:
             raise RuntimeError("db went away")
@@ -161,7 +161,7 @@ async def test_valid_message_claims_executes_and_reports_handled() -> None:
     score_store = FakeScoreStore()
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, score_store
     )
 
     assert handled is True
@@ -180,7 +180,7 @@ async def test_a_raising_score_store_does_not_flip_the_handled_result() -> None:
     score_store = FakeScoreStore(raise_error=True)
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, score_store
     )
 
     assert handled is True
@@ -194,7 +194,7 @@ async def test_unclaimable_run_is_handled_without_execution() -> None:
     score_store = FakeScoreStore()
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, score_store
     )
 
     assert handled is True
@@ -214,7 +214,6 @@ async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
             calibration_store,
             control(),
             CADENCE,
-            None,
             score_store,
         )
         is True
@@ -227,7 +226,6 @@ async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
             calibration_store,
             control(),
             CADENCE,
-            None,
             score_store,
         )
         is True
@@ -240,7 +238,6 @@ async def test_unknown_event_and_malformed_body_are_poison_pills() -> None:
             calibration_store,
             control(),
             CADENCE,
-            None,
             score_store,
         )
         is True
@@ -257,7 +254,7 @@ async def test_execution_failure_keeps_message_for_redelivery() -> None:
     score_store = FakeScoreStore()
 
     handled = await handle_message(
-        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, None, score_store
+        _body(run_id), store, {}, FakeCalibrationStore(), control(), CADENCE, score_store
     )
 
     assert handled is False  # not deleted -> SQS visibility timeout redelivers

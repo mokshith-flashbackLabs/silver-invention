@@ -13,7 +13,6 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
-from imageshield.confirm.models import ConfirmCriteria
 from imageshield.db.connection import make_async_pool
 from imageshield.search.cadence import CadenceInput
 from imageshield.search.models import ProviderDescriptor
@@ -31,14 +30,6 @@ HIVE_DESC = ProviderDescriptor(
 GOOGLE_DESC = ProviderDescriptor(
     provider_id=GOOGLE, score_kind="categorical", score_version="google-web-detection-v1"
 )
-
-# The design-doc §7 defaults (config.py's CONFIRM_HIVE_MIN_SCORE /
-# CONFIRM_GOOGLE_KINDS), pinned here rather than read from Config: this
-# module tests the store's SQL against fixed criteria, not config wiring.
-CONFIRM = ConfirmCriteria(
-    hive_min_score=Decimal("0.80"), google_kinds=frozenset({"full_match", "partial_match"})
-)
-
 
 @pytest.fixture
 def migrated_db(throwaway_db: str) -> str:
@@ -194,7 +185,7 @@ async def test_claim_run_skips_completed(store: PostgresSearchStore) -> None:
     user_ref = _user()
     seed_id, run_id = await _seeded_run(store, user_ref)
     assert await store.claim_run(run_id) is not None
-    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, confirm=None)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, enqueue_confirm=False)
     assert await store.claim_run(run_id) is None
 
 
@@ -240,7 +231,7 @@ async def test_completion_and_cadence_are_one_transaction(
     seed_id, run_id = await _seeded_run(store, user_ref)
 
     update = await store.complete_run(
-        run_id, seed_id, (HIVE,), retier=_retier(False), confirm=None
+        run_id, seed_id, (HIVE,), retier=_retier(False), enqueue_confirm=False
     )
 
     assert update is not None
@@ -268,7 +259,7 @@ async def test_a_run_with_no_successful_provider_leaves_the_tier_alone(
     assert before is not None
 
     assert (
-        await store.complete_run(run_id, seed_id, (), retier=None, confirm=None) is None
+        await store.complete_run(run_id, seed_id, (), retier=None, enqueue_confirm=False) is None
     )
 
     after = await store.get_seed(seed_id)
@@ -298,8 +289,8 @@ async def test_concurrent_completions_on_one_seed_lose_no_empty_scan(
     )
 
     await asyncio.gather(
-        store.complete_run(first, seed_id, (HIVE,), retier=_retier(False), confirm=None),
-        store.complete_run(second, seed_id, (HIVE,), retier=_retier(False), confirm=None),
+        store.complete_run(first, seed_id, (HIVE,), retier=_retier(False), enqueue_confirm=False),
+        store.complete_run(second, seed_id, (HIVE,), retier=_retier(False), enqueue_confirm=False),
     )
 
     seed = await store.get_seed(seed_id)
@@ -313,7 +304,7 @@ async def test_a_non_empty_scan_promotes_to_priority_through_the_store(
     user_ref = _user()
     seed_id, run_id = await _seeded_run(store, user_ref)
 
-    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True), confirm=None)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True), enqueue_confirm=False)
 
     seed = await store.get_seed(seed_id)
     assert seed is not None
@@ -344,7 +335,7 @@ async def test_run_status_carries_the_seeds_cadence(
     run row, so the join has to bring them through."""
     user_ref = _user()
     seed_id, run_id = await _seeded_run(store, user_ref)
-    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True), confirm=None)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True), enqueue_confirm=False)
 
     run = await store.get_run(run_id)
     assert run is not None
@@ -397,7 +388,7 @@ async def test_complete_run_sets_status_succeeded_and_count(
         {},
     )
 
-    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True), confirm=None)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=_retier(True), enqueue_confirm=False)
 
     run = await store.get_run(run_id)
     assert run is not None
@@ -731,7 +722,7 @@ async def test_52_weekly_rescans_over_static_corpus_add_zero_rows(
         await store.record_infringements(run_id, user_ref, HIVE_DESC, hive_corpus, {})
         await store.record_infringements(run_id, user_ref, GOOGLE_DESC, google_corpus, {})
         await store.complete_run(
-            run_id, seed_id, (HIVE, GOOGLE), retier=None, confirm=None
+            run_id, seed_id, (HIVE, GOOGLE), retier=None, enqueue_confirm=False
         )
         if week == 0:
             first_week_counts = _counts()
@@ -820,12 +811,12 @@ def _infringement_id(migrated_db: str, user_ref: UserRef) -> UUID:
     return row[0]  # type: ignore[no-any-return]
 
 
-async def test_complete_run_enqueues_one_confirm_job_for_a_qualifying_hive_hit(
+async def test_complete_run_enqueues_one_confirm_job_for_a_hive_hit(
     store: PostgresSearchStore, migrated_db: str
 ) -> None:
-    """Design doc §7: a review-band hit whose hive score clears the 'most
-    similar' floor gets a Rekognition triage job — one outbox row, committed
-    in the SAME transaction as run completion (INVARIANTS #39's shape)."""
+    """Spec 2026-08-21 §1: every hit a run wrote gets a Rekognition triage
+    job — one outbox row, committed in the SAME transaction as run completion
+    (INVARIANTS #39's shape)."""
     user_ref = _user()
     seed_id, run_id = await _seeded_run(store, user_ref)
     await store.record_infringements(
@@ -833,7 +824,7 @@ async def test_complete_run_enqueues_one_confirm_job_for_a_qualifying_hive_hit(
     )
     infringement_id = _infringement_id(migrated_db, user_ref)
 
-    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, confirm=CONFIRM)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, enqueue_confirm=True)
 
     rows = _query(
         migrated_db,
@@ -844,11 +835,14 @@ async def test_complete_run_enqueues_one_confirm_job_for_a_qualifying_hive_hit(
     assert rows[0][1] == {"event": "confirm.hit_requested", "id": str(infringement_id)}
 
 
-async def test_complete_run_skips_below_floor_hive_and_page_match_google(
+async def test_low_hive_scores_and_page_match_google_enqueue_too(
     store: PostgresSearchStore, migrated_db: str
 ) -> None:
-    """A below-floor hive score and a google `page_match` (not in
-    CONFIRM_GOOGLE_KINDS) on the SAME hit qualify neither attestation."""
+    """Spec 2026-08-21 §1 opened the gate: the per-provider 'most similar'
+    criteria are gone, because the subject's crop-and-decide surface starves
+    on any hit that never triages. A 0.50 hive score and a google
+    `page_match` — both excluded under the old criteria — now enqueue (one
+    row: same page, one hit, DISTINCT)."""
     user_ref = _user()
     seed_id, run_id = await _seeded_run(store, user_ref)
     page = "https://site.example/below-floor"
@@ -862,15 +856,17 @@ async def test_complete_run_skips_below_floor_hive_and_page_match_google(
     await store.record_infringements(
         run_id, user_ref, GOOGLE_DESC, [_google_match(page, "page_match")], {}
     )
+    infringement_id = _infringement_id(migrated_db, user_ref)
 
     await store.complete_run(
-        run_id, seed_id, (HIVE, GOOGLE), retier=None, confirm=CONFIRM
+        run_id, seed_id, (HIVE, GOOGLE), retier=None, enqueue_confirm=True
     )
 
-    assert (
-        _query(migrated_db, "SELECT 1 FROM outbox WHERE queue_name = 'confirm:hits'")
-        == []
+    rows = _query(
+        migrated_db, "SELECT payload FROM outbox WHERE queue_name = 'confirm:hits'"
     )
+    assert len(rows) == 1
+    assert rows[0][0] == {"event": "confirm.hit_requested", "id": str(infringement_id)}
 
 
 async def test_complete_run_does_not_re_enqueue_an_already_triaged_hit(
@@ -892,7 +888,7 @@ async def test_complete_run_does_not_re_enqueue_an_already_triaged_hit(
         (infringement_id,),
     )
 
-    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, confirm=CONFIRM)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, enqueue_confirm=True)
 
     assert (
         _query(migrated_db, "SELECT 1 FROM outbox WHERE queue_name = 'confirm:hits'")
@@ -900,12 +896,12 @@ async def test_complete_run_does_not_re_enqueue_an_already_triaged_hit(
     )
 
 
-async def test_two_qualifying_attestations_on_one_hit_enqueue_once(
+async def test_two_attestations_on_one_hit_enqueue_once(
     store: PostgresSearchStore, migrated_db: str
 ) -> None:
-    """DISTINCT collapses a hit that clears BOTH providers' bars to one
-    outbox row, not two — the same 'one hit, many attestations' rule as
-    CLAUDE.md §7.4's dedup, applied to the confirm queue."""
+    """DISTINCT collapses a hit both providers found to one outbox row, not
+    two — the same 'one hit, many attestations' rule as CLAUDE.md §7.4's
+    dedup, applied to the confirm queue."""
     user_ref = _user()
     seed_id, run_id = await _seeded_run(store, user_ref)
     page = "https://site.example/double-qualified"
@@ -922,7 +918,7 @@ async def test_two_qualifying_attestations_on_one_hit_enqueue_once(
     infringement_id = _infringement_id(migrated_db, user_ref)
 
     await store.complete_run(
-        run_id, seed_id, (HIVE, GOOGLE), retier=None, confirm=CONFIRM
+        run_id, seed_id, (HIVE, GOOGLE), retier=None, enqueue_confirm=True
     )
 
     rows = _query(
@@ -932,19 +928,18 @@ async def test_two_qualifying_attestations_on_one_hit_enqueue_once(
     assert rows[0][0] == {"event": "confirm.hit_requested", "id": str(infringement_id)}
 
 
-async def test_complete_run_with_confirm_none_enqueues_nothing(
+async def test_complete_run_with_enqueue_confirm_false_enqueues_nothing(
     store: PostgresSearchStore, migrated_db: str
 ) -> None:
-    """confirm=None is the off switch: verified separately from the
-    below-floor case above, this is 'the caller disabled it', not 'nothing
-    qualified'."""
+    """enqueue_confirm=False is the off switch — 'the caller disabled it',
+    for runs completed outside the triage flow."""
     user_ref = _user()
     seed_id, run_id = await _seeded_run(store, user_ref)
     await store.record_infringements(
         run_id, user_ref, HIVE_DESC, [_hive_match("https://cdn.example/a.jpg", "0.95")], {}
     )
 
-    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, confirm=None)
+    await store.complete_run(run_id, seed_id, (HIVE,), retier=None, enqueue_confirm=False)
 
     assert (
         _query(migrated_db, "SELECT 1 FROM outbox WHERE queue_name = 'confirm:hits'")

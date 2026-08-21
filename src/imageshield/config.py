@@ -415,15 +415,6 @@ class Config(BaseSettings):
     fetcher_base_url: str
     fetcher_token: str
 
-    # Per-provider "most similar" trigger criteria for enqueueing a hit onto
-    # confirm:hits (design §7). Hive's raw score domain is 0.5-1.0; the
-    # ceiling this validates is 1, its true maximum (see the field validator
-    # below).
-    confirm_hive_min_score: float = 0.80
-    # Comma list drawn from Google's Web Detection categories. Kept a string
-    # (not a list) so it round-trips through one env var — callers read
-    # `confirm_google_kind_set` below, not this field directly.
-    confirm_google_kinds: str = "full_match,partial_match"
     # Face-match threshold for the confirm pipeline's attribution call — its
     # OWN knob, distinct from FACE_MATCH_THRESHOLD (enrolment),
     # SEARCH_MATCH_THRESHOLD (provider search) and ATTRIBUTION_MATCH_THRESHOLD
@@ -592,16 +583,6 @@ class Config(BaseSettings):
     def _positive_float(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be a positive number")
-        return value
-
-    @field_validator("confirm_hive_min_score")
-    @classmethod
-    def _hive_min_score_range(cls, value: float) -> float:
-        if not 0 < value <= 1:
-            raise ValueError(
-                "must be greater than 0 and at most 1 — Hive's raw score domain"
-                " tops out at 1"
-            )
         return value
 
     @field_validator("provider_retry_jitter_fraction")
@@ -876,27 +857,12 @@ class Config(BaseSettings):
             raise ValueError(
                 "SCORE_THREAT_GLOBAL_MAX_PENALTY may not exceed SCORE_WEIGHT_THREAT"
             )
-        known = {"full_match", "partial_match", "page_match"}
-        kinds = {part.strip() for part in self.confirm_google_kinds.split(",") if part.strip()}
-        if not kinds or not kinds <= known:
-            raise ValueError(
-                "CONFIRM_GOOGLE_KINDS must be a comma list drawn from"
-                " full_match/partial_match/page_match"
-            )
         return self
 
     @property
     def auth_disabled(self) -> bool:
         """True only when the bypass was requested AND environment is development."""
         return self.service_token_auth_disabled and self.environment == "development"
-
-    @property
-    def confirm_google_kind_set(self) -> frozenset[str]:
-        """The parsed form of `confirm_google_kinds` — callers (the confirm
-        worker's dispatch trigger) want a set, never the raw comma string."""
-        return frozenset(
-            part.strip() for part in self.confirm_google_kinds.split(",") if part.strip()
-        )
 
 
 def load_config() -> Config:

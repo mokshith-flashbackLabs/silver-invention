@@ -74,7 +74,6 @@ def test_equal_tokens_refuse_to_start(clean_env: pytest.MonkeyPatch) -> None:
         ("FETCHER_TOKEN", "short"),
         ("CSAM_AGE_LOW_THRESHOLD", "-5"),
         ("CONFIRM_FACE_MATCH_THRESHOLD", "101"),
-        ("CONFIRM_HIVE_MIN_SCORE", "1.5"),
         ("SCORE_TICK_INTERVAL_SECONDS", "0"),
     ],
 )
@@ -509,8 +508,6 @@ def test_score_config_defaults() -> None:
         cfg.score_weight_exposure,
         cfg.score_weight_threat,
     ) == (40, 25, 25, 10)
-    assert cfg.confirm_hive_min_score == 0.80
-    assert cfg.confirm_google_kind_set == frozenset({"full_match", "partial_match"})
 
 
 def test_score_weights_must_sum_to_100() -> None:
@@ -570,27 +567,6 @@ def test_a_negative_component_weight_is_rejected_even_if_the_sum_is_100() -> Non
 def test_new_positive_int_fields_reject_zero(field: str) -> None:
     with pytest.raises(ValidationError):
         make_config(**{field: 0})
-
-
-def test_google_confirm_kinds_must_be_known_categories() -> None:
-    with pytest.raises(ValidationError, match="CONFIRM_GOOGLE_KINDS"):
-        make_config(confirm_google_kinds="full_match,made_up")
-
-
-def test_confirm_google_kind_set_strips_whitespace() -> None:
-    cfg = make_config(confirm_google_kinds="full_match, page_match")
-    assert cfg.confirm_google_kind_set == frozenset({"full_match", "page_match"})
-
-
-@pytest.mark.parametrize("bad_value", [0.0, 1.5, -0.1])
-def test_confirm_hive_min_score_rejects_out_of_range_values(bad_value: float) -> None:
-    with pytest.raises(ValidationError):
-        make_config(confirm_hive_min_score=bad_value)
-
-
-def test_confirm_hive_min_score_accepts_values_up_to_one() -> None:
-    assert make_config(confirm_hive_min_score=0.5).confirm_hive_min_score == 0.5
-    assert make_config(confirm_hive_min_score=1.0).confirm_hive_min_score == 1.0
 
 
 @pytest.mark.parametrize("bad_value", [-1, 131])

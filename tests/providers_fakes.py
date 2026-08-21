@@ -266,18 +266,18 @@ class FakeSeedStore:
         providers_succeeded: Sequence[ProviderId],
         *,
         retier: CadenceInput | None,
-        confirm: Any = None,
+        enqueue_confirm: bool = False,
     ) -> CadenceUpdate | None:
         """Mirrors the real store: completion and re-tiering are ONE call, so a
         test cannot accidentally assert a cadence write that the production path
         could not have made independently of the completion.
 
-        ``confirm`` is accepted and recorded but not acted on — this fake has no
-        Postgres to enqueue against, and no runner test in this module asserts
-        on the confirm-queue enqueue (that lives in tests/test_search_store.py,
-        against the real store)."""
+        ``enqueue_confirm`` is accepted and recorded but not acted on — this
+        fake has no Postgres to enqueue against, and no runner test in this
+        module asserts on the confirm-queue enqueue (that lives in
+        tests/test_search_store.py, against the real store)."""
         self.completed.append((run_id, tuple(providers_succeeded)))
-        self.confirm_criteria.append(confirm)
+        self.confirm_criteria.append(enqueue_confirm)
         if retier is None:
             return None
         update = update_for(

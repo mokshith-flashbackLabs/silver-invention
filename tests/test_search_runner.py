@@ -69,7 +69,7 @@ async def test_a_subject_who_became_ineligible_is_refused_at_dispatch() -> None:
     claim = make_claim((HIVE, GOOGLE), store.seed, discovery_eligible=False)
 
     outcome = await execute_run(
-        claim, {HIVE: hive}, store, {}, control, CADENCE, confirm=None
+        claim, {HIVE: hive}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     assert hive.calls == []  # no provider client invoked
@@ -92,7 +92,7 @@ async def test_one_provider_timing_out_still_completes_with_the_others_results()
     claim = make_claim((HIVE, GOOGLE), store.seed)
 
     outcome = await execute_run(
-        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, confirm=None
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     assert outcome.providers_succeeded == (HIVE,)
@@ -112,7 +112,7 @@ async def test_adapter_raising_becomes_error_result_not_a_failed_run() -> None:
     claim = make_claim((HIVE, GOOGLE), store.seed)
 
     outcome = await execute_run(
-        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, confirm=None
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     assert outcome.providers_succeeded == (GOOGLE,)
@@ -128,7 +128,7 @@ async def test_attempted_provider_without_adapter_is_visible_error() -> None:
     claim = make_claim((HIVE, GOOGLE), store.seed)
 
     outcome = await execute_run(
-        claim, {GOOGLE: google}, store, {}, control, CADENCE, confirm=None
+        claim, {GOOGLE: google}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     assert outcome.providers_succeeded == (GOOGLE,)
@@ -147,7 +147,7 @@ async def test_disabled_provider_is_never_called_and_the_run_still_completes() -
     claim = make_claim((HIVE, GOOGLE), store.seed)
 
     outcome = await execute_run(
-        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, confirm=None
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     assert google.calls == []  # the whole point: no API call
@@ -174,7 +174,7 @@ async def test_budget_exceeded_makes_no_api_call() -> None:
     claim = make_claim((HIVE,), store.seed)
 
     outcome = await execute_run(
-        claim, {HIVE: hive}, store, {}, control, CADENCE, confirm=None
+        claim, {HIVE: hive}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     assert hive.calls == []
@@ -203,7 +203,7 @@ async def test_open_breaker_within_cooldown_is_never_called() -> None:
     )
     claim = make_claim((HIVE,), store.seed)
 
-    await execute_run(claim, {HIVE: hive}, store, {}, control, CADENCE, confirm=None)
+    await execute_run(claim, {HIVE: hive}, store, {}, control, CADENCE, enqueue_confirm=False)
 
     assert hive.calls == []
     assert control.half_open_claims == [HIVE]  # it did try to claim a probe
@@ -228,7 +228,7 @@ async def test_half_open_probe_is_dispatched_when_the_claim_is_won() -> None:
     claim = make_claim((HIVE,), store.seed)
 
     outcome = await execute_run(
-        claim, {HIVE: hive}, store, {}, control, CADENCE, confirm=None
+        claim, {HIVE: hive}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     assert hive.calls == [claim.seed_url]  # exactly one probe
@@ -247,7 +247,7 @@ async def test_a_non_empty_scan_promotes_to_priority_and_resets_the_counter() ->
 
     await execute_run(
         make_claim((HIVE,), seed), {HIVE: hive}, store, {}, control, CADENCE,
-        confirm=None,
+        enqueue_confirm=False,
     )
 
     [(seed_id, update)] = store.cadence_updates
@@ -264,7 +264,7 @@ async def test_an_empty_scan_increments_and_demotes_at_the_threshold() -> None:
 
     await execute_run(
         make_claim((HIVE,), seed), {HIVE: hive}, store, {}, control, CADENCE,
-        confirm=None,
+        enqueue_confirm=False,
     )
 
     [(_, update)] = store.cadence_updates
@@ -283,7 +283,7 @@ async def test_a_run_where_nothing_succeeded_does_not_change_the_tier() -> None:
 
     await execute_run(
         make_claim((HIVE,), seed), {HIVE: hive}, store, {}, control, CADENCE,
-        confirm=None,
+        enqueue_confirm=False,
     )
 
     assert store.cadence_updates == []
@@ -315,7 +315,7 @@ async def test_an_expired_seed_url_completes_the_run_and_leaves_cadence_alone() 
     )
 
     outcome = await execute_run(
-        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, confirm=None
+        claim, {HIVE: hive, GOOGLE: google}, store, {}, control, CADENCE, enqueue_confirm=False
     )
 
     # Both were genuinely attempted — this is a fetch failure, not a skip.
