@@ -307,6 +307,12 @@ must not delay live ingest.
 There is no timeout that auto-promotes a review-band candidate to a hit. If the queue backs up, the
 queue backs up.
 
+*Amended 2026-08-21 (subject-verified hits spec):* **the subject is a valid deciding human for hits
+on their own likeness** — `subject_decide` writes `confirm_decided_by = 'subject'`, satisfying 0021's
+`infringements_confirmed_needs_human` CHECK. A blurred face crop may be shown **to the subject — and
+only the subject — for the purpose of deciding**; staff surfaces never render hit imagery, anywhere.
+Machine triage still decides nothing (#47); what changed is who the deciding human is.
+
 **20. Backfill is priority-tiered and rate-limited per user.**
 A new enrolment triggers a search across the entire content index. Without a cap, ten signups
 saturate the cluster.
@@ -329,6 +335,8 @@ for my lawyer" action. There is no one-tap path from a report to the content.
 
 **23. Crops are blurred by default, revealed per-item on explicit tap, and never appear in a digest,
 an email, a push notification, or a list view.**
+*Scoped 2026-08-21:* "never in a list view" binds **un-blurred** crops; a blurred preview renders
+only on the hit's own card (the subject's decide surface), and reveal stays a per-item explicit tap.
 
 **24. Notifications are batched digests. Never real-time, never between 22:00 and 08:00 local.**
 "New match found" at 2am is a harm. Cadence here is a safety decision, not a growth lever.
@@ -573,6 +581,13 @@ it: no feedback signal a user gives — `not_me`, `uncertain`, `confirmed`, `aut
 The old system's −18-per-active-report divergence (§D above) is exactly the failure this rule exists to
 stop from recurring in the new score.
 
+*Amended 2026-08-21 (subject-verified hits spec):* **a subject decision is not feedback.** The
+subject's `confirmed` on `POST /v1/infringements/{id}/decision` moves Exposure exactly as an operator
+confirm would (`cause_kind='subject_decision'`) — the exposure is real, and the score reflects
+reality. The no-lowering rule binds the four feedback signals; the decision lane sits beside the
+operator's, not under this rule. A subject's `rejected` retires the hit from their counts and can
+only ever raise the score.
+
 Check: `tests/test_score_store.py::test_user_feedback_never_lowers_the_score`.
 
 **46. Threat penalties are bounded, decaying, relevance-scoped, and reversible on retraction.**
@@ -596,7 +611,10 @@ in front of a human late). `confirmed` requires a human by construction: migrati
 `infringements_confirmed_needs_human` CHECK enforces `confirm_state <> 'confirmed' OR
 (confirm_decided_by IS NOT NULL AND confirm_decided_at IS NOT NULL)` at the database — the same
 schema-over-discipline shape #19 already takes for the (unbuilt) match module's review band.
-`review/store.py::decide` is the only writer of a `confirmed` transition and always supplies
-`decided_by` from the authenticated operator baked into the request.
+`review/store.py::decide` and `review/store.py::subject_decide` are the only writers of a
+`confirmed` transition — the first supplies `decided_by` from the authenticated operator baked into
+the request; the second (added 2026-08-21) writes the constant `'subject'` for the hit's own
+`user_ref`, ownership enforced in the locking `WHERE`. Machine triage still cannot confirm or drop;
+the *subject* now can.
 
 Check: `tests/test_review.py::test_decide_never_trips_the_infringements_confirmed_needs_human_check`.

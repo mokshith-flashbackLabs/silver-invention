@@ -330,16 +330,20 @@ future misconfiguration.
 
 The full image exists only as a local variable inside the fetcher process and is never returned to the
 caller, even on error paths. Two jobs, one process: hand the confirm worker bytes, and render blurred
-crops live for the review screen — the same isolated path serves both callers, so there is exactly one
-place in the whole system that touches a hostile image byte.
+face crops live — the same isolated path serves both callers, so there is exactly one place in the
+whole system that touches a hostile image byte. *Callers, as of 2026-08-21:* the confirm worker
+(`/v1/fetch`) and the services API's subject preview endpoint (`/v1/crop`). The console's crop route
+was **removed** with the subject-verified-hits decision — staff never see hit imagery.
 
 ### 3.8 Confirm pipeline — **built** (2026-08-19)
 
 `src/imageshield/confirm/` — a worker (`python -m imageshield.confirm.worker`) consuming `confirm:hits`
 (the third application queue, via the outbox — same idiom as `identity:index` and `search:runs`;
 messages carry IDs only, the worker re-reads Postgres). Triggered after a search run's attestations
-land: each new/updated review-band infringement meeting a per-provider "most similar" threshold
-(`CONFIRM_HIVE_MIN_SCORE`, `CONFIRM_GOOGLE_KINDS`) is enqueued.
+land: **every** still-unconfirmed infringement the run touched is enqueued (spec 2026-08-21 §1 — the
+per-provider "most similar" criteria were removed, because the subject's crop-and-decide surface
+starves on any hit that never triages; the `rekognition_confirm` provider row's budget/breaker/kill
+switch is the spend control).
 
 Per hit, in order:
 
@@ -415,19 +419,28 @@ becomes `'confirmed'`, enforced at the database (migration 0021's `infringements
 CHECK, INVARIANTS #47) rather than trusted from the route. An `uncertain` decision returns the task to
 `pending` in place — no timeout, no auto-promotion (INVARIANTS #19).
 
+*As of 2026-08-21 (subject-verified hits), operator review is the exception path, not the gate.* The
+deciding human for a hit is normally its own subject (`subject_decide`, INVARIANTS #19/#47 as
+amended): the subject sees a blurred crop via `GET /v1/infringements/{id}/preview` and answers via
+`POST /v1/infringements/{id}/decision`. The operator queue survives for the CSAM quarantine lane and
+as the override/correction path — metadata-only in both cases, because staff never see hit imagery —
+and the console's `/decisions` page observes what subjects decided (explicit-severity confirmations
+flagged as takedown-campaign candidates).
+
 ### 3.11 Control room console — **built** (2026-08-19)
 
 Its own deployable (`src/imageshield/console/`, `uvicorn imageshield.console.app:create_app`, port
 8082), its own internal ingress, **never routed through the proxy** — the client-never-talks-to-us rule
 (§CLAUDE.md §3) is untouched, because this is an operator surface, not a user one. No database
-credentials; it talks to the services API and the fetcher over HTTP only, same boundary discipline as
-the fetcher itself.
+credentials; it talks to the services API over HTTP only — since 2026-08-21 it holds no fetcher
+client at all, because staff never see hit imagery.
 
-Server-rendered (Jinja2) over the existing admin API: threat events CRUD, the review queue, provider
-spend/breaker health (existing admin reads, §3.6b), and a per-user score journal inspector. Operator
-auth is HTTP Basic against `CONSOLE_OPERATORS` (`console/auth.py`); the authenticated operator name
-flows into every write (`decide`, `create_event`, `retract_event`) so `audit_log` names a person, not
-"whoever holds the token."
+Server-rendered (Jinja2) over the existing admin API: threat events CRUD, the review queue
+(metadata-only), the `/decisions` subject-decisions observer page, provider spend/breaker health
+(existing admin reads, §3.6b), and a per-user score journal inspector. Operator auth is HTTP Basic
+against `CONSOLE_OPERATORS` (`console/auth.py`); the authenticated operator name flows into every
+write (`decide`, `create_event`, `retract_event`) so `audit_log` names a person, not "whoever holds
+the token."
 
 ---
 

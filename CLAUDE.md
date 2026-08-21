@@ -62,10 +62,11 @@ Not used here, unlike Flashback: pgvector (not until we own embeddings), Valkey 
 concept), and any LLM SDK — see §10.
 
 **Pillow has three call sites, and no more.** `attribution/crop.py` (cropping a candidate face before
-`SearchFacesByImage`, so three faces in one photo are never searched as the same "largest face"),
-`confirm/phash.py` (the 64-bit dHash used for cross-URL duplicate detection), and `fetcher/app.py`
-(the blur applied to every face crop before it leaves the process). All three operate on bytes already
-in memory and never write a file — see INVARIANTS #9 and #12.
+`SearchFacesByImage`, so three faces in one photo are never searched as the same "largest face" — and,
+since 2026-08-21, `to_rekognition_jpeg`, the in-memory transcode that turns the web's WebP into the
+JPEG/PNG Rekognition accepts), `confirm/phash.py` (the 64-bit dHash used for cross-URL duplicate
+detection), and `fetcher/app.py` (the blur applied to every face crop before it leaves the process).
+All three operate on bytes already in memory and never write a file — see INVARIANTS #9 and #12.
 
 External dependencies we **call** but do not own: the proxy (REST), Rekognition, Hive, Postgres, SQS.
 
@@ -188,7 +189,10 @@ code being written **now**, carrying the same numbers.
    `reference_image_uri` and `source_object_uri` must pass. Match on suffix and type, never on the
    substring "image". See `INVARIANTS.md` #9.
 19. **Nothing reaches a user from the `review` band without a human decision.** There is no timeout
-   that auto-promotes. If the queue backs up, the queue backs up.
+   that auto-promotes. If the queue backs up, the queue backs up. *Since 2026-08-21 the subject is a
+   valid deciding human for their own hits* (`subject_decide`, `decided_by='subject'`): they see a
+   blurred face crop — the subject, and only the subject; staff never see hit imagery — and their
+   yes/not-me IS the confirm/reject. Operators remain the quarantine lane and the override path.
 21. **Scores are computed server-side, once.** The old system computes one client-side and one
    server-side that disagree by −18 per active report. For a product whose entire output is a score,
    that is disqualifying.
@@ -314,6 +318,14 @@ confuse them:**
 
 An earlier version of this doc called the cadence scheduler "the recheck loop", which is why the two
 are spelled out. They share no code.
+
+**2026-08-21 — subject-verified hits, sanctioned.** See
+`docs/superpowers/specs/2026-08-21-subject-verified-hits-design.md`: the subject decides their own
+hits (INVARIANTS #19/#45/#47 as amended), staff never see hit imagery, the confirm enqueue gate is
+open to every new hit, `attribution/crop.py` transcodes for Rekognition, and the subject surface is
+`GET /v1/infringements/{id}/preview` + `POST /v1/infringements/{id}/decision`. The console is
+metadata-only with a `/decisions` observer page. Like the 2026-08-19 push, this does not renumber the
+build order below.
 
 The build spec for what's in scope is `NEAR-TERM-BUILD.md`. It is the authoritative task list.
 

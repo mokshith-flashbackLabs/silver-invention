@@ -140,8 +140,9 @@ def require_fetcher_token(
 ) -> None:
     """Validate ``X-Fetcher-Token``. Purely a guard — handlers never see it.
     No bypass: unlike the main app's SERVICE_TOKEN_AUTH_DISABLED escape hatch,
-    this deployable has exactly one caller (the confirm worker) and no local
-    harness that needs one.
+    this deployable has exactly two callers (the confirm worker on /v1/fetch,
+    the services API's subject preview endpoint on /v1/crop — spec 2026-08-21)
+    and no local harness that needs one.
     """
     if x_fetcher_token is None or not _constant_time_equal(x_fetcher_token, cfg.fetcher_token):
         raise FetcherError(401, "unauthorised", "invalid fetcher token")

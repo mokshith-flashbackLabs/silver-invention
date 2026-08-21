@@ -41,10 +41,12 @@ connection roles (`app_backend` / `imageshield_proxy` members) already inherit
 >    users the event actually matched; render as context ("a leak was reported at a site where
 >    your content appears"), never as a global news ticker.
 > 5. **Hits list update** — `svc.v_person_hits` gained three columns: `confirm_state`,
->    `severity`, `decided_at`. Only `confirm_state = 'confirmed'` may be presented to the user
->    as a finding (severity drives urgency copy: `ncii_suspected` ≫ `benign_copy`); everything
->    else renders, at most, as "being checked". Quarantined/duplicate rows never appear in the
->    view at all — build nothing for them.
+>    `severity`, `decided_at`. ~~Only `confirm_state = 'confirmed'` may be presented to the user
+>    as a finding; everything else renders, at most, as "being checked".~~ **SUPERSEDED
+>    2026-08-21** by the subject-verified-hits presentation rule — `machine_triaged` hits now
+>    carry the ask-card (blurred preview + "is this your photo?"); see PROXY_INTEGRATION.md's
+>    "Presentation rule, as of 2026-08-21" for the full state table and the two new endpoints.
+>    Quarantined/duplicate rows never appear in the view at all — build nothing for them.
 >
 > ### Copy rules (safety, non-negotiable)
 > - The score is "protection" / "likeness health" in *monitored sources* — never "you're safe",
