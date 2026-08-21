@@ -1,4 +1,4 @@
-"""Crop a photo to one face's bounding box.
+"""Crop a photo to one face's bounding box, and normalise bytes for Rekognition.
 
 The only place Pillow is used, and the only reason it is a dependency.
 
@@ -104,3 +104,25 @@ def _pixel_box(
 
 def _clamp(value: float) -> float:
     return min(1.0, max(0.0, value))
+
+
+# Rekognition accepts JPEG and PNG bytes only. Everything else the web serves
+# (WebP above all — the 2026-08-20 weibook hit failed DetectFaces five times on
+# one) is re-encoded in memory. convert("RGB") never resizes, so normalised
+# bounding boxes computed against the re-encode remain valid for the original.
+_REKOGNITION_FORMATS = frozenset({"JPEG", "PNG"})
+
+
+def to_rekognition_jpeg(image: bytes) -> bytes:
+    """Return bytes Rekognition accepts: the input untouched if already
+    JPEG/PNG, an in-memory JPEG re-encode otherwise."""
+    try:
+        with Image.open(io.BytesIO(image)) as opened:
+            if opened.format in _REKOGNITION_FORMATS:
+                return image
+            converted = opened.convert("RGB")
+            buffer = io.BytesIO()
+            converted.save(buffer, format="JPEG", quality=_JPEG_QUALITY)
+            return buffer.getvalue()
+    except (UnidentifiedImageError, OSError, DecompressionBombError) as exc:
+        raise UndecodableImage(str(exc)) from exc
