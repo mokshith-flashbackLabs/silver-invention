@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "console",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:d73952a",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:5d546e5",
       "essential": true,
       "memory": 160,
       "command": [
