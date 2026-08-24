@@ -1,0 +1,53 @@
+-- 0025 up: audit_log becomes readable to the audit role.
+--
+-- WHY THIS EXISTS. The 2026-08-21 subject-verified-hits push added two reads
+-- against audit_log and no grant to match them, so both failed with
+-- `permission denied for table audit_log` under every application role:
+--
+--   * the preview render ceiling (INVARIANTS #32) -- the count of
+--     'preview.rendered' rows for one user_ref in a rolling 24h window
+--     (preview/store.py), which is the query 0024's partial index was added to
+--     serve;
+--   * the console's subject-decisions observer feed (spec 2026-08-21 6) --
+--     'review.subject_decided' rows, most recent first (review/store.py).
+--
+-- The first one took out the whole subject preview surface in dev from the day
+-- it deployed: renders_last_24h() is the third statement in the endpoint, so
+-- every GET /v1/infringements/{id}/preview answered 500 before it reached the
+-- fetcher. The second was latent only because nothing had called it yet.
+--
+-- WHY CI DID NOT CATCH IT. The suite connects as the database owner, and the
+-- owner reads everything -- so the ceiling query passed in every test while
+-- being impossible in dev. That is the same shape as 0016/0017, where the svc
+-- contract reached nobody for five days because the proxy also connected as
+-- the owner. The regression test added alongside this migration runs the two
+-- real queries under SET ROLE audit_w for exactly that reason.
+--
+-- WHAT THIS DOES NOT WEAKEN. Append-only survives untouched. SELECT is not
+-- UPDATE and not DELETE, and 0015's grant of exactly INSERT is unchanged. "An
+-- audit log an application can edit is not an audit log" is a claim about
+-- writes; tests/test_migrations.py continues to assert that UPDATE and DELETE
+-- raise InsufficientPrivilege under audit_w, and this migration is covered by
+-- a test that re-asserts it after the read grant lands.
+--
+-- WHAT IT DOES WIDEN, DELIBERATELY. This is a whole-table read. audit_w -- and
+-- therefore app_services, a member of it via 0018 -- can now read every audit
+-- row for every user: liveness attempts, enrolments, consent references, admin
+-- actions, not merely the two actions the application queries. That is broader
+-- than those two queries need, and it is a considered choice rather than an
+-- oversight: it was taken over the narrower alternative (one view per action,
+-- SELECT granted on the views and no base-table grant -- the same view-owner
+-- mechanism 0016 uses for the svc contract) on the owner's call, 2026-08-24,
+-- for one line and no application change.
+--
+-- If that read surface ever needs narrowing, the views are the way back: add
+-- them, point preview/store.py and review/store.py at them, and REVOKE this
+-- grant. Nothing else depends on the base-table read.
+--
+-- WHY audit_w AND NOT A NEW ROLE. audit_w already reaches every deployable that
+-- needs the read, through 0018's membership chain, so a new read role would
+-- need its own conditional membership block and would leave two roles to reason
+-- about where one does. The cost is that the name now understates it: audit_w
+-- is the audit role, not merely the audit writer.
+
+GRANT SELECT ON audit_log TO audit_w;

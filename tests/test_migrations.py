@@ -16,10 +16,18 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 
+from imageshield.preview.store import (
+    _COUNT_RENDERS_SQL,
+    _RECORD_RENDER_SQL,
+    PREVIEW_RENDERED_ACTION,
+)
+from imageshield.review.store import _SUBJECT_DECISIONS_SQL
 from tests.db import run_migrate  # re-exported
 from tests.db import second_throwaway_db as second_throwaway_db
 
@@ -1566,6 +1574,65 @@ def test_0022_score_events_is_insert_only_for_score_rw(throwaway_db: str) -> Non
             conn.execute("DELETE FROM score_events")
         conn.execute("RESET ROLE")
 
+
+
+def test_0025_audit_w_can_read_audit_log_but_still_cannot_edit_it(throwaway_db: str) -> None:
+    """The two reads the 2026-08-21 push added, exercised under the application
+    role rather than the owner.
+
+    Both queries passed in CI while being impossible in dev, because the suite
+    connects as the database owner and the owner reads everything. So the part
+    of this test that carries the weight is ``SET ROLE``, not the SQL: without
+    it, it would go green against a missing grant exactly as the rest of the
+    suite did. The queries are imported from the modules that ship them — a
+    copy retyped here would drift from the code this test exists to protect.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    user_ref = uuid4()
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute("SET ROLE audit_w")
+
+        # The endpoint's own order: audit the render (INVARIANTS #31), then
+        # count renders in the window (#32). INSERT was always granted; the
+        # count is what 0025 adds.
+        conn.execute(
+            _RECORD_RENDER_SQL,
+            {
+                "action": PREVIEW_RENDERED_ACTION,
+                "user_ref": user_ref,
+                "infringement_id": uuid4(),
+                "metadata": Jsonb({"reveal": False}),
+            },
+        )
+        row = conn.execute(_COUNT_RENDERS_SQL, {"user_ref": user_ref}).fetchone()
+        assert row is not None and row[0] == 1
+
+        # The console's observer feed, same grant, different action filter.
+        conn.execute(_SUBJECT_DECISIONS_SQL, {"limit": 10})
+
+        # The read must not have brought write access with it. 0015's
+        # append-only property is what makes this an audit log at all, and
+        # 0025's whole claim is that SELECT does not touch it.
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE audit_log SET action = 'changed'")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM audit_log")
+        conn.execute("RESET ROLE")
+
+
+def test_0025_down_returns_audit_log_to_write_only(throwaway_db: str) -> None:
+    """Reversibility, and the failure mode this migration fixes: with 0025
+    reverted the ceiling query is a permission error again, which is what dev
+    was doing on every preview call."""
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    assert run_migrate(throwaway_db, "down", "--steps", "1").returncode == 0
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute("SET ROLE audit_w")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(_COUNT_RENDERS_SQL, {"user_ref": uuid4()})
+        conn.execute("RESET ROLE")
 
 # ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────
 #

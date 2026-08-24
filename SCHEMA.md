@@ -1203,6 +1203,18 @@ There is no `sessions` table here — the proxy owns sessions entirely.
 `audit_log` is append-only. No `UPDATE` or `DELETE` grant on it for the application role. Every crop
 render gets a row — it is the only way to detect a compromised account being used as a search console.
 
+It is readable, though, and that is newer than the append-only rule: migration `0025` grants `SELECT`
+to `audit_w` because two features read their own audit rows back — the preview render ceiling
+(INVARIANTS #32, counting `preview.rendered` per `user_ref` over 24h, against `0024`'s partial index)
+and the console's subject-decisions feed (`review.subject_decided`). Both shipped in the 2026-08-21
+push against a table no role could read, so both failed with `permission denied` in dev until `0025`.
+Append-only is untouched by that grant — `SELECT` is not `UPDATE` — but note the read is
+**whole-table**: `audit_w`, and `app_services` through its `0018` membership, can read every audit row
+for every user, not only the two actions the code queries. The narrower alternative (a view per
+action, `SELECT` on the views only, the mechanism `0016` uses for `svc`) was considered and declined
+for one line and no application change; if that surface ever needs tightening, those views are the
+way back.
+
 ---
 
 ## Cross-service contracts enforced in application code
