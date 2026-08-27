@@ -4,7 +4,7 @@ The one writer of ``articles``. Every write is one transaction: the row
 change plus one ``audit_log`` row naming the operator, the same shape as
 ``threats/store.py``. Reads are plain projections.
 
-Not identity data: nothing here takes or returns a ``user_ref``. Pictures are
+Not identity data: nothing here takes or returns a person identifier. Pictures are
 pasted URLs (INVARIANTS #9 -- no bytes, anywhere); the proxy reads published
 rows through ``svc.v_articles`` (migration 0026), never this table.
 """
