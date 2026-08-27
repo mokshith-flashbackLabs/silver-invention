@@ -419,6 +419,12 @@ class ProviderReasonRequest(ServiceModel):
     """
 
     reason: str = Field(min_length=3, max_length=500)
+    # Who asked, when the caller can say. The console sends its Basic-auth
+    # operator name (console/auth.py); a curl caller omits it and the audit
+    # row records the token-holder fallback in routes/admin_providers.py.
+    # Optional so every existing ``{"reason": ...}`` caller keeps working —
+    # ServiceModel is extra='forbid', so the field must be declared to be sent.
+    operator: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class ProviderDisableRequest(ProviderReasonRequest):
@@ -484,9 +490,7 @@ class ThreatEventCreateRequest(ServiceModel):
         # the obviously-wrong request fails as a 422 here rather than as an
         # opaque database constraint violation.
         if not self.is_global and not self.domains:
-            raise ValueError(
-                "domains must name at least one domain unless is_global is true"
-            )
+            raise ValueError("domains must name at least one domain unless is_global is true")
         return self
 
 

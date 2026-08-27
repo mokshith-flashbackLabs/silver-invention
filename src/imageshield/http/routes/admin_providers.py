@@ -56,9 +56,10 @@ router = APIRouter(
     dependencies=[Depends(require_service_token), Depends(require_admin_service_token)],
 )
 
-# The audit trail records who asked. There is no per-user auth on this service
-# (CLAUDE.md §3.1), so the honest answer is "whoever holds the admin token" —
-# recorded as a constant rather than as a name we would be inventing.
+# The audit trail records who asked. The console names its operator in the
+# body (ProviderReasonRequest.operator); a caller that names nobody — curl
+# during an incident — is recorded as the token it held, rather than as a
+# name we would be inventing.
 _ACTOR = "admin_service_token"
 
 
@@ -66,9 +67,7 @@ def _provider_id(raw: str) -> ProviderId:
     try:
         return parse_provider_id(raw)
     except ValueError as exc:
-        raise ServiceError(
-            422, "invalid_provider_id", str(exc), retryable=False
-        ) from None
+        raise ServiceError(422, "invalid_provider_id", str(exc), retryable=False) from None
 
 
 def _not_found(provider_id: ProviderId) -> ServiceError:
@@ -85,7 +84,7 @@ async def disable_provider(
 ) -> ProviderAdminResponse:
     """The kill switch. No dispatch, no API call, no cost, no deploy."""
     pid = _provider_id(provider_id)
-    if not await store.set_enabled(pid, False, actor=_ACTOR, reason=body.reason):
+    if not await store.set_enabled(pid, False, actor=body.operator or _ACTOR, reason=body.reason):
         raise _not_found(pid)
     return ProviderAdminResponse(provider_id=pid, enabled=False)
 
@@ -97,7 +96,7 @@ async def enable_provider(
     store: ProviderControlStore = Depends(get_provider_control_store),
 ) -> ProviderAdminResponse:
     pid = _provider_id(provider_id)
-    if not await store.set_enabled(pid, True, actor=_ACTOR, reason=body.reason):
+    if not await store.set_enabled(pid, True, actor=body.operator or _ACTOR, reason=body.reason):
         raise _not_found(pid)
     return ProviderAdminResponse(provider_id=pid, enabled=True)
 
@@ -116,7 +115,7 @@ async def reset_breaker(
     operator who wanted the first silently makes the second.
     """
     pid = _provider_id(provider_id)
-    if not await store.reset_breaker(pid, actor=_ACTOR, reason=body.reason):
+    if not await store.reset_breaker(pid, actor=body.operator or _ACTOR, reason=body.reason):
         raise _not_found(pid)
     return ProviderAdminResponse(provider_id=pid, breaker_state="closed")
 
@@ -158,14 +157,10 @@ async def provider_health(
                 call_count=stats.call_count,
                 cost_usd=str(stats.cost_usd),
                 daily_budget_usd=(
-                    str(stats.daily_budget_usd)
-                    if stats.daily_budget_usd is not None
-                    else None
+                    str(stats.daily_budget_usd) if stats.daily_budget_usd is not None else None
                 ),
                 monthly_budget_usd=(
-                    str(stats.monthly_budget_usd)
-                    if stats.monthly_budget_usd is not None
-                    else None
+                    str(stats.monthly_budget_usd) if stats.monthly_budget_usd is not None else None
                 ),
                 month_to_date_cost_usd=str(stats.month_to_date_cost_usd),
                 budget_headroom_usd=(
@@ -178,9 +173,7 @@ async def provider_health(
                 successful_calls_24h=stats.successful_calls_24h,
                 latency_p50_ms=stats.latency_p50_ms,
                 latency_p99_ms=stats.latency_p99_ms,
-                alarms=[
-                    {"kind": a.kind, "detail": a.detail} for a in provider_alarms
-                ],
+                alarms=[{"kind": a.kind, "detail": a.detail} for a in provider_alarms],
             )
         )
     if firing:
