@@ -98,8 +98,8 @@ We hold **no AWS S3 credentials**. If they aren't in the environment, the mistak
   and the hash *it* computed; we never render, fetch or hash the document, and we cannot determine
   who is required to sign.
 - All S3 buckets, all credentials, all object lifecycle.
-- All user-facing reads for the report UI — **through the four `svc` views and nothing else**
-  (migration 0016). `imageshield_proxy_ro` holds `USAGE` on `svc` and `SELECT` on
+- All user-facing reads for the report UI — **through the `svc` contract views and nothing else**
+  (0016, 0023, 0026). `imageshield_proxy_ro` holds `USAGE` on `svc` and `SELECT` on
   `v_person_enrolment_state`, `v_person_report_summary`, `v_person_hits`,
   `v_person_liveness_attempts` (0016), the four 0023 score/threat views, and `v_articles` (0026).
   No grant on any base table, no `USAGE` on `public`; a view's base-table

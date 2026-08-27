@@ -16,7 +16,7 @@ caught.
 
 **Three things are checked, not one.** The relations exist *as views*, their
 columns are present and correctly typed, and `imageshield_proxy_ro` still holds
-SELECT on all eight. The grant is half the contract and it is the half whose
+SELECT on all nine. The grant is half the contract and it is the half whose
 failure lands entirely on the other repo: revoke it and the views are still
 present, still correctly shaped, and unreadable by the only role that reads
 them. `relkind` matters for the same reason a name check is not enough —
@@ -276,7 +276,7 @@ async def check_svc_contract(
         problems.append(
             f"missing_grant_role: {proxy_role} does not exist — migration 0016"
             " creates it and 0017 grants the proxy's login roles membership;"
-            " without it the four views below are readable by nobody"
+            " without it the nine views below are readable by nobody"
         )
 
     for view, expected in EXPECTED_VIEWS.items():

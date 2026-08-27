@@ -163,6 +163,38 @@ def test_the_proxy_role_reads_the_view_and_not_the_table(migrated_db: str) -> No
         conn.execute("RESET ROLE")
 
 
+def test_content_rw_can_write_articles_but_never_delete_them(migrated_db: str) -> None:
+    """content_rw's grant is SELECT/INSERT/UPDATE only -- archive is the soft
+    delete (0026's up.sql comment). Same shape as
+    test_0022_score_events_is_insert_only_for_score_rw: a role's real
+    privileges only show up under SET ROLE, never under the owner connection
+    every other assertion in this file uses."""
+    article_id = uuid4()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(
+            "SELECT has_schema_privilege('content_rw', 'public', 'USAGE')"
+        ).fetchone() == (True,)
+
+        conn.execute("SET ROLE content_rw")
+        conn.execute(
+            "INSERT INTO articles (article_id, title, created_by, updated_by)"
+            " VALUES (%s, 'Draft one', 'alice', 'alice')",
+            (article_id,),
+        )
+        conn.execute(
+            "UPDATE articles SET title = 'Updated title', updated_by = 'bob'"
+            " WHERE article_id = %s",
+            (article_id,),
+        )
+        row = conn.execute(
+            "SELECT title FROM articles WHERE article_id = %s", (article_id,)
+        ).fetchone()
+        assert row == ("Updated title",)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM articles WHERE article_id = %s", (article_id,))
+        conn.execute("RESET ROLE")
+
+
 def test_the_database_refuses_a_published_row_with_no_date_and_a_dated_draft(
     migrated_db: str,
 ) -> None:

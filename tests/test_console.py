@@ -660,6 +660,63 @@ def test_articles_create_parses_the_line_encoded_pictures_and_sources() -> None:
     assert created["sources"] == [{"name": "Example News", "url": "https://news.example/story"}]
 
 
+def test_article_update_parses_the_line_encoded_pictures_and_sources() -> None:
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+    client.post(
+        "/articles", data={"title": "T", "csrf_token": _csrf("alice")}, auth=ALICE,
+        follow_redirects=False,
+    )
+    article_id = next(iter(fake.articles))
+
+    response = client.post(
+        f"/articles/{article_id}",
+        data={
+            "title": "Updated title",
+            "summary": "new blurb",
+            "body": "new text",
+            "images": "https://cdn.example/c.jpg | cover\n\nhttps://cdn.example/d.jpg",
+            "sources": "Example News | https://news.example/story",
+            "csrf_token": _csrf("alice"),
+        },
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/articles/{article_id}"
+    assert fake.article_calls[-1] == {
+        "action": "update",
+        "article_id": article_id,
+        "title": "Updated title",
+        "summary": "new blurb",
+        "body": "new text",
+        "images": [
+            {"url": "https://cdn.example/c.jpg", "alt": "cover"},
+            {"url": "https://cdn.example/d.jpg", "alt": ""},
+        ],
+        "sources": [{"name": "Example News", "url": "https://news.example/story"}],
+        "operator": "alice",
+    }
+
+
+def test_article_update_without_csrf_is_403_and_reaches_nothing() -> None:
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+    client.post(
+        "/articles", data={"title": "T", "csrf_token": _csrf("alice")}, auth=ALICE,
+        follow_redirects=False,
+    )
+    article_id = next(iter(fake.articles))
+
+    response = client.post(
+        f"/articles/{article_id}", data={"title": "New title"}, auth=ALICE,
+    )
+
+    assert response.status_code == 403
+    assert [c["action"] for c in fake.article_calls] == ["create"]
+
+
 def test_article_edit_page_links_pictures_and_never_renders_an_img() -> None:
     fake = FakeServicesClient()
     client = _client(services=fake)

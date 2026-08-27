@@ -1086,6 +1086,12 @@ granted to `app_services`. `svc.v_articles` is the **ninth contract view**, gran
 one `audit_log` row (`article.created|updated|published|archived`) naming the operator. A re-publish
 keeps the original `published_at`.
 
+Deploy order: `svc.v_articles` is a REQUIRED entry in `EXPECTED_VIEWS`
+(`src/imageshield/http/svc_contract.py`), not an optional one like `v_person_liveness_attempts` —
+running `0026 down` 503s this service's own `/readyz` in addition to degrading the proxy's
+(optional, on their side) articles reader to an empty feed. Reverting 0026 on a live database is a
+coordinated deploy, never a solo rollback.
+
 ---
 
 ## 3. Adjudication service

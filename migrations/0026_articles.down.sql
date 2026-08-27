@@ -1,6 +1,9 @@
 -- Reverses 0026. Dropping svc.v_articles breaks the proxy's articles reader
--- (optional on their side -- the feed degrades to empty with a warn log) and
--- nothing here. Coordinated deploy, not a solo rollback.
+-- (optional on their side -- the feed degrades to empty with a warn log) AND
+-- this service's own /readyz: v_articles is a REQUIRED entry in
+-- EXPECTED_VIEWS (src/imageshield/http/svc_contract.py), so a database
+-- reverted past 0026 answers /readyz 503 with a missing_view problem until
+-- 0026 is reapplied. Coordinated deploy, not a solo rollback.
 
 REVOKE SELECT ON svc.v_articles FROM imageshield_proxy_ro;
 DROP VIEW IF EXISTS svc.v_articles;
