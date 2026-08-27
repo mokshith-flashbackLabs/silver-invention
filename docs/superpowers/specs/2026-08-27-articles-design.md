@@ -30,7 +30,7 @@ score effect, no LLM.
 | Audience | Every user. No targeting menu, no per-user state. |
 | Read path to the proxy | A ninth `svc` view, `svc.v_articles`, read through `src/services/contract/` like every other cross-boundary read. Not an HTTP relay. |
 | Sequencing | Build the APIs first, then run the suites and write the tests, then close gaps. Owner's explicit ordering for this cycle. |
-| Branching | `feat/articles` off `main` in both repos. Forward-merge to the proxy's `release/sep-1` only on the owner's say-so. |
+| Branching | `feat/articles` off `main` in both repos. The proxy half ships on BOTH lines (owner, 2026-08-27): merge to `main`, then forward-merge `main` → `release/sep-1` — never cherry-pick. Services has one line. |
 
 ## 3. Hard rules
 

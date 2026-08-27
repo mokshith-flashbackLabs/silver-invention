@@ -476,12 +476,29 @@ $$;
     },
 ```
 
-- [ ] **Step 4: Verify** — services dir with Docker up: `python scripts/migrate.py up` against `TEST_DATABASE_URL`-style scratch is exercised by the suite; run `REQUIRE_DB=1 pytest tests/test_migrations.py tests/test_schema_lint.py -q` → green (schema lint must accept `images`/`sources` jsonb). `pytest tests/test_readyz.py tests/test_svc_views.py -q` will FAIL on the "eight views" assertions — expected; Task 11 updates them. `ruff check .`; `mypy`.
+- [ ] **Step 4: Keep the contract tests green in the same commit** — in `tests/test_readyz.py` rename `test_the_eight_views_are_all_declared` to `test_the_nine_views_are_all_declared` and add `"v_articles",` to its set. In `tests/test_svc_views.py` add `"v_articles",` to the `VIEWS` tuple; add to `FROZEN_CONTRACT_COLUMNS` (hand-maintained on purpose — read its comment before editing):
 
-- [ ] **Step 5: Commit**
+```python
+    "v_articles": {
+        "article_id",
+        "title",
+        "summary",
+        "body",
+        "images",
+        "sources",
+        "published_at",
+        "updated_at",
+    },
+```
+
+and add `"public.articles",` to the forbidden-table tuple in `test_the_proxy_role_reads_the_views_and_nothing_else`.
+
+- [ ] **Step 5: Verify** — services dir with Docker up: `REQUIRE_DB=1 pytest tests/test_migrations.py tests/test_schema_lint.py tests/test_readyz.py tests/test_svc_views.py -q` → green (schema lint must accept `images`/`sources` jsonb; the readiness gate must see the grant). Without Docker those tests skip — say so in the report rather than reporting green. `ruff check .`; `mypy`.
+
+- [ ] **Step 6: Commit**
 
 ```
-git add migrations/0026_articles.up.sql migrations/0026_articles.down.sql src/imageshield/http/svc_contract.py
+git add migrations/0026_articles.up.sql migrations/0026_articles.down.sql src/imageshield/http/svc_contract.py tests/test_readyz.py tests/test_svc_views.py
 git commit -m "feat(schema): 0026 articles table, content_rw role, svc.v_articles as the ninth contract view"
 ```
 
@@ -1910,7 +1927,8 @@ def test_dashboard_leads_with_the_alarms_and_renders_a_null_rate_as_a_dash() -> 
     body = response.content.decode()
     assert "no_successful_calls_24h" in body
     assert "—" in body
-    assert "0%" not in body
+    # Not a bare "0%": base.html's CSS carries `width: 100%`.
+    assert "0%</td>" not in body
     assert "24h window" in body
 
 
@@ -2612,30 +2630,15 @@ def test_0026_creates_articles_and_the_view_and_down_removes_them(throwaway_db: 
     assert run_migrate(throwaway_db, "up").returncode == 0
 ```
 
-- [ ] **Step 3: Readiness + contract tests** — in `tests/test_readyz.py` rename `test_the_eight_views_are_all_declared` to `test_the_nine_views_are_all_declared` and add `"v_articles",` to the set. In `tests/test_svc_views.py` add `"v_articles",` to the `VIEWS` tuple; add to `FROZEN_CONTRACT_COLUMNS` (hand-maintained on purpose — read its comment):
-
-```python
-    "v_articles": {
-        "article_id",
-        "title",
-        "summary",
-        "body",
-        "images",
-        "sources",
-        "published_at",
-        "updated_at",
-    },
-```
-
-and add `"public.articles",` to the forbidden-table tuple in `test_the_proxy_role_reads_the_views_and_nothing_else`.
+- [ ] **Step 3: Readiness + contract tests** — already updated in Task 3 (`tests/test_readyz.py` names `v_articles`; `FROZEN_CONTRACT_COLUMNS` carries it). Confirm both are present; nothing to change here.
 
 - [ ] **Step 4: Run** — `REQUIRE_DB=1 pytest tests/test_articles_store.py tests/test_migrations.py tests/test_readyz.py tests/test_svc_views.py tests/test_schema_lint.py -q` → all pass. Then the whole suite: `REQUIRE_DB=1 pytest -q` → green.
 
 - [ ] **Step 5: Commit**
 
 ```
-git add tests/test_articles_store.py tests/test_migrations.py tests/test_readyz.py tests/test_svc_views.py
-git commit -m "test(articles): store transactions, the published-only view, proxy grant, 0026 round-trip; nine-view contract"
+git add tests/test_articles_store.py tests/test_migrations.py
+git commit -m "test(articles): store transactions, the published-only view, proxy grant, 0026 round-trip"
 ```
 
 ---
@@ -2926,4 +2929,4 @@ git commit -m "docs: svc.v_articles — ninth contract view, optional for readin
 - [ ] **Step 2: Proxy** — `npm run typecheck`; `npm run lint`; `npm run test:unit`; `npm run test:integration`. Same rule.
 - [ ] **Step 3: Boundary re-check** — services: `grep -rn "user_ref" src/imageshield/articles src/imageshield/http/routes/admin_articles.py` → no output; `grep -rn "<img" src/imageshield/console/templates` → no output. Proxy: `grep -rn "svc\.v_" src --include=*.ts | grep -v "src/services/contract/"` → no output.
 - [ ] **Step 4: Manual smoke (services, local compose)** — run the API and console locally per `docs/DEPLOY-DEV.md`/`devtools/`; in the console create an article with one `https://` picture and one source, publish it, confirm `SELECT * FROM svc.v_articles` shows it, archive it, confirm it disappears; on the dashboard disable and re-enable the `stub` provider and confirm two `audit_log` rows carry your operator name.
-- [ ] **Step 5: Finish** — invoke `superpowers:finishing-a-development-branch` for each repo separately. Do NOT merge either branch yourself; the owner decides merge to `main` and whether the proxy half forward-merges to `release/sep-1`. Note for the deploy: migration 0026 must be applied on dev before the console's Articles page can create anything, and no ECS task def gains an env key.
+- [ ] **Step 5: Finish** — invoke `superpowers:finishing-a-development-branch` for each repo separately. Do NOT merge either branch yourself; present the options. The owner has already decided the targets (2026-08-27): services → `main`; proxy → `main`, then forward-merge `main` → `release/sep-1` (never cherry-pick). Expect one textual conflict on that forward-merge: `tests/repo-lint/contract-confinement.test.ts` lists five views on `release/sep-1` (no threat context) — resolve to that line's list plus `svc.v_articles`, and `docs/CLAUDE.md` §6's table on that line lacks the threat-context row. Note for the deploy: migration 0026 must be applied on dev before the console's Articles page can create anything, and no ECS task def gains an env key.
