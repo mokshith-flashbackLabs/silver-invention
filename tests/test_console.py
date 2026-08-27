@@ -49,16 +49,53 @@ class FakeServicesClient:
         *,
         open_hits: list[dict[str, Any]] | None = None,
         decisions: list[dict[str, Any]] | None = None,
+        providers: list[dict[str, Any]] | None = None,
     ) -> None:
         self._task = task
         self._open_hits = open_hits if open_hits is not None else []
         self._decisions = decisions if decisions is not None else []
+        self._providers = providers if providers is not None else []
         self.decide_calls: list[dict[str, Any]] = []
         self.create_event_calls: list[dict[str, Any]] = []
         self.retract_calls: list[dict[str, Any]] = []
+        self.provider_writes: list[dict[str, Any]] = []
 
     async def provider_health(self) -> dict[str, Any]:
-        return {"providers": []}
+        return {
+            "as_of": "2026-08-27T10:00:00+00:00",
+            "window_hours": 24,
+            "providers": self._providers,
+        }
+
+    async def disable_provider(self, provider_id: str, *, reason: str, operator: str) -> None:
+        self.provider_writes.append(
+            {
+                "action": "disable",
+                "provider_id": provider_id,
+                "reason": reason,
+                "operator": operator,
+            }
+        )
+
+    async def enable_provider(self, provider_id: str, *, reason: str, operator: str) -> None:
+        self.provider_writes.append(
+            {
+                "action": "enable",
+                "provider_id": provider_id,
+                "reason": reason,
+                "operator": operator,
+            }
+        )
+
+    async def reset_breaker(self, provider_id: str, *, reason: str, operator: str) -> None:
+        self.provider_writes.append(
+            {
+                "action": "breaker/reset",
+                "provider_id": provider_id,
+                "reason": reason,
+                "operator": operator,
+            }
+        )
 
     async def review_next(self) -> dict[str, Any] | None:
         return self._task
@@ -447,3 +484,102 @@ def test_operator_name_but_not_token_appears_in_the_page() -> None:
     assert response.status_code == 200
     assert "alice" in response.text
     assert "token-a" not in response.text
+
+
+# ── provider ops on the dashboard ─────────────────────────────────────────
+
+_QUIET_PROVIDER: dict[str, Any] = {
+    "provider_id": "hive",
+    "enabled": True,
+    "breaker_state": "closed",
+    "breaker_reason": None,
+    "call_count": 0,
+    "cost_usd": "0.00",
+    "daily_budget_usd": "10.00",
+    "monthly_budget_usd": None,
+    "month_to_date_cost_usd": "14.00",
+    "budget_headroom_usd": "10.00",
+    # None, not 0.0: no calls in the window is a different fact from a 0% rate.
+    "success_rate": None,
+    "window_call_count": 0,
+    "successful_calls_24h": 0,
+    "latency_p50_ms": None,
+    "latency_p99_ms": None,
+    "alarms": [{"kind": "no_successful_calls_24h", "detail": "0 successful calls in 24h"}],
+}
+
+
+def test_dashboard_leads_with_the_alarms_and_renders_a_null_rate_as_a_dash() -> None:
+    response = _client(services=FakeServicesClient(providers=[_QUIET_PROVIDER])).get(
+        "/", auth=ALICE
+    )
+
+    assert response.status_code == 200
+    body = response.content.decode()
+    assert "no_successful_calls_24h" in body
+    assert "—" in body
+    # Not a bare "0%": base.html's CSS carries `width: 100%`.
+    assert "0%</td>" not in body
+    assert "24h window" in body
+
+
+def test_dashboard_offers_reset_only_while_the_breaker_is_not_closed() -> None:
+    closed = _client(services=FakeServicesClient(providers=[_QUIET_PROVIDER])).get(
+        "/", auth=ALICE
+    )
+    assert b"/providers/hive/breaker-reset" not in closed.content
+    assert b"/providers/hive/disable" in closed.content
+
+    opened = dict(_QUIET_PROVIDER, breaker_state="open", breaker_reason="timeout")
+    response = _client(services=FakeServicesClient(providers=[opened])).get("/", auth=ALICE)
+    assert b"/providers/hive/breaker-reset" in response.content
+
+
+def test_provider_disable_posts_through_with_the_operator_and_redirects_home() -> None:
+    fake = FakeServicesClient()
+    response = _client(services=fake).post(
+        "/providers/hive/disable",
+        data={"reason": "returning garbage", "csrf_token": _csrf("alice")},
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert fake.provider_writes == [
+        {"action": "disable", "provider_id": "hive", "reason": "returning garbage",
+         "operator": "alice"}
+    ]
+
+
+def test_provider_enable_and_breaker_reset_post_through() -> None:
+    fake = FakeServicesClient()
+    client = _client(services=fake)
+    client.post(
+        "/providers/hive/enable",
+        data={"reason": "vendor confirmed fixed", "csrf_token": _csrf("bob")},
+        auth=BOB,
+        follow_redirects=False,
+    )
+    client.post(
+        "/providers/hive/breaker-reset",
+        data={"reason": "verified by hand", "csrf_token": _csrf("bob")},
+        auth=BOB,
+        follow_redirects=False,
+    )
+
+    assert [w["action"] for w in fake.provider_writes] == ["enable", "breaker/reset"]
+    assert {w["operator"] for w in fake.provider_writes} == {"bob"}
+
+
+def test_provider_disable_without_csrf_is_403_and_writes_nothing() -> None:
+    fake = FakeServicesClient()
+    response = _client(services=fake).post(
+        "/providers/hive/disable",
+        data={"reason": "returning garbage"},
+        auth=ALICE,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert fake.provider_writes == []
