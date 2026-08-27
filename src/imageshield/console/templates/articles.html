@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Articles - ImageShield Console{% endblock %}
+{% block content %}
+<h1>Articles</h1>
+<p class="muted">A published article appears in every user's in-app feed on their next open — no
+notification (digests only, INVARIANTS #24). Pictures are pasted URLs; the console shows them as
+links, never as images.</p>
+<p><a href="/articles/new">New article</a></p>
+<table>
+<tr><th>Title</th><th>Status</th><th>Published</th><th>Updated</th><th>By</th><th></th></tr>
+{% for a in articles %}
+<tr>
+  <td>{{ a.title }}</td>
+  <td>{{ a.status }}</td>
+  <td>{{ a.published_at if a.published_at else "—" }}</td>
+  <td>{{ a.updated_at }}</td>
+  <td>{{ a.updated_by }}</td>
+  <td><a href="/articles/{{ a.article_id }}">Edit</a></td>
+</tr>
+{% else %}
+<tr><td colspan="6" class="muted">No articles yet.</td></tr>
+{% endfor %}
+</table>
+{% endblock %}
