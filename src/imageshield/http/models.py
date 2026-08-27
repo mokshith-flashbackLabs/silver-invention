@@ -541,10 +541,11 @@ _URL_MAX = 2000
 
 def _https_only(value: str) -> str:
     # The app opens these. An http:// picture or source is a 422 here rather
-    # than a mixed-content failure on a phone.
+    # than a mixed-content failure on a phone; a URL with no host cannot be
+    # opened at all.
     parts = urlsplit(value)
-    if parts.scheme != "https" or not parts.netloc:
-        raise ValueError("must be an https:// URL")
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("must be an https:// URL with a host")
     return value
 
 
