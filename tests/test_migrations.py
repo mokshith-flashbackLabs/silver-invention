@@ -1632,6 +1632,34 @@ def test_0025_down_returns_audit_log_to_write_only(throwaway_db: str) -> None:
         conn.execute("RESET ROLE")
 
 
+def test_0026_creates_articles_and_the_view_and_down_removes_them(throwaway_db: str) -> None:
+    assert run_migrate(throwaway_db, "down", "--all").returncode == 0
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db) as conn:
+        assert "articles" in _table_names(conn)
+        assert (
+            conn.execute(
+                "SELECT 1 FROM pg_views WHERE schemaname = 'svc' AND viewname = 'v_articles'"
+            ).fetchone()
+            is not None
+        )
+        assert conn.execute(
+            "SELECT has_table_privilege('imageshield_proxy_ro', 'svc.v_articles', 'SELECT')"
+        ).fetchone() == (True,)
+
+    assert run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0025_")).returncode == 0
+    with psycopg.connect(throwaway_db) as conn:
+        assert "articles" not in _table_names(conn)
+        assert (
+            conn.execute(
+                "SELECT 1 FROM pg_views WHERE schemaname = 'svc' AND viewname = 'v_articles'"
+            ).fetchone()
+            is None
+        )
+
+    assert run_migrate(throwaway_db, "up").returncode == 0
+
+
 # ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────
 #
 # The migration ECS task never goes through imageshield.config.Config (see
