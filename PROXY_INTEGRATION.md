@@ -615,10 +615,10 @@ built; we built `infringements` and `attestations` instead, with different names
 The grant named a schema that was never created. That was our mistake, not yours, and it is why
 `src/services/contract/readers.ts` was written against a contract nobody here had agreed to implement.
 
-### The eight `svc` views
+### The nine `svc` views
 
 The views your reader expects now exist, in an `svc` schema, owned by this repo (migration 0016;
-four more in 0023).
+four more in 0023; one more in 0026).
 
 | View | Key columns |
 |---|---|
@@ -630,6 +630,11 @@ four more in 0023).
 | `svc.v_person_score_events` *(0023)* | `score_event_id`, `person_ref`, `delta`, `component`, `cause_kind`, `cause_ref`, `score_after`, `created_at` |
 | `svc.v_person_recommendations` *(0023)* | `rec_id`, `person_ref`, `kind`, `params`, `status`, `source_event_id`, `created_at`, `completed_at`, `expires_at` |
 | `svc.v_person_threat_context` *(0023)* | `person_ref`, `event_id`, `kind`, `title`, `body`, `severity`, `starts_at`, `expires_at` — pre-filtered to `status = 'active' AND expires_at > now()`; a `draft` or `retracted` event never appears here |
+| `svc.v_articles` *(0026)* | `article_id`, `title`, `summary`, `body`, `images`, `sources`, `published_at`, `updated_at` — published rows only; operator content for every user, no person column |
+
+**`v_articles` is optional on the proxy side by agreement:** their `GET /v1/articles` serves an empty
+feed with a warn log while the view is absent, so a database migrated one release behind does not hold
+their api off.
 
 **0023 also changed two existing views, additively.** `v_person_hits` gained the three trailing
 columns above, and both `v_person_hits` and `v_person_report_summary` now exclude
@@ -677,9 +682,11 @@ GRANT SELECT ON svc.v_person_enrolment_state, svc.v_person_report_summary,
 GRANT SELECT ON svc.v_person_score, svc.v_person_score_events,
                 svc.v_person_recommendations, svc.v_person_threat_context
   TO imageshield_proxy_ro;
+-- 0026, same role, same idiom:
+GRANT SELECT ON svc.v_articles TO imageshield_proxy_ro;
 ```
 
-**`SELECT` on the eight views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
+**`SELECT` on the nine views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
 view's base-table reads are checked against the view *owner*, which is what lets exactly this
 projection through while `enrolments`, `attestations` and `attributed_faces` stay closed. Verify by
 attempting `SELECT * FROM public.enrolments` as that role: it must fail with a permission error, not be

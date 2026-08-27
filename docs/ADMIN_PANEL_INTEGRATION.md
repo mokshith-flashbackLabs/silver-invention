@@ -34,11 +34,10 @@ richer panel replaces or sits beside it; the API does not change either way.
 4. **CSRF is your job.** The API is token-authenticated and stateless; if your panel holds
    those tokens server-side and exposes browser forms, protect the forms
    (`console/auth.py::make_csrf_token` shows the shipped pattern).
-5. **Pixels are rendered live through the fetcher, blurred by default.** Never persist, proxy,
-   cache, or hotlink an infringing image. The review card gives you `image_url` +
-   `triage.best_face_bbox`; render a crop via the fetcher's `/v1/crop` with `blur=true`, and
-   offer reveal (`blur=false`) only behind an explicit operator click. Reviewer welfare is a
-   design requirement, not a styling choice.
+5. **Pixels are never shown to staff.** Since 2026-08-21 the subject decides their own hits and
+   staff never see hit imagery, blurred or otherwise; the fetcher's crop route is not part of
+   this contract and the review card is metadata-only. Article pictures (below) are
+   operator-pasted URLs rendered as links, not images.
 6. **Errors** (4xx/5xx) arrive as `{"error": {"code", "message", "retryable", "request_id"}}`.
    `422` adds `error.details` (`loc` + `msg`). Show `request_id` in error toasts — it is the
    log-correlation handle.
@@ -155,12 +154,35 @@ threat_event, threat_retracted, tick`.
 ## 6. Provider health (pre-existing, unchanged)
 
 - `GET /v1/admin/providers/health` — per-provider spend/breaker/success stats + alarms.
-- `POST /v1/admin/providers/{provider_id}/disable` / `/enable` — body `{"reason": "…"}`. The
-  kill switch.
-- `POST /v1/admin/providers/{provider_id}/breaker/reset` — body `{"reason": "…"}`.
+- `POST /v1/admin/providers/{provider_id}/disable` / `/enable` — body
+  `{"reason": "…", "operator": "…"}`. The kill switch.
+- `POST /v1/admin/providers/{provider_id}/breaker/reset` — body
+  `{"reason": "…", "operator": "…"}`.
+
+`operator` is optional; omitted, the audit row records `admin_service_token` instead of a name.
+The shipped console always sends it.
 
 `rekognition_confirm` appears here like any provider — its budget/breaker govern the confirm
 pipeline's Rekognition spend.
+
+## 6b. Articles — operator content for the app feed
+
+Every user sees every published article; nothing here is per-person. Both tokens; `operator` in
+every write body.
+
+- `GET /v1/admin/articles?limit=` → `{articles: [...]}` all statuses, newest edited first.
+- `POST /v1/admin/articles` → `201 {article_id, status: "draft"}`. Body: `title` (1–200), `summary`
+  (≤500), `body` (≤20000, markdown), `images: [{url, alt}]` (≤10), `sources: [{name, url}]` (≤10),
+  `operator`. **Every URL must be `https://`** — `http://` is a 422.
+- `GET /v1/admin/articles/{id}`, `PUT /v1/admin/articles/{id}` (same body as create; editing a
+  published article changes it live).
+- `POST /v1/admin/articles/{id}/publish` body `{operator}` → `{article_id, status}`. Draft or
+  archived → published; already published → no-op. A re-publish keeps the original `published_at`.
+- `POST /v1/admin/articles/{id}/archive` body `{operator, reason}` → removes it from the feed.
+- Unknown id → `404 article_not_found`.
+
+Rendering pictures in an ops panel is your call, but the shipped console deliberately shows them
+as links only so "no imagery in the control room" stays a rule without carve-outs.
 
 ## 7. Fetcher (crop rendering)
 

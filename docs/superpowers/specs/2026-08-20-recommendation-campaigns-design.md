@@ -1,7 +1,7 @@
 # Recommendation campaigns + the console ideas panel — design addendum
 
 **Date:** 2026-08-20
-**Status:** approved in discussion; NOT built — next push
+**Status:** SUPERSEDED 2026-08-27 by `2026-08-27-articles-design.md`. Not built and not planned: campaigns, audience targeting and the LLM ideas panel were replaced by operator-authored articles published to every user.
 **Extends:** `2026-08-19-protection-score-design.md` (the score/recommendations system it plugs into)
 
 ## 1. What this adds

@@ -1057,6 +1057,37 @@ rollback.
 
 ---
 
+## 2e. Articles — **built** (migration 0026)
+
+Operator-authored content for the app's feed (`docs/superpowers/specs/2026-08-27-articles-design.md`).
+Not identity data: no `user_ref` in the table, the view or the module.
+
+```sql
+CREATE TABLE articles (
+  article_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title        TEXT NOT NULL CHECK (title <> ''),
+  summary      TEXT NOT NULL DEFAULT '',
+  body         TEXT NOT NULL DEFAULT '',
+  images       JSONB NOT NULL DEFAULT '[]',   -- [{"url","alt"}], https URLs only, never bytes
+  sources      JSONB NOT NULL DEFAULT '[]',   -- [{"name","url"}]
+  status       TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published','archived')),
+  published_at TIMESTAMPTZ,
+  created_by / updated_by TEXT NOT NULL,      -- operator names
+  created_at / updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (status <> 'draft' OR published_at IS NULL),
+  CHECK (status <> 'published' OR published_at IS NOT NULL)
+);
+CREATE VIEW svc.v_articles AS SELECT … FROM articles WHERE status = 'published';
+```
+
+`content_rw` owns the table's SELECT/INSERT/UPDATE (no DELETE — archive is the soft delete) and is
+granted to `app_services`. `svc.v_articles` is the **ninth contract view**, granted to
+`imageshield_proxy_ro`, same rules as §2c. The one writer is `articles/store.py`; every write lands
+one `audit_log` row (`article.created|updated|published|archived`) naming the operator. A re-publish
+keeps the original `published_at`.
+
+---
+
 ## 3. Adjudication service
 
 ⚠ **This section is the original match-module-era sketch and was never built as written.** It predates

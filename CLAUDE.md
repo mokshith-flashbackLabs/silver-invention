@@ -101,7 +101,8 @@ We hold **no AWS S3 credentials**. If they aren't in the environment, the mistak
 - All user-facing reads for the report UI — **through the four `svc` views and nothing else**
   (migration 0016). `imageshield_proxy_ro` holds `USAGE` on `svc` and `SELECT` on
   `v_person_enrolment_state`, `v_person_report_summary`, `v_person_hits`,
-  `v_person_liveness_attempts`. No grant on any base table, no `USAGE` on `public`; a view's base-table
+  `v_person_liveness_attempts` (0016), the four 0023 score/threat views, and `v_articles` (0026).
+  No grant on any base table, no `USAGE` on `public`; a view's base-table
   reads are checked against the view owner, so `SELECT * FROM public.enrolments` under that role is a
   Postgres permission error rather than something application code has to remember. `PROXY_INTEGRATION.md`
   §6 previously granted `SELECT` on `report.reports`, `report.report_hits` and `report.hit_feedback` —
@@ -302,6 +303,7 @@ decisions behind the new rows.
 | **Protection score + recommendations** — `score/` (engine, journaled store, `tick` drift-healer), `recommendations/` catalog. Journal is the product surface (INVARIANTS #44) | |
 | **Threat events** — `threats/`, admin-curated via `/v1/admin/threat-events`, bounded/decaying/reversible score effect (INVARIANTS #46) | |
 | **Control room console** — its own deployable (`console/`, port 8082), HTTP Basic per-operator, server-rendered; review queue, threat events CRUD, provider health, score inspector | |
+| **Articles** — `articles/`, `/v1/admin/articles`, the console's Articles pages, `svc.v_articles` (0026). Operator content for the app feed; no targeting, no score effect, no LLM (spec 2026-08-27, supersedes the 2026-08-20 campaigns spec) | |
 
 Two notes on that right-hand column. **CSAM screening and reporting are what gate minor
 discovery** — `MINOR_DISCOVERY_SUPPORTED` stays `False` until both exist, and flipping it without them

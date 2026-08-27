@@ -161,6 +161,9 @@ provider just refills it. Fix the cause, then replay.
 **Disable it. No deploy, effective within 30 seconds** (the provider config
 cache TTL is capped at 30s in code).
 
+**From the console (preferred):** Dashboard → the provider's row → *Disable* with a reason. The
+audit row names you. The curl below is the break-glass path for when the console itself is down:
+
 ```bash
 curl -X POST "$BASE/v1/admin/providers/hive/disable" \
   -H "X-Service-Token: $TOKEN" -H "X-Admin-Service-Token: $ADMIN_TOKEN" \
@@ -214,6 +217,9 @@ abandoned by a dead worker is reclaimed after cooldown + grace.
 
 **To force it closed** once you know the provider is fixed:
 
+**From the console:** Dashboard → *Reset breaker* (shown only while the breaker is not closed).
+Break-glass:
+
 ```bash
 curl -X POST "$BASE/v1/admin/providers/hive/breaker/reset" \
   -H "X-Service-Token: $TOKEN" -H "X-Admin-Service-Token: $ADMIN_TOKEN" \
@@ -235,6 +241,9 @@ one of them gets made by accident.
 curl "$BASE/v1/admin/providers/health" \
   -H "X-Service-Token: $TOKEN" -H "X-Admin-Service-Token: $ADMIN_TOKEN"
 ```
+
+The console's dashboard renders the same payload: every firing alarm first, then spend, headroom
+and latency per provider.
 
 Money crosses as decimal **strings**, not floats. Per-provider per-day call
 count, cost, success rate, p50/p99, breaker state, budget headroom and every
