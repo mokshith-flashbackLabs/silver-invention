@@ -53,9 +53,7 @@ def _unprivileged_login_role(db_url: str, name: str) -> Iterator[str]:
     identifier = sql.Identifier(name)
     with psycopg.connect(db_url, autocommit=True) as conn:
         conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(identifier))
-        conn.execute(
-            sql.SQL("CREATE ROLE {} LOGIN PASSWORD 'probe'").format(identifier)
-        )
+        conn.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD 'probe'").format(identifier))
     parts = urlsplit(db_url)
     host = parts.netloc.rsplit("@", 1)[-1]
     try:
@@ -67,7 +65,7 @@ def _unprivileged_login_role(db_url: str, name: str) -> Iterator[str]:
             conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(identifier))
 
 
-def test_the_eight_views_are_all_declared() -> None:
+def test_the_nine_views_are_all_declared() -> None:
     assert set(EXPECTED_VIEWS) == {
         "v_person_enrolment_state",
         "v_person_report_summary",
@@ -77,6 +75,7 @@ def test_the_eight_views_are_all_declared() -> None:
         "v_person_score_events",
         "v_person_recommendations",
         "v_person_threat_context",
+        "v_articles",
     }
 
 
@@ -132,9 +131,7 @@ async def test_an_added_column_is_not_a_problem(migrated_db: str) -> None:
             FROM enrolments e WHERE e.status = 'active'
             """
         )
-        await conn.execute(
-            f"GRANT SELECT ON svc.v_person_enrolment_state TO {PROXY_ROLE}"
-        )
+        await conn.execute(f"GRANT SELECT ON svc.v_person_enrolment_state TO {PROXY_ROLE}")
         assert await check_svc_contract(conn) == []
 
 
@@ -160,14 +157,11 @@ async def test_the_contract_holds_for_a_role_with_no_privilege_on_svc(
     owns the views and therefore cannot see the bug. This one does not.
     """
     with _unprivileged_login_role(migrated_db, "readyz_probe_role") as probe_url:
-        async with await psycopg.AsyncConnection.connect(
-            probe_url, autocommit=True
-        ) as conn:
+        async with await psycopg.AsyncConnection.connect(probe_url, autocommit=True) as conn:
             # Sanity: prove the role really is unprivileged, so a future grant
             # cannot quietly turn this test back into the owner-role case.
             cur = await conn.execute(
-                "SELECT count(*) FROM information_schema.columns"
-                " WHERE table_schema = 'svc'"
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'svc'"
             )
             filtered = await cur.fetchone()
             assert filtered is not None and filtered[0] == 0, (
@@ -186,9 +180,7 @@ async def test_a_revoked_proxy_grant_is_reported(migrated_db: str) -> None:
     /readyz stays green while the proxy's report screen fails on its first read.
     """
     async with await psycopg.AsyncConnection.connect(migrated_db, autocommit=True) as conn:
-        await conn.execute(
-            f"REVOKE SELECT ON svc.v_person_hits FROM {PROXY_ROLE}"
-        )
+        await conn.execute(f"REVOKE SELECT ON svc.v_person_hits FROM {PROXY_ROLE}")
         problems = await check_svc_contract(conn)
     assert any("v_person_hits" in p and PROXY_ROLE in p for p in problems)
     # The other three are untouched, so exactly one problem is reported.
@@ -220,9 +212,7 @@ async def test_a_stub_table_wearing_a_view_name_is_reported(migrated_db: str) ->
                 " person_ref uuid, status text, model_id text,"
                 " enrolled_at timestamptz)"
             )
-            await conn.execute(
-                f"GRANT SELECT ON svc.v_person_enrolment_state TO {PROXY_ROLE}"
-            )
+            await conn.execute(f"GRANT SELECT ON svc.v_person_enrolment_state TO {PROXY_ROLE}")
             problems = await check_svc_contract(conn)
         finally:
             # 0016's down leg says DROP VIEW, which errors on a table — leaving

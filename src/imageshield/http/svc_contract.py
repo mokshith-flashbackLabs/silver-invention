@@ -1,4 +1,4 @@
-"""The expected shape of the eight `svc` contract views.
+"""The expected shape of the nine `svc` contract views.
 
 This is the ONE place outside migration 0016 that names `svc.v_person_*`, which
 is what the deploy checklist's `grep svc.v_person_` check relies on.
@@ -172,6 +172,17 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         "starts_at": "timestamp with time zone",
         "expires_at": "timestamp with time zone",
     },
+    # ── 0026: articles — operator content, not identity data ───────────────
+    "v_articles": {
+        "article_id": "uuid",
+        "title": "text",
+        "summary": "text",
+        "body": "text",
+        "images": "jsonb",
+        "sources": "jsonb",
+        "published_at": "timestamp with time zone",
+        "updated_at": "timestamp with time zone",
+    },
 }
 
 # LEFT JOIN to pg_attribute so a relation whose columns have all been dropped
@@ -291,8 +302,5 @@ async def check_svc_contract(
                     f" is {found}, expected {expected_type}"
                 )
         if role_exists and not may_select.get(view, False):
-            problems.append(
-                f"missing_select_grant: {proxy_role} cannot SELECT"
-                f" {SVC_SCHEMA}.{view}"
-            )
+            problems.append(f"missing_select_grant: {proxy_role} cannot SELECT {SVC_SCHEMA}.{view}")
     return problems
