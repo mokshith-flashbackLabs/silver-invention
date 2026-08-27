@@ -72,18 +72,77 @@ async def dashboard(
     request: Request,
     operator: str = Depends(require_operator),
     services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
 ) -> HTMLResponse:
     health_data = await services_client.provider_health()
     queue = await services_client.review_queue()
+    providers: list[dict[str, Any]] = list(health_data.get("providers", []))
+    # Flattened so the page can lead with every alarm across every provider.
+    # no_successful_calls_24h is the one that matters most: a dead provider
+    # and a quiet week look identical without it.
+    alarms = [
+        {"provider_id": p.get("provider_id"), **a} for p in providers for a in p.get("alarms", [])
+    ]
     return _templates.TemplateResponse(
         request,
         "dashboard.html",
         {
             "operator": operator,
-            "providers": health_data.get("providers", []),
+            "providers": providers,
+            "alarms": alarms,
+            "as_of": health_data.get("as_of"),
+            "window_hours": health_data.get("window_hours"),
             "queue": queue,
+            "csrf_token": make_csrf_token(cfg, operator),
         },
     )
+
+
+@router.post("/providers/{provider_id}/disable")
+async def provider_disable(
+    provider_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    """The kill switch, from the dashboard. Services validate provider_id
+    (422 invalid_provider_id) and record the operator on the audit row."""
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.disable_provider(provider_id, reason=reason, operator=operator)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@router.post("/providers/{provider_id}/enable")
+async def provider_enable(
+    provider_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.enable_provider(provider_id, reason=reason, operator=operator)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@router.post("/providers/{provider_id}/breaker-reset")
+async def provider_breaker_reset(
+    provider_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    """Separate from enable on purpose (admin_providers.py): "it is fixed, let
+    it back in now" and "it should receive traffic at all" are different
+    decisions."""
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.reset_breaker(provider_id, reason=reason, operator=operator)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @router.get("/review")
@@ -248,9 +307,7 @@ def _install_error_handlers(app: FastAPI) -> None:
     # reading an error page (what happened, in one sentence) are kept and the
     # rest is deliberately omitted rather than faked with placeholder values.
     @app.exception_handler(ConsoleUpstreamError)
-    async def _upstream_error_handler(
-        request: Request, exc: ConsoleUpstreamError
-    ) -> JSONResponse:
+    async def _upstream_error_handler(request: Request, exc: ConsoleUpstreamError) -> JSONResponse:
         # An upstream failure here is an operator-facing incident, not a
         # secret -- but the detail is upstream response text, never a token
         # (the clients never put a token in a body they'd echo back).
