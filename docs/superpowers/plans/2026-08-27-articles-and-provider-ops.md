@@ -20,7 +20,7 @@
 - The console renders NO `<img>` tag on any page. Pasted picture URLs are links.
 - Every URL in an article is `https://` only, ≤ 2 000 chars. Title 1–200, summary ≤ 500, body ≤ 20 000, ≤ 10 images, ≤ 10 sources, source name 1–120, alt ≤ 300, operator 1–64, archive reason 3–500.
 - Every services write names an operator and lands exactly one `audit_log` row in the same transaction.
-- Services tooling: `ruff check .` / `ruff format <the files you changed>` — NEVER `ruff format .` repo-wide: the repo is not format-clean and CI does not check formatting, so a repo-wide run reformats ~126 unrelated files / `mypy` (strict) / `pytest` (DB tests need `docker compose -f docker-compose.local.yml up -d`; they skip when Postgres is unreachable — run with `REQUIRE_DB=1` when Docker is up so a skip cannot pass for a pass).
+- Services tooling: `ruff check .` / `ruff format <new files only>` — NEVER format a modified existing file and NEVER `ruff format .`: the repo is not format-clean and CI checks `ruff check .` only, so formatting an existing file drags unrelated reformat hunks into the commit (Task 3's one-line fix became a 60-line diff) / `mypy` (strict) / `pytest` (DB tests need `docker compose -f docker-compose.local.yml up -d`; they skip when Postgres is unreachable — run with `REQUIRE_DB=1` when Docker is up so a skip cannot pass for a pass).
 - Only ONE DB-backed pytest session may run at a time against the local Postgres: migrations create cluster-global roles and concurrent sessions collide. Implementers run the focused test files their task names and skip the full suite; the controller runs the full suite serially between tasks.
 - Proxy tooling: `npm run typecheck` / `npm run lint` / `npm run test:unit` / `npm run test:integration` (Docker for testcontainers).
 - Commit messages end with `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
@@ -111,7 +111,7 @@ and in `disable_provider`, `enable_provider`, `reset_breaker` change every `acto
 
 - [ ] **Step 3: Verify**
 
-Services dir: `ruff check .` → clean; `ruff format <the files you changed>`; `mypy` → clean; `pytest tests/test_admin_providers.py -q` → all pass (existing tests send no operator, so behaviour is unchanged).
+Services dir: `ruff check .` → clean; `ruff format <new files only>`; `mypy` → clean; `pytest tests/test_admin_providers.py -q` → all pass (existing tests send no operator, so behaviour is unchanged).
 
 - [ ] **Step 4: Commit**
 
@@ -326,7 +326,7 @@ async def provider_breaker_reset(
 
 `—` is a literal em dash (the file is UTF-8). A `None` success rate renders `—`, never `0%`: the model's own comment says those are different facts.
 
-- [ ] **Step 5: Verify** — services dir: `ruff check .`; `ruff format <the files you changed>`; `mypy`; `pytest tests/test_console.py -q` → existing tests pass (the fake returns `{"providers": []}`, which the new `.get` defaults tolerate).
+- [ ] **Step 5: Verify** — services dir: `ruff check .`; `ruff format <new files only>`; `mypy`; `pytest tests/test_console.py -q` → existing tests pass (the fake returns `{"providers": []}`, which the new `.get` defaults tolerate).
 
 - [ ] **Step 6: Commit**
 
@@ -803,7 +803,7 @@ class PostgresArticleStore:
         return [_row_to_dict(row) for row in rows]
 ```
 
-- [ ] **Step 2: Verify** — `ruff check .`; `ruff format <the files you changed>`; `mypy` → clean. `pytest tests/test_boundaries.py -q` → green (no phone-shaped literals, no face search, no S3).
+- [ ] **Step 2: Verify** — `ruff check .`; `ruff format <new files only>`; `mypy` → clean. `pytest tests/test_boundaries.py -q` → green (no phone-shaped literals, no face search, no S3).
 
 - [ ] **Step 3: Commit**
 
@@ -1073,7 +1073,7 @@ def get_article_store(request: Request) -> ArticleStore:
 
 In `create_app`, after `app.include_router(admin_threat_events_router)`: `app.include_router(admin_articles_router)`.
 
-- [ ] **Step 5: Verify** — `ruff check .` (it will reorder imports if needed — accept with `ruff check --fix .`); `ruff format <the files you changed>`; `mypy` → clean; `pytest tests/test_auth.py tests/test_error_envelope.py -q` → green (route-auth gates walk the router table).
+- [ ] **Step 5: Verify** — `ruff check .` (it will reorder imports if needed — accept with `ruff check --fix .`); `ruff format <new files only>`; `mypy` → clean; `pytest tests/test_auth.py tests/test_error_envelope.py -q` → green (route-auth gates walk the router table).
 
 - [ ] **Step 6: Commit**
 
@@ -1417,7 +1417,7 @@ links, never as images.</p>
 {% endblock %}
 ```
 
-- [ ] **Step 6: Verify** — `ruff check .`; `ruff format <the files you changed>`; `mypy`; `pytest tests/test_console.py -q` → existing tests still green. Then a manual smoke: `python -c "from imageshield.console.app import create_app"` imports cleanly.
+- [ ] **Step 6: Verify** — `ruff check .`; `ruff format <new files only>`; `mypy`; `pytest tests/test_console.py -q` → existing tests still green. Then a manual smoke: `python -c "from imageshield.console.app import create_app"` imports cleanly.
 
 - [ ] **Step 7: Commit**
 
@@ -2926,7 +2926,7 @@ git commit -m "docs: svc.v_articles — ninth contract view, optional for readin
 
 ### Task 15: Full verification and gap closure
 
-- [ ] **Step 1: Services** — Docker up; `ruff check .`; `ruff format <the files you changed>` (already applied per task); `mypy`; `REQUIRE_DB=1 pytest -q`. Every failure is a gap: fix it in the file that owns the behaviour (not by loosening the test), re-run, and commit with a `fix:` message naming the gap.
+- [ ] **Step 1: Services** — Docker up; `ruff check .`; `ruff format` on NEW files only; `mypy`; `REQUIRE_DB=1 pytest -q`. Every failure is a gap: fix it in the file that owns the behaviour (not by loosening the test), re-run, and commit with a `fix:` message naming the gap.
 - [ ] **Step 2: Proxy** — `npm run typecheck`; `npm run lint`; `npm run test:unit`; `npm run test:integration`. Same rule.
 - [ ] **Step 3: Boundary re-check** — services: `grep -rn "user_ref" src/imageshield/articles src/imageshield/http/routes/admin_articles.py` → no output; `grep -rn "<img" src/imageshield/console/templates` → no output. Proxy: `grep -rn "svc\.v_" src --include=*.ts | grep -v "src/services/contract/"` → no output.
 - [ ] **Step 4: Manual smoke (services, local compose)** — run the API and console locally per `docs/DEPLOY-DEV.md`/`devtools/`; in the console create an article with one `https://` picture and one source, publish it, confirm `SELECT * FROM svc.v_articles` shows it, archive it, confirm it disappears; on the dashboard disable and re-enable the `stub` provider and confirm two `audit_log` rows carry your operator name.
