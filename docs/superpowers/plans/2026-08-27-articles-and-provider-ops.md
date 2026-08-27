@@ -2402,13 +2402,15 @@ def test_articles_pages_require_credentials() -> None:
     assert client.get("/articles/new").status_code == 401
 ```
 
-- [ ] **Step 3: Run** — `pytest tests/test_admin_articles_routes.py tests/test_console.py -q` → all pass. `ruff check tests`; `mypy` (tests are type-checked only if `mypy` is configured over them — `packages = ["imageshield"]` says no; run `ruff` regardless).
+- [ ] **Step 3: Make the grep gate true** — the module docstrings of `src/imageshield/articles/store.py` and `src/imageshield/http/routes/admin_articles.py` currently contain the literal token `user_ref` in prose ("no ``user_ref`` anywhere"), which `test_articles_never_mention_a_user_ref` forbids. Reword each occurrence to `no person identifier` — one phrase per file, nothing else in those files changes. The gate stays literal, like the grep gates in `tests/test_boundaries.py`.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Run** — `python -m pytest tests/test_admin_articles_routes.py tests/test_console.py` → all pass. `ruff check tests`; `mypy` (tests are type-checked only if `mypy` is configured over them — `packages = ["imageshield"]` says no; run `ruff` regardless).
+
+- [ ] **Step 5: Commit**
 
 ```
-git add tests/test_admin_articles_routes.py tests/test_console.py
-git commit -m "test(articles): admin routes over a fake store; console pages, line encoding, no <img>"
+git add tests/test_admin_articles_routes.py tests/test_console.py src/imageshield/articles/store.py src/imageshield/http/routes/admin_articles.py
+git commit -m "test(articles): admin routes over a fake store; console pages, line encoding, no <img>; no person identifier in the module text"
 ```
 
 ---
