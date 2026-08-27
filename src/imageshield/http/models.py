@@ -534,6 +534,89 @@ class ThreatEventsResponse(BaseModel):
     events: list[ThreatEventItem]
 
 
+# ── articles (spec 2026-08-27) ────────────────────────────────────────────
+
+_URL_MAX = 2000
+
+
+def _https_only(value: str) -> str:
+    # The app opens these. An http:// picture or source is a 422 here rather
+    # than a mixed-content failure on a phone.
+    parts = urlsplit(value)
+    if parts.scheme != "https" or not parts.netloc:
+        raise ValueError("must be an https:// URL")
+    return value
+
+
+class ArticleImage(ServiceModel):
+    url: str = Field(min_length=9, max_length=_URL_MAX)
+    alt: str = Field(default="", max_length=300)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str) -> str:
+        return _https_only(value)
+
+
+class ArticleSource(ServiceModel):
+    name: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=9, max_length=_URL_MAX)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str) -> str:
+        return _https_only(value)
+
+
+class ArticleUpsertRequest(ServiceModel):
+    """Create and edit share one shape: an article is its whole content."""
+
+    title: str = Field(min_length=1, max_length=200)
+    summary: str = Field(default="", max_length=500)
+    body: str = Field(default="", max_length=20_000)
+    images: tuple[ArticleImage, ...] = Field(default=(), max_length=10)
+    sources: tuple[ArticleSource, ...] = Field(default=(), max_length=10)
+    operator: str = Field(min_length=1, max_length=64)
+
+
+class ArticlePublishRequest(ServiceModel):
+    operator: str = Field(min_length=1, max_length=64)
+
+
+class ArticleArchiveRequest(ServiceModel):
+    operator: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ArticleItem(BaseModel):
+    article_id: UUID
+    title: str
+    summary: str
+    body: str
+    images: list[dict[str, str]]
+    sources: list[dict[str, str]]
+    status: str
+    published_at: datetime | None
+    created_by: str
+    updated_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArticlesResponse(BaseModel):
+    articles: list[ArticleItem]
+
+
+class ArticleCreateResponse(BaseModel):
+    article_id: UUID
+    status: Literal["draft"] = "draft"
+
+
+class ArticleStatusResponse(BaseModel):
+    article_id: UUID
+    status: str
+
+
 # ── review (Task 15) ────────────────────────────────────────────────────
 
 # The 0021 severity vocabulary, restated as a Literal so a bogus value is a
