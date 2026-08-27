@@ -1,4 +1,4 @@
-"""The expected shape of the eight `svc` contract views.
+"""The expected shape of the nine `svc` contract views.
 
 This is the ONE place outside migration 0016 that names `svc.v_person_*`, which
 is what the deploy checklist's `grep svc.v_person_` check relies on.
@@ -16,7 +16,7 @@ caught.
 
 **Three things are checked, not one.** The relations exist *as views*, their
 columns are present and correctly typed, and `imageshield_proxy_ro` still holds
-SELECT on all eight. The grant is half the contract and it is the half whose
+SELECT on all nine. The grant is half the contract and it is the half whose
 failure lands entirely on the other repo: revoke it and the views are still
 present, still correctly shaped, and unreadable by the only role that reads
 them. `relkind` matters for the same reason a name check is not enough —
@@ -172,6 +172,17 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         "starts_at": "timestamp with time zone",
         "expires_at": "timestamp with time zone",
     },
+    # ── 0026: articles — operator content, not identity data ───────────────
+    "v_articles": {
+        "article_id": "uuid",
+        "title": "text",
+        "summary": "text",
+        "body": "text",
+        "images": "jsonb",
+        "sources": "jsonb",
+        "published_at": "timestamp with time zone",
+        "updated_at": "timestamp with time zone",
+    },
 }
 
 # LEFT JOIN to pg_attribute so a relation whose columns have all been dropped
@@ -265,7 +276,7 @@ async def check_svc_contract(
         problems.append(
             f"missing_grant_role: {proxy_role} does not exist — migration 0016"
             " creates it and 0017 grants the proxy's login roles membership;"
-            " without it the four views below are readable by nobody"
+            " without it the nine views below are readable by nobody"
         )
 
     for view, expected in EXPECTED_VIEWS.items():
@@ -291,8 +302,5 @@ async def check_svc_contract(
                     f" is {found}, expected {expected_type}"
                 )
         if role_exists and not may_select.get(view, False):
-            problems.append(
-                f"missing_select_grant: {proxy_role} cannot SELECT"
-                f" {SVC_SCHEMA}.{view}"
-            )
+            problems.append(f"missing_select_grant: {proxy_role} cannot SELECT {SVC_SCHEMA}.{view}")
     return problems

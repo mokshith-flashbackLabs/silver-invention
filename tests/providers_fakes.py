@@ -87,6 +87,7 @@ class FakeControlStore:
         self.half_open_claims: list[ProviderId] = []
         self.enabled_writes: list[tuple[ProviderId, bool, str]] = []
         self.breaker_resets: list[ProviderId] = []
+        self.actors: list[str] = []
 
     async def runtimes(self) -> Mapping[ProviderId, ProviderRuntime]:
         return dict(self._runtimes)
@@ -130,6 +131,7 @@ class FakeControlStore:
         if provider_id not in self._runtimes:
             return False
         self.enabled_writes.append((provider_id, enabled, reason))
+        self.actors.append(actor)
         return True
 
     async def reset_breaker(
@@ -138,6 +140,7 @@ class FakeControlStore:
         if provider_id not in self._runtimes:
             return False
         self.breaker_resets.append(provider_id)
+        self.actors.append(actor)
         return True
 
 

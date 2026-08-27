@@ -229,3 +229,32 @@ def test_a_deliberately_disabled_provider_raises_no_alarms() -> None:
     hive = next(i for i in body["providers"] if i["provider_id"] == "hive")
     assert hive["enabled"] is False
     assert hive["alarms"] == []
+
+
+def test_operator_in_the_body_becomes_the_audit_actor() -> None:
+    """The console names a person; the audit row should say who, not which
+    token was held."""
+    client, control = make_client()
+
+    response = client.post(
+        "/v1/admin/providers/hive/disable",
+        json={"reason": "vendor breach notice", "operator": "alice"},
+        headers=ADMIN,
+    )
+
+    assert response.status_code == 200
+    assert control.actors == ["alice"]
+    assert control.enabled_writes == [(HIVE, False, "vendor breach notice")]
+
+
+def test_an_omitted_operator_still_records_the_token_holder() -> None:
+    """curl callers are unchanged: no operator, the fallback actor."""
+    client, control = make_client()
+
+    client.post(
+        "/v1/admin/providers/hive/breaker/reset",
+        json={"reason": "verified by hand"},
+        headers=ADMIN,
+    )
+
+    assert control.actors == ["admin_service_token"]

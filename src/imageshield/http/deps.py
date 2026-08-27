@@ -20,6 +20,7 @@ from imageshield.config import Config
 if TYPE_CHECKING:
     from psycopg_pool import AsyncConnectionPool
 
+    from imageshield.articles.store import ArticleStore
     from imageshield.enrolment.faceindex import FaceIndex
     from imageshield.enrolment.store import EnrolmentStore
     from imageshield.liveness.provider import LivenessProvider
@@ -136,6 +137,11 @@ def get_score_store(request: Request) -> ScoreStore:
 
 def get_threat_store(request: Request) -> ThreatStore:
     store: ThreatStore = _required_state(request, "threat_store")  # type: ignore[assignment]
+    return store
+
+
+def get_article_store(request: Request) -> ArticleStore:
+    store: ArticleStore = _required_state(request, "article_store")  # type: ignore[assignment]
     return store
 
 

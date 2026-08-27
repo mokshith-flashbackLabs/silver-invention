@@ -38,6 +38,7 @@ VIEWS = (
     "v_person_score_events",
     "v_person_recommendations",
     "v_person_threat_context",
+    "v_articles",
 )
 
 # Derived, not transcribed: src/imageshield/http/svc_contract.py is the single
@@ -154,6 +155,16 @@ FROZEN_CONTRACT_COLUMNS: dict[str, set[str]] = {
         "starts_at",
         "expires_at",
     },
+    "v_articles": {
+        "article_id",
+        "title",
+        "summary",
+        "body",
+        "images",
+        "sources",
+        "published_at",
+        "updated_at",
+    },
 }
 
 
@@ -217,9 +228,7 @@ def _enrolment(conn: psycopg.Connection[Any], user_ref: UUID) -> None:
     )
 
 
-def _seed(
-    conn: psycopg.Connection[Any], user_ref: UUID, *, face_id: UUID | None = None
-) -> UUID:
+def _seed(conn: psycopg.Connection[Any], user_ref: UUID, *, face_id: UUID | None = None) -> UUID:
     row = conn.execute(
         "INSERT INTO search_seeds (user_ref, seed_kind, source_object_ref,"
         " attributed_face_id) VALUES (%s, 'user_supplied', %s, %s) RETURNING seed_id",
@@ -364,6 +373,7 @@ def test_the_proxy_role_reads_the_views_and_nothing_else(migrated_db: str) -> No
             "public.attestations",
             "public.attributed_faces",
             "public.subjects",
+            "public.articles",
         ):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute(f"SELECT * FROM {table}")
@@ -493,7 +503,7 @@ def test_counts_do_not_multiply_when_a_person_has_several_runs(
 def test_monitored_sources_counts_providers_that_returned_and_are_enabled(
     migrated_db: str,
 ) -> None:
-    """"We monitor 2 sources" while one has an open breaker is a false claim
+    """ "We monitor 2 sources" while one has an open breaker is a false claim
     (CLAUDE.md §7.5). Configured is not the same as returned, and returned once
     is not the same as still enabled."""
     with psycopg.connect(migrated_db, autocommit=True) as conn:
@@ -548,9 +558,7 @@ def test_one_row_per_hit_however_many_providers_attested(migrated_db: str) -> No
         run = _run(conn, user_ref, seed)
         _infringement(conn, user_ref, run, providers=("hive", "google"))
 
-    row = _one(
-        migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,)
-    )
+    row = _one(migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,))
     assert row["provider_count"] == 2
     # A single representative attestation's raw score, never a blend of the two
     # — provider A's 0.90 and provider B's 0.90 are different quantities
@@ -574,9 +582,7 @@ def test_hits_carry_provenance_to_the_seed_and_the_attributed_face(
             "SELECT source_object_ref FROM search_seeds WHERE seed_id = %s", (seed,)
         ).fetchone()
 
-    row = _one(
-        migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,)
-    )
+    row = _one(migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,))
     assert expected_ref is not None
     assert row["source_photo_id"] == expected_ref[0]
     assert row["face_bbox"] == {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}
@@ -595,9 +601,7 @@ def test_the_permanently_null_columns_are_present_and_typed(migrated_db: str) ->
         run = _run(conn, user_ref, seed)
         _infringement(conn, user_ref, run)
 
-    row = _one(
-        migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,)
-    )
+    row = _one(migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,))
     assert row["report_id"] is None
     assert row["title"] is None
     assert row["resolution_note"] is None
@@ -657,9 +661,7 @@ def test_match_action_is_the_latest_feedback_not_the_first(migrated_db: str) -> 
             (infringement, user_ref),
         )
 
-    row = _one(
-        migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,)
-    )
+    row = _one(migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,))
     assert row["match_action"] == "confirmed"
 
 
@@ -671,9 +673,7 @@ def test_resolved_at_is_set_for_a_terminal_position_and_for_a_dead_url(
         seed = _seed(conn, user_ref)
         run = _run(conn, user_ref, seed)
         open_hit = _infringement(conn, user_ref, run, domain="open.test")
-        authorised = _infringement(
-            conn, user_ref, run, domain="mine.test", status="authorised"
-        )
+        authorised = _infringement(conn, user_ref, run, domain="mine.test", status="authorised")
         conn.execute(
             "INSERT INTO infringement_feedback (infringement_id, user_ref, signal)"
             " VALUES (%s, %s, 'authorised')",
@@ -722,8 +722,7 @@ def test_quarantined_hits_appear_in_no_view(migrated_db: str) -> None:
 
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         conn.execute(
-            "UPDATE infringements SET confirm_state = 'quarantined'"
-            " WHERE infringement_id = %s",
+            "UPDATE infringements SET confirm_state = 'quarantined' WHERE infringement_id = %s",
             (infringement,),
         )
 
@@ -797,9 +796,7 @@ def test_confirmed_severity_travels_on_v_person_hits(migrated_db: str) -> None:
             (infringement,),
         )
 
-    row = _one(
-        migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,)
-    )
+    row = _one(migrated_db, "SELECT * FROM svc.v_person_hits WHERE person_ref = %s", (user_ref,))
     assert row["confirm_state"] == "confirmed"
     assert row["severity"] == "ncii_suspected"
     assert row["decided_at"] is not None
@@ -849,8 +846,7 @@ def test_an_unknown_infringement_status_is_refused_by_the_database(
         infringement = _infringement(conn, user_ref, run)
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(
-                "UPDATE infringements SET status = 'resolved_probably'"
-                " WHERE infringement_id = %s",
+                "UPDATE infringements SET status = 'resolved_probably' WHERE infringement_id = %s",
                 (infringement,),
             )
 
@@ -916,9 +912,7 @@ def test_score_views_read_under_the_proxy_role(migrated_db: str) -> None:
             conn.execute("UPDATE svc.v_person_score SET score = 0")
         conn.execute("RESET ROLE")
 
-    row = _one(
-        migrated_db, "SELECT * FROM svc.v_person_score WHERE person_ref = %s", (user_ref,)
-    )
+    row = _one(migrated_db, "SELECT * FROM svc.v_person_score WHERE person_ref = %s", (user_ref,))
     assert row["score"] == 72
     context = _one(
         migrated_db,
@@ -949,8 +943,7 @@ def test_0023_only_rollback_leaves_v_person_hits_readable_by_the_proxy(
     about 0023's ACL.
     """
     before = sorted(
-        row["filename"]
-        for row in _rows(migrated_db, "SELECT filename FROM schema_migrations")
+        row["filename"] for row in _rows(migrated_db, "SELECT filename FROM schema_migrations")
     )
     steps = sum(1 for name in before if name >= "0023_svc_score_views.up.sql")
     assert steps >= 1, "0023 must be applied for this test to mean anything"
@@ -959,8 +952,7 @@ def test_0023_only_rollback_leaves_v_person_hits_readable_by_the_proxy(
     assert revert.returncode == 0, revert.stderr
 
     applied = {
-        row["filename"]
-        for row in _rows(migrated_db, "SELECT filename FROM schema_migrations")
+        row["filename"] for row in _rows(migrated_db, "SELECT filename FROM schema_migrations")
     }
     assert "0023_svc_score_views.up.sql" not in applied
 
@@ -1001,9 +993,7 @@ def _proxy_login_role(db_url: str, name: str) -> Iterator[None]:
     finally:
         if not existed:
             with psycopg.connect(db_url, autocommit=True) as conn:
-                conn.execute(
-                    sql.SQL("REVOKE imageshield_proxy_ro FROM {}").format(identifier)
-                )
+                conn.execute(sql.SQL("REVOKE imageshield_proxy_ro FROM {}").format(identifier))
                 conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(identifier))
 
 
@@ -1062,26 +1052,22 @@ def test_reverting_the_chain_revokes_membership_and_leaves_their_role_alone(
         # under test is "0017's down leg revokes the membership", not "0017 is
         # last".
         applied_before = sorted(
-            row["filename"]
-            for row in _rows(throwaway_db, "SELECT filename FROM schema_migrations")
+            row["filename"] for row in _rows(throwaway_db, "SELECT filename FROM schema_migrations")
         )
         at_or_after_0017 = [name for name in applied_before if name >= "0017_"]
         assert at_or_after_0017, "0017 is not applied — the ledger query is wrong"
 
-        revert = run_migrate(
-            throwaway_db, "down", "--steps", str(len(at_or_after_0017))
-        )
+        revert = run_migrate(throwaway_db, "down", "--steps", str(len(at_or_after_0017)))
         assert revert.returncode == 0, revert.stderr
         applied = {
-            row["filename"]
-            for row in _rows(throwaway_db, "SELECT filename FROM schema_migrations")
+            row["filename"] for row in _rows(throwaway_db, "SELECT filename FROM schema_migrations")
         }
         assert "0017_proxy_ro_grant_chain.up.sql" not in applied
 
         assert not _is_member(throwaway_db, "app_worker", "imageshield_proxy_ro")
-        assert _rows(
-            throwaway_db, "SELECT 1 FROM pg_roles WHERE rolname = 'app_worker'"
-        ), "0017's down leg dropped a role it does not own"
+        assert _rows(throwaway_db, "SELECT 1 FROM pg_roles WHERE rolname = 'app_worker'"), (
+            "0017's down leg dropped a role it does not own"
+        )
 
 
 def test_the_grant_target_never_becomes_an_identity(migrated_db: str) -> None:

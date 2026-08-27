@@ -24,6 +24,7 @@ import httpx
 import structlog
 from fastapi import FastAPI
 
+from imageshield.articles.store import PostgresArticleStore
 from imageshield.attribution.fetch import HttpxPhotoFetcher
 from imageshield.attribution.fetch import make_client as make_photo_client
 from imageshield.attribution.rekognition import RekognitionFaceAttribution
@@ -35,6 +36,7 @@ from imageshield.enrolment.faceindex import RekognitionFaceIndex
 from imageshield.enrolment.store import PostgresEnrolmentStore
 from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
+from imageshield.http.routes.admin_articles import router as admin_articles_router
 from imageshield.http.routes.admin_providers import router as admin_providers_router
 from imageshield.http.routes.admin_review import router as admin_review_router
 from imageshield.http.routes.admin_scores import router as admin_scores_router
@@ -118,6 +120,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     if getattr(app.state, "threat_store", None) is None:
         app.state.threat_store = PostgresThreatStore(pool)
+    if getattr(app.state, "article_store", None) is None:
+        app.state.article_store = PostgresArticleStore(pool)
     if getattr(app.state, "review_store", None) is None:
         app.state.review_store = PostgresReviewStore(pool)
     if getattr(app.state, "preview_store", None) is None:
@@ -182,6 +186,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(admin_router)
     app.include_router(admin_providers_router)
     app.include_router(admin_threat_events_router)
+    app.include_router(admin_articles_router)
     app.include_router(admin_review_router)
     app.include_router(admin_scores_router)
     return app

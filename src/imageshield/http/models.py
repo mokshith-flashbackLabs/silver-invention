@@ -419,6 +419,12 @@ class ProviderReasonRequest(ServiceModel):
     """
 
     reason: str = Field(min_length=3, max_length=500)
+    # Who asked, when the caller can say. The console sends its Basic-auth
+    # operator name (console/auth.py); a curl caller omits it and the audit
+    # row records the token-holder fallback in routes/admin_providers.py.
+    # Optional so every existing ``{"reason": ...}`` caller keeps working —
+    # ServiceModel is extra='forbid', so the field must be declared to be sent.
+    operator: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class ProviderDisableRequest(ProviderReasonRequest):
@@ -484,9 +490,7 @@ class ThreatEventCreateRequest(ServiceModel):
         # the obviously-wrong request fails as a 422 here rather than as an
         # opaque database constraint violation.
         if not self.is_global and not self.domains:
-            raise ValueError(
-                "domains must name at least one domain unless is_global is true"
-            )
+            raise ValueError("domains must name at least one domain unless is_global is true")
         return self
 
 
@@ -528,6 +532,90 @@ class ThreatEventItem(BaseModel):
 
 class ThreatEventsResponse(BaseModel):
     events: list[ThreatEventItem]
+
+
+# ── articles (spec 2026-08-27) ────────────────────────────────────────────
+
+_URL_MAX = 2000
+
+
+def _https_only(value: str) -> str:
+    # The app opens these. An http:// picture or source is a 422 here rather
+    # than a mixed-content failure on a phone; a URL with no host cannot be
+    # opened at all.
+    parts = urlsplit(value)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("must be an https:// URL with a host")
+    return value
+
+
+class ArticleImage(ServiceModel):
+    url: str = Field(min_length=9, max_length=_URL_MAX)
+    alt: str = Field(default="", max_length=300)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str) -> str:
+        return _https_only(value)
+
+
+class ArticleSource(ServiceModel):
+    name: str = Field(min_length=1, max_length=120)
+    url: str = Field(min_length=9, max_length=_URL_MAX)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str) -> str:
+        return _https_only(value)
+
+
+class ArticleUpsertRequest(ServiceModel):
+    """Create and edit share one shape: an article is its whole content."""
+
+    title: str = Field(min_length=1, max_length=200)
+    summary: str = Field(default="", max_length=500)
+    body: str = Field(default="", max_length=20_000)
+    images: tuple[ArticleImage, ...] = Field(default=(), max_length=10)
+    sources: tuple[ArticleSource, ...] = Field(default=(), max_length=10)
+    operator: str = Field(min_length=1, max_length=64)
+
+
+class ArticlePublishRequest(ServiceModel):
+    operator: str = Field(min_length=1, max_length=64)
+
+
+class ArticleArchiveRequest(ServiceModel):
+    operator: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class ArticleItem(BaseModel):
+    article_id: UUID
+    title: str
+    summary: str
+    body: str
+    images: list[dict[str, str]]
+    sources: list[dict[str, str]]
+    status: str
+    published_at: datetime | None
+    created_by: str
+    updated_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArticlesResponse(BaseModel):
+    articles: list[ArticleItem]
+
+
+class ArticleCreateResponse(BaseModel):
+    article_id: UUID
+    status: Literal["draft"] = "draft"
+
+
+class ArticleStatusResponse(BaseModel):
+    article_id: UUID
+    status: str
 
 
 # ── review (Task 15) ────────────────────────────────────────────────────

@@ -14,12 +14,14 @@ richer panel replaces or sits beside it; the API does not change either way.
 
 0. **Topology (owner's decision, 2026-08-20): nothing external talks to the services — the
    panel goes through the backend.** The admin panel's browser frontend talks ONLY to the
-   backend (the Node/proxy repo); the backend holds `X-Service-Token`, `X-Admin-Service-Token`
-   and `X-Fetcher-Token` and proxies these admin calls over the private network. Every endpoint
-   below is therefore a contract between the BACKEND and the services; the frontend's contract
-   is whatever admin routes the backend exposes on top of it. The only direct-to-services
-   client is the co-located ops console shipped in this repo (`console/`, same box, private) —
-   the reference implementation of the proxying pattern, not a license for external callers.
+   backend (the Node/proxy repo); the backend holds `X-Service-Token` and `X-Admin-Service-Token`
+   and proxies these admin calls over the private network. (The backend separately holds
+   `X-Fetcher-Token` for the unrelated subject-facing preview relay — see rule 5 and §7; that
+   token is never used for anything in this contract.) Every endpoint below is therefore a
+   contract between the BACKEND and the services; the frontend's contract is whatever admin
+   routes the backend exposes on top of it. The only direct-to-services client is the co-located
+   ops console shipped in this repo (`console/`, same box, private) — the reference
+   implementation of the proxying pattern, not a license for external callers.
 1. **This surface is operator-facing, never user-facing.** Reachable only on the private
    network / VPN; no end user, end-user session, or public DNS name may ever reach it — and per
    rule 0, not even an operator's browser reaches the services directly.
@@ -34,11 +36,12 @@ richer panel replaces or sits beside it; the API does not change either way.
 4. **CSRF is your job.** The API is token-authenticated and stateless; if your panel holds
    those tokens server-side and exposes browser forms, protect the forms
    (`console/auth.py::make_csrf_token` shows the shipped pattern).
-5. **Pixels are rendered live through the fetcher, blurred by default.** Never persist, proxy,
-   cache, or hotlink an infringing image. The review card gives you `image_url` +
-   `triage.best_face_bbox`; render a crop via the fetcher's `/v1/crop` with `blur=true`, and
-   offer reveal (`blur=false`) only behind an explicit operator click. Reviewer welfare is a
-   design requirement, not a styling choice.
+5. **Pixels are never shown to staff.** Since 2026-08-21 the subject decides their own hits and
+   staff never see hit imagery, blurred or otherwise; the fetcher's crop route is not part of
+   this contract. `image_url` still ships on the review card (§3) as **evidence for
+   URL-context review only** — a panel must never persist, proxy, cache, render, or hotlink
+   `image_url` or any infringing image. Article pictures (below) are operator-pasted URLs
+   rendered as links, not images.
 6. **Errors** (4xx/5xx) arrive as `{"error": {"code", "message", "retryable", "request_id"}}`.
    `422` adds `error.details` (`loc` + `msg`). Show `request_id` in error toasts — it is the
    log-correlation handle.
@@ -50,9 +53,10 @@ richer panel replaces or sits beside it; the API does not change either way.
 | Upstream | Base (dev) | Auth header(s) |
 |---|---|---|
 | Services admin API | `http://<services-host>:8081` | `X-Service-Token`, `X-Admin-Service-Token` |
-| Fetcher (crops) | `http://<fetcher-host>:8083` | `X-Fetcher-Token` |
 
-All admin routes live under `/v1/admin/…`. Missing/wrong tokens → `401` envelope.
+All admin routes live under `/v1/admin/…`. Missing/wrong tokens → `401` envelope. The fetcher
+(crops) is a separate upstream used by the subject-facing preview flow, not by this contract —
+see rule 5 and §7.
 
 ## 3. Review queue — the human-only confirm gate
 
@@ -102,9 +106,12 @@ queue-depth widget.
 - `404 review_task_not_found`: the task is not pending any more (another operator decided it,
   or it was quarantined). Refresh `/next` — this is the normal two-operators race, not a bug.
 
-**UI obligations:** blurred crop by default with click-to-reveal; the severity override select
-defaults to the triage value; `confirmed` on an `ncii_suspected` hit is the highest-consequence
-action in the whole product — make it deliberate, never one accidental click.
+**UI obligations:** **SUPERSEDED 2026-08-21 (rule 5) — staff never see hit imagery.** No crop,
+no image of any kind: `image_url` and `triage.best_face_bbox` are evidence, shown as plain
+text/numbers for URL-context review, never fetched, proxied, cached, rendered, or hotlinked. The
+severity override select defaults to the triage value; `confirmed` on an `ncii_suspected` hit is
+the highest-consequence action in the whole product — make it deliberate, never one accidental
+click.
 
 ## 4. Threat events
 
@@ -155,26 +162,48 @@ threat_event, threat_retracted, tick`.
 ## 6. Provider health (pre-existing, unchanged)
 
 - `GET /v1/admin/providers/health` — per-provider spend/breaker/success stats + alarms.
-- `POST /v1/admin/providers/{provider_id}/disable` / `/enable` — body `{"reason": "…"}`. The
-  kill switch.
-- `POST /v1/admin/providers/{provider_id}/breaker/reset` — body `{"reason": "…"}`.
+- `POST /v1/admin/providers/{provider_id}/disable` / `/enable` — body
+  `{"reason": "…", "operator": "…"}`. The kill switch.
+- `POST /v1/admin/providers/{provider_id}/breaker/reset` — body
+  `{"reason": "…", "operator": "…"}`.
+
+`operator` is optional; omitted, the audit row records `admin_service_token` instead of a name.
+The shipped console always sends it.
 
 `rekognition_confirm` appears here like any provider — its budget/breaker govern the confirm
 pipeline's Rekognition spend.
 
+## 6b. Articles — operator content for the app feed
+
+Every user sees every published article; nothing here is per-person. Both tokens; `operator` in
+every write body.
+
+- `GET /v1/admin/articles?limit=` → `{articles: [...]}` all statuses, newest edited first.
+- `POST /v1/admin/articles` → `201 {article_id, status: "draft"}`. Body: `title` (1–200), `summary`
+  (≤500), `body` (≤20000, markdown), `images: [{url, alt}]` (≤10), `sources: [{name, url}]` (≤10),
+  `operator`. **Every URL must be `https://`** — `http://` is a 422.
+- `GET /v1/admin/articles/{id}`, `PUT /v1/admin/articles/{id}` (same body as create; editing a
+  published article changes it live).
+- `POST /v1/admin/articles/{id}/publish` body `{operator}` → `{article_id, status}`. Draft or
+  archived → published; already published → no-op. A re-publish keeps the original `published_at`.
+- `POST /v1/admin/articles/{id}/archive` body `{operator, reason}` → removes it from the feed.
+- Unknown id → `404 article_not_found`.
+
+Rendering pictures in an ops panel is your call, but the shipped console deliberately shows them
+as links only so "no imagery in the control room" stays a rule without carve-outs.
+
 ## 7. Fetcher (crop rendering)
 
-`POST {fetcher}/v1/crop` with `X-Fetcher-Token`:
-```json
-{ "url": "<image_url from the review card>",
-  "bbox": {"x":0.1,"y":0.2,"w":0.3,"h":0.4},        // triage.best_face_bbox
-  "blur": true }
-→ 200 image/jpeg bytes
-```
-Errors: `400 refused_private_address | not_an_image | crop_too_small | redirect_limit`,
-`413 too_large`, `502 unfetchable`, `401` bad token. Your panel proxies this server-side (the
-browser must never hold `X-Fetcher-Token`); render failures as "crop unavailable — review by
-URL context" rather than an error page, because unfetchable hits are still decidable.
+**SUPERSEDED 2026-08-21 (rule 5) — not part of this contract.** Staff never see hit imagery, so
+no admin/ops surface calls `/v1/crop`; the section below is background on what the endpoint is,
+not an instruction to a panel builder. `POST {fetcher}/v1/crop` exists. Its callers are the
+**subject-facing** preview route
+(`GET /v1/infringements/{id}/preview`, relayed by the proxy as `GET /v1/hits/{id}/preview`) and
+the confirm pipeline's own internal moderation pass — neither is an operator surface. The shipped
+console holds no fetcher client and no `X-Fetcher-Token` at all
+(`console/config.py`: "the console's ONLY upstream" is the services admin API). Do not build a
+crop-fetching path into an ops panel: if staff ever need to see a pixel, that is a rule-5 change
+to raise before building, not an integration detail to infer from this endpoint's existence.
 
 ## 8. Things the panel must NOT build
 
@@ -189,27 +218,36 @@ URL context" rather than an error page, because unfetchable hits are still decid
 
 ## 9. Copy-paste integration prompt
 
+**SUPERSEDED 2026-08-21 (rule 5):** the Review screen below no longer fetches or renders a crop
+— it was rewritten in place rather than left contradicting rule 5, since this block is meant to
+be pasted verbatim to an external team or agent.
+
 > Build an internal admin panel ("control room") for ImageShield operators against the API
 > contract in `docs/ADMIN_PANEL_INTEGRATION.md` of the `image_flashbacklabs` repo — read that
 > file first; it is the requirements document and its §1 hard rules are non-negotiable.
 > Topology is fixed: the browser frontend talks ONLY to the backend (the Node/proxy repo);
-> you implement admin routes in the backend that proxy to the services API and the fetcher
-> over the private network, holding all three machine tokens server-side.
+> you implement admin routes in the backend that proxy to the services admin API over the
+> private network, holding both machine tokens server-side. The fetcher is a separate upstream
+> for an unrelated flow (§7) — this panel never talks to it.
 >
-> Screens: (1) **Review** — poll `GET /v1/admin/review/next`, render the task card with a
-> blurred face crop fetched server-side via the fetcher `/v1/crop` (reveal on explicit click),
-> triage facts, and a decision form (confirmed + severity override / rejected / uncertain);
-> treat 204 as "queue empty" and 404-on-decide as the normal operator race. Show
+> Screens: (1) **Review** — poll `GET /v1/admin/review/next`, render the task card as metadata
+> only: `image_url` and `source_domain` as plain text (a link if you like, never an embedded or
+> fetched image), `triage.best_face_bbox` and `face_match_score` as numbers, never drawn on a
+> pixel — rule 5, no crop, no fetcher call, ever — plus a decision form (confirmed + severity
+> override / rejected / uncertain); treat 204 as "queue empty" and 404-on-decide as the normal
+> operator race. Show
 > `GET /v1/admin/review/queue` depths in the nav. (2) **Threat events** — list, create (domains
 > or global, penalty as a decimal string, a confirm step that warns the effect is immediate),
 > retract with reason. (3) **Score inspector** — lookup by user_ref, show the score, its four
 > components, and the journal as a human-readable "why it moved" feed. (4) **Provider health**
 > — the health table plus enable/disable/breaker-reset with reasons.
 >
-> Constraints: the panel's backend holds `X-Service-Token`, `X-Admin-Service-Token`, and
-> `X-Fetcher-Token` server-side only — never in the browser. Authenticate operators yourself,
-> pass the real operator name in every write's `operator` field, and CSRF-protect every form.
-> All errors follow `{"error":{code,message,retryable,request_id}}` — surface `request_id`.
-> Decimals are strings. No image is ever stored, cached, or hotlinked; crops are rendered live
-> and blurred by default. Do not build bulk-confirm, auto-decide, quarantine listing, or any
-> score-editing affordance. Deploy target is the private network only.
+> Constraints: the panel's backend holds `X-Service-Token` and `X-Admin-Service-Token`
+> server-side only — never in the browser, and it never needs a fetcher token: the fetcher's
+> crop route is not part of this contract (rule 5; §7). Authenticate operators yourself, pass
+> the real operator name in every write's `operator` field, and CSRF-protect every form. All
+> errors follow `{"error":{code,message,retryable,request_id}}` — surface `request_id`.
+> Decimals are strings. No pixel of a hit ever reaches an operator, blurred or not; article
+> picture URLs are shown as plain links only, never fetched, embedded, cached, or hotlinked. Do
+> not build bulk-confirm, auto-decide, quarantine listing, or any score-editing affordance.
+> Deploy target is the private network only.

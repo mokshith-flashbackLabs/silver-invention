@@ -320,11 +320,7 @@ def _steps_back_to(version: str) -> str:
     # Compare the 4-digit prefix, not the whole filename: "0004_foo.up.sql" is
     # lexicographically greater than "0004", so a substring comparison would
     # count the target migration itself and revert one step too many.
-    later = [
-        path
-        for path in (ROOT / "migrations").glob("*.up.sql")
-        if path.name[:4] > version[:4]
-    ]
+    later = [path for path in (ROOT / "migrations").glob("*.up.sql") if path.name[:4] > version[:4]]
     return str(len(later))
 
 
@@ -450,8 +446,7 @@ def test_0005_migrates_existing_search_matches_rows(throwaway_db: str) -> None:
 
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         infringements = conn.execute(
-            "SELECT infringement_id, page_url, image_url, keyed_on, seen_count"
-            " FROM infringements"
+            "SELECT infringement_id, page_url, image_url, keyed_on, seen_count FROM infringements"
         ).fetchall()
         assert len(infringements) == 1  # two providers, ONE infringement
         assert infringements[0][1] == "https://x/page"
@@ -580,7 +575,7 @@ def test_0007_consent_basis_regex_accepts_nbsp(throwaway_db: str) -> None:
         ("same_person", "true_match", True),
         ("same_person", "false_match", False),
         ("derived_edit", "true_match", True),
-        ("derived_edit", "false_match", False),   # the inversion that must be impossible
+        ("derived_edit", "false_match", False),  # the inversion that must be impossible
         ("derived_edit", "uncertain", True),
         ("novel_generation", "true_match", True),
         ("novel_generation", "false_match", False),
@@ -1035,9 +1030,9 @@ def test_0011_backfills_existing_runs_with_an_empty_seed_url(throwaway_db: str) 
         # The dead presigned URL is preserved verbatim under the new name, not
         # salvaged and not deleted: the count of these is what gets reported so
         # the proxy knows which seeds to re-register.
-        assert conn.execute(
-            "SELECT source_object_ref FROM search_seeds"
-        ).fetchone() == ("https://s3/seed.jpg?X-Amz-Signature=deadbeef",)
+        assert conn.execute("SELECT source_object_ref FROM search_seeds").fetchone() == (
+            "https://s3/seed.jpg?X-Amz-Signature=deadbeef",
+        )
 
 
 def test_0011_down_restores_the_seed_column_and_drops_the_run_url(
@@ -1170,9 +1165,7 @@ def test_0013_leaves_existing_rows_unattempted(throwaway_db: str) -> None:
     assert up.returncode == 0, up.stderr
 
     with psycopg.connect(throwaway_db) as conn:
-        row = conn.execute(
-            "SELECT last_attempted_at, url_alive FROM infringements"
-        ).fetchone()
+        row = conn.execute("SELECT last_attempted_at, url_alive FROM infringements").fetchone()
     assert row == (None, True)
 
 
@@ -1235,7 +1228,7 @@ def test_0014_allows_an_unattributed_face(throwaway_db: str) -> None:
         conn.execute(
             "INSERT INTO attributed_faces (run_id, face_index, bbox,"
             " detect_confidence, model_id)"
-            " VALUES (%s, 0, '{\"x\":0.1,\"y\":0.2,\"w\":0.3,\"h\":0.4}'::jsonb,"
+            ' VALUES (%s, 0, \'{"x":0.1,"y":0.2,"w":0.3,"h":0.4}\'::jsonb,'
             "         99.9, 'rekognition:7.0')",
             (run_id,),
         )
@@ -1360,8 +1353,7 @@ def test_0015_no_role_can_edit_the_migration_ledger(throwaway_db: str) -> None:
 # ── 0019: the stub provider, registered and disabled ──────────────────────
 
 _STUB_PROVIDER_COLUMNS = (
-    "kind, enabled, calibrated, score_version, cost_per_call_usd,"
-    " score_kind, score_domain"
+    "kind, enabled, calibrated, score_version, cost_per_call_usd, score_kind, score_domain"
 )
 
 
@@ -1492,8 +1484,14 @@ def test_0021_confirm_columns_and_review_tasks(throwaway_db: str) -> None:
             ).fetchall()
         }
         assert {
-            "confirm_state", "severity", "confirm_decided_by", "confirm_decided_at",
-            "duplicate_of", "phash", "face_match_score", "moderation_labels",
+            "confirm_state",
+            "severity",
+            "confirm_decided_by",
+            "confirm_decided_at",
+            "duplicate_of",
+            "phash",
+            "face_match_score",
+            "moderation_labels",
         } <= cols
         # confirmed without a human is a constraint violation (INVARIANTS #19 by schema)
         conn.execute(
@@ -1509,9 +1507,7 @@ def test_0021_confirm_columns_and_review_tasks(throwaway_db: str) -> None:
             " ('00000000-0000-0000-0000-000000000001', repeat('a', 64), 'https://x.example/a')"
         )
         with pytest.raises(psycopg.errors.CheckViolation):
-            conn.execute(
-                "UPDATE infringements SET confirm_state = 'confirmed'"
-            )
+            conn.execute("UPDATE infringements SET confirm_state = 'confirmed'")
 
 
 def test_0021_seeds_the_rekognition_confirm_provider(throwaway_db: str) -> None:
@@ -1539,17 +1535,19 @@ def test_0022_score_tables_and_role(throwaway_db: str) -> None:
         tables = {
             r[0]
             for r in conn.execute(
-                "SELECT table_name FROM information_schema.tables"
-                " WHERE table_schema = 'public'"
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
             ).fetchall()
         }
         assert {
-            "protection_scores", "score_events", "recommendations",
-            "threat_events", "threat_event_matches",
+            "protection_scores",
+            "score_events",
+            "recommendations",
+            "threat_events",
+            "threat_event_matches",
         } <= tables
-        assert conn.execute(
-            "SELECT 1 FROM pg_roles WHERE rolname = 'score_rw'"
-        ).fetchone() is not None
+        assert (
+            conn.execute("SELECT 1 FROM pg_roles WHERE rolname = 'score_rw'").fetchone() is not None
+        )
 
 
 def test_0022_score_events_is_insert_only_for_score_rw(throwaway_db: str) -> None:
@@ -1573,7 +1571,6 @@ def test_0022_score_events_is_insert_only_for_score_rw(throwaway_db: str) -> Non
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("DELETE FROM score_events")
         conn.execute("RESET ROLE")
-
 
 
 def test_0025_audit_w_can_read_audit_log_but_still_cannot_edit_it(throwaway_db: str) -> None:
@@ -1627,12 +1624,41 @@ def test_0025_down_returns_audit_log_to_write_only(throwaway_db: str) -> None:
     was doing on every preview call."""
     run_migrate(throwaway_db, "down", "--all")
     assert run_migrate(throwaway_db, "up").returncode == 0
-    assert run_migrate(throwaway_db, "down", "--steps", "1").returncode == 0
+    assert run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0024_")).returncode == 0
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         conn.execute("SET ROLE audit_w")
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute(_COUNT_RENDERS_SQL, {"user_ref": uuid4()})
         conn.execute("RESET ROLE")
+
+
+def test_0026_creates_articles_and_the_view_and_down_removes_them(throwaway_db: str) -> None:
+    assert run_migrate(throwaway_db, "down", "--all").returncode == 0
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db) as conn:
+        assert "articles" in _table_names(conn)
+        assert (
+            conn.execute(
+                "SELECT 1 FROM pg_views WHERE schemaname = 'svc' AND viewname = 'v_articles'"
+            ).fetchone()
+            is not None
+        )
+        assert conn.execute(
+            "SELECT has_table_privilege('imageshield_proxy_ro', 'svc.v_articles', 'SELECT')"
+        ).fetchone() == (True,)
+
+    assert run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0025_")).returncode == 0
+    with psycopg.connect(throwaway_db) as conn:
+        assert "articles" not in _table_names(conn)
+        assert (
+            conn.execute(
+                "SELECT 1 FROM pg_views WHERE schemaname = 'svc' AND viewname = 'v_articles'"
+            ).fetchone()
+            is None
+        )
+
+    assert run_migrate(throwaway_db, "up").returncode == 0
+
 
 # ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────
 #

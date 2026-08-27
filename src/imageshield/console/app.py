@@ -32,7 +32,7 @@ from uuid import UUID
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from imageshield.console.auth import (
@@ -72,18 +72,77 @@ async def dashboard(
     request: Request,
     operator: str = Depends(require_operator),
     services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
 ) -> HTMLResponse:
     health_data = await services_client.provider_health()
     queue = await services_client.review_queue()
+    providers: list[dict[str, Any]] = list(health_data.get("providers", []))
+    # Flattened so the page can lead with every alarm across every provider.
+    # no_successful_calls_24h is the one that matters most: a dead provider
+    # and a quiet week look identical without it.
+    alarms = [
+        {"provider_id": p.get("provider_id"), **a} for p in providers for a in p.get("alarms", [])
+    ]
     return _templates.TemplateResponse(
         request,
         "dashboard.html",
         {
             "operator": operator,
-            "providers": health_data.get("providers", []),
+            "providers": providers,
+            "alarms": alarms,
+            "as_of": health_data.get("as_of"),
+            "window_hours": health_data.get("window_hours"),
             "queue": queue,
+            "csrf_token": make_csrf_token(cfg, operator),
         },
     )
+
+
+@router.post("/providers/{provider_id}/disable")
+async def provider_disable(
+    provider_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    """The kill switch, from the dashboard. Services validate provider_id
+    (422 invalid_provider_id) and record the operator on the audit row."""
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.disable_provider(provider_id, reason=reason, operator=operator)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@router.post("/providers/{provider_id}/enable")
+async def provider_enable(
+    provider_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.enable_provider(provider_id, reason=reason, operator=operator)
+    return RedirectResponse(url="/", status_code=303)
+
+
+@router.post("/providers/{provider_id}/breaker-reset")
+async def provider_breaker_reset(
+    provider_id: str,
+    reason: str = Form(...),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    """Separate from enable on purpose (admin_providers.py): "it is fixed, let
+    it back in now" and "it should receive traffic at all" are different
+    decisions."""
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.reset_breaker(provider_id, reason=reason, operator=operator)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @router.get("/review")
@@ -239,6 +298,175 @@ async def scores_get(
     )
 
 
+# ── articles (spec 2026-08-27 §7) ─────────────────────────────────────────
+
+
+def _parse_pairs(raw: str, first: str, second: str) -> list[dict[str, str]]:
+    """One ``left | right`` per line into ``[{first: left, second: right}]``.
+
+    The console's form encoding for the plural article fields: ``url | alt``
+    for pictures, ``name | url`` for sources. A line with no bar keeps its
+    whole text as ``first`` and an empty ``second``; blank lines are skipped.
+    Validation is the API's -- a bad URL comes back as its 422, rendered
+    through the upstream-error page.
+    """
+    pairs: list[dict[str, str]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        left, _, right = line.partition("|")
+        pairs.append({first: left.strip(), second: right.strip()})
+    return pairs
+
+
+def _pairs_text(items: list[dict[str, Any]], first: str, second: str) -> str:
+    return "\n".join(f"{item.get(first, '')} | {item.get(second, '')}" for item in items)
+
+
+def _article_payload(
+    *, title: str, summary: str, body: str, images: str, sources: str, operator: str
+) -> dict[str, Any]:
+    return {
+        "title": title,
+        "summary": summary,
+        "body": body,
+        "images": _parse_pairs(images, "url", "alt"),
+        "sources": _parse_pairs(sources, "name", "url"),
+        "operator": operator,
+    }
+
+
+def _render_article_form(
+    request: Request, operator: str, cfg: ConsoleConfig, *, article: dict[str, Any] | None
+) -> HTMLResponse:
+    return _templates.TemplateResponse(
+        request,
+        "article_form.html",
+        {
+            "operator": operator,
+            "article": article,
+            "images_text": (
+                _pairs_text(list(article.get("images", [])), "url", "alt") if article else ""
+            ),
+            "sources_text": (
+                _pairs_text(list(article.get("sources", [])), "name", "url") if article else ""
+            ),
+            "csrf_token": make_csrf_token(cfg, operator),
+        },
+    )
+
+
+@router.get("/articles")
+async def articles_list(
+    request: Request,
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+) -> HTMLResponse:
+    articles = await services_client.list_articles()
+    return _templates.TemplateResponse(
+        request, "articles.html", {"operator": operator, "articles": articles}
+    )
+
+
+@router.get("/articles/new")
+async def articles_new(
+    request: Request,
+    operator: str = Depends(require_operator),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> HTMLResponse:
+    return _render_article_form(request, operator, cfg, article=None)
+
+
+@router.post("/articles")
+async def articles_create(
+    title: str = Form(...),
+    summary: str = Form(""),
+    body: str = Form(""),
+    images: str = Form(""),
+    sources: str = Form(""),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
+    created = await services_client.create_article(
+        _article_payload(
+            title=title, summary=summary, body=body, images=images, sources=sources,
+            operator=operator,
+        )
+    )
+    return RedirectResponse(url=f"/articles/{created['article_id']}", status_code=303)
+
+
+@router.get("/articles/{article_id}")
+async def articles_edit(
+    article_id: UUID,
+    request: Request,
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> Response:
+    article = await services_client.get_article(article_id)
+    if article is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "article_not_found", "message": "No article with this id."}},
+        )
+    return _render_article_form(request, operator, cfg, article=article)
+
+
+@router.post("/articles/{article_id}")
+async def articles_update(
+    article_id: UUID,
+    title: str = Form(...),
+    summary: str = Form(""),
+    body: str = Form(""),
+    images: str = Form(""),
+    sources: str = Form(""),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.update_article(
+        article_id,
+        _article_payload(
+            title=title, summary=summary, body=body, images=images, sources=sources,
+            operator=operator,
+        ),
+    )
+    return RedirectResponse(url=f"/articles/{article_id}", status_code=303)
+
+
+@router.post("/articles/{article_id}/publish")
+async def articles_publish(
+    article_id: UUID,
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.publish_article(article_id, operator=operator)
+    return RedirectResponse(url=f"/articles/{article_id}", status_code=303)
+
+
+@router.post("/articles/{article_id}/archive")
+async def articles_archive(
+    article_id: UUID,
+    reason: str = Form(...),
+    csrf_token: str = Form(""),
+    operator: str = Depends(require_operator),
+    services_client: ServicesClient = Depends(get_services_client),
+    cfg: ConsoleConfig = Depends(get_console_config),
+) -> RedirectResponse:
+    verify_csrf_token(cfg, operator, csrf_token)
+    await services_client.archive_article(article_id, operator=operator, reason=reason)
+    return RedirectResponse(url=f"/articles/{article_id}", status_code=303)
+
+
 def _install_error_handlers(app: FastAPI) -> None:
     # Both handlers render the repo's {"error": {"code", "message"}} envelope
     # (CLAUDE.md §9) rather than FastAPI's default {"detail": ...} shape.
@@ -248,9 +476,7 @@ def _install_error_handlers(app: FastAPI) -> None:
     # reading an error page (what happened, in one sentence) are kept and the
     # rest is deliberately omitted rather than faked with placeholder values.
     @app.exception_handler(ConsoleUpstreamError)
-    async def _upstream_error_handler(
-        request: Request, exc: ConsoleUpstreamError
-    ) -> JSONResponse:
+    async def _upstream_error_handler(request: Request, exc: ConsoleUpstreamError) -> JSONResponse:
         # An upstream failure here is an operator-facing incident, not a
         # secret -- but the detail is upstream response text, never a token
         # (the clients never put a token in a body they'd echo back).

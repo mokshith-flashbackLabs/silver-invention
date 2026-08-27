@@ -150,3 +150,76 @@ class ServicesClient:
         self._raise_for_status(response)
         data: dict[str, Any] = response.json()
         return list(data.get("hits", []))
+
+    async def disable_provider(self, provider_id: str, *, reason: str, operator: str) -> None:
+        await self._provider_write(provider_id, "disable", reason=reason, operator=operator)
+
+    async def enable_provider(self, provider_id: str, *, reason: str, operator: str) -> None:
+        await self._provider_write(provider_id, "enable", reason=reason, operator=operator)
+
+    async def reset_breaker(self, provider_id: str, *, reason: str, operator: str) -> None:
+        await self._provider_write(provider_id, "breaker/reset", reason=reason, operator=operator)
+
+    async def _provider_write(
+        self, provider_id: str, action: str, *, reason: str, operator: str
+    ) -> None:
+        # The operator travels in the body so the services audit row names a
+        # person (ProviderReasonRequest.operator), not the shared admin token.
+        response = await self._client.post(
+            f"{self._base_url}/v1/admin/providers/{provider_id}/{action}",
+            json={"reason": reason, "operator": operator},
+            headers=self._headers,
+        )
+        self._raise_for_status(response)
+
+    async def list_articles(self) -> list[dict[str, Any]]:
+        response = await self._client.get(
+            f"{self._base_url}/v1/admin/articles", headers=self._headers
+        )
+        self._raise_for_status(response)
+        data: dict[str, Any] = response.json()
+        return list(data.get("articles", []))
+
+    async def get_article(self, article_id: UUID) -> dict[str, Any] | None:
+        response = await self._client.get(
+            f"{self._base_url}/v1/admin/articles/{article_id}", headers=self._headers
+        )
+        if response.status_code == 404:
+            return None
+        self._raise_for_status(response)
+        data: dict[str, Any] = response.json()
+        return data
+
+    async def create_article(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self._client.post(
+            f"{self._base_url}/v1/admin/articles", json=payload, headers=self._headers
+        )
+        self._raise_for_status(response)
+        data: dict[str, Any] = response.json()
+        return data
+
+    async def update_article(self, article_id: UUID, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self._client.put(
+            f"{self._base_url}/v1/admin/articles/{article_id}",
+            json=payload,
+            headers=self._headers,
+        )
+        self._raise_for_status(response)
+        data: dict[str, Any] = response.json()
+        return data
+
+    async def publish_article(self, article_id: UUID, *, operator: str) -> None:
+        response = await self._client.post(
+            f"{self._base_url}/v1/admin/articles/{article_id}/publish",
+            json={"operator": operator},
+            headers=self._headers,
+        )
+        self._raise_for_status(response)
+
+    async def archive_article(self, article_id: UUID, *, operator: str, reason: str) -> None:
+        response = await self._client.post(
+            f"{self._base_url}/v1/admin/articles/{article_id}/archive",
+            json={"operator": operator, "reason": reason},
+            headers=self._headers,
+        )
+        self._raise_for_status(response)
