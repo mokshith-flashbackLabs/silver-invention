@@ -125,6 +125,10 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         "confirm_state": "text",
         "severity": "text",
         "decided_at": "timestamp with time zone",
+        # 0027: which URL keyed the infringement -- 'page_url' (a provider
+        # backlink) or 'image_url' (no backlink, so host_page_url is the raw
+        # image address). Appended at the end of the select list; additive.
+        "keyed_on": "text",
     },
     "v_person_liveness_attempts": {
         "person_ref": "uuid",

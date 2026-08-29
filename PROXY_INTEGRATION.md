@@ -618,13 +618,13 @@ The grant named a schema that was never created. That was our mistake, not yours
 ### The nine `svc` views
 
 The views your reader expects now exist, in an `svc` schema, owned by this repo (migration 0016;
-four more in 0023; one more in 0026).
+four more in 0023; one more in 0026; `keyed_on` appended to `v_person_hits` in 0027).
 
 | View | Key columns |
 |---|---|
 | `svc.v_person_enrolment_state` | `person_ref`, `status`, `model_id`, `enrolled_at` |
 | `svc.v_person_report_summary` | `person_ref`, `active_reports`, `unresolved_matches`, `live_exposure_count`, `last_run_at`, `first_scan_completed_at`, `monitored_sources` |
-| `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score`, `confirm_state`, `severity`, `decided_at` |
+| `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score`, `confirm_state`, `severity`, `decided_at`, `keyed_on` *(0027)* |
 | `svc.v_person_liveness_attempts` | `person_ref`, `attempts_24h`, `last_attempt_at` |
 | `svc.v_person_score` *(0023)* | `person_ref`, `score`, `components`, `config_version`, `computed_at` |
 | `svc.v_person_score_events` *(0023)* | `score_event_id`, `person_ref`, `delta`, `component`, `cause_kind`, `cause_ref`, `score_after`, `created_at` |
@@ -635,6 +635,14 @@ four more in 0023; one more in 0026).
 **`v_articles` is optional on the proxy side by agreement:** their `GET /v1/articles` serves an empty
 feed with a warn log while the view is absent, so a database migrated one release behind does not hold
 their api off.
+
+**0027 appended `keyed_on` to `v_person_hits`** (2026-08-29, additive, same OR REPLACE idiom as 0023).
+You now hand the subject `host_page_url` once they have marked a hit as abuse. That column is the
+*page* only when the provider returned a backlink; with none, 0005 keys the infringement on the image
+URL and stores it there (`keyed_on = 'image_url'`), so the link opens a raw image file — possibly the
+subject's own intimate imagery, full size — with no page around it. `keyed_on` (`'page_url' |
+`'image_url'`) is how you tell the two apart before the link leaves your process. Label it or withhold
+it; do not treat every value as a page.
 
 **0023 also changed two existing views, additively.** `v_person_hits` gained the three trailing
 columns above, and both `v_person_hits` and `v_person_report_summary` now exclude

@@ -803,6 +803,9 @@ raises `InsufficientPrivilege`.
 - **Permanently NULL:** `report_id` (there is no `reports` table — the hit is the unit), `title` (we do
   not fetch or parse the host page), `resolution_note` (no adjudication surface exists). Returned as
   typed NULLs rather than omitted: a missing column breaks the proxy's reader, a NULL does not.
+- **`keyed_on` (0027) says which URL the hit was keyed on.** `page_url` when the provider returned a
+  backlink; `image_url` when it did not, in which case `host_page_url` is the image's own address and
+  not a page. The proxy reads it before handing a subject the link (PROXY_INTEGRATION.md §6).
 - **`match_lifecycle` carries four values, two of which cannot occur in v1.** `open` and `url_dead` are
   reachable; `takedown_requested` and `removed` are not, because takedown is not built. Declared anyway
   so the proxy's reader needs no change later.

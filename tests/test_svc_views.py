@@ -111,6 +111,7 @@ FROZEN_CONTRACT_COLUMNS: dict[str, set[str]] = {
         "confirm_state",
         "severity",
         "decided_at",
+        "keyed_on",
     },
     "v_person_liveness_attempts": {
         "person_ref",
@@ -639,6 +640,34 @@ def test_match_lifecycle_reports_open_and_url_dead(migrated_db: str) -> None:
         )
     }
     assert lifecycles == {"live.test": "open", "dead.test": "url_dead"}
+
+
+def test_keyed_on_says_which_url_the_hit_was_keyed_on(migrated_db: str) -> None:
+    """Done-when (0027): ``keyed_on`` travels on the view -- ``page_url`` for
+    a hit keyed on a provider backlink, ``image_url`` for one keyed on the image
+    itself because the provider returned no backlink. In the second case
+    ``host_page_url`` is a raw image address, not a page, and the proxy needs
+    to know that before it hands the link to the subject."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        seed = _seed(conn, user_ref)
+        run = _run(conn, user_ref, seed)
+        _infringement(conn, user_ref, run, domain="page.test")
+        image_keyed = _infringement(conn, user_ref, run, domain="image.test")
+        conn.execute(
+            "UPDATE infringements SET keyed_on = 'image_url' WHERE infringement_id = %s",
+            (image_keyed,),
+        )
+
+    keyed = {
+        row["source_domain"]: row["keyed_on"]
+        for row in _rows(
+            migrated_db,
+            "SELECT * FROM svc.v_person_hits WHERE person_ref = %s",
+            (user_ref,),
+        )
+    }
+    assert keyed == {"page.test": "page_url", "image.test": "image_url"}
 
 
 def test_match_action_is_the_latest_feedback_not_the_first(migrated_db: str) -> None:
