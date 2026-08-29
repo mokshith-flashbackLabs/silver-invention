@@ -1106,8 +1106,9 @@ its `review_tasks` (keyed on `candidate_id`, a `task_status`/`review_decision` e
 migration 0021 — see §2d above, which documents the real columns (`infringement_id`-keyed, plain
 `TEXT` + `CHECK` rather than enums, no separate decisions table — the decision lives on the row).
 Kept here for the historical design reasoning ("reviewers see a crop, never the full image" — still
-true, and still how the fetcher deployable and the control-room console behave); do not build against
-the SQL below.
+true, and still how the fetcher deployable behaves; the control-room console that also followed
+this rule was retired 2026-08-29, and staff now reach the same reads via the panel through the
+backend's `/v1/admin/*` proxy); do not build against the SQL below.
 
 ```sql
 CREATE TYPE task_status AS ENUM ('queued','assigned','decided','expired');
@@ -1246,8 +1247,10 @@ render gets a row — it is the only way to detect a compromised account being u
 It is readable, though, and that is newer than the append-only rule: migration `0025` grants `SELECT`
 to `audit_w` because two features read their own audit rows back — the preview render ceiling
 (INVARIANTS #32, counting `preview.rendered` per `user_ref` over 24h, against `0024`'s partial index)
-and the console's subject-decisions feed (`review.subject_decided`). Both shipped in the 2026-08-21
-push against a table no role could read, so both failed with `permission denied` in dev until `0025`.
+and the subject-decisions observer feed (`review.subject_decided`) — read by the control-room
+console until its 2026-08-29 retirement, now by the panel via the backend's `/v1/admin/*` proxy.
+Both shipped in the 2026-08-21 push against a table no role could read, so both failed with
+`permission denied` in dev until `0025`.
 Append-only is untouched by that grant — `SELECT` is not `UPDATE` — but note the read is
 **whole-table**: `audit_w`, and `app_services` through its `0018` membership, can read every audit row
 for every user, not only the two actions the code queries. The narrower alternative (a view per

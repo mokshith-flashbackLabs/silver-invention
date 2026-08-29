@@ -14,7 +14,8 @@ handoff brief for the proxy).
 > are designed here but **not built**. The crop fetcher (§3.7) and a minimal adjudication queue
 > (§3.4/§3.8) were pulled into scope by the 2026-08-19 protection-score push, alongside four pieces
 > this document did not originally describe at all — the confirm pipeline, the score engine, threat
-> events, and the control-room console (§3.8–§3.11). See `CLAUDE.md` §6 for the current scope table
+> events, and the control-room console (§3.8–§3.11, the console **retired** 2026-08-29 — see §3.11).
+> See `CLAUDE.md` §6 for the current scope table
 > and `NEAR-TERM-BUILD.md` for the v1 task list. Do not build the match module or partner ingest
 > because this document describes them.
 
@@ -108,9 +109,10 @@ forward** (INVARIANTS #18) — a backfill must never delay live ingest.
 Originally specified against the (still unbuilt) match module's `review`-band candidates. What
 actually ships against the provider-search pipeline is narrower and described in §3.8/§3.10: a
 review-band infringement's most-similar hits are enqueued to `confirm:hits`, machine-triaged
-(severity, face-match, pHash dedup, moderation), and land in `review_tasks` for a human in the
-control-room console. The reviewer sees a **face crop only**, rendered live by the crop fetcher, and
-decides `confirmed` / `rejected` / `uncertain`.
+(severity, face-match, pHash dedup, moderation), and land in `review_tasks` for a human — reached via
+the panel, through the backend's `/v1/admin/*` proxy (§3.11: the control-room console that used to
+serve this was retired 2026-08-29). The reviewer sees a **face crop only**, rendered live by the crop
+fetcher, and decides `confirmed` / `rejected` / `uncertain`.
 
 There is no timeout that auto-promotes a review-band candidate or a triaged hit (INVARIANTS #19, #47).
 If the queue backs up, the queue backs up.
@@ -424,23 +426,24 @@ deciding human for a hit is normally its own subject (`subject_decide`, INVARIAN
 amended): the subject sees a blurred crop via `GET /v1/infringements/{id}/preview` and answers via
 `POST /v1/infringements/{id}/decision`. The operator queue survives for the CSAM quarantine lane and
 as the override/correction path — metadata-only in both cases, because staff never see hit imagery —
-and the console's `/decisions` page observes what subjects decided (explicit-severity confirmations
-flagged as takedown-campaign candidates).
+and the `/decisions` observer view observes what subjects decided (explicit-severity confirmations
+flagged as takedown-campaign candidates), now served via the panel through the backend's
+`/v1/admin/*` proxy (§3.11).
 
-### 3.11 Control room console — **built** (2026-08-19)
+### 3.11 Control room console — **built 2026-08-19, retired 2026-08-29**
 
-Its own deployable (`src/imageshield/console/`, `uvicorn imageshield.console.app:create_app`, port
-8082), its own internal ingress, **never routed through the proxy** — the client-never-talks-to-us rule
-(§CLAUDE.md §3) is untouched, because this is an operator surface, not a user one. No database
-credentials; it talks to the services API over HTTP only — since 2026-08-21 it holds no fetcher
-client at all, because staff never see hit imagery.
+This admin API used to have its own deployable (`src/imageshield/console/`, port 8082): its own
+internal ingress, never routed through the proxy, no database credentials, server-rendered
+(Jinja2) over the admin API — threat events CRUD, the review queue (metadata-only), the
+`/decisions` subject-decisions observer page, provider spend/breaker health, and a per-user score
+journal inspector, with HTTP Basic operator auth against `CONSOLE_OPERATORS`.
 
-Server-rendered (Jinja2) over the existing admin API: threat events CRUD, the review queue
-(metadata-only), the `/decisions` subject-decisions observer page, provider spend/breaker health
-(existing admin reads, §3.6b), and a per-user score journal inspector. Operator auth is HTTP Basic
-against `CONSOLE_OPERATORS` (`console/auth.py`); the authenticated operator name flows into every
-write (`decide`, `create_event`, `retract_event`) so `audit_log` names a person, not "whoever holds
-the token."
+It is retired: staff now reach every one of those screens through the backend's `/v1/admin/*`
+operator proxy (`image_backend` spec `2026-08-29-admin-proxy-design.md` §12), which authenticates
+operators via an account + `iam.operator_grants` grant and injects the granted `display_name`
+into every write server-side. This repo's admin routes (§3.6b and the rest of `/v1/admin/*`) are
+unchanged — only the direct-to-services client is gone. `CONSOLE_OPERATORS` stays in Secrets
+Manager (an audit artifact of what was granted); no code reads it any more.
 
 ---
 
@@ -463,8 +466,12 @@ the token."
 | Confirm-pipeline triage (severity, pHash, moderation labels) | **Services** | Postgres, on `infringements` (migration 0021 — §3.8). No image bytes; text and a 64-bit hash only |
 | Hostile-image fetch + live crop render | **Services** | Nothing persisted — the fetcher deployable (§3.7) holds no DB credentials at all |
 | Report reads for the UI | **Proxy** | Postgres (read-only, `svc` views — migrations 0016 + 0023) |
-| Control-room console reads/writes | **Services** (operator-facing, not user-facing) | Over HTTP to the services API + fetcher; no DB access of its own (§3.11) |
 | Pushing onto any queue | **Services** | SQS (via outbox) |
+
+Admin/operator reads and writes (threat events, review, provider health, score inspector) own no
+data of their own — they are Services' existing `/v1/admin/*` routes over the tables above. Until
+2026-08-29 a co-located console called them directly; that deployable is retired, and the backend's
+`/v1/admin/*` proxy is now the only caller (§3.11).
 
 Services receive `user_ref` on every request and trust that the proxy has authorised the caller. **If the
 user is wrong, the proxy is wrong.**

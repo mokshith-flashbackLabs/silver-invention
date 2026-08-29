@@ -419,10 +419,12 @@ class ProviderReasonRequest(ServiceModel):
     """
 
     reason: str = Field(min_length=3, max_length=500)
-    # Who asked, when the caller can say. The console sends its Basic-auth
-    # operator name (console/auth.py); a curl caller omits it and the audit
-    # row records the token-holder fallback in routes/admin_providers.py.
-    # Optional so every existing ``{"reason": ...}`` caller keeps working —
+    # Who asked, when the caller can say. The backend's /v1/admin/* proxy
+    # sends the operator's display name (injected server-side from
+    # iam.operator_grants — image_backend's admin-proxy design, 2026-08-29);
+    # a break-glass curl caller omits it and the audit row records the
+    # token-holder fallback in routes/admin_providers.py. Optional so every
+    # existing ``{"reason": ...}`` caller keeps working —
     # ServiceModel is extra='forbid', so the field must be declared to be sent.
     operator: str | None = Field(default=None, min_length=1, max_length=64)
 
@@ -467,10 +469,11 @@ class ProviderHealthResponse(BaseModel):
 
 
 class ThreatEventCreateRequest(ServiceModel):
-    """Console input for a new threat event. ``penalty`` crosses as a decimal
-    STRING (pydantic coerces to ``Decimal``), same convention as every other
-    money-shaped value at this boundary — a float round-trip is exactly the
-    drift ``NUMERIC(5,2)`` exists to avoid.
+    """Operator input for a new threat event, submitted via the backend's
+    /v1/admin/* proxy. ``penalty`` crosses as a decimal STRING (pydantic
+    coerces to ``Decimal``), same convention as every other money-shaped
+    value at this boundary — a float round-trip is exactly the drift
+    ``NUMERIC(5,2)`` exists to avoid.
     """
 
     kind: Literal["leak", "deepfake_wave", "platform_incident", "other"]

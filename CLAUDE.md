@@ -53,7 +53,6 @@ copyable rather than re-derived.
 | Liveness | AWS Rekognition Face Liveness |
 | Face index | AWS Rekognition collections (`identity-v1`) |
 | Queues | AWS SQS — `identity:index`, `search:runs`, `confirm:hits` — with a transactional outbox |
-| Templating | Jinja2 — **console deployable only**; the API and fetcher return JSON and never render HTML |
 | Tests | pytest, pytest-postgresql, pytest-asyncio, httpx |
 | Local dev | docker compose — Postgres + LocalStack (SQS) |
 | Health / readiness | `GET /health` — always `200`, db reachability only; `GET /readyz` — `503` when the `svc` contract is broken (deploy gate) |
@@ -297,13 +296,13 @@ decisions behind the new rows.
 | Attribution: face → seed (`/v1/attribute`) | |
 | The four `svc` contract views (0016) | |
 | `GET /v1/config/floors` | |
-| **Adjudication queue + reviewer tooling (minimal)** — `review/`, `review_tasks`, `/v1/admin/review/*`, the control-room review screen. Human-only `confirmed`/`rejected`/`uncertain`; no auto-promotion (INVARIANTS #19, #47) | |
+| **Adjudication queue + reviewer tooling (minimal)** — `review/`, `review_tasks`, `/v1/admin/review/*`, the panel via the backend proxy. Human-only `confirmed`/`rejected`/`uncertain`; no auto-promotion (INVARIANTS #19, #47) | |
 | **Crop fetcher deployable** — `ARCHITECTURE.md` §3.7, pulled into scope; hands the confirm worker image bytes and renders blurred review crops live; no DB credentials | |
 | **Confirm pipeline** — `confirm/` worker on `confirm:hits`: fetch → pHash dedup → face-match (through `attribution/`, never a direct Rekognition search call) → moderation → severity triage | |
 | **Protection score + recommendations** — `score/` (engine, journaled store, `tick` drift-healer), `recommendations/` catalog. Journal is the product surface (INVARIANTS #44) | |
 | **Threat events** — `threats/`, admin-curated via `/v1/admin/threat-events`, bounded/decaying/reversible score effect (INVARIANTS #46) | |
-| **Control room console** — its own deployable (`console/`, port 8082), HTTP Basic per-operator, server-rendered; review queue, threat events CRUD, provider health, score inspector | |
-| **Articles** — `articles/`, `/v1/admin/articles`, the console's Articles pages, `svc.v_articles` (0026). Operator content for the app feed; no targeting, no score effect, no LLM (spec 2026-08-27, supersedes the 2026-08-20 campaigns spec) | |
+| **Control room console — retired 2026-08-29.** Staff now reach this admin API through the backend's `/v1/admin/*` operator proxy (`image_backend` spec `2026-08-29-admin-proxy-design.md`); this repo's admin routes are unchanged, only the direct-to-services client is gone | |
+| **Articles** — `articles/`, `/v1/admin/articles`, the panel's Articles pages (via the backend proxy), `svc.v_articles` (0026). Operator content for the app feed; no targeting, no score effect, no LLM (spec 2026-08-27, supersedes the 2026-08-20 campaigns spec) | |
 
 Two notes on that right-hand column. **CSAM screening and reporting are what gate minor
 discovery** — `MINOR_DISCOVERY_SUPPORTED` stays `False` until both exist, and flipping it without them
@@ -325,8 +324,9 @@ are spelled out. They share no code.
 `docs/superpowers/specs/2026-08-21-subject-verified-hits-design.md`: the subject decides their own
 hits (INVARIANTS #19/#45/#47 as amended), staff never see hit imagery, the confirm enqueue gate is
 open to every new hit, `attribution/crop.py` transcodes for Rekognition, and the subject surface is
-`GET /v1/infringements/{id}/preview` + `POST /v1/infringements/{id}/decision`. The console is
-metadata-only with a `/decisions` observer page. Like the 2026-08-19 push, this does not renumber the
+`GET /v1/infringements/{id}/preview` + `POST /v1/infringements/{id}/decision`. The subject-decisions
+observer view (`/decisions`) is metadata-only; it was the console's, now the panel's, via the backend's
+`/v1/admin/*` proxy (console retired 2026-08-29). Like the 2026-08-19 push, this does not renumber the
 build order below.
 
 The build spec for what's in scope is `NEAR-TERM-BUILD.md`. It is the authoritative task list.

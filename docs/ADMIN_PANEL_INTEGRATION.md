@@ -4,9 +4,11 @@
 a frontend team, another repo, or an AI agent handed the prompt at the bottom of this file.
 
 **Status of the surface:** every endpoint below is live on `main` (protection-score push,
-2026-08-20). A minimal server-rendered console already ships in this repo
-(`src/imageshield/console/` — port 8082); it is the **reference client** for these contracts. A
-richer panel replaces or sits beside it; the API does not change either way.
+2026-08-20). The reference client used to be a minimal server-rendered console shipped in this
+repo (`src/imageshield/console/`) — **retired 2026-08-29.** Staff now reach this surface through
+the backend's `/v1/admin/*` operator proxy (`image_backend` spec `2026-08-29-admin-proxy-design.md`
+§12); the panel is the frontend team's build against that proxy. The API below does not change
+either way — it is still the contract the backend's admin routes mirror.
 
 ---
 
@@ -19,9 +21,12 @@ richer panel replaces or sits beside it; the API does not change either way.
    `X-Fetcher-Token` for the unrelated subject-facing preview relay — see rule 5 and §7; that
    token is never used for anything in this contract.) Every endpoint below is therefore a
    contract between the BACKEND and the services; the frontend's contract is whatever admin
-   routes the backend exposes on top of it. The only direct-to-services client is the co-located
-   ops console shipped in this repo (`console/`, same box, private) — the reference
-   implementation of the proxying pattern, not a license for external callers.
+   routes the backend exposes on top of it. **The backend's `/v1/admin/*` proxy is now the ONLY
+   client of this surface** (`image_backend` spec `2026-08-29-admin-proxy-design.md`) — the
+   co-located ops console that used to be this repo's reference implementation of the proxying
+   pattern was retired 2026-08-29 once that proxy shipped. For the panel, build against the
+   backend's own collection, `postman/imageshield-admin.postman_collection.json` (`image_backend`
+   repo); the collection below (§2) stays the services-side upstream reference.
 1. **This surface is operator-facing, never user-facing.** Reachable only on the private
    network / VPN; no end user, end-user session, or public DNS name may ever reach it — and per
    rule 0, not even an operator's browser reaches the services directly.
@@ -29,13 +34,14 @@ richer panel replaces or sits beside it; the API does not change either way.
    (they must differ; the service refuses to boot otherwise). These identify the *panel*, not
    the person.
 3. **Operator identity is data, not auth.** Every write carries an `operator` string in the
-   body. It lands in `audit_log` and in `decided_by`/`created_by` columns. Your panel must
-   authenticate its human operators itself (the shipped console uses HTTP Basic with
-   per-operator tokens + CSRF double-submit — copy that or better) and must pass the real
-   operator name, never a shared constant.
-4. **CSRF is your job.** The API is token-authenticated and stateless; if your panel holds
-   those tokens server-side and exposes browser forms, protect the forms
-   (`console/auth.py::make_csrf_token` shows the shipped pattern).
+   body. It lands in `audit_log` and in `decided_by`/`created_by` columns. The backend proxy
+   authenticates its human operators itself (an account + `iam.operator_grants` grant, not HTTP
+   Basic — `image_backend` admin-proxy design §5) and injects the granted `display_name` into
+   this field server-side; clients of the backend never send `operator` at all.
+4. **CSRF is your job.** The API is token-authenticated and stateless; whoever holds these
+   tokens server-side and exposes browser forms must protect the forms. The retired console used
+   HTTP Basic with per-operator tokens plus CSRF double-submit; the backend proxy sits behind its
+   own session model instead.
 5. **Pixels are never shown to staff.** Since 2026-08-21 the subject decides their own hits and
    staff never see hit imagery, blurred or otherwise; the fetcher's crop route is not part of
    this contract. `image_url` still ships on the review card (§3) as **evidence for
@@ -170,7 +176,7 @@ threat_event, threat_retracted, tick`.
   `{"reason": "…", "operator": "…"}`.
 
 `operator` is optional; omitted, the audit row records `admin_service_token` instead of a name.
-The shipped console always sends it.
+The backend proxy always sends it (injected from the operator's `iam.operator_grants.display_name`).
 
 `rekognition_confirm` appears here like any provider — its budget/breaker govern the confirm
 pipeline's Rekognition spend.
@@ -191,8 +197,8 @@ every write body.
 - `POST /v1/admin/articles/{id}/archive` body `{operator, reason}` → removes it from the feed.
 - Unknown id → `404 article_not_found`.
 
-Rendering pictures in an ops panel is your call, but the shipped console deliberately shows them
-as links only so "no imagery in the control room" stays a rule without carve-outs.
+Rendering pictures in an ops panel is your call, but show them as links only, never fetched or
+embedded, so "no imagery in the control room" stays a rule without carve-outs.
 
 ## 7. Fetcher (crop rendering)
 
@@ -201,9 +207,9 @@ no admin/ops surface calls `/v1/crop`; the section below is background on what t
 not an instruction to a panel builder. `POST {fetcher}/v1/crop` exists. Its callers are the
 **subject-facing** preview route
 (`GET /v1/infringements/{id}/preview`, relayed by the proxy as `GET /v1/hits/{id}/preview`) and
-the confirm pipeline's own internal moderation pass — neither is an operator surface. The shipped
-console holds no fetcher client and no `X-Fetcher-Token` at all
-(`console/config.py`: "the console's ONLY upstream" is the services admin API). Do not build a
+the confirm pipeline's own internal moderation pass — neither is an operator surface. No admin/ops
+surface — the retired console held no fetcher client and no `X-Fetcher-Token`, and the backend's
+admin proxy does not either — has any reason to hold one. Do not build a
 crop-fetching path into an ops panel: if staff ever need to see a pixel, that is a rule-5 change
 to raise before building, not an integration detail to infer from this endpoint's existence.
 

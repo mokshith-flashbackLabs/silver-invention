@@ -471,20 +471,34 @@ controls on both.
 
 ---
 
-## 9b. The protection-score push — confirm, fetcher, console
+## 9b. The protection-score push — confirm, fetcher (console retired 2026-08-29)
 
-**Deployed 2026-08-19+, after §9a.** Three new task definitions in `infra/ecs/`:
+**RETIRED 2026-08-29.** This section originally deployed a third task definition,
+`imageshield-dev-console.json` (the control-room console, port 8082), alongside confirm and
+fetcher below. The console is gone — staff now reach its admin API through the backend's
+`/v1/admin/*` operator proxy (`image_backend` spec `2026-08-29-admin-proxy-design.md` §12). What
+follows is the original deploy history, trimmed to the two deployables that are still current; the
+console-specific steps (its secret key, its task role, its `create-service` call) are removed. The
+repo now ships **five** task definitions total: `imageshield-dev-services`,
+`imageshield-dev-services-worker`, `imageshield-dev-fetcher`, `imageshield-dev-confirm`,
+`imageshield-dev-migrate-services`. Deleting the ECS service is an operator action, not run as
+part of this change:
+
+```bash
+aws ecs delete-service --cluster imageshield-dev --service console --force
+```
+
+**Deployed 2026-08-19+, after §9a.** Two new task definitions in `infra/ecs/`:
 `imageshield-dev-confirm.json` (two containers: `confirm-worker` +
 `python -m imageshield.confirm.worker`, 192 MB; `score-tick` +
-`python -m imageshield.score.tick`, 96 MB), `imageshield-dev-fetcher.json` (one container, port 8083),
-`imageshield-dev-console.json` (one container, port 8082).
+`python -m imageshield.score.tick`, 96 MB), `imageshield-dev-fetcher.json` (one container, port 8083).
 
 ### Secrets keys to add first
 
-Two **new keys on the existing** `imageshield/<env>/service-token/backend-to-services` secret
-container — not new secret containers, new keys inside the one that already exists. Terraform creates
-containers only, never values (§1), and that rule applies here too: add the keys by hand in Secrets
-Manager **before** registering any of the three task definitions below, or the tasks fail at launch
+One **new key on the existing** `imageshield/<env>/service-token/backend-to-services` secret
+container — not a new secret container, a new key inside the one that already exists. Terraform
+creates containers only, never values (§1), and that rule applies here too: add the key by hand in
+Secrets Manager **before** registering either task definition below, or the tasks fail at launch
 with `ResourceInitializationError` and no application logs (§12.4 — the same failure mode, a different
 cause).
 
@@ -492,38 +506,42 @@ cause).
 aws secretsmanager get-secret-value \
   --secret-id imageshield/dev/service-token/backend-to-services \
   --query SecretString --output text
-# add FETCHER_TOKEN and CONSOLE_OPERATORS to the JSON, then:
+# add FETCHER_TOKEN to the JSON, then:
 aws secretsmanager put-secret-value \
   --secret-id imageshield/dev/service-token/backend-to-services \
-  --secret-string '<the merged JSON, all existing keys plus the two new ones>'
+  --secret-string '<the merged JSON, all existing keys plus the new one>'
 ```
 
 | Key | Consumed by | Shape |
 |---|---|---|
-| `FETCHER_TOKEN` | confirm-worker, fetcher, console | A random token ≥16 chars — the fetcher checks it with `hmac.compare_digest`. Same value on all three consumers; it is the shared secret between them, not a per-service one |
-| `CONSOLE_OPERATORS` | console only | `"name:token,name:token,..."` — `console/auth.py`'s parser rejects a malformed roster at **boot**, not on first login, so a typo here crash-loops the console task rather than locking out one operator |
+| `FETCHER_TOKEN` | confirm-worker, fetcher | A random token ≥16 chars — the fetcher checks it with `hmac.compare_digest`. Same value on both consumers; it is the shared secret between them, not a per-service one |
 
-Verify both keys exist before moving on:
+At the time this was written, a second key (`CONSOLE_OPERATORS`) was also added here for the
+control-room console — retired 2026-08-29 (see §9b's opening note). That key **stays** in Secrets
+Manager as an audit artifact of who was ever granted console access; no code reads it any more, so
+it is not part of this checklist going forward.
+
+Verify the key exists before moving on:
 
 ```bash
 aws secretsmanager get-secret-value \
   --secret-id imageshield/dev/service-token/backend-to-services \
   --query SecretString --output text \
   | python -c 'import sys,json;print(sorted(json.load(sys.stdin)))'
-# must include FETCHER_TOKEN and CONSOLE_OPERATORS alongside the pre-existing "token" key
+# must include FETCHER_TOKEN alongside the pre-existing "token" key
 ```
 
-### The no-AWS task role, before registering fetcher or console
+### The no-AWS task role, before registering fetcher
 
-Both new task definitions carried `taskRoleArn: imageshield-dev-services` in an earlier draft of
+The fetcher task definition carried `taskRoleArn: imageshield-dev-services` in an earlier draft of
 this deploy -- the role with Rekognition, S3, SQS and KMS grants meant for the API, worker and
-confirm processes. Neither the fetcher (outbound HTTP fetches only) nor the console (an HTTP client
-of the services API and the fetcher, §17) calls any AWS API, so that grant was pure over-privilege:
-a bug in either process would have reached credentials it never needed. `tests/test_ecs_task_defs.py
-::test_fetcher_and_console_do_not_hold_the_services_task_role` makes that a build-time check now.
+confirm processes. The fetcher (outbound HTTP fetches only) calls no AWS API, so that grant was pure
+over-privilege: a bug in the process would have reached credentials it never needed.
+`tests/test_ecs_task_defs.py::test_fetcher_does_not_hold_the_services_task_role` makes that a
+build-time check now.
 
-Create the role once, before registering `imageshield-dev-fetcher.json` or
-`imageshield-dev-console.json` -- both files' `taskRoleArn` already points at it:
+Create the role once, before registering `imageshield-dev-fetcher.json` -- the file's `taskRoleArn`
+already points at it:
 
 ```bash
 # Same ecs-tasks.amazonaws.com trust document as imageshield-dev-exec / imageshield-dev-services
@@ -535,17 +553,16 @@ aws iam create-role --role-name imageshield-dev-no-aws \
 # using it that somehow calls an AWS API gets an explicit AccessDenied, not a working credential.
 ```
 
-### Register and create the three services
+### Register and create the two services
 
 Same pattern as §9a — register, then create with `minimumHealthyPercent=0, maximumPercent=100` (still
-one instance, still fixed host ports for fetcher/console; the confirm task has no health check and no
+one instance, still a fixed host port for fetcher; the confirm task has no health check and no
 port, same reasoning as the worker task in §9a: neither process serves HTTP, and `essential: true`
 already restarts a dead one).
 
 ```bash
 aws ecs register-task-definition --cli-input-json file://infra/ecs/imageshield-dev-confirm.json
 aws ecs register-task-definition --cli-input-json file://infra/ecs/imageshield-dev-fetcher.json
-aws ecs register-task-definition --cli-input-json file://infra/ecs/imageshield-dev-console.json
 
 aws ecs create-service --cluster $CLUSTER --service-name fetcher \
   --task-definition imageshield-dev-fetcher --desired-count 1 --launch-type EC2 \
@@ -556,16 +573,11 @@ aws ecs create-service --cluster $CLUSTER --service-name confirm \
   --task-definition imageshield-dev-confirm --desired-count 1 --launch-type EC2 \
   --deployment-configuration 'minimumHealthyPercent=0,maximumPercent=100'
 aws ecs wait services-stable --cluster $CLUSTER --services confirm
-
-aws ecs create-service --cluster $CLUSTER --service-name console \
-  --task-definition imageshield-dev-console --desired-count 1 --launch-type EC2 \
-  --deployment-configuration 'minimumHealthyPercent=0,maximumPercent=100'
-aws ecs wait services-stable --cluster $CLUSTER --services console
 ```
 
 ### Deploy order, and why it is an order
 
-**Fetcher → confirm → console.** Not arbitrary:
+**Fetcher → confirm.** Not arbitrary:
 
 1. **Fetcher first.** The confirm worker calls `FETCHER_BASE_URL` (`http://localhost:8083`) for every
    hit it processes; if confirm starts before the fetcher is reachable, its first batch of jobs fails
@@ -574,18 +586,18 @@ aws ecs wait services-stable --cluster $CLUSTER --services console
    starting confirm avoids manufacturing a false alarm.
 2. **Confirm second.** It is the thing actually consuming `confirm:hits` and writing triage state;
    nothing downstream needs it up first.
-3. **Console last.** It is a pure read/write client of the services API and the fetcher — nothing
-   breaks by starting it last, and starting it last means an operator opening the console for the
-   first time sees a fully-live backend rather than a console reporting upstream errors while the
-   other two are still coming up.
+
+(A third step, "console last", existed here for the control-room console; removed with its
+retirement — see §9b's opening note.)
 
 ### Placement caveat — read before assuming a `create-service` failure is a bug
 
 **The dev instance is one burstable `t4g.medium`, and headroom is not guaranteed.** §9a's worker
 service already budgets memory carefully (448 MB of the ~763 MB schedulable, leaving ≥256 for one-off
-tasks); the three new services here (192 + 96 + 192 + 160 = 640 MB more) can push total scheduled
-memory past what the instance actually has free at the moment you deploy, especially if a one-off
-migrate task or the §6d probe is mid-flight.
+tasks); at the time this was written the three new services here (192 + 96 + 192 + 160 = 640 MB
+more, the last 160 being the now-retired console) could push total scheduled memory past what the
+instance actually has free at the moment you deploy, especially if a one-off migrate task or the
+§6d probe is mid-flight. With the console gone the current figure is 192 + 96 + 192 = 480 MB.
 
 **Symptom:** `create-service` succeeds (it just registers the desired state) but the task never
 reaches `RUNNING` — `aws ecs describe-services` shows an event like
@@ -598,10 +610,11 @@ This is not a bug in the task definition; it is arithmetic.
    task).
 2. **Resize the instance** (or add a second one) if dev is expected to run all seven processes
    concurrently going forward — a `t4g.medium` was sized for the original four-process v1 footprint,
-   not eight.
-3. As a temporary measure only, reduce `desired-count` on a lower-priority service (console is the
-   safest candidate — it has no consumers waiting on it) to free headroom, but treat this as a
-   stopgap and raise the sizing question rather than leaving it that way.
+   not seven.
+3. As a temporary measure only, reduce `desired-count` on a lower-priority service to free headroom,
+   but treat this as a stopgap and raise the sizing question rather than leaving it that way. (The
+   console used to be the safest candidate for this — it had no consumers waiting on it; it is
+   retired, so pick the next-lowest-priority service instead.)
 
 Do not "fix" a placement failure by trimming a container's `memory` value below what the process
 actually needs — that trades a visible placement failure for an invisible OOM kill later, which is a
