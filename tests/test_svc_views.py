@@ -477,6 +477,36 @@ def test_live_exposure_excludes_dismissed_authorised_and_dead(migrated_db: str) 
     assert row["unresolved_matches"] == 3
 
 
+def test_live_exposure_and_unresolved_matches_exclude_user_resolved(
+    migrated_db: str,
+) -> None:
+    """Done-when (0028, design spec §8): the user's own third terminal
+    position -- "I've dealt with it" -- drops out of BOTH
+    ``live_exposure_count`` and ``unresolved_matches``, the same as
+    ``dismissed_not_me`` and ``authorised`` already do.
+
+    ``unresolved_matches`` needed no SQL edit to get this: its FILTER is
+    ``status IN ('new', 'acknowledged')``, and ``user_resolved`` is neither,
+    so it falls out on its own. This test is what proves that claim rather
+    than leaving it asserted only in the migration's comment.
+    """
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        seed = _seed(conn, user_ref)
+        run = _run(conn, user_ref, seed)
+        _infringement(conn, user_ref, run, domain="open.test", status="acknowledged")
+        _infringement(conn, user_ref, run, domain="dealt-with.test", status="user_resolved")
+
+    row = _one(
+        migrated_db,
+        "SELECT * FROM svc.v_person_report_summary WHERE person_ref = %s",
+        (user_ref,),
+    )
+    assert row["live_exposure_count"] == 1
+    assert row["unresolved_matches"] == 1
+    assert row["active_reports"] == 0  # neither row is 'new'
+
+
 def test_counts_do_not_multiply_when_a_person_has_several_runs(
     migrated_db: str,
 ) -> None:
@@ -721,6 +751,38 @@ def test_resolved_at_is_set_for_a_terminal_position_and_for_a_dead_url(
     assert resolved["open.test"] is None
     assert resolved["mine.test"] is not None
     assert resolved["gone.test"] is not None
+    assert open_hit is not None
+
+
+def test_resolved_at_is_set_for_user_resolved(migrated_db: str) -> None:
+    """Done-when (0028): ``resolved_at`` is stamped with the user's own
+    feedback timestamp for ``user_resolved``, the same as it already is for
+    ``dismissed_not_me`` and ``authorised`` -- a third terminal position, not
+    a special case in the CASE expression's shape."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        seed = _seed(conn, user_ref)
+        run = _run(conn, user_ref, seed)
+        open_hit = _infringement(conn, user_ref, run, domain="open.test")
+        resolved = _infringement(
+            conn, user_ref, run, domain="dealt-with.test", status="user_resolved"
+        )
+        conn.execute(
+            "INSERT INTO infringement_feedback (infringement_id, user_ref, signal)"
+            " VALUES (%s, %s, 'resolved')",
+            (resolved, user_ref),
+        )
+
+    resolved_at = {
+        row["source_domain"]: row["resolved_at"]
+        for row in _rows(
+            migrated_db,
+            "SELECT * FROM svc.v_person_hits WHERE person_ref = %s",
+            (user_ref,),
+        )
+    }
+    assert resolved_at["open.test"] is None
+    assert resolved_at["dealt-with.test"] is not None
     assert open_hit is not None
 
 

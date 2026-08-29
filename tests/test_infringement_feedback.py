@@ -135,6 +135,7 @@ async def test_a_refused_feedback_writes_nothing(
         ("confirmed", "acknowledged"),
         ("uncertain", "new"),  # unchanged, but still recorded
         ("authorised", "authorised"),
+        ("resolved", "user_resolved"),
     ],
 )
 async def test_each_signal_sets_the_specified_status(
@@ -304,6 +305,54 @@ async def test_authorised_terminates_and_leaves_live_exposure(
             (infringement_id,),
         ).fetchall()
     assert [row[0] for row in recorded] == ["authorised"]
+
+
+# ── the fifth signal ─────────────────────────────────────────────────────────
+
+
+async def test_resolved_terminates_and_leaves_live_exposure_and_unresolved_matches(
+    store: PostgresSearchStore, migrated_db: str
+) -> None:
+    """Done-when (migration 0028, design spec §8): ``signal = 'resolved'``
+    moves the hit to ``user_resolved``, and a subsequent read of
+    ``v_person_report_summary`` shows BOTH ``live_exposure_count`` and
+    ``unresolved_matches`` one lower -- the same shape ``authorised`` already
+    proves for the first count, extended to the second because the design
+    spec names it explicitly.
+
+    'resolved' is a different KIND of claim than the other four signals: it
+    is the user's own assertion that they dealt with an infringement they
+    already called abuse, not a statement about whether the match is really
+    them.
+    """
+    infringement_id, owner = await _an_infringement(store, migrated_db)
+
+    def counts() -> tuple[int, int]:
+        with psycopg.connect(migrated_db, autocommit=True) as conn:
+            row = conn.execute(
+                "SELECT live_exposure_count, unresolved_matches"
+                " FROM svc.v_person_report_summary WHERE person_ref = %s",
+                (owner,),
+            ).fetchone()
+        assert row is not None
+        exposure, unresolved = row
+        return exposure, unresolved
+
+    before_exposure, before_unresolved = counts()
+
+    assert await store.record_feedback(infringement_id, owner, "resolved") == (
+        "user_resolved"
+    )
+
+    after_exposure, after_unresolved = counts()
+    assert after_exposure == before_exposure - 1
+    assert after_unresolved == before_unresolved - 1
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        recorded = conn.execute(
+            "SELECT signal FROM infringement_feedback WHERE infringement_id = %s",
+            (infringement_id,),
+        ).fetchall()
+    assert [row[0] for row in recorded] == ["resolved"]
 
 
 async def test_an_unknown_signal_is_refused_by_the_database(

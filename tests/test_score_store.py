@@ -341,6 +341,41 @@ async def test_dead_url_restores_exposure(
     assert after.score >= before.score
 
 
+async def test_resolved_restores_exposure_like_a_dead_url(
+    migrated_db: str, store: PostgresScoreStore, pool: AsyncConnectionPool
+) -> None:
+    """migration 0028's signal gets the identical treatment as a dead URL and
+    as ``authorised``/``dismissed_not_me``: a hit the user has resolved
+    themselves stops costing exposure points, through the same ``counts``
+    boolean in ``score/store.py``'s ``_CONFIRMED_HITS_SQL``.
+
+    This is INVARIANTS #44 ("no feedback signal ever lowers the score")
+    applied to the new signal: charging exposure for a hit the person already
+    told us they dealt with is exactly a score-lowering effect of that
+    signal, just arriving through a stale read on the next recompute instead
+    of an explicit write. The design spec's own "nothing here touches a
+    score" (§2) is about the ONE user-facing score in the backend repo
+    (P13, bands, escrow) -- this repo's own control-room exposure component
+    is a second, independent score this repo owns, and INVARIANTS #44 binds
+    it regardless of who reads it.
+    """
+    user_ref = _user()
+    await ensure_subject(pool, user_ref)
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        infringement_id = _infringement(conn, user_ref, severity="ncii_suspected")
+
+    before = await store.recompute(user_ref, cause_kind="test")
+    assert before is not None
+
+    search_store = PostgresSearchStore(pool)
+    await search_store.record_feedback(infringement_id, user_ref, "resolved")
+
+    after = await store.recompute(user_ref, cause_kind="test")
+    assert after is not None
+    assert after.components.exposure > before.components.exposure
+    assert after.score >= before.score
+
+
 # ── unknown subject ────────────────────────────────────────────────────────
 
 

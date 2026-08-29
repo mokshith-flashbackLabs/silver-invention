@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Literal, get_args
 
-FeedbackSignal = Literal["not_me", "confirmed", "uncertain", "authorised"]
+FeedbackSignal = Literal["not_me", "confirmed", "uncertain", "authorised", "resolved"]
 
 FEEDBACK_SIGNALS: tuple[str, ...] = get_args(FeedbackSignal)
 
@@ -43,11 +43,22 @@ FEEDBACK_SIGNALS: tuple[str, ...] = get_args(FeedbackSignal)
 # points with no way to clear it. That is the same inversion the legacy system
 # had, where reporting abuse permanently depressed your score and dismissing a
 # hit improved it, in a milder form.
+#
+# 'resolved' (migration 0028) is the fifth signal, and it is a claim of a
+# different KIND than the other four: it is the user's assertion that they
+# dealt with an infringement they already called abuse, not a statement about
+# whether the match is really them. It is reached only from 'acknowledged' in
+# practice, but that gate is enforced by the backend (the only ingress), not
+# here — this table is a faithful recorder of whatever the caller sends, the
+# same restraint 'not_me' already demonstrates. Reversible for free: sending
+# 'confirmed' again after 'resolved' is a second append-only row and moves
+# infringements.status straight back to 'acknowledged'.
 _STATUS_BY_SIGNAL: dict[str, str | None] = {
     "not_me": "dismissed_not_me",
     "confirmed": "acknowledged",
     "uncertain": None,
     "authorised": "authorised",
+    "resolved": "user_resolved",
 }
 
 
