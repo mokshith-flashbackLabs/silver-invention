@@ -34,13 +34,12 @@ dependencies = [
     "httpx>=0.27.2",
     # attribution/crop.py ONLY -- see the note above.
     "pillow>=11.0.0,<12.0",
-    # console only -- server-rendered templates for the control-room console.
-    "jinja2>=3.1,<4.0",
-    # console's Form handlers need this at runtime to parse
-    # application/x-www-form-urlencoded bodies; devtools/harness (file-upload
-    # form parsing for the local test UI) uses it too, but the console is why
-    # it can no longer be dev-only -- without it the console image 500s on
-    # every form post in production.
+    # devtools/harness (file-upload form parsing for the local test UI) needs
+    # this at runtime to parse application/x-www-form-urlencoded bodies. Used
+    # to be load-bearing for the control-room console too (retired
+    # 2026-08-29 -- staff now reach the admin API through the backend's
+    # /v1/admin/* proxy); kept as a main dependency rather than moved to
+    # dev-only because devtools is not a separate install target.
     "python-multipart>=0.0.9",
 ]
 
@@ -61,7 +60,7 @@ where = ["src"]
 include = ["imageshield*"]
 
 [tool.setuptools.package-data]
-imageshield = ["py.typed", "console/templates/*.html"]
+imageshield = ["py.typed"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

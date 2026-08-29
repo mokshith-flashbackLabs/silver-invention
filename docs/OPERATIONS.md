@@ -15,8 +15,10 @@ while invisible.
 
 ## Orientation
 
-Eight processes, all from one image except where noted. The first four are v1; the last four are the
-2026-08-19 protection-score push (`imageshield-dev-confirm`, `-fetcher`, `-console` task defs).
+Seven processes, all from one image except where noted. The first four are v1; the last three are the
+2026-08-19 protection-score push (`imageshield-dev-confirm`, `-fetcher` task defs). An eighth,
+the control-room console (`-console`), shipped in the same push and was retired 2026-08-29 — staff
+now reach its admin API through the backend's `/v1/admin/*` operator proxy.
 
 | Process | Command | What it does |
 |---|---|---|
@@ -27,7 +29,6 @@ Eight processes, all from one image except where noted. The first four are v1; t
 | Confirm worker | `python -m imageshield.confirm.worker` | Consumes `confirm:hits`: fetch → pHash → face-match (via `attribution/`) → moderation → severity triage into `review_tasks` |
 | Score tick | `python -m imageshield.score.tick` | Daily drift-healer: re-runs score recompute for aging effects and any trigger whose recompute crashed after commit |
 | Fetcher | `uvicorn imageshield.fetcher.app:create_app --factory --port 8083` | Standalone deployable, no DB credentials. Hands the confirm worker image bytes; renders the subject's blurred face crops live (services preview endpoint — the console's crop access was removed 2026-08-21: staff never see hit imagery) |
-| Console | `uvicorn imageshield.console.app:create_app --factory --port 8082` | Standalone deployable, no DB credentials, no fetcher client. Control-room UI: review queue (metadata-only), subject-decisions observer (`/decisions` — open hits show THAT a person has a hit; explicit-severity confirmations are takedown-campaign candidates), threat events, provider health, score inspector; HTTP Basic per operator |
 
 The API logs the AWS **account, region and collection** at startup as a
 `WARNING` (`event: aws.identity`). If you are unsure which environment a
@@ -161,14 +162,17 @@ provider just refills it. Fix the cause, then replay.
 **Disable it. No deploy, effective within 30 seconds** (the provider config
 cache TTL is capped at 30s in code).
 
-**From the console (preferred):** Dashboard → the provider's row → *Disable* with a reason. The
-audit row names you. The curl below is the break-glass path for when the console itself is down:
+**From the panel (preferred):** Provider health → the provider's row → *Disable* with a reason —
+the backend's `/v1/admin/providers/{id}/disable`, proxied to the services route below. The audit
+row names the signed-in operator. The curl below is the **break-glass** path for when the panel or
+the backend itself is down — hit the services route directly, naming yourself, since there is no
+operator session to inject a name for you:
 
 ```bash
 curl -X POST "$BASE/v1/admin/providers/hive/disable" \
   -H "X-Service-Token: $TOKEN" -H "X-Admin-Service-Token: $ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"reason": "returning Media Search results, not Web Search — key on wrong project"}'
+  -d '{"reason": "returning Media Search results, not Web Search — key on wrong project", "operator": "<your name>"}'
 ```
 
 The reason is mandatory (min 3 characters) and it is not paperwork.
@@ -217,13 +221,15 @@ abandoned by a dead worker is reclaimed after cooldown + grace.
 
 **To force it closed** once you know the provider is fixed:
 
-**From the console:** Dashboard → *Reset breaker* (shown only while the breaker is not closed).
-Break-glass:
+**From the panel:** Provider health → *Reset breaker* (shown only while the breaker is not closed)
+— the backend's `/v1/admin/providers/{id}/breaker-reset`. Break-glass, straight to services,
+naming yourself:
 
 ```bash
 curl -X POST "$BASE/v1/admin/providers/hive/breaker/reset" \
   -H "X-Service-Token: $TOKEN" -H "X-Admin-Service-Token: $ADMIN_TOKEN" \
-  -H 'Content-Type: application/json' -d '{"reason": "vendor confirmed incident resolved"}'
+  -H 'Content-Type: application/json' \
+  -d '{"reason": "vendor confirmed incident resolved", "operator": "<your name>"}'
 ```
 
 This is **separate from `/enable` deliberately**: *"this provider is fixed, let
@@ -242,8 +248,9 @@ curl "$BASE/v1/admin/providers/health" \
   -H "X-Service-Token: $TOKEN" -H "X-Admin-Service-Token: $ADMIN_TOKEN"
 ```
 
-The console's dashboard renders the same payload: every firing alarm first, then spend, headroom
-and latency per provider.
+The panel's provider health screen renders the same payload, via the backend's
+`GET /v1/admin/providers/health`: every firing alarm first, then spend, headroom and latency per
+provider.
 
 Money crosses as decimal **strings**, not floats. Per-provider per-day call
 count, cost, success rate, p50/p99, breaker state, budget headroom and every

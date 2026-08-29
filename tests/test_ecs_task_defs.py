@@ -23,7 +23,6 @@ MIGRATE_TASK = ECS_DIR / "imageshield-dev-migrate-services.json"
 WORKER_TASK = ECS_DIR / "imageshield-dev-services-worker.json"
 CONFIRM_TASK = ECS_DIR / "imageshield-dev-confirm.json"
 FETCHER_TASK = ECS_DIR / "imageshield-dev-fetcher.json"
-CONSOLE_TASK = ECS_DIR / "imageshield-dev-console.json"
 TASK_ROLE = ECS_DIR / "policies" / "services-task-role.json"
 
 LIVENESS_BUCKET = "imageshield-dev-liveness-225989356895"
@@ -55,7 +54,6 @@ def _actions(path: Path) -> list[str]:
         WORKER_TASK,
         CONFIRM_TASK,
         FETCHER_TASK,
-        CONSOLE_TASK,
         TASK_ROLE,
     ],
 )
@@ -128,7 +126,7 @@ def test_no_rekognition_action_is_unscoped() -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, CONFIRM_TASK, FETCHER_TASK, CONSOLE_TASK],
+    [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, CONFIRM_TASK, FETCHER_TASK],
 )
 def test_no_secret_arrives_through_environment(path: Path) -> None:
     """An `environment` value is visible in describe-task-definition to anyone
@@ -145,7 +143,7 @@ def test_no_secret_arrives_through_environment(path: Path) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, CONFIRM_TASK, FETCHER_TASK, CONSOLE_TASK],
+    [SERVICES_TASK, MIGRATE_TASK, WORKER_TASK, CONFIRM_TASK, FETCHER_TASK],
 )
 def test_every_task_has_both_roles(path: Path) -> None:
     """Execution role pulls the image and resolves secrets before the code runs;
@@ -430,51 +428,45 @@ def test_confirm_uses_the_narrower_db_pool(name: str = "DB_POOL_MAX_SIZE") -> No
         assert env[name] == "2", f"{container['name']} does not use the narrower pool"
 
 
-def test_fetcher_and_console_do_not_hold_the_services_task_role() -> None:
-    """Both processes were carrying ``imageshield-dev-services`` -- the role
-    with Rekognition, S3, SQS and KMS grants meant for the API/worker/confirm
-    processes -- for no reason: neither one calls AWS at all (fetcher does
-    outbound HTTP fetches, console is an HTTP client of two other services).
-    They must point at a distinct role with no attached policy, so that a
-    future bug in either process cannot reach an AWS credential it should
-    never have held.
+def test_fetcher_does_not_hold_the_services_task_role() -> None:
+    """The fetcher was carrying ``imageshield-dev-services`` -- the role with
+    Rekognition, S3, SQS and KMS grants meant for the API/worker/confirm
+    processes -- for no reason: it does outbound HTTP fetches only and calls
+    no AWS API at all. It must point at a distinct role with no attached
+    policy, so that a future bug in the process cannot reach an AWS
+    credential it should never have held.
     """
     services_role = _load(SERVICES_TASK)["taskRoleArn"]
-    for path in (FETCHER_TASK, CONSOLE_TASK):
-        role = _load(path)["taskRoleArn"]
-        assert role != services_role, (
-            f"{path.name} still carries the over-privileged services task role"
-        )
-        assert role.endswith("/imageshield-dev-no-aws"), (
-            f"{path.name} taskRoleArn is {role!r}, expected the no-aws role"
-        )
+    role = _load(FETCHER_TASK)["taskRoleArn"]
+    assert role != services_role, (
+        f"{FETCHER_TASK.name} still carries the over-privileged services task role"
+    )
+    assert role.endswith("/imageshield-dev-no-aws"), (
+        f"{FETCHER_TASK.name} taskRoleArn is {role!r}, expected the no-aws role"
+    )
 
 
-def test_fetcher_and_console_hold_no_database_access() -> None:
-    """The fetcher and console are the no-DB-access property in deployable
-    form (ARCHITECTURE.md §3.7, console/config.py, fetcher/config.py): neither
-    process's config class even has a ``database_url`` field, so neither task
-    definition may carry DATABASE_URL or any DB_* secret or environment
-    entry — the property this test exists to make mechanically checkable
-    rather than trusted to a docstring.
+def test_fetcher_holds_no_database_access() -> None:
+    """The fetcher is the no-DB-access property in deployable form
+    (ARCHITECTURE.md §3.7, fetcher/config.py): its config class has no
+    ``database_url`` field, so its task definition may not carry
+    DATABASE_URL or any DB_* secret or environment entry — the property this
+    test exists to make mechanically checkable rather than trusted to a
+    docstring.
     """
-    for path in (FETCHER_TASK, CONSOLE_TASK):
-        for container in _load(path)["containerDefinitions"]:
-            supplied = _container_supplied_names(container)
-            db_names = {
-                name for name in supplied if name == "DATABASE_URL" or name.startswith("DB_")
-            }
-            assert db_names == set(), (
-                f"{path.name} container {container['name']!r} carries database"
-                f" access it must never have: {sorted(db_names)}"
-            )
+    for container in _load(FETCHER_TASK)["containerDefinitions"]:
+        supplied = _container_supplied_names(container)
+        db_names = {
+            name for name in supplied if name == "DATABASE_URL" or name.startswith("DB_")
+        }
+        assert db_names == set(), (
+            f"{FETCHER_TASK.name} container {container['name']!r} carries database"
+            f" access it must never have: {sorted(db_names)}"
+        )
 
 
-def test_fetcher_serves_8083_and_console_8082() -> None:
-    """Each deployable binds its own dedicated port on the shared host-network
-    instance — 8081 is `services`, so the new ones must not collide with it
-    or each other."""
+def test_fetcher_serves_8083() -> None:
+    """The fetcher binds its own dedicated port on the shared host-network
+    instance — 8081 is `services`, so it must not collide with it."""
     fetcher = _load(FETCHER_TASK)["containerDefinitions"][0]
-    console = _load(CONSOLE_TASK)["containerDefinitions"][0]
     assert "8083" in " ".join(fetcher["command"])
-    assert "8082" in " ".join(console["command"])
