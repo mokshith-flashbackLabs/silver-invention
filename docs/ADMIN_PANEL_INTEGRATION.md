@@ -54,7 +54,9 @@ richer panel replaces or sits beside it; the API does not change either way.
 |---|---|---|
 | Services admin API | `http://<services-host>:8081` | `X-Service-Token`, `X-Admin-Service-Token` |
 
-All admin routes live under `/v1/admin/…`. Missing/wrong tokens → `401` envelope. The fetcher
+All admin routes live under `/v1/admin/…`. Missing/wrong tokens → `401` envelope.
+
+A Postman collection of this whole surface (22 requests, six folders, test scripts that chain the created ids) lives at `postman/imageshield-services-admin.postman_collection.json`, with an environment file beside it whose token values are deliberately empty — fill them from Secrets Manager, never commit them. Its description repeats rule 0: the panel's browser goes through the backend; the collection is the services-side contract the backend's admin routes mirror. The fetcher
 (crops) is a separate upstream used by the subject-facing preview flow, not by this contract —
 see rule 5 and §7.
 
