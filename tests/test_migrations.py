@@ -1660,6 +1660,85 @@ def test_0026_creates_articles_and_the_view_and_down_removes_them(throwaway_db: 
     assert run_migrate(throwaway_db, "up").returncode == 0
 
 
+# -- 0028: the user marks their own hit resolved -----------------------------
+
+
+def test_0028_down_reassigns_status_forward_and_grandfathers_feedback_not_valid(
+    throwaway_db: str,
+) -> None:
+    """Done-when (design spec §8): the down migration reverts data before
+    narrowing the CHECK it depends on, and does it two different ways for two
+    different reasons.
+
+    ``infringements.status`` is a CURRENT-POSITION column, so the down leg
+    reassigns a ``user_resolved`` row forward to ``acknowledged`` -- a real
+    transition the feature already allows (sending ``confirmed`` again does
+    the same thing), not an invented one -- and then narrows the CHECK with a
+    normal, validating ``ADD CONSTRAINT``: no row violates it any more, so
+    nothing needs grandfathering.
+
+    ``infringement_feedback.signal`` is an APPEND-ONLY EVENT LOG with no
+    current-position column to reassign to, so the down leg instead re-adds
+    its narrower CHECK ``NOT VALID`` -- the same tool 0016's down leg uses to
+    revert 'authorised' for the identical reason. The 'resolved' row a real
+    person wrote about their own report survives untouched; only a FRESH
+    'resolved' row is refused from here.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        infringement_id, user_ref = _seed_infringement(conn)
+        conn.execute(
+            "UPDATE infringements SET status = 'user_resolved' WHERE infringement_id = %s",
+            (infringement_id,),
+        )
+        conn.execute(
+            "INSERT INTO infringement_feedback (infringement_id, user_ref, signal)"
+            " VALUES (%s, %s, 'resolved')",
+            (infringement_id, user_ref),
+        )
+
+    # Land with 0027 (not 0028) as the newest applied migration -- the target
+    # for "revert 0028 itself" is the step count back to the migration BEFORE
+    # it, same convention as test_0007_down_removes_them_and_the_added_columns.
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0027_"))
+    assert back.returncode == 0, back.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        status = conn.execute(
+            "SELECT status FROM infringements WHERE infringement_id = %s",
+            (infringement_id,),
+        ).fetchone()
+        # Grandfathered, not deleted and not rewritten: the historical row
+        # still says exactly what the user said.
+        signals = conn.execute(
+            "SELECT signal FROM infringement_feedback WHERE infringement_id = %s",
+            (infringement_id,),
+        ).fetchall()
+    assert status == ("acknowledged",)
+    assert [row[0] for row in signals] == ["resolved"]
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        # The narrowed CHECKs are for real -- a fresh attempt at either value
+        # is refused now, not just cosmetically absent from the up-migration.
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "UPDATE infringements SET status = 'user_resolved' WHERE infringement_id = %s",
+                (infringement_id,),
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO infringement_feedback (infringement_id, user_ref, signal)"
+                " VALUES (%s, %s, 'resolved')",
+                (infringement_id, user_ref),
+            )
+
+    forward = run_migrate(throwaway_db, "up")
+    assert forward.returncode == 0, forward.stderr
+
+
 # ── scripts/migrate.py's own DATABASE_URL-from-parts fallback ─────────────
 #
 # The migration ECS task never goes through imageshield.config.Config (see

@@ -831,6 +831,7 @@ def test_feedback_404s_identically_for_not_yours_and_not_there() -> None:
         ("not_me", "dismissed_not_me"),
         ("confirmed", "acknowledged"),
         ("uncertain", "new"),
+        ("resolved", "user_resolved"),
     ],
 )
 def test_feedback_returns_the_resulting_status(signal: str, expected: str) -> None:

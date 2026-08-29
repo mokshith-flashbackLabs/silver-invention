@@ -137,8 +137,13 @@ _MONITORED_SOURCES_SQL = """
 # costing exposure points into one boolean the engine can just read:
 #   - the URL died (recheck loop sets url_alive false — not built in v1, but
 #     the column exists and a test writes it directly);
-#   - the user's own terminal position (`dismissed_not_me` / `authorised`,
-#     the 0016 vocabulary);
+#   - the user's own terminal position (`dismissed_not_me` / `authorised` from
+#     the 0016 vocabulary, plus `user_resolved` from 0028 — the user's own
+#     assertion that they dealt with a hit they already called abuse, which
+#     must stop costing exposure points for exactly the reason INVARIANTS #44
+#     forbids any feedback signal from lowering the score: charging exposure
+#     for a hit the person resolved themselves is a score DROP disguised as a
+#     stale read, not a neutral omission);
 #   - a PENDING `not_me` review — the latest feedback row says `not_me` but
 #     `infringements.status` has not (yet, or ever, via a path other than
 #     record_feedback) caught up. Both checks stay in, deliberately
@@ -163,7 +168,7 @@ _CONFIRMED_HITS_SQL = """
       i.severity,
       (
         i.url_alive
-        AND i.status NOT IN ('dismissed_not_me', 'authorised')
+        AND i.status NOT IN ('dismissed_not_me', 'authorised', 'user_resolved')
         AND (lf.signal IS DISTINCT FROM 'not_me')
       ) AS counts,
       -- A hit the SUBJECT decided (subject-verified-hits spec) has already

@@ -253,7 +253,7 @@ that will eventually feed the same report surface.
 
 Tables: `search_seeds`, `search_runs`, `content_urls`, `provider_calls`, `infringements`,
 `attestations`, `subjects`, `provider_spend`, `infringement_feedback`. Migrations `0001`, `0004`,
-`0005`, `0006`, `0007`, `0008`, `0009`, `0011`, `0012`, `0013`, `0016`.
+`0005`, `0006`, `0007`, `0008`, `0009`, `0011`, `0012`, `0013`, `0016`, `0028`.
 
 ### Feedback on a hit, and the one thing it must not do
 
@@ -263,7 +263,7 @@ CREATE TABLE infringement_feedback (
   infringement_id  UUID NOT NULL REFERENCES infringements(infringement_id) ON DELETE CASCADE,
   user_ref         UUID NOT NULL,
   signal           TEXT NOT NULL
-                   CHECK (signal IN ('not_me','confirmed','uncertain','authorised')),
+                   CHECK (signal IN ('not_me','confirmed','uncertain','authorised','resolved')),
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
@@ -272,7 +272,7 @@ CREATE TABLE infringement_feedback (
 is deliberately no `UNIQUE (infringement_id, user_ref)` to force one opinion per person.
 
 `signal` sets `infringements.status`: `not_me` → `dismissed_not_me`, `confirmed` → `acknowledged`,
-`authorised` → `authorised`, `uncertain` → unchanged but still recorded.
+`authorised` → `authorised`, `resolved` → `user_resolved`, `uncertain` → unchanged but still recorded.
 
 **`authorised` (migration 0016) is the fourth signal**, and it means *"this is me, and it is
 authorised"* — my own post, a licensed use, a photo the user published themselves. It exists because the
@@ -282,11 +282,26 @@ while `confirmed` claims an infringement the user explicitly denied. It **termin
 **excluded from `svc.v_person_report_summary.live_exposure_count`** — without the exclusion, a user
 whose own licensed photo is flagged keeps paying exposure points with no way to clear it.
 
-0016 also puts a `CHECK` on `infringements.status`
+**`resolved` (migration 0028) is the fifth signal**, and it is a different KIND of claim than the other
+four: it is the user's assertion that they have *dealt with* an infringement they already called abuse,
+not a statement about whether the match is really them. It sets `infringements.status` to
+`user_resolved` and is reached only from `acknowledged` in practice — but that gate is a **backend** rule
+(the only public ingress), not one enforced here; this table records whatever signal the caller sends,
+the same restraint `not_me` already demonstrates. It is **excluded from both
+`svc.v_person_report_summary.live_exposure_count` and `unresolved_matches`**, and it sets
+`svc.v_person_hits.resolved_at` to the feedback row's timestamp, the same as `dismissed_not_me` and
+`authorised` already do. `url_alive` is untouched — the weekly recheck keeps probing a user-resolved
+hit exactly as before, because `user_resolved` is the user's assertion, not our observation that the
+content is gone; the two facts stay separate columns. Reversal is free: sending `confirmed` again is a
+second append-only row and moves the status straight back to `acknowledged`. Design:
+`docs/superpowers/specs/2026-08-29-user-resolved-hits-design.md`.
+
+0016 puts a `CHECK` on `infringements.status`
 (`new`, `acknowledged`, `dismissed_not_me`, `authorised`, `url_dead`, `withdrawn`), which 0005 left
-unconstrained. The vocabulary stops being a convention once it is a published contract column
-(`svc.v_person_hits.hit_status`). `url_dead` and `withdrawn` are declared and unwritten in v1: the
-recheck loop sets `url_alive` and leaves `status` alone (0013), and nothing withdraws.
+unconstrained, and 0028 widens it with `user_resolved`. The vocabulary stops being a convention once it
+is a published contract column (`svc.v_person_hits.hit_status`). `url_dead` and `withdrawn` are declared
+and unwritten in v1: the recheck loop sets `url_alive` and leaves `status` alone (0013), and nothing
+withdraws.
 
 **`not_me` never adjusts identity vectors, never suppresses a domain, and never feeds banding.** Users
 reject *true* positives under distress, and it is common; if rejections retrained the index, the users
@@ -789,9 +804,16 @@ raises `InsufficientPrivilege`.
   screen. Its three aggregates are separate subqueries: joining `infringements` to `search_runs` first
   multiplies every count by the other table's cardinality, and it looks right until a user has more
   than one of each.
-- **`live_exposure_count` excludes** dead URLs, `dismissed_not_me` and `authorised`. This is the number
-  the legacy scoring inverted — every unresolved match cost 18 points, so reporting abuse permanently
-  depressed the score while dismissing a hit improved it.
+- **`live_exposure_count` excludes** dead URLs, `dismissed_not_me`, `authorised`, and — since migration
+  0028 — `user_resolved`. This is the number the legacy scoring inverted — every unresolved match cost
+  18 points, so reporting abuse permanently depressed the score while dismissing a hit improved it.
+  `unresolved_matches` excludes `user_resolved` too, with no separate edit: its filter is
+  `status IN ('new', 'acknowledged')`, and `user_resolved` is neither.
+- **`user_resolved` (0028) is the user's own assertion that a hit they called abuse is dealt with**, not
+  an observation that the content is gone — that stays `url_alive`'s job, untouched by this value, and
+  the recheck loop keeps probing. `resolved_at` is stamped from the feedback row's timestamp, the same
+  as `dismissed_not_me` and `authorised` already do. Reached only from `acknowledged`, but that gate is
+  enforced by the proxy, not by this view or a database constraint — see §2b.
 - **`monitored_sources`** counts providers that actually returned for this person *and* are still
   enabled, not configured ones (CLAUDE.md §7.5). **`last_run_at`** and **`first_scan_completed_at`**
   count `status = 'completed'` runs only: a run refused at dispatch carries a `completed_at` and looked

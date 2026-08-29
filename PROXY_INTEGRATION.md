@@ -408,7 +408,7 @@ three more ways to be attempted-but-not-succeeded.
 ### New — `POST /v1/infringements/{infringement_id}/feedback`
 
 ```
-{ user_ref, signal }        signal: 'not_me' | 'confirmed' | 'uncertain' | 'authorised'
+{ user_ref, signal }        signal: 'not_me' | 'confirmed' | 'uncertain' | 'authorised' | 'resolved'
 -> 200 { status }           the infringement's status after the write
 
 404  infringement_not_found
@@ -419,6 +419,7 @@ three more ways to be attempted-but-not-succeeded.
 | `not_me` | `not_me` | `dismissed_not_me` |
 | `confirmed` | `infringement` | `acknowledged` |
 | `authorised` | `not_infringement` | `authorised` |
+| `resolved` | `resolved` | `user_resolved` |
 | `uncertain` | — | unchanged — but the feedback IS recorded |
 
 **`authorised` is new, and it is the home for your `not_infringement`.** It means *"this is me, and it
@@ -429,6 +430,21 @@ the user said, and `uncertain` leaves the status alone so the hit would never re
 It **terminates** the hit, and it is **excluded from `live_exposure_count`** (§6). Without that
 exclusion a user whose own licensed photo is flagged keeps paying exposure points with no way to clear
 it — the same inversion `live_exposure_count` exists to fix, in a milder form.
+
+**`resolved` is new (migration 0028), and it is the home for a `PATCH /v1/hits/{id}` action of the same
+name.** It is a different KIND of signal than the other four: it is **the user's own assertion that
+they dealt with a hit they already called abuse**, not a claim about whether the match is really them.
+Send it and nothing else when your user taps "I've dealt with it" on an `acknowledged` hit — that gate
+("resolved only from acknowledged, else `409 HIT_NOT_RESOLVABLE`") is yours to enforce; we record
+whatever you send from whatever state, the same restraint `not_me` already gets.
+
+It **terminates** the hit (`user_resolved`) and is **excluded from both `live_exposure_count` and
+`unresolved_matches`** (§6), and it sets `v_person_hits.resolved_at` to this feedback row's timestamp,
+the same as `dismissed_not_me` and `authorised` already do. **`url_alive` is untouched** — we keep
+probing the page weekly regardless, because `resolved` is the user's assertion, not our observation
+that the content is gone; if the recheck later finds the page actually dead, `match_lifecycle` reports
+`url_dead` on top, same as it would for any other status. **Reversal is free and already how your
+"reopen" works**: send `confirmed` again and the hit is back to `acknowledged`, no new endpoint needed.
 
 `uncertain` is unchanged and stays distinct. Someone who looked at a match of their own face and could
 not tell has told us something.
@@ -618,7 +634,9 @@ The grant named a schema that was never created. That was our mistake, not yours
 ### The nine `svc` views
 
 The views your reader expects now exist, in an `svc` schema, owned by this repo (migration 0016;
-four more in 0023; one more in 0026; `keyed_on` appended to `v_person_hits` in 0027).
+four more in 0023; one more in 0026; `keyed_on` appended to `v_person_hits` in 0027; a fifth
+feedback signal and a new `hit_status` value threaded through both `v_person_hits` and
+`v_person_report_summary` in 0028 — no new column, see below).
 
 | View | Key columns |
 |---|---|
@@ -643,6 +661,18 @@ URL and stores it there (`keyed_on = 'image_url'`), so the link opens a raw imag
 subject's own intimate imagery, full size — with no page around it. `keyed_on` (`'page_url' |
 `'image_url'`) is how you tell the two apart before the link leaves your process. Label it or withhold
 it; do not treat every value as a page.
+
+**0028 (same day) adds a fifth feedback signal, `resolved`, and a new `hit_status` value,
+`user_resolved`** — full contract in §4's `POST /v1/infringements/{id}/feedback`. No new column on
+either view: `user_resolved` is a value your existing `hit_status` can already carry, and it changes
+exactly one predicate on each of the two views you already read —
+`v_person_report_summary.live_exposure_count` and `.unresolved_matches` now exclude it, and
+`v_person_hits.resolved_at` now covers it. This is the pair CLAUDE.md §6 says a contract change of
+this shape should be: no `CONTRACT_VIEW_COLUMNS` edit on your side, no risk of the `keyed_on`
+column-naming trap (naming a column here before you deploy against it), because nothing is named that
+was not already named. **The transition guard is entirely yours**: we record `resolved` from whatever
+state a hit is in when you send it — the same restraint `not_me` already gets — so "only from
+`acknowledged`, else `409`" has to be your gate, not one you can lean on us for.
 
 **0023 also changed two existing views, additively.** `v_person_hits` gained the three trailing
 columns above, and both `v_person_hits` and `v_person_report_summary` now exclude
@@ -752,10 +782,15 @@ omitted, so your reader does not break — but do not build UI expecting them to
 The column is declared with all four so your reader needs no change later. Do not ship UI for the two
 that cannot happen.
 
-**`live_exposure_count` excludes exactly three things:** dead URLs, `dismissed_not_me`, and
-`authorised`. This is the number the legacy scoring got backwards — every unresolved match cost 18
-points, so marking a hit "this is abuse of me" left it unresolved and permanently depressed the score
-while *dismissing* one improved it. **Reporting abuse must never make the number worse.**
+**`live_exposure_count` excludes exactly four things:** dead URLs, `dismissed_not_me`, `authorised`,
+and — since migration 0028 — `user_resolved`. This is the number the legacy scoring got backwards —
+every unresolved match cost 18 points, so marking a hit "this is abuse of me" left it unresolved and
+permanently depressed the score while *dismissing* one improved it. **Reporting abuse must never make
+the number worse**, and that now extends to a user who reports abuse and later clears it themselves.
+
+**`unresolved_matches` excludes `user_resolved` too**, with no separate migration line for it: the
+filter is `status IN ('new', 'acknowledged')`, and `user_resolved` is neither, so it fell out the
+moment the value existed.
 
 **`monitored_sources` counts providers that actually returned for this person and are still enabled**,
 not configured ones. "We monitor 2 sources" while one has an open breaker is a false claim (`CLAUDE.md`
