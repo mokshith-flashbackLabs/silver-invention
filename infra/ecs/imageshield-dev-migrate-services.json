@@ -7,7 +7,7 @@
   "containerDefinitions": [
     {
       "name": "migrate-services",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:5d546e5",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:1735762",
       "essential": true,
       "memory": 256,
       "command": ["python", "scripts/migrate.py", "up"],
