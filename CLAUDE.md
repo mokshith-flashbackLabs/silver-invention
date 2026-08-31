@@ -414,9 +414,13 @@ apart on retry policy again), `store.py` (the one transaction), `observability.p
 
 Two things to know before touching it:
 
-- **`hive.cost_per_call_usd` is NULL and that is deliberate.** Hive Web Search is contract-priced and
-  no measured figure exists in this repo. Google's is list price (0.003500). A budget set without a
-  cost fails closed, so filling Hive's in is a prerequisite for capping Hive's spend — not a nicety.
+- **`hive.cost_per_call_usd` is 0.003000, MEASURED, not contracted (0029, 2026-08-31).** It is spend
+  ÷ calls read off the Hive dashboard, so it is what we have been charged so far rather than a rate
+  the agreement guarantees — a tier change or a bundled endpoint moves it and nothing here fails.
+  Prefer the signed figure over it if the two disagree. Google's is list price (0.003500). It was
+  NULL until 0029 precisely because a budget enforced against an unsourced number is worse than none;
+  now that a figure exists, **Hive spend is priced but still uncapped** — `daily_budget_usd` is NULL
+  and setting it is the remaining finance decision.
 - **`monthly_budget_usd` is reported, not enforced at dispatch.** The dispatch guard is one indexed
   row by design; a month is a range scan. Month-to-date is an admin read.
 

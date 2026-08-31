@@ -740,14 +740,16 @@ silent (#41).
 
 **Cost figures as shipped.** `google.cost_per_call_usd = 0.003500` — Cloud Vision Web Detection list
 price, USD 3.50 per 1000 units, one annotate request with one `WEB_DETECTION` feature = one unit.
-`hive.cost_per_call_usd` is deliberately **NULL**: Hive Web Search is contract-priced and no measured
-or quoted figure exists in this repo (the devtools harness measured the *liveness* cost, ≈USD 0.015,
-and nothing else). A budget enforced against an unsourced number is worse than no budget, because the
-error surfaces on an invoice. Both `daily_budget_usd` values are NULL, so behaviour is unchanged; a
-budget set *without* a cost fails closed (#38).
+`hive.cost_per_call_usd = 0.003000` since **0029** (2026-08-31) — spend ÷ calls read off the Hive
+dashboard, a MEASUREMENT of what we have been charged and not a rate quoted by the signed agreement;
+prefer the agreement's figure if they ever disagree, and re-read the dashboard when reported spend
+stops matching the invoice. It was deliberately NULL until then, because a budget enforced against an
+unsourced number is worse than no budget: the error surfaces on an invoice. (The devtools harness had
+measured only the *liveness* cost, ≈USD 0.015, which is a different call.) Both `daily_budget_usd`
+values remain NULL, so dispatch behaviour is unchanged — Hive spend is now *priced*, not *capped*.
 
-**Follow-up:** fill `hive.cost_per_call_usd` and both `daily_budget_usd` values from the signed Hive
-agreement. Until then the mechanism is built and tested but enforcing nothing for hive.
+**Follow-up:** set both `daily_budget_usd` values. That is now a plain finance decision: before 0029 a
+budget without a cost failed closed (#38) and would have stopped hive dispatching altogether.
 
 `monthly_budget_usd` is reported and alarmed on (`monthly_spend_near_budget`, the column's ONLY
 enforcement), **not** enforced at dispatch: the dispatch guard is

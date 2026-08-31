@@ -92,9 +92,9 @@ def build_providers(config: Config) -> dict[ProviderId, SearchProvider]:
     That word does the work: the real adapters are not constructed at all, so no
     object in this process holds a live provider key and no code path — a future
     edit included — can reach one. Disabling them at dispatch instead would leave
-    two loaded clients and one guard between them and a bill; `hive`'s
-    ``cost_per_call_usd`` is NULL, so the budget guard caps nothing (§7.6) and
-    that guard is thinner than it looks.
+    two loaded clients and one guard between them and a bill; `hive` has a price
+    since 0029 but no ``daily_budget_usd``, so the budget guard still caps
+    nothing (§7.6) and that guard is thinner than it looks.
 
     ``hive`` and ``google`` both select the real stack, whole. Which of the pair
     actually runs is ``providers.enabled``'s job — the hot-reloadable per-provider

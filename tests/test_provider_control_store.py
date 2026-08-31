@@ -111,7 +111,9 @@ async def test_runtimes_reads_the_migration_seeded_cost_and_breaker_defaults(
     # Migration 0009 fills Google's list price and deliberately leaves Hive's
     # contract price NULL rather than inventing one.
     assert runtimes[GOOGLE].cost_per_call_usd == Decimal("0.003500")
-    assert runtimes[HIVE].cost_per_call_usd is None
+    # 0029: measured off the Hive dashboard. Its budget is still NULL, so the
+    # guard dispatches freely — a price alone caps nothing.
+    assert runtimes[HIVE].cost_per_call_usd == Decimal("0.003000")
     # 0019 gives the stub 0, not NULL: it makes no network call, and a NULL
     # cost fails the budget check closed (#38), which would refuse it at the
     # gate rather than let it run for free.
