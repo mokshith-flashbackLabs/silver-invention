@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "confirm-worker",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:036686b",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:c2761cf",
       "essential": true,
       "memory": 192,
       "command": [
@@ -177,7 +177,7 @@
     },
     {
       "name": "score-tick",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:036686b",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:c2761cf",
       "essential": true,
       "memory": 96,
       "command": [
