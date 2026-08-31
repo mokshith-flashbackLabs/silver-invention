@@ -269,11 +269,15 @@ at least a budget outage will not also relax everyone's cadence.
 
 **Two traps:**
 
-- **`hive.cost_per_call_usd` is NULL and that is deliberate** — Hive Web Search
-  is contract-priced and no measured figure exists in this repo. A budget set
-  with an unknown cost **fails closed**: an operator who asked for a cap must
-  not get unbounded spend because we cannot price the calls. So setting a Hive
-  budget without first filling in its cost stops Hive dispatching entirely.
+- **`hive.cost_per_call_usd` is 0.003000 as of 0029, and it is a MEASUREMENT** —
+  spend ÷ calls off the Hive dashboard (2026-08-31), not a rate from the signed
+  agreement. Hive spend is therefore priced but **still uncapped**:
+  `daily_budget_usd` is NULL, so the guard reads "no daily budget configured"
+  and dispatches. Setting that cap is now safe — before 0029 a budget with an
+  unknown cost **failed closed** and would have stopped Hive dispatching
+  entirely (#38). If reported spend stops matching the invoice, re-read the
+  dashboard: the measurement can drift from the contract without anything
+  failing.
 - **`monthly_budget_usd` is reported, not enforced at dispatch.** The dispatch
   guard is one indexed row by design; a month is a range scan. Month-to-date is
   an admin read only.
