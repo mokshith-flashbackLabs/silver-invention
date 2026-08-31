@@ -1,7 +1,9 @@
 # Face-crop seeds — design
 
-**Date:** 2026-08-31 · **Status:** **DRAFT, BLOCKED.** Not approved on this side, nothing built.
-Two questions in §7 must be answered here before either repo starts.
+**Date:** 2026-08-31 · **Status:** **APPROVED IN PRINCIPLE, GATED ON A MEASUREMENT.** The owner
+answered §7.1 *yes* (stop seeding the full photo) on 2026-08-31 and left §7.2 to my recommendation
+(`face_crop`). §7.3 came back "I don't know", which turns §6's measurement from a nice-to-have into
+the one thing standing between this and implementation. Nothing built.
 **Counterpart:** `../image_backend/docs/superpowers/specs/2026-08-31-weekly-reports-design.md` §7
 and `../image_backend/docs/SERVICES-ASKS.md` §11.
 
@@ -134,8 +136,9 @@ migration. But the corpus stops being legible: nothing then distinguishes "the p
 from "a region we cut out of it", and the first question anyone asks when calibration looks odd is
 which kind of image the provider actually saw.
 
-**Recommendation: a new value, `face_crop`.** One migration, no `CHECK` to widen, and every later
-question about provider behaviour by seed shape becomes answerable with a `GROUP BY`.
+**Decided: a new value, `face_crop`** (§7.2 — left to me, taken on this reasoning). One migration,
+no `CHECK` to widen, and every later question about provider behaviour by seed shape becomes
+answerable with a `GROUP BY`.
 
 ## 5. Stopping the full-photo seed — the part that actually delivers §1
 
@@ -167,23 +170,66 @@ A verbatim repost of the whole group photo becomes harder to find.
   what image search does.
 
 The proxy's spec accepts this on the grounds that their §1 makes consent the constraint and detection
-the trade-off, and this repo's §1 says the same thing in the same words. **It is still an unmeasured
-number and should not stay that way:** ~10 real group photos, each queried both ways against both
-providers, before this ships. That is `devtools/` spike work with a live key —
-`SEARCH_PROVIDER=stub` must be off, so it is real spend, and it does not advance the numbered build
-order (§8).
+the trade-off, and this repo's §1 says the same thing in the same words.
 
-## 7. The two questions this repo has to answer
+**Asked on 2026-08-31 whether anyone already knew how Hive behaves on a face crop, the answer was
+"I don't know".** So nobody does, and this stops being a footnote: we would be accepting a detection
+regression of unknown size in a product where §1 calls a false negative a broken promise. **Measure
+before building.**
 
-Nothing gets built on either side until these are settled.
+### 6.1 The measurement, and it is cheaper than I first wrote
 
-1. **Do we agree to stop seeding the full photo when a crop exists?** This is a behaviour change in
-   `POST /v1/attribute`, not an addition, and it is the whole point. If the answer is "seed both", the
-   consent argument in §1 is not addressed and this design should be dropped rather than half-built.
-2. **`face_crop` as a new `seed_kind`, or reuse `user_supplied`?** §4 recommends the former.
+An earlier draft of this section called the spike "real spend". That was an overstatement and worth
+correcting, because it made a trivial cost sound like a decision:
 
-A third, softer one: **does anyone here already know how Hive behaves on a face crop?** §6 plans to
-spend real money finding out, and it would be good not to.
+- **~10 group photos × 2 query shapes × 2 providers = ~40 calls.**
+- **Google:** list price 0.003500/call (their `providers` row), so ~20 calls ≈ **$0.07**.
+- **Hive:** genuinely unknown, because `hive.cost_per_call_usd` is **still NULL** — deliberately, per
+  migration 0009 ("Hive Web Search is contract-priced and no measured figure exists in this repo")
+  and CLAUDE.md §7.6. Even at a generous guess this is cents, but the honest statement is that we
+  cannot price it, and that is the standing gap 0009's own FOLLOW-UP note names.
+
+So the cost is not the obstacle; the absence of the number is. **Filling
+`hive.cost_per_call_usd` is a prerequisite for capping Hive's spend at all** (§7.6: "A budget set
+without a cost fails closed"), and this spike is a natural moment to measure it from the dashboard.
+
+### 6.2 Most of the harness already exists
+
+`devtools/harness/server.py` already exposes both providers and already accepts **either an uploaded
+file or a URL** (`media: UploadFile | None`, `url: str | None`). So the spike is: crop N photos
+locally with `crop_to_face`, POST each crop and each full photo to both endpoints, and diff the
+result sets. No new provider client, no app boot, and therefore no argument with
+`config.py`'s refusal to run anything but `stub` in development.
+
+**What to record per photo:** whether the parent page appeared at all, which Google section carried
+it (`fullMatchingImages` vs `partialMatchingImages` vs `pagesWithMatchingImages`), and for Hive
+whether the `matches` path came back non-empty. `raw_payload` verbatim, per §7.2, so a later
+recalibration can re-read it.
+
+**The decision rule, fixed before the data arrives** so it cannot be rationalised afterwards: if
+crops find the parent page in a clear majority of cases, ship as designed. If crops find materially
+less, the consent argument in §1 still stands and the full photo still must not be seeded — but the
+product needs to be told the coverage it is buying, and the scope text in §7.1 may need to say so.
+**"Crops find less, so keep seeding the full photo" is not an available answer**: that reinstates the
+transmission this design exists to prevent.
+
+## 7. The three questions — answered 2026-08-31
+
+1. **Stop seeding the full photo when a crop exists? — YES.** Owner, 2026-08-31. This is the whole
+   point: it is what turns the design from a detection tweak into a consent fix. `record_run` writes
+   the crop seed and no photo seed for that subject, with the failure rule in §5 (a failed PUT writes
+   NO seed, and must never fall back to the photo).
+2. **`face_crop` as a new `seed_kind`? — YES, taken as my call.** Left unanswered, so I am proceeding
+   on §4's recommendation rather than re-asking: one migration, no `CHECK` to widen, and
+   provider-behaviour-by-seed-shape stays answerable with a `GROUP BY`. Reusing `user_supplied` would
+   make "the photo they gave us" and "a region we cut out of it" indistinguishable in the corpus,
+   which is the first thing anyone wants to separate when calibration looks wrong. **Say the word and
+   it reverts to `user_supplied`;** it is one line either way, but it is one line in a migration, so
+   it is easier to decide now than after there are rows.
+3. **Does anyone know how Hive behaves on a face crop? — "I don't know."** So §6.1's measurement is
+   now the gate. It costs cents, not money, and most of the harness already exists.
+
+**Net: the design is settled and implementation is gated on §6, not on agreement.**
 
 ## 8. Where this sits in the build order
 
