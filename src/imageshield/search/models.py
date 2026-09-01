@@ -28,7 +28,12 @@ ScoreKind = Literal["numeric", "categorical"]
 # provider reported, or the image itself when it reported no page.
 KeyedOn = Literal["page_url", "image_url"]
 
-SEED_KINDS = ("enrolment", "user_supplied", "public_profile")
+# 'face_crop' is one subject's face cut out of a group photo, so the other
+# people in frame are never sent to a search provider (spec 2026-08-31). It is
+# written by attribution/ only — the seed-create route deliberately does not
+# accept it, because the crop object is one WE asked the proxy to store during
+# an attribution run and a caller cannot conjure that key from outside.
+SEED_KINDS = ("enrolment", "user_supplied", "face_crop", "public_profile")
 
 
 class SeedRow(BaseModel):

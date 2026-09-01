@@ -85,9 +85,47 @@ class AttributedFace:
 
 
 @dataclass(frozen=True, slots=True)
+class CropTarget:
+    """Where one subject's crop goes. The domain half of the HTTP model.
+
+    Kept as a plain dataclass so ``attribution/`` never imports the HTTP layer;
+    the route maps one to the other, the same way it already passes ``photo_ref``
+    as a bare ``str``.
+    """
+
+    user_ref: UserRef
+    crop_ref: str
+    # A credential. It is never logged and never stored — the only thing that
+    # happens to it is one PUT.
+    crop_put_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedSeed:
+    """One seed the run intends to write, and WHAT it will be searched with.
+
+    The distinction this type exists to carry: ``source_object_ref`` is the
+    whole photo for a single-face photo and the subject's own face crop for a
+    group photo (spec 2026-08-31 §5). A subject whose crop could not be
+    persisted gets **no PlannedSeed at all** rather than one pointing at the
+    photo — falling back would silently ship a non-consenting bystander's face
+    to Hive and Google, which is the transmission that design exists to stop.
+    """
+
+    user_ref: UserRef
+    face: AttributedFace
+    source_object_ref: str
+    seed_kind: str
+    # Non-None iff this seed is a crop. Echoed to the proxy so it can record
+    # the key on its own row; it is theirs, and we only hand it back.
+    crop_object_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RegisteredSeed:
     user_ref: UserRef
     seed_id: UUID
+    crop_object_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

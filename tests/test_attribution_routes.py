@@ -24,6 +24,7 @@ from imageshield.attribution.models import (
     RegisteredSeed,
 )
 from imageshield.http.app import create_app
+from imageshield.liveness.models import UploadError
 from imageshield.score.store import ScoreResult
 from imageshield.types import UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
@@ -102,9 +103,16 @@ class FakeStore:
 
     async def record_run(self, **kwargs: Any) -> AttributionOutcome:
         self.runs.append(kwargs)
+        # planned_seeds, not seed_owners: since 2026-08-31 the caller decides
+        # WHAT each subject is searched with (the photo, or a crop of their own
+        # face) and hands the store a plan rather than a list of people.
         seeds = tuple(
-            RegisteredSeed(user_ref=ref, seed_id=uuid4())
-            for ref, _face in kwargs["seed_owners"]
+            RegisteredSeed(
+                user_ref=plan.user_ref,
+                seed_id=uuid4(),
+                crop_object_ref=plan.crop_object_ref,
+            )
+            for plan in kwargs["planned_seeds"]
         )
         return AttributionOutcome(run_id=uuid4(), faces=kwargs["faces"], seeds=seeds)
 
@@ -155,6 +163,25 @@ class FakeScoreStore:
         raise NotImplementedError
 
 
+class FakeUploader:
+    """Records every presigned PUT. Reachable as
+    ``client.app.state.object_uploader``, the same trick FakeScoreStore uses so
+    ``make_client``'s existing 4-tuple callers need no change.
+
+    ``fail_for`` names crop_refs whose PUT raises, which is how the
+    no-seed-on-upload-failure rule gets exercised without a network.
+    """
+
+    def __init__(self, fail_for: frozenset[str] = frozenset()) -> None:
+        self.puts: list[tuple[str, bytes, str]] = []
+        self._fail_for = fail_for
+
+    async def put(self, url: str, data: bytes, *, content_type: str) -> None:
+        self.puts.append((url, data, content_type))
+        if any(ref in url for ref in self._fail_for):
+            raise UploadError("presigned PUT returned HTTP 403")
+
+
 def make_client(
     faces: tuple[DetectedFace, ...] = (),
     matches: dict[int, tuple[FaceMatch, ...]] | None = None,
@@ -163,6 +190,7 @@ def make_client(
     fetch_error: Exception | None = None,
     fetch_payload: bytes | None = None,
     raising_score_store: bool = False,
+    upload_fails_for: frozenset[str] = frozenset(),
     **config_overrides: Any,
 ) -> tuple[TestClient, FakeProvider, FakeStore, FakeFetcher]:
     app = create_app(config=make_config(**config_overrides))
@@ -173,6 +201,7 @@ def make_client(
     app.state.attribution_store = store
     app.state.photo_fetcher = fetcher
     app.state.score_store = FakeScoreStore(raise_error=raising_score_store)
+    app.state.object_uploader = FakeUploader(upload_fails_for)
     return TestClient(app), provider, store, fetcher
 
 

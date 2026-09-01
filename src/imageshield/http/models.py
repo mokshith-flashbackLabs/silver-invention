@@ -321,6 +321,49 @@ class FeedbackRequest(ServiceModel):
     signal: FeedbackSignal
 
 
+class CropTarget(ServiceModel):
+    """Where one candidate's face crop is to be written (spec 2026-08-31 §3).
+
+    The proxy mints these — it owns every bucket and every credential, and this
+    service holds neither (CLAUDE.md §3.3).
+    """
+
+    user_ref: UserRef
+    # The proxy's opaque object key for this crop. It becomes the seed's
+    # source_object_ref, where migration 0011 forbids a URL: a presigned URL is
+    # a credential with at most 7 days of life and the seed outlives it.
+    crop_ref: str
+    # Presigned PUT. A CREDENTIAL — never logged, never persisted, never
+    # returned. The query string carries the signature.
+    crop_put_url: str
+
+    @field_validator("crop_ref")
+    @classmethod
+    def _ref_is_durable(cls, value: str) -> str:
+        # The inverted validator from 0011, applied at the boundary rather than
+        # discovered at the INSERT: a URL here is the exact bug that migration
+        # exists to prevent, and it presents a week later as "the provider is
+        # failing" rather than "our reference expired".
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("crop_ref must not be blank")
+        lowered = candidate.lower()
+        if lowered.startswith(("http://", "https://")) or "x-amz-signature" in lowered:
+            raise ValueError("crop_ref must be a durable object reference, never a URL")
+        return candidate
+
+    @field_validator("crop_put_url")
+    @classmethod
+    def _put_is_https(cls, value: str) -> str:
+        # Same rule and same reason as presigned_get_url below: the object
+        # behind it is a photograph of someone's face crossing the public
+        # internet.
+        parts = urlsplit(value)
+        if parts.scheme.lower() != "https" or not parts.netloc:
+            raise ValueError("crop_put_url must be an absolute https:// URL")
+        return value
+
+
 class AttributeRequest(ServiceModel):
     photo_ref: str  # the proxy's photo_id. Opaque to us — never dereferenced.
     requested_by: UserRef
@@ -329,6 +372,22 @@ class AttributeRequest(ServiceModel):
     # is filtered against afterwards — see attribution/resolve.py.
     candidate_refs: list[UserRef]
     presigned_get_url: str
+    # ONE PER CANDIDATE, minted before anyone knows which candidates will
+    # attribute — the proxy cannot know that until we answer, so it mints for
+    # all of them and the unused URLs simply expire. Absent or empty means the
+    # caller does not want crop seeds and the full photo is seeded as before.
+    crop_targets: list[CropTarget] = []
+
+    @field_validator("crop_targets")
+    @classmethod
+    def _one_target_per_subject(cls, value: list[CropTarget]) -> list[CropTarget]:
+        # Two PUT targets for one subject is a caller bug. Picking one silently
+        # would leave the other object dangling in their bucket forever, and
+        # nothing on either side would ever name it.
+        refs = [target.user_ref for target in value]
+        if len(set(refs)) != len(refs):
+            raise ValueError("crop_targets must name each user_ref at most once")
+        return value
 
     @field_validator("photo_ref")
     @classmethod
@@ -374,6 +433,11 @@ class AttributedFaceItem(BaseModel):
 class RegisteredSeedItem(BaseModel):
     user_ref: UUID
     seed_id: UUID
+    # ECHOED BACK from the crop_target we were given, never invented here — it
+    # is the proxy's key in the proxy's bucket. None means this seed is the
+    # whole photo, which is the answer for a single-face photo and for a caller
+    # that sent no targets.
+    crop_object_key: str | None = None
 
 
 class AttributeResponse(BaseModel):

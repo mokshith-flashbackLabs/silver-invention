@@ -15,7 +15,7 @@ from __future__ import annotations
 import structlog
 from fastapi import APIRouter, Depends
 
-from imageshield.attribution.models import AttributionUnavailable
+from imageshield.attribution.models import AttributionUnavailable, CropTarget
 from imageshield.attribution.provider import FaceAttributionProvider, PhotoFetcher
 from imageshield.attribution.service import attribute_photo
 from imageshield.attribution.store import AttributionStore
@@ -25,6 +25,7 @@ from imageshield.http.deps import (
     get_attribution_provider,
     get_attribution_store,
     get_config,
+    get_object_uploader,
     get_photo_fetcher,
     get_score_store,
 )
@@ -35,6 +36,7 @@ from imageshield.http.models import (
     AttributeResponse,
     RegisteredSeedItem,
 )
+from imageshield.liveness.uploader import ObjectUploader
 from imageshield.score.store import ScoreStore
 
 log = structlog.get_logger("imageshield.attribution")
@@ -50,6 +52,7 @@ async def attribute(
     provider: FaceAttributionProvider = Depends(get_attribution_provider),
     store: AttributionStore = Depends(get_attribution_store),
     score_store: ScoreStore = Depends(get_score_store),
+    uploader: ObjectUploader = Depends(get_object_uploader),
 ) -> AttributeResponse:
     try:
         outcome = await attribute_photo(
@@ -63,6 +66,18 @@ async def attribute(
             fetcher=fetcher,
             provider=provider,
             store=store,
+            uploader=uploader,
+            # HTTP model -> domain model, so attribution/ never imports the
+            # HTTP layer. Empty means the caller does not want crop seeds and
+            # the full photo is seeded exactly as before.
+            crop_targets=tuple(
+                CropTarget(
+                    user_ref=target.user_ref,
+                    crop_ref=target.crop_ref,
+                    crop_put_url=target.crop_put_url,
+                )
+                for target in body.crop_targets
+            ),
         )
     except AttributionUnavailable as exc:
         # The run is recorded as 'failed' by the service before this fires, so
@@ -102,7 +117,11 @@ async def attribute(
             for face in outcome.faces
         ],
         seeds_registered=[
-            RegisteredSeedItem(user_ref=seed.user_ref, seed_id=seed.seed_id)
+            RegisteredSeedItem(
+                user_ref=seed.user_ref,
+                seed_id=seed.seed_id,
+                crop_object_key=seed.crop_object_ref,
+            )
             for seed in outcome.seeds
         ],
     )

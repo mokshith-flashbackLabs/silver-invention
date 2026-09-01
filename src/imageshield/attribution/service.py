@@ -13,7 +13,12 @@ The sequence, and why each step is where it is:
    ``candidate_refs`` (``resolve.py``). Highest surviving score wins.
 4. One seed per distinct attributed person — not per face, so a photo showing
    someone twice is still one seed for them.
-5. Run + faces + seeds in ONE transaction.
+5. WHAT that seed points at: the whole photo for a one-face photo, and the
+   subject's own face crop for a group photo the caller minted targets for
+   (``crop_upload.plan_seeds``, spec 2026-08-31). The crop replaces the photo
+   rather than joining it — keeping both would still ship the bystander's face
+   to Hive and Google, which is the entire thing being prevented.
+6. Run + faces + seeds in ONE transaction.
 
 An unattributed face is the common case and is handled as ordinary throughout:
 not logged as a warning, not counted as an error, not surfaced to the proxy as
@@ -26,14 +31,17 @@ from __future__ import annotations
 import structlog
 
 from imageshield.attribution.crop import UndecodableImage, to_rekognition_jpeg
+from imageshield.attribution.crop_upload import plan_seeds
 from imageshield.attribution.models import (
     AttributedFace,
     AttributionOutcome,
     AttributionUnavailable,
+    CropTarget,
 )
 from imageshield.attribution.provider import FaceAttributionProvider, PhotoFetcher
 from imageshield.attribution.resolve import distinct_attributed, resolve_face
 from imageshield.attribution.store import AttributionStore
+from imageshield.liveness.uploader import ObjectUploader
 from imageshield.types import UserRef
 
 log = structlog.get_logger("imageshield.attribution")
@@ -51,6 +59,8 @@ async def attribute_photo(
     fetcher: PhotoFetcher,
     provider: FaceAttributionProvider,
     store: AttributionStore,
+    uploader: ObjectUploader,
+    crop_targets: tuple[CropTarget, ...] = (),
 ) -> AttributionOutcome:
     model_id = provider.model_id
     try:
@@ -104,6 +114,17 @@ async def attribute_photo(
         raise
 
     seed_owners = distinct_attributed(tuple(faces))
+    # The crop is cut from `image` — the TRANSCODED bytes the searches ran
+    # against, not the original fetch. Same bytes, same bbox, same deterministic
+    # function, so what gets stored is exactly what got searched.
+    planned, skipped = await plan_seeds(
+        image=image,
+        photo_ref=photo_ref,
+        seed_owners=seed_owners,
+        crop_targets=crop_targets,
+        faces_detected=len(faces),
+        uploader=uploader,
+    )
     outcome = await store.record_run(
         photo_ref=photo_ref,
         requested_by=requested_by,
@@ -112,13 +133,18 @@ async def attribute_photo(
         max_candidates=max_candidates,
         model_id=model_id,
         faces=tuple(faces),
-        seed_owners=seed_owners,
+        planned_seeds=planned,
+        skipped_seeds=skipped,
     )
     log.info(
         "attribution.completed",
         run_id=str(outcome.run_id),
         photo_ref=photo_ref,
         faces_detected=len(faces),
+        # A subject whose crop never reached the bucket. Non-zero means someone
+        # is unmonitored for this photo until the next attribution — worth
+        # seeing, and never worth papering over with a full-photo seed.
+        seeds_skipped=len(skipped),
         # Counted, not warned about. An unattributed face is the expected
         # majority, and logging it as a problem would train everyone to ignore
         # the log.

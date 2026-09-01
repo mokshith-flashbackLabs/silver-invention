@@ -14,7 +14,13 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from imageshield.attribution.models import AttributedFace, BoundingBox
+from imageshield.attribution.crop_upload import SkippedSeed
+from imageshield.attribution.models import (
+    AttributedFace,
+    BoundingBox,
+    PlannedSeed,
+)
+from imageshield.attribution.seeds import crop_seed, photo_seed
 from imageshield.attribution.store import PostgresAttributionStore
 from imageshield.db.connection import make_async_pool
 from imageshield.types import UserRef
@@ -66,6 +72,28 @@ async def _record(
     owner: UserRef,
     photo_ref: str = "photo-abc",
 ) -> object:
+    """Seeds the whole photo — the pre-2026-08-31 shape, still what a caller
+    that mints no crop targets gets. Kept taking (person, face) pairs so the
+    tests below read the same as before; the translation to a PlannedSeed is
+    what the service now does for real."""
+    return await _record_planned(
+        store,
+        faces,
+        tuple(photo_seed(ref, face, photo_ref) for ref, face in seed_owners),
+        owner=owner,
+        photo_ref=photo_ref,
+    )
+
+
+async def _record_planned(
+    store: PostgresAttributionStore,
+    faces: tuple[AttributedFace, ...],
+    planned_seeds: tuple[PlannedSeed, ...],
+    *,
+    owner: UserRef,
+    photo_ref: str = "photo-abc",
+    skipped_seeds: tuple[SkippedSeed, ...] = (),
+) -> object:
     return await store.record_run(
         photo_ref=photo_ref,
         requested_by=owner,
@@ -74,7 +102,8 @@ async def _record(
         max_candidates=5,
         model_id="rekognition:7.0",
         faces=faces,
-        seed_owners=seed_owners,
+        planned_seeds=planned_seeds,
+        skipped_seeds=skipped_seeds,
     )
 
 
@@ -249,3 +278,102 @@ async def test_a_failed_run_is_recorded_and_stays_distinguishable(
     assert row[0] == "failed"
     assert "Throttling" in row[1]
     assert row[2] is None  # never claims to have detected zero faces
+
+
+# ── face-crop seeds (spec 2026-08-31) ────────────────────────────────────────
+
+
+async def test_a_crop_seed_carries_the_crop_ref_and_the_face_crop_kind(
+    store: PostgresAttributionStore, migrated_db: str
+) -> None:
+    """The kind is what keeps the corpus legible. Without it nothing separates
+    "the photo they gave us" from "a region we cut out of it", which is the
+    first question anyone asks when calibration looks odd."""
+    (owner,) = await _enrolled(store)
+    matched = _face(1, owner, 95.0)
+
+    await _record_planned(
+        store,
+        (_face(0), matched),
+        (crop_seed(owner, matched, "face-crops/abc.jpg"),),
+        owner=owner,
+    )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        seeds = conn.execute(
+            "SELECT seed_kind, source_object_ref FROM search_seeds"
+        ).fetchall()
+    assert seeds == [("face_crop", "face-crops/abc.jpg")]
+
+
+async def test_two_members_in_one_photo_get_two_distinct_crop_objects(
+    store: PostgresAttributionStore, migrated_db: str
+) -> None:
+    """Before this, both seeds pointed at the SAME photo object — so two covered
+    members in one photo dispatched an identical query twice, every cycle."""
+    first, second = await _enrolled(store, 2)
+    face_a, face_b = _face(0, first, 95.0), _face(1, second, 93.0)
+
+    await _record_planned(
+        store,
+        (face_a, face_b),
+        (
+            crop_seed(first, face_a, "face-crops/one.jpg"),
+            crop_seed(second, face_b, "face-crops/two.jpg"),
+        ),
+        owner=first,
+    )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        refs = conn.execute(
+            "SELECT source_object_ref FROM search_seeds ORDER BY source_object_ref"
+        ).fetchall()
+    assert refs == [("face-crops/one.jpg",), ("face-crops/two.jpg",)]
+
+
+async def test_a_skipped_subject_writes_an_audit_row_and_no_seed(
+    store: PostgresAttributionStore, migrated_db: str
+) -> None:
+    """A missing seed must not look like a person who was not in the photo.
+
+    The audit row is the only thing that distinguishes them, and it commits in
+    the same transaction as the run so "the run completed" and "one of its
+    subjects has no seed" can never disagree.
+    """
+    (owner,) = await _enrolled(store)
+    matched = _face(1, owner, 95.0)
+
+    outcome = await _record_planned(
+        store,
+        (_face(0), matched),
+        (),
+        owner=owner,
+        skipped_seeds=(SkippedSeed(user_ref=owner, reason="crop_upload_failed"),),
+    )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute("SELECT count(*) FROM search_seeds").fetchone() == (0,)
+        rows = conn.execute(
+            "SELECT actor_type, action, subject_ref, resource_id, metadata"
+            " FROM audit_log WHERE action = 'attribution.seed_skipped'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "service"
+    assert rows[0][2] == owner
+    assert rows[0][3] == outcome.run_id  # type: ignore[attr-defined]
+    assert rows[0][4] == {"reason": "crop_upload_failed", "photo_ref": "photo-abc"}
+
+
+async def test_a_run_with_no_skips_writes_no_audit_noise(
+    store: PostgresAttributionStore, migrated_db: str
+) -> None:
+    (owner,) = await _enrolled(store)
+    matched = _face(0, owner, 95.0)
+
+    await _record(store, (matched,), ((owner, matched),), owner=owner)
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM audit_log WHERE action = 'attribution.seed_skipped'"
+        ).fetchone()
+    assert count == (0,)

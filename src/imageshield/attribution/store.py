@@ -22,9 +22,11 @@ from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.attribution.crop_upload import SkippedSeed
 from imageshield.attribution.models import (
     AttributedFace,
     AttributionOutcome,
+    PlannedSeed,
     RegisteredSeed,
 )
 from imageshield.types import UserRef
@@ -66,16 +68,32 @@ _INSERT_FACE_SQL = """
     RETURNING face_id
 """
 
-# source_object_ref is the photo_ref — an opaque durable reference, never a URL
-# (migration 0011). The presigned GET this run was given expires; the seed must
-# not carry it.
+# source_object_ref is an opaque durable reference, never a URL (migration
+# 0011). The presigned GET this run was given expires; the seed must not carry
+# it.
+#
+# Both the ref and the kind are now PARAMETERS rather than 'user_supplied' and
+# the photo: on a group photo each subject's seed is a crop of their own face
+# with kind 'face_crop' (spec 2026-08-31). The caller decides which; this just
+# writes what it is handed.
 _INSERT_SEED_SQL = """
     INSERT INTO search_seeds
       (user_ref, seed_kind, source_object_ref, scan_tier, attributed_face_id)
     VALUES
-      (%(user_ref)s, 'user_supplied', %(source_object_ref)s, 'new',
+      (%(user_ref)s, %(seed_kind)s, %(source_object_ref)s, 'new',
        %(attributed_face_id)s)
     RETURNING seed_id
+"""
+
+# A subject we meant to seed and did not, because their crop never reached the
+# proxy's bucket. In the SAME transaction as the run, so "the run completed" and
+# "one of its subjects has no seed" can never disagree. Without this the only
+# evidence is a warning log, and a missing seed looks exactly like a person who
+# was not in the photo.
+_INSERT_SKIPPED_SEED_AUDIT_SQL = """
+    INSERT INTO audit_log (actor_type, action, subject_ref, resource_id, metadata)
+    VALUES ('service', 'attribution.seed_skipped', %(subject_ref)s, %(run_id)s,
+            %(metadata)s)
 """
 
 
@@ -90,7 +108,8 @@ class AttributionStore(Protocol):
         max_candidates: int,
         model_id: str,
         faces: tuple[AttributedFace, ...],
-        seed_owners: tuple[tuple[UserRef, AttributedFace], ...],
+        planned_seeds: tuple[PlannedSeed, ...],
+        skipped_seeds: tuple[SkippedSeed, ...] = (),
     ) -> AttributionOutcome: ...
 
     async def record_failed_run(
@@ -120,7 +139,8 @@ class PostgresAttributionStore:
         max_candidates: int,
         model_id: str,
         faces: tuple[AttributedFace, ...],
-        seed_owners: tuple[tuple[UserRef, AttributedFace], ...],
+        planned_seeds: tuple[PlannedSeed, ...],
+        skipped_seeds: tuple[SkippedSeed, ...] = (),
     ) -> AttributionOutcome:
         attributed = sum(1 for face in faces if face.resolved_user_ref is not None)
         async with self._pool.connection() as conn, conn.transaction():
@@ -136,7 +156,8 @@ class PostgresAttributionStore:
                 faces_attributed=attributed,
             )
             face_ids = await self._insert_faces(conn, run_id, faces, model_id)
-            seeds = await self._insert_seeds(conn, photo_ref, seed_owners, face_ids)
+            seeds = await self._insert_seeds(conn, planned_seeds, face_ids)
+            await self._insert_skipped_audit(conn, run_id, photo_ref, skipped_seeds)
         return AttributionOutcome(run_id=run_id, faces=faces, seeds=seeds)
 
     async def record_failed_run(
@@ -227,21 +248,49 @@ class PostgresAttributionStore:
     @staticmethod
     async def _insert_seeds(
         conn: AsyncConnection[tuple[object, ...]],
-        photo_ref: str,
-        seed_owners: tuple[tuple[UserRef, AttributedFace], ...],
+        planned_seeds: tuple[PlannedSeed, ...],
         face_ids: dict[int, UUID],
     ) -> tuple[RegisteredSeed, ...]:
         seeds: list[RegisteredSeed] = []
-        for user_ref, face in seed_owners:
+        for plan in planned_seeds:
             cur = await conn.execute(
                 _INSERT_SEED_SQL,
                 {
-                    "user_ref": user_ref,
-                    "source_object_ref": photo_ref,
-                    "attributed_face_id": face_ids[face.face_index],
+                    "user_ref": plan.user_ref,
+                    "seed_kind": plan.seed_kind,
+                    "source_object_ref": plan.source_object_ref,
+                    "attributed_face_id": face_ids[plan.face.face_index],
                 },
             )
             row = await cur.fetchone()
             assert row is not None
-            seeds.append(RegisteredSeed(user_ref=user_ref, seed_id=cast(UUID, row[0])))
+            seeds.append(
+                RegisteredSeed(
+                    user_ref=plan.user_ref,
+                    seed_id=cast(UUID, row[0]),
+                    crop_object_ref=plan.crop_object_ref,
+                )
+            )
         return tuple(seeds)
+
+    @staticmethod
+    async def _insert_skipped_audit(
+        conn: AsyncConnection[tuple[object, ...]],
+        run_id: UUID,
+        photo_ref: str,
+        skipped_seeds: tuple[SkippedSeed, ...],
+    ) -> None:
+        for skipped in skipped_seeds:
+            await conn.execute(
+                _INSERT_SKIPPED_SEED_AUDIT_SQL,
+                {
+                    "subject_ref": skipped.user_ref,
+                    "run_id": run_id,
+                    # photo_ref is an opaque object key, never a URL — safe to
+                    # record, and it is the only way to find the photo this
+                    # subject is now unmonitored for.
+                    "metadata": Jsonb(
+                        {"reason": skipped.reason, "photo_ref": photo_ref}
+                    ),
+                },
+            )
