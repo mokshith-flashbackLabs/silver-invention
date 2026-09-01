@@ -176,10 +176,14 @@ async def subject_decision(
     if outcome is None:
         raise _not_found()
     if outcome.outcome == "conflict":
+        # NARROWED 2026-09-01: this now means an OPERATOR decided the hit, and
+        # only that. A subject changing their own earlier answer is a normal
+        # 'decided' and never reaches here — they must be able to undo a "not
+        # me" they gave under distress or by mistake without filing a ticket.
         raise ServiceError(
             409,
             "decision_conflict",
-            "This hit already carries a different decision.",
+            "This hit was decided by a reviewer and cannot be changed here.",
             retryable=False,
         )
     log.info(

@@ -535,29 +535,127 @@ async def test_repeat_of_the_same_decision_is_an_idempotent_replay(
     assert len(audits) == 1  # the replay wrote nothing
 
 
-async def test_a_different_decision_after_the_first_is_a_conflict(
+async def test_a_subject_can_take_back_their_own_not_me(
     migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
 ) -> None:
+    """The undo, and the reason it exists (2026-09-01).
+
+    Until now a second, different decision was a 409: "v1 has no re-decide,
+    changes go through the team". That was wrong in the direction that matters.
+    ``feedback.py`` already records why -- users reject TRUE positives, under
+    distress, and it is common -- so the one answer people most need to take
+    back was the one that needed a support ticket.
+    """
     confirm_store, review_store = stores
     user_ref, infringement_id = await _seeded_infringement(
-        migrated_db, confirm_store, severity="benign_copy"
+        migrated_db, confirm_store, severity="ncii_suspected"
+    )
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+
+    undo = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+
+    assert undo is not None
+    assert undo.outcome == "decided"
+    infringement = _row(
+        migrated_db,
+        "SELECT confirm_state, confirm_decided_by FROM infringements"
+        " WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infringement["confirm_state"] == "confirmed"
+    assert infringement["confirm_decided_by"] == "subject"
+
+
+async def test_the_undo_clears_the_dismissal_that_hid_the_hit(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """Reversing the DECISION has to reverse its side effect too.
+
+    Rejecting sets status='dismissed_not_me', which is exactly the value the
+    proxy's weekly-report close filters out of countable hits and the exposure
+    count. Leave it behind and the user taps "actually this is me", watches the
+    card change, and the number does not move -- the hit is confirmed and still
+    hidden. It clears to 'new', where a FIRST-TIME confirm also leaves it, so
+    the end state does not depend on how many answers came before.
+    """
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="ncii_suspected"
+    )
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+    dismissed = _row(
+        migrated_db,
+        "SELECT status FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert dismissed["status"] == "dismissed_not_me"
+
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+
+    after = _row(
+        migrated_db,
+        "SELECT status FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert after["status"] == "new"
+
+
+async def test_the_undo_moves_the_review_task_too(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """The task UPDATE used to be WHERE status = 'pending', so on a reversal it
+    matched nothing and the queue kept asserting the answer the user had just
+    changed."""
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="ncii_suspected"
+    )
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="confirmed"
+    )
+
+    task = _row(
+        migrated_db,
+        "SELECT decision, decided_by FROM review_tasks WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert task["decision"] == "confirmed"
+    assert task["decided_by"] == "subject"
+
+
+async def test_the_undo_is_appended_to_the_audit_never_an_edit(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """Both answers stay in the record. Nothing about this feature deletes."""
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="ncii_suspected"
+    )
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
     )
     await review_store.subject_decide(
         infringement_id, user_ref=user_ref, decision="confirmed"
     )
 
-    conflict = await review_store.subject_decide(
-        infringement_id, user_ref=user_ref, decision="rejected"
-    )
-
-    assert conflict is not None
-    assert conflict.outcome == "conflict"
-    infringement = _row(
+    audits = _rows(
         migrated_db,
-        "SELECT confirm_state FROM infringements WHERE infringement_id = %s",
-        (infringement_id,),
+        "SELECT metadata FROM audit_log WHERE action = %s ORDER BY audit_id",
+        (SUBJECT_DECIDED_ACTION,),
     )
-    assert infringement["confirm_state"] == "confirmed"  # nothing overwritten
+    assert [a["metadata"]["decision"] for a in audits] == ["rejected", "confirmed"]
 
 
 async def test_a_subject_cannot_overturn_an_operator_decision(

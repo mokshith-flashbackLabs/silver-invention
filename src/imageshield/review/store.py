@@ -139,22 +139,50 @@ _LOCK_INFRINGEMENT_SUBJECT_SQL = """
 # severity is deliberately untouched: it stays whatever machine triage
 # assigned. 'rejected' also retires the hit from the user's own counts via the
 # same status value the not_me feedback signal uses.
+#
+# THE SECOND BRANCH IS WHAT MAKES A REVERSAL COMPLETE. Rejecting sets
+# status='dismissed_not_me'; un-rejecting has to take it off again, or the hit
+# comes back as confirm_state='confirmed' while still carrying the dismissal
+# that hides it from live exposure and from the weekly report's countable hits
+# (the proxy's reports/close.ts filters exactly that value). The user would tap
+# "actually this is me", see the card change, and the number would not move.
+#
+# It clears to 'new', not to 'acknowledged', for two reasons. 'new' is where a
+# FIRST-TIME confirm leaves it, so decide(X) lands in the same place however
+# many answers came before — the property worth having. And 'acknowledged'
+# belongs to the feedback lane, which is a different axis: this decision says
+# "that is me", not "I am reporting it as abuse".
+#
+# Only 'dismissed_not_me' is cleared. 'authorised', 'user_resolved' and
+# 'acknowledged' were set through the feedback lane and are not ours to undo.
 _SUBJECT_DECIDE_INFRINGEMENT_SQL = """
     UPDATE infringements
     SET confirm_state = %(confirm_state)s,
         confirm_decided_by = 'subject',
         confirm_decided_at = now(),
-        status = CASE WHEN %(confirm_state)s = 'rejected'
-                      THEN 'dismissed_not_me' ELSE status END
+        status = CASE
+                   WHEN %(confirm_state)s = 'rejected' THEN 'dismissed_not_me'
+                   WHEN status = 'dismissed_not_me' THEN 'new'
+                   ELSE status
+                 END
     WHERE infringement_id = %(infringement_id)s
     RETURNING severity
 """
 
+# 'pending' OR a task this same subject already decided. Without the second
+# arm a reversal updates zero rows and the queue keeps asserting the answer the
+# user just changed — infringements says 'confirmed', review_tasks still says
+# 'rejected', and the reviewer-facing side quietly disagrees with the product.
+#
+# `decided_by = 'subject'` carries the never-overturn-an-operator rule down to
+# the task row, so it holds even if a caller reaches this SQL by another path.
 _SUBJECT_DECIDE_TASK_SQL = """
     UPDATE review_tasks
     SET status = 'decided', decision = %(decision)s,
         decided_by = 'subject', decided_at = now()
-    WHERE infringement_id = %(infringement_id)s AND status = 'pending'
+    WHERE infringement_id = %(infringement_id)s
+      AND (status = 'pending'
+           OR (status = 'decided' AND decided_by = 'subject'))
 """
 
 _SUBJECT_AUDIT_SQL = """
@@ -202,9 +230,11 @@ class DecisionOutcome(BaseModel):
 
 class SubjectDecisionOutcome(BaseModel):
     """What one ``subject_decide`` call produced. ``outcome`` is the route's
-    dispatch key: ``decided`` wrote the transition, ``replay`` found the same
-    subject decision already committed (idempotent no-op), ``conflict`` found a
-    different or operator-made decision (409, no re-decide in v1)."""
+    dispatch key: ``decided`` wrote the transition (including a subject
+    reversing their own earlier answer, since 2026-09-01), ``replay`` found the
+    identical subject decision already committed (idempotent no-op), and
+    ``conflict`` now means one thing only — an OPERATOR decided this hit, and a
+    subject may not overturn that (409)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -350,8 +380,14 @@ class PostgresReviewStore:
         """The subject's own confirm/reject — one transaction, mirroring
         ``decide``. Spec 2026-08-21 §0.1: the subject is a valid deciding
         human (INVARIANTS #19 as amended); the 0021 CHECK is satisfied by
-        ``confirm_decided_by = 'subject'``. A subject can never overturn an
-        operator, and v1 has no re-decide — changes go through the team."""
+        ``confirm_decided_by = 'subject'``.
+
+        **A subject can never overturn an operator** — that is the part of the
+        old rule that stands. What changed on 2026-09-01 is the other part: a
+        subject MAY overturn their own earlier answer, as often as they like.
+        Someone who tapped "not me" on a real hit needs a way back that is not
+        a support ticket, and ``feedback.py`` already spells out why: users
+        reject true positives under distress, and it is common."""
         async with self._pool.connection() as conn, conn.transaction():
             cur = await conn.execute(
                 _LOCK_INFRINGEMENT_SUBJECT_SQL,
@@ -366,19 +402,39 @@ class PostgresReviewStore:
                 # absent, so the response can never confirm a quarantined hit.
                 return None
             if confirm_state in ("confirmed", "rejected"):
-                if decided_by == "subject" and confirm_state == decision:
+                if decided_by != "subject":
+                    # AN OPERATOR DECIDED THIS. A subject can never overturn
+                    # one, and that half of the rule is unchanged.
+                    return SubjectDecisionOutcome(
+                        infringement_id=infringement_id,
+                        decision=confirm_state,
+                        severity=severity,
+                        outcome="conflict",
+                    )
+                if confirm_state == decision:
                     return SubjectDecisionOutcome(
                         infringement_id=infringement_id,
                         decision=decision,
                         severity=severity,
                         outcome="replay",
                     )
-                return SubjectDecisionOutcome(
-                    infringement_id=infringement_id,
-                    decision=confirm_state,
-                    severity=severity,
-                    outcome="conflict",
-                )
+                # THE SUBJECT IS CHANGING THEIR OWN MIND, and since 2026-09-01
+                # that is allowed — it falls through to the same write below.
+                #
+                # It used to be a 409: "v1 has no re-decide, changes go through
+                # the team". That was wrong in the one direction that matters.
+                # A person who taps "not me" on a real hit -- under distress,
+                # by mistake, or before recognising the photo -- had no way
+                # back except contacting support, and feedback.py already
+                # records why that misreads people: users reject TRUE positives
+                # and it is common. The row was never deleted and the report
+                # never disappeared, so nothing had to be recovered; only the
+                # answer was frozen.
+                #
+                # Nothing here is destructive. infringement_feedback is
+                # append-only, the audit row below is a second row rather than
+                # an edit, and the reversal is as visible in the record as the
+                # original answer was.
 
             cur = await conn.execute(
                 _SUBJECT_DECIDE_INFRINGEMENT_SQL,
