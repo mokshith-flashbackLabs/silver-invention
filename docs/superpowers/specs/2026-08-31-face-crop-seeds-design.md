@@ -1,9 +1,20 @@
 # Face-crop seeds — design
 
-**Date:** 2026-08-31 · **Status:** **APPROVED IN PRINCIPLE, GATED ON A MEASUREMENT.** The owner
-answered §7.1 *yes* (stop seeding the full photo) on 2026-08-31 and left §7.2 to my recommendation
-(`face_crop`). §7.3 came back "I don't know", which turns §6's measurement from a nice-to-have into
-the one thing standing between this and implementation. Nothing built.
+**Date:** 2026-08-31 · **Status:** **BUILT 2026-09-01, SHIPPED DARK.** The owner answered §7.1
+*yes* (stop seeding the full photo) on 2026-08-31 and left §7.2 to my recommendation (`face_crop`).
+§7.3 came back "I don't know", and **§6's measurement has still not run** — so the code is complete
+on both sides but reaches no user: the proxy sends `crop_targets` only when `FACE_CROP_BUCKET` is
+set, and it is unset everywhere. The measurement now gates *enabling* the flag, not writing the
+code. Run §6.1 before setting that bucket in any environment with real users.
+
+**What was built (2026-09-01):** `attribution/seeds.py` (the pure rules),
+`attribution/crop_upload.py` (crop + presigned PUT + the no-fallback rule), `CropTarget` on
+`AttributeRequest`, `crop_object_key` on `RegisteredSeedItem`, per-seed kind and ref in
+`attribution/store.py` with an `attribution.seed_skipped` audit row, and migration `0029`. Tests:
+`tests/test_attribution_crop_seeds.py` (17) plus four in `tests/test_attribution_store.py`.
+On the proxy side, `LiveAttributionClient` was **minting crop targets and dropping them** — no
+`crop_targets` on the body, no `crop_object_key` read back — so the halves did not meet until
+`tests/unit/attribution-crop-wire.test.ts` pinned the serialised body.
 **Counterpart:** `../image_backend/docs/superpowers/specs/2026-08-31-weekly-reports-design.md` §7
 and `../image_backend/docs/SERVICES-ASKS.md` §11.
 

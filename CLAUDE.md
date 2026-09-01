@@ -294,6 +294,7 @@ decisions behind the new rows.
 | Infringement feedback (`not_me` / `authorised`) | Automated threat-event feeds (v1 threat events are admin-curated only) |
 | URL recheck loop (`url_alive`) | Takedown, of any kind |
 | Attribution: face → seed (`/v1/attribute`) | |
+| **Face-crop seeds** — on a photo with 2+ faces each subject's seed is a crop of their own face, so a bystander who never consented is not transmitted to Hive/Google every cycle. `attribution/seeds.py` + `crop_upload.py`, `seed_kind='face_crop'` (0029). A failed crop upload registers NO seed, never a photo seed. Built 2026-09-01, dark until the proxy sets its crop bucket; the §6 recall measurement has not run | |
 | The four `svc` contract views (0016) | |
 | `GET /v1/config/floors` | |
 | **Adjudication queue + reviewer tooling (minimal)** — `review/`, `review_tasks`, `/v1/admin/review/*`, the panel via the backend proxy. Human-only `confirmed`/`rejected`/`uncertain`; no auto-promotion (INVARIANTS #19, #47) | |

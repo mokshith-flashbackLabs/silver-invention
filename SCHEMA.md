@@ -363,6 +363,27 @@ not hold.
 Note this is `search_seeds` only. `enrolments.source_object_uri` is a different column — the
 ReferenceImage pointer named in INVARIANTS #9 — and is unchanged.
 
+### `seed_kind` — what kind of image the seed is (0029)
+
+`TEXT`, no `CHECK`, vocabulary carried in a `COMMENT` so `\d+` shows it. Four values:
+
+| Value | What it points at |
+|---|---|
+| `enrolment` | the liveness `ReferenceImage` |
+| `user_supplied` | a photo the user uploaded, seeded **whole** |
+| `face_crop` | **one subject's face, cut out of a group photo** (0029, 2026-08-31) |
+| `public_profile` | specified, not built |
+
+`face_crop` exists because seeding the whole group photo transmits everyone in it — including a
+person who never consented — to Hive and Google on every cycle. `attribution/` is its only writer:
+the crop object is one *we* asked the proxy to store during an attribution run, so `POST /v1/search/seeds`
+deliberately does not accept the kind. A subject whose crop fails to upload gets **no seed at all**
+rather than a `user_supplied` fallback, plus one `audit_log` row (`attribution.seed_skipped`).
+
+Reusing `user_supplied` needed no migration and was rejected on legibility: nothing would then
+separate "the photo they gave us" from "a region we cut out of it", which is the first question
+anyone asks when calibration looks odd.
+
 ### The thing found vs. the observation of it
 
 This split is the whole point of step 6 and it is worth stating plainly, because the alternative was

@@ -508,15 +508,54 @@ looked lately, and you should not make the claim.
 ### New — `POST /v1/attribute`
 
 ```
-{ photo_ref, requested_by, candidate_refs: [uuid], presigned_get_url }
+{ photo_ref, requested_by, candidate_refs: [uuid], presigned_get_url,
+  crop_targets?: [ { user_ref, crop_ref, crop_put_url } ] }
 -> 200 {
      run_id,
      faces: [ { face_index, bbox, detect_confidence,
                 resolved_user_ref | null, match_score | null } ],
-     seeds_registered: [ { user_ref, seed_id } ]
+     seeds_registered: [ { user_ref, seed_id, crop_object_key | null } ]
    }
 503 attribution_unavailable   (retryable; the run is recorded as 'failed')
 ```
+
+#### `crop_targets` — face-crop seeds (2026-08-31, **built**)
+
+On a photo with **two or more detected faces**, each attributed subject's seed becomes a crop of
+**their own face**, and the full photo stops being a seed. Single-face photos are unchanged.
+
+The reason is consent, not detection. While the full photo is the seed, a person in frame who never
+consented — a household member with monitoring off, one who has not enrolled, a passer-by — has their
+face sent to Hive and Google on **every scan cycle, indefinitely**. Your face-level seed gate stops a
+stranger becoming a monitored *subject*; it says nothing about their face being *transmitted*.
+
+**Mint one target per candidate**, before you know which will attribute — you cannot know that until
+we answer, and an unused presigned URL simply expires. Same shape as `audit_put_urls` on
+`POST /v1/liveness/{sid}/result`.
+
+- `crop_ref` — your **opaque durable object key**. It becomes the seed's `source_object_ref`, so 0011's
+  rule applies and we `422` a value that starts `http(s)://` or contains `X-Amz-Signature`.
+- `crop_put_url` — presigned **PUT**, absolute `https`, content type `image/jpeg`. A credential: it
+  appears in this body and nowhere else, never in a log line, never in a response.
+- Two targets naming the same `user_ref` is a `422`. Picking one silently would leave the other
+  object dangling in your bucket with nothing on either side naming it.
+
+`crop_object_key` on the response is **the value you sent**, echoed — never a key we invented. `null`
+means that seed is the whole photo, which is the answer for a single-face photo and for a call that
+sent no targets.
+
+**When a crop cannot be stored we register NO SEED for that subject** — not a photo seed. The run
+still returns `200`, and one `audit_log` row records it. This is deliberate and please do not ask us
+to soften it: falling back to the photo would let a transient S3 hiccup silently reinstate the exact
+transmission this design prevents, invisibly. A missing seed is recoverable — your next
+`POST /v1/attribute` for that photo registers it. A face already sent to Hive is not. The gap reaches
+you as a subject simply **absent from `seeds_registered`**; do not reconstruct a row for them.
+
+One cost, stated plainly: a verbatim repost of the whole group photo becomes harder to find. Google
+maps `partialMatchingImages`, which exists for the crop-to-parent relationship, so it may still
+surface the page; Hive is near-duplicate embedding over whole images and will probably miss the
+parent. **This has not been measured yet** (design §6), which is why your side ships it behind a
+bucket-name feature flag.
 
 `match_threshold` and `max_candidates` are **not** request fields, though an earlier draft of the
 contract had them. They come from our config: a per-request threshold would defeat INVARIANTS #1b
