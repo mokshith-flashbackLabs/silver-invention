@@ -815,11 +815,17 @@ threshold. **It is not a measured value**, and
 `DEPLOY-DEV-HANDOFF.md` §11 says explicitly not to tune a threshold from a dev
 measurement. Production needs a value derived from a labelled eval set.
 
-### 13.4 `hive.cost_per_call_usd` is NULL
+### 13.4 Hive is priced but not capped
 
-Hive is contract-priced and no measured figure exists here. A budget set without
-a cost **fails closed** (invariant #38), so filling this in is a prerequisite for
-capping Hive spend, not a nicety.
+`hive.cost_per_call_usd = 0.003000` since migration **0029** (2026-08-31) — spend
+÷ calls off the Hive dashboard, a measurement of what we have been charged, not a
+rate from the signed agreement. Re-read the dashboard if reported spend stops
+matching the invoice.
+
+`hive.daily_budget_usd` is still **NULL**, so nothing caps Hive spend; the guard
+reads "no daily budget configured" and dispatches. Setting a cap is now a plain
+finance decision — before 0029 a budget without a cost **failed closed**
+(invariant #38) and would have stopped Hive dispatching entirely.
 
 ### 13.5 No provider is calibrated and no eval set exists
 

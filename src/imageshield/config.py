@@ -155,9 +155,10 @@ class Config(BaseSettings):
     # `search/stub.py` INSTEAD of Hive and Google — never alongside — so no object
     # in the worker holds a live provider key and no code path can reach one. In
     # development that is the only thing standing between a test run and billable
-    # Hive traffic: the dev key is real, Hive has no sandbox, and its
-    # cost_per_call_usd is NULL so the step-8 budget guard fails closed and caps
-    # nothing.
+    # Hive traffic: the dev key is real, Hive has no sandbox, and while 0029
+    # priced a Hive call (0.003000, measured), its daily_budget_usd is still
+    # NULL — so the step-8 budget guard reads "no cap configured" and caps
+    # nothing. Pricing a call and capping spend are different things.
     #
     # 'hive' and 'google' both mean "the real stack". Selecting one provider of
     # the pair is `providers.enabled`'s job (hot-reloadable, §7.6), not this
@@ -770,10 +771,10 @@ class Config(BaseSettings):
     def _development_uses_the_stub_provider(self) -> Config:
         """The dev Hive credential is a REAL key — Hive has no sandbox.
 
-        Hive Web Search is contract-priced and `hive.cost_per_call_usd` is NULL,
-        so a budget set against it fails closed and caps nothing (§7.6). That
-        makes config the only cheap place to stop a dev run spending real money,
-        and an env edit alone must not be enough to do it.
+        0029 priced a Hive call (0.003000, measured off their dashboard) but set
+        no `daily_budget_usd`, so the budget guard still caps nothing (§7.6).
+        That makes config the only cheap place to stop a dev run spending real
+        money, and an env edit alone must not be enough to do it.
 
         This is only half a switch on its own. The other half is
         `search/worker.py:build_providers`, which honours the value; while nothing

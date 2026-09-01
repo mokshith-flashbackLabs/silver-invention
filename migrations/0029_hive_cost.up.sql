@@ -1,0 +1,29 @@
+-- 0029: price Hive Web Search.
+--
+-- 0009 shipped `hive.cost_per_call_usd` as NULL on purpose: Hive Web Search is
+-- contract-priced, no measured figure existed in this repo, and a budget
+-- enforced against an unsourced number is worse than no budget because the
+-- error only surfaces on an invoice. That follow-up is now closed.
+--
+-- PROVENANCE, AND ITS LIMITS. 0.003000 USD/call is DERIVED FROM THE HIVE
+-- DASHBOARD (spend / calls, read 2026-08-31 by the owner). It is not a rate
+-- copied from the signed agreement, so treat it as a measurement of what we
+-- have been charged so far rather than a contractual guarantee: a tier change,
+-- a bundled endpoint, or a different Hive project can move it without anything
+-- here failing. Re-read the dashboard when spend reporting stops matching the
+-- invoice, and prefer the agreement's figure over this one if they disagree.
+--
+-- WHAT THIS DOES AND DOES NOT CHANGE. `hive.daily_budget_usd` stays NULL, so
+-- the guard still reads "no daily budget configured" and dispatches freely —
+-- this migration caps nothing. What it changes is that every Hive call now
+-- accumulates a PRICED figure into `provider_spend` instead of being spend the
+-- system cannot quantify, and that a daily budget set from here on is
+-- enforceable rather than fail-closed (INVARIANTS #38: a budget with an
+-- unknown cost refuses to dispatch, which is the misconfiguration that rule
+-- exists to refuse). Setting that cap is a finance decision and is still open.
+--
+-- The scale is deliberate: `NUMERIC(10,6)` holds 0.003000 exactly, and the
+-- `provider_spend` accumulator is NUMERIC(14,6), so each increment is added at
+-- full precision rather than rounded to nothing (0009's note on why a narrower
+-- accumulator was a silent fail-open in the one check that must fail closed).
+UPDATE providers SET cost_per_call_usd = 0.003000 WHERE provider_id = 'hive';

@@ -738,10 +738,12 @@ def test_0009_adds_the_cost_and_cadence_columns(throwaway_db: str) -> None:
 
 def test_0009_writes_the_real_google_cost_and_leaves_hive_null(throwaway_db: str) -> None:
     """Google Cloud Vision Web Detection is published list price. Hive Web Search
-    is contract-priced and no measured figure exists anywhere in this repo, so
-    the column stays NULL rather than holding a plausible-looking guess — a
-    budget enforced against an unsourced number is worse than no budget, because
-    the error only surfaces on an invoice."""
+    is contract-priced: 0009 shipped it NULL rather than a plausible-looking
+    guess — a budget enforced against an unsourced number is worse than no
+    budget, because the error only surfaces on an invoice — and 0029 filled it
+    from a figure measured off the Hive dashboard. This asserts the state at
+    HEAD, which is why hive is no longer None here; 0029's own test below
+    covers the transition and its reversal."""
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
     with psycopg.connect(throwaway_db) as conn:
@@ -749,7 +751,7 @@ def test_0009_writes_the_real_google_cost_and_leaves_hive_null(throwaway_db: str
             conn.execute("SELECT provider_id, cost_per_call_usd FROM providers").fetchall()
         )
     assert costs["google"] == Decimal("0.003500")
-    assert costs["hive"] is None
+    assert costs["hive"] == Decimal("0.003000")
 
 
 def test_0009_rejects_an_unknown_breaker_state(throwaway_db: str) -> None:
@@ -1782,3 +1784,49 @@ def test_migrate_script_refuses_with_partial_parts_naming_the_gap(tmp_path: Path
     )
     assert result.returncode != 0
     assert "DB_PASSWORD" in result.stderr
+
+
+# ── 0029: Hive is priced ───────────────────────────────────────────────────
+
+
+def test_0029_prices_hive_and_leaves_its_budget_alone(throwaway_db: str) -> None:
+    """The measured Hive rate lands, and NOTHING ELSE does.
+
+    The value matters less than the two things around it: `daily_budget_usd`
+    stays NULL, so this migration caps nothing and cannot start refusing
+    dispatches (INVARIANTS #38 refuses a budget it cannot price — the inverse,
+    a price with no budget, simply dispatches and now records a real figure);
+    and google's list price is untouched, so a migration about one provider
+    cannot quietly reprice another.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    with psycopg.connect(throwaway_db) as conn:
+        row = conn.execute(
+            "SELECT cost_per_call_usd, daily_budget_usd, monthly_budget_usd"
+            " FROM providers WHERE provider_id = 'hive'"
+        ).fetchone()
+        google = conn.execute(
+            "SELECT cost_per_call_usd FROM providers WHERE provider_id = 'google'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == Decimal("0.003000")
+    assert row[1] is None, "0029 must not set a cap; that is a finance decision"
+    assert row[2] is None
+    assert google is not None and google[0] == Decimal("0.003500")
+
+
+def test_0029_down_restores_the_absence_of_a_price(throwaway_db: str) -> None:
+    """Down restores NULL, not a remembered number: before 0029 the column had
+    never held one, and a budget set meanwhile correctly returns to failing
+    closed rather than enforcing against a price the operator rolled back."""
+    run_migrate(throwaway_db, "down", "--all")
+    run_migrate(throwaway_db, "up")
+    # 0028_, not 0029_: the helper lands with the NAMED migration still
+    # applied, so asking for 0029 would revert nothing and pass vacuously.
+    run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0028_"))
+    with psycopg.connect(throwaway_db) as conn:
+        cost = conn.execute(
+            "SELECT cost_per_call_usd FROM providers WHERE provider_id = 'hive'"
+        ).fetchone()
+    assert cost is not None and cost[0] is None
