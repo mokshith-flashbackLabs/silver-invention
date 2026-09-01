@@ -12,3 +12,6 @@ dist/
 build/
 node_modules/
 .playwright-mcp/
+
+# SDD scratch: ledgers, briefs, review packages (per-plan, not history)
+.superpowers/
