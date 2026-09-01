@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "fetcher",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:98e6b5e",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:623525b",
       "essential": true,
       "memory": 192,
       "command": [
