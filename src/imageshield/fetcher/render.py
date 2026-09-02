@@ -43,6 +43,17 @@ _LONG_EDGE_MAX = 1024
 _BLUR_FRACTION = 0.012
 _BLUR_RADIUS_MIN = 6
 
+# The sharp region is bbox plus its OWN margin, deliberately much smaller than
+# attribution/crop.py's 0.25: a search seed wants context around the face,
+# while every pixel sharpened here is a pixel of the hit image shown sharp.
+# Enough that a tight Rekognition box does not clip a jaw or hairline, no more.
+# Never import _MARGIN_FRACTION for this -- spec §1a.
+_SHARP_MARGIN_FRACTION = 0.08
+
+# Below this the sharp patch is too small to help identify anyone, so reveal
+# degrades to the blurred frame rather than erroring -- spec §1a.
+_MIN_SHARP_PIXELS = 24
+
 _JPEG_QUALITY = 80
 
 
@@ -56,6 +67,8 @@ def render_preview(image: bytes, bbox: BoundingBox, *, reveal: bool) -> bytes:
         with Image.open(io.BytesIO(image)) as opened:
             source = _downscale(opened.convert("RGB"))
             rendered = _blur(source)
+            if reveal:
+                rendered = _sharpen_face(rendered, source, bbox)
             buffer = io.BytesIO()
             rendered.save(buffer, format="JPEG", quality=_JPEG_QUALITY)
             return buffer.getvalue()
@@ -75,11 +88,46 @@ def _downscale(source: Image.Image) -> Image.Image:
     scale = _LONG_EDGE_MAX / longest
     # Image.Resampling.LANCZOS, not the deprecated Image.LANCZOS alias --
     # matching confirm/phash.py:31, and the only form Pillow's stubs accept.
-    return source.resize(
-        (round(width * scale), round(height * scale)), Image.Resampling.LANCZOS
-    )
+    return source.resize((round(width * scale), round(height * scale)), Image.Resampling.LANCZOS)
 
 
 def _blur(source: Image.Image) -> Image.Image:
     radius = max(_BLUR_RADIUS_MIN, round(max(source.size) * _BLUR_FRACTION))
     return source.filter(ImageFilter.GaussianBlur(radius))
+
+
+def _sharpen_face(blurred: Image.Image, source: Image.Image, bbox: BoundingBox) -> Image.Image:
+    """Paste the sharp face box back over the blurred base.
+
+    Both layers come from the SAME downscaled source, so they align exactly --
+    which is why _downscale runs before this and not after.
+    """
+    box = _sharp_box(bbox, *source.size)
+    if box is None:
+        # Too small to identify anyone by. The blurred frame is still the
+        # honest answer; erroring here would withhold it for nothing.
+        return blurred
+    composited = blurred.copy()
+    composited.paste(source.crop(box), (box[0], box[1]))
+    return composited
+
+
+def _sharp_box(bbox: BoundingBox, width: int, height: int) -> tuple[int, int, int, int] | None:
+    """Normalised box + the sharp margin -> pixel box, clamped to the frame.
+    ``None`` when the result is too small to be worth sharpening."""
+    margin_x = bbox.w * _SHARP_MARGIN_FRACTION
+    margin_y = bbox.h * _SHARP_MARGIN_FRACTION
+
+    left = _clamp(bbox.x - margin_x) * width
+    top = _clamp(bbox.y - margin_y) * height
+    right = _clamp(bbox.x + bbox.w + margin_x) * width
+    bottom = _clamp(bbox.y + bbox.h + margin_y) * height
+
+    box = (int(left), int(top), int(right), int(bottom))
+    if box[2] - box[0] < _MIN_SHARP_PIXELS or box[3] - box[1] < _MIN_SHARP_PIXELS:
+        return None
+    return box
+
+
+def _clamp(value: float) -> float:
+    return min(1.0, max(0.0, value))
