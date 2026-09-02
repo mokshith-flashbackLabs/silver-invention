@@ -20,7 +20,6 @@ caller, no reason to publish an OpenAPI surface.
 from __future__ import annotations
 
 import hmac
-import io
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -28,25 +27,26 @@ import httpx
 import structlog
 from fastapi import APIRouter, Depends, FastAPI, Header, Request, Response
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageFilter
 from pydantic import BaseModel, ConfigDict
 
-from imageshield.attribution.crop import CropTooSmall, UndecodableImage, crop_to_face
+from imageshield.attribution.crop import UndecodableImage
 from imageshield.attribution.models import BoundingBox
 from imageshield.fetcher.config import FetcherConfig, load_fetcher_config
 from imageshield.fetcher.fetch import FetchRefused, fetch_image
+from imageshield.fetcher.render import render_preview
 from imageshield.recheck.ssrf import Resolver
 
 log = structlog.get_logger("imageshield.fetcher")
 
-# The margin crop from attribution.crop.crop_to_face is never shown un-blurred
-# by default (ARCHITECTURE.md §2.4: a reviewer sees a face crop, not a full
-# image, and it stays blurred until they choose to look). Radius and quality
-# are properties of what "usably blurred but still a JPEG worth sending" means
-# — not operational knobs — so they are constants here, not config, the same
-# reasoning attribution/crop.py gives its own margin fraction.
-_BLUR_RADIUS = 12
-_BLUR_JPEG_QUALITY = 80
+# The render itself lives in fetcher/render.py, along with the radius, the
+# long-edge cap and the sharp-face margin — they are properties of what
+# "usably blurred but still a JPEG worth sending" means, not operational
+# knobs, so they are constants there rather than config.
+#
+# WHAT THIS ROUTE SERVES CHANGED ON 2026-09-02 (spec
+# docs/superpowers/specs/2026-09-02-whole-frame-blur-design.md): the whole
+# frame blurred end to end, and `blur=false` sharpens ONLY the face box. It is
+# no longer a face crop, and no request returns a fully sharp image.
 
 
 class FetcherError(Exception):
@@ -113,6 +113,11 @@ class _BBoxRequest(_RequestModel):
 class CropRequest(_RequestModel):
     url: str
     bbox: _BBoxRequest
+    # True (the default) blurs the whole frame, face included. False SHARPENS
+    # THE FACE BOX ONLY — it does not return the image unblurred, and nothing
+    # this route accepts does. The name is kept because the proxy passes it
+    # through from its own `reveal` parameter; renaming it is a coordinated
+    # two-repo deploy for a cosmetic gain.
     blur: bool = True
 
 
@@ -208,9 +213,15 @@ async def crop(
 
     bbox = BoundingBox(x=body.bbox.x, y=body.bbox.y, w=body.bbox.w, h=body.bbox.h)
     try:
-        cropped = crop_to_face(fetched.body, bbox)
-    except CropTooSmall as exc:
-        raise FetcherError(400, "crop_too_small", str(exc)) from exc
+        # `blur=false` means SHARPEN THE FACE, not "return it unblurred" — see
+        # render.render_preview. No value of this flag returns a fully sharp
+        # frame.
+        #
+        # There is no crop_too_small branch any more: that came from
+        # crop_to_face, and a face too small for a useful sharp patch still
+        # deserves the blurred frame. Refusing the whole render would withhold
+        # the default view for no safety gain.
+        rendered = render_preview(fetched.body, bbox, reveal=not body.blur)
     except UndecodableImage as exc:
         # The upstream content-type claimed image/*; the bytes disagreed.
         # Same user-facing meaning as the not_an_image refusal above — what we
@@ -218,14 +229,7 @@ async def crop(
         # than minting a second one for a distinction only this service sees.
         raise FetcherError(400, "not_an_image", str(exc)) from exc
 
-    if body.blur:
-        with Image.open(io.BytesIO(cropped)) as opened:
-            blurred = opened.convert("RGB").filter(ImageFilter.GaussianBlur(_BLUR_RADIUS))
-            buffer = io.BytesIO()
-            blurred.save(buffer, format="JPEG", quality=_BLUR_JPEG_QUALITY)
-            cropped = buffer.getvalue()
-
-    return Response(content=cropped, media_type="image/jpeg")
+    return Response(content=rendered, media_type="image/jpeg")
 
 
 @asynccontextmanager

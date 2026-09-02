@@ -91,30 +91,81 @@ def test_fetch_rechecks_every_redirect_hop() -> None:
     assert response.json()["error"]["code"] == "refused_private_address"
 
 
-def test_crop_returns_blurred_jpeg_by_default() -> None:
-    client = _client(_image_handler)
-    body = {"url": "https://x.example/a.png", "bbox": {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}}
-    response = client.post("/v1/crop", json=body, headers=AUTH)
+def _textured_png(size: tuple[int, int] = (256, 256)) -> bytes:
+    """See tests/test_fetcher_render.py::_texture — a flat fill cannot show a
+    blur, so the crop-route tests need texture too."""
+    cells = (max(2, size[0] // 8), max(2, size[1] // 8))
+    base = Image.new("L", cells)
+    base.putdata([255 if (x + y) % 2 == 0 else 0 for y in range(cells[1]) for x in range(cells[0])])
+    buffer = io.BytesIO()
+    base.resize(size, Image.NEAREST).convert("RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _textured_handler(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, content=_textured_png(), headers={"content-type": "image/png"})
+
+
+def _grey_variance(data: bytes) -> float:
+    pixels = list(Image.open(io.BytesIO(data)).convert("L").getdata())
+    mean = sum(pixels) / len(pixels)
+    return sum((value - mean) ** 2 for value in pixels) / len(pixels)
+
+
+CROP_BODY = {
+    "url": "https://x.example/a.png",
+    "bbox": {"x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2},
+}
+
+
+def test_crop_returns_the_whole_frame_blurred_by_default() -> None:
+    """Changed 2026-09-02: this asserted ``size[0] < 64  # cropped, not the
+    whole frame``. The whole frame IS the contract now -- the subject needs to
+    recognise the photo to answer honestly, and the blur is what makes showing
+    it safe (spec §0.1)."""
+    client = _client(_textured_handler)
+    response = client.post("/v1/crop", json=CROP_BODY, headers=AUTH)
+
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/jpeg"
-    blurred = Image.open(io.BytesIO(response.content))
-    assert blurred.size[0] < 64  # cropped, not the whole frame
+    rendered = Image.open(io.BytesIO(response.content))
+    assert rendered.size == (256, 256)  # the whole frame, not a crop
 
 
-def test_crop_with_blur_false_reveals_unblurred_bytes() -> None:
-    """The reveal path: ``review.html``'s reveal link re-requests the same
-    crop with ``blur=0``, and the two responses must actually differ -- a
-    ``blur`` flag that is accepted but silently ignored would make "reveal"
-    a no-op button that still shows the blurred crop."""
-    client = _client(_image_handler)
-    body = {"url": "https://x.example/a.png", "bbox": {"x": 0.25, "y": 0.25, "w": 0.5, "h": 0.5}}
-
-    blurred = client.post("/v1/crop", json=body, headers=AUTH)
-    revealed = client.post("/v1/crop", json={**body, "blur": False}, headers=AUTH)
+def test_crop_with_blur_false_sharpens_only_the_face() -> None:
+    """``blur=false`` is 'sharpen the face', NOT 'return it unblurred' -- the
+    two responses must differ (a reveal button that changes nothing is a lie),
+    and the revealed one must still be mostly blurred (spec §0.4)."""
+    client = _client(_textured_handler)
+    blurred = client.post("/v1/crop", json=CROP_BODY, headers=AUTH)
+    revealed = client.post("/v1/crop", json={**CROP_BODY, "blur": False}, headers=AUTH)
 
     assert blurred.status_code == revealed.status_code == 200
     assert blurred.headers["content-type"] == revealed.headers["content-type"] == "image/jpeg"
     assert blurred.content != revealed.content
+
+    assert _grey_variance(revealed.content) < _grey_variance(_textured_png()) / 3
+
+
+def test_crop_no_longer_refuses_a_tiny_face() -> None:
+    """``crop_too_small`` was raised by ``crop_to_face``, which this route no
+    longer calls. A tiny face now yields a blurred frame (spec §1a)."""
+    client = _client(_textured_handler)
+    body = {**CROP_BODY, "bbox": {"x": 0.5, "y": 0.5, "w": 0.001, "h": 0.001}}
+    response = client.post("/v1/crop", json=body, headers=AUTH)
+
+    assert response.status_code == 200
+
+
+def test_crop_still_refuses_undecodable_bytes() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"nope", headers={"content-type": "image/png"})
+
+    client = _client(handler)
+    response = client.post("/v1/crop", json=CROP_BODY, headers=AUTH)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "not_an_image"
 
 
 def test_health_needs_no_token() -> None:

@@ -7,7 +7,7 @@ hard rule 3 describes, and it is the same path the liveness ``ReferenceImage``
 already takes — the same ``ObjectUploader``, deliberately, rather than a second
 one that could drift.
 
-**Pillow gains no fourth call site.** ``crop_to_face`` already exists and is
+**Pillow gains no extra call site.** ``crop_to_face`` already exists and is
 already sanctioned (CLAUDE.md §2); this calls it again from the module that
 owns the attribution sequence. Re-cropping rather than threading the search's
 crop out through the provider interface costs one deterministic Pillow
