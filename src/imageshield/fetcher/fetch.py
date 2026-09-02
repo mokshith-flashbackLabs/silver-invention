@@ -32,8 +32,8 @@ successful rebind still reaches nothing worth reaching from here.
 ``FetchedImage`` holds bytes **in memory only, for the lifetime of one
 request**. Nothing here writes to disk, a column, or a log (INVARIANTS #9) —
 the caller (``fetcher/app.py``) streams it straight into the HTTP response (or
-through ``attribution.crop.crop_to_face``) and it is discarded when that
-response is sent.
+through ``fetcher.render.render_preview``, which blurs the whole frame) and it
+is discarded when that response is sent.
 """
 
 from __future__ import annotations

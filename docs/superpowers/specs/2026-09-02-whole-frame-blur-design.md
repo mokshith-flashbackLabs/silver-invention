@@ -130,7 +130,13 @@ has exactly two callers, both in `attribution/`, both untouched — which is a t
 it has today, since the preview and the search seeds no longer share a crop whose margin serves
 only one of them.
 
-**Pillow gains a fourth call site, named and documented.** *Corrected 2026-09-02, after this spec
+**Pillow's third call site MOVES; the count stays three.** *Corrected again 2026-09-02, during
+implementation:* `fetcher/app.py` ends up importing no Pillow at all — the pixel work leaves it
+entirely — so `fetcher/render.py` replaces it rather than joining it. This section twice predicted a
+fourth site and was twice wrong; `CLAUDE.md` §2 still reads "three call sites", with the third
+renamed.
+
+**On why the count was a choice at all.** *Corrected 2026-09-02, after this spec
 was first committed:* the "three call sites, and no more" rule in `CLAUDE.md` §2 is a
 **documentation convention, not a test** — `tests/test_boundaries.py` enforces the face-search grep
 and the S3 grep, and asserts nothing about Pillow. The first draft of this section claimed a

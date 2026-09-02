@@ -26,7 +26,15 @@ NCMEC's Take It Down, Loti, and Ceartas — not reverse image search. Several ru
   appears online is a stalking tool. That's Clearview, and the Dutch DPA fined them ~€30.5M for it.
 - We do **not** store image bytes of infringing content. Hashes, embeddings, URLs, and bounding boxes
   only. A database of NCII indexed by identity is the highest-value breach target imaginable.
-- We do **not** show full images. Face crops, rendered live, blurred by default, revealed on tap.
+- We show a hit's full frame to **the subject only**, blurred end to end, and a per-item tap
+  sharpens **only their face** — never the frame. There is no code path, and no request parameter,
+  that returns a fully sharp image: the explicit content of a hit is never rendered sharp by this
+  system. Staff never see hit imagery at all. *(Amended 2026-09-02, spec
+  `docs/superpowers/specs/2026-09-02-whole-frame-blur-design.md` — previously "we do not show full
+  images. Face crops, rendered live, blurred by default, revealed on tap". The frame widened because
+  a face box strips the context a person needs to answer "is this you?" honestly; the blur, the tap
+  and the subject-only access are what make showing it safe, and §0.2 of that spec records the
+  `likely_not_subject` exposure the owner accepted.)*
 - We do **not** do takedown in v1. Detection only. The product must say so in onboarding, in plain
   words — not buried in a ToS.
 - We do **not** serve users under 18 in v1. A hit on a minor is CSAM, which is a mandatory-reporting
@@ -64,8 +72,18 @@ concept), and any LLM SDK — see §10.
 `SearchFacesByImage`, so three faces in one photo are never searched as the same "largest face" — and,
 since 2026-08-21, `to_rekognition_jpeg`, the in-memory transcode that turns the web's WebP into the
 JPEG/PNG Rekognition accepts), `confirm/phash.py` (the 64-bit dHash used for cross-URL duplicate
-detection), and `fetcher/app.py` (the blur applied to every face crop before it leaves the process).
-All three operate on bytes already in memory and never write a file — see INVARIANTS #9 and #12.
+detection), and `fetcher/render.py` (the subject preview: downscale, whole-frame Gaussian, and the
+sharp-face composite). All three operate on bytes already in memory and never write a file — see
+INVARIANTS #9 and #12.
+
+*The third site MOVED on 2026-09-02*, from `fetcher/app.py` to `fetcher/render.py`: the route module
+now holds no pixel work at all and imports no Pillow. The count is unchanged — the whole-frame spec
+first predicted a fourth site, and was wrong, because the render replaced the blur rather than
+joining it.
+
+**This rule is a convention, not a test.** `tests/test_boundaries.py` enforces the face-search grep
+and the S3 grep and asserts nothing about Pillow, so the count is kept honest by review rather than
+by CI. Adding a fourth site means editing this sentence, which is the point.
 
 External dependencies we **call** but do not own: the proxy (REST), Rekognition, Hive, Postgres, SQS.
 

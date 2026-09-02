@@ -324,8 +324,14 @@ future misconfiguration.
 - SSRF guards applied **after** DNS resolution, not before, on every redirect hop
 - 5s timeout, 10MB cap (`fetch_max_bytes`), 2 redirects
 - `POST /v1/fetch` returns raw bytes to the confirm worker (transient, in-memory only); `POST /v1/crop`
-  crops to `face_bbox` + 15% margin and **blurs by default** (Pillow `ImageFilter`, radius 12, JPEG
-  quality 80) — reveal-on-request is the caller's job, not the fetcher's
+  returns **the whole frame, blurred end to end** — long edge capped at 1024px, Gaussian radius a
+  fraction of that edge (floored), JPEG quality 80 — and `blur=false` sharpens **only** the
+  `face_bbox` region (+8% margin) over that blurred base. **No parameter returns a fully sharp
+  frame.** *(Changed 2026-09-02, spec
+  `docs/superpowers/specs/2026-09-02-whole-frame-blur-design.md`; previously a `face_bbox` + margin
+  crop blurred at a constant radius 12. The radius became proportional because a constant tuned for
+  a crop is nearly transparent over a full frame, and the 1024 cap keeps the proxy's buffered relay
+  honest.)* The pixel work lives in `fetcher/render.py`, not the route module
 - `Cache-Control: no-store, private`. No CDN, no disk, no temp file
 - Both routes are gated on `X-Fetcher-Token` (`hmac.compare_digest`); `GET /health` is not, matching
   every other deployable's rule that a load-balancer probe cannot carry a secret

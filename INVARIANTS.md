@@ -193,9 +193,13 @@ substring.
 Check: adding `photo bytea` to any table fails the build. Adding `thumbnail_b64 text` fails. Adding
 `reference_image_uri text` passes.
 
-**10. Face crops are rendered in-memory and never cached.**
+**10. Previews are rendered in-memory and never cached.**
 No CDN, no `Cache-Control: public`, no disk write, no temp file. Response headers are
 `Cache-Control: no-store, private`.
+
+*Unchanged by the 2026-09-02 whole-frame change, and restated because the payload moved:* what is
+rendered is now the whole frame rather than a face crop, and it is still built in memory, still
+written nowhere, and still `no-store, private`. A bigger payload does not earn a cache.
 
 Check: hit the crop endpoint twice and confirm two fetcher invocations.
 
@@ -333,10 +337,25 @@ Check: no scoring arithmetic exists in the mobile client.
 Domain, title, and date are shown. The URL is available behind an interstitial via an explicit "copy
 for my lawyer" action. There is no one-tap path from a report to the content.
 
-**23. Crops are blurred by default, revealed per-item on explicit tap, and never appear in a digest,
-an email, a push notification, or a list view.**
-*Scoped 2026-08-21:* "never in a list view" binds **un-blurred** crops; a blurred preview renders
+**23. Previews are blurred by default, the tap reveals THE FACE ONLY, and they never appear in a
+digest, an email, a push notification, or a list view.**
+*Scoped 2026-08-21:* "never in a list view" binds **un-blurred** previews; a blurred preview renders
 only on the hit's own card (the subject's decide surface), and reveal stays a per-item explicit tap.
+
+*Amended 2026-09-02* (spec `docs/superpowers/specs/2026-09-02-whole-frame-blur-design.md`): the
+preview is the whole hit frame, blurred end to end, and the tap sharpens **only the face box** —
+it does not un-blur the frame. **NO CODE PATH, AND NO REQUEST PARAMETER, RETURNS A FULLY SHARP
+FRAME**: the explicit content of a hit is never rendered sharp by this system. `blur=false` on
+`POST /v1/crop` means "sharpen the face", which is why the flag's name is now misleading and its
+docstring says so.
+
+The frame widened because a face box strips the context a person needs to answer "is this you?"
+honestly. §0.2 of that spec records the accepted cost: on a `likely_not_subject` hit the frame may
+be a stranger's, and a blurred stranger's scene is now shown where a blurred stranger's face was.
+
+Check: `tests/test_fetcher_render.py::test_no_reveal_returns_a_fully_sharp_frame`, plus
+`test_reveal_leaves_everything_outside_the_face_blurred` — the surround must be as blurred as it is
+in the default render, not merely less sharp than the face.
 
 **24. Notifications are batched digests. Never real-time, never between 22:00 and 08:00 local.**
 "New match found" at 2am is a harm. Cadence here is a safety decision, not a growth lever.
