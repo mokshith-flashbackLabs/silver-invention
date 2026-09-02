@@ -130,8 +130,20 @@ has exactly two callers, both in `attribution/`, both untouched — which is a t
 it has today, since the preview and the search seeds no longer share a crop whose margin serves
 only one of them.
 
-**Pillow gains no fourth call site.** `fetcher/app.py` is already one of the three sanctioned sites
-(`CLAUDE.md` §2), and the new render lives there.
+**Pillow gains a fourth call site, named and documented.** *Corrected 2026-09-02, after this spec
+was first committed:* the "three call sites, and no more" rule in `CLAUDE.md` §2 is a
+**documentation convention, not a test** — `tests/test_boundaries.py` enforces the face-search grep
+and the S3 grep, and asserts nothing about Pillow. The first draft of this section claimed a
+boundary test would hold the count; no such assertion exists, and planning against it would have
+produced a test step for a test that cannot be written.
+
+So the count is a choice rather than a constraint, and the choice is a **new module,
+`src/imageshield/fetcher/render.py`**, holding the whole-frame render as pure functions over bytes.
+Reasons: it matches how `attribution/crop.py` already separates image algebra from routes,
+`fetcher/app.py` is a route module and this is ~40 lines of pixel work, and a pure function is
+directly unit-testable without a `TestClient`. `CLAUDE.md` §2 is amended in the same change to say
+**four** sites and to name this one — the rule's purpose is that every place decoding untrusted
+bytes is known and listed, which naming serves and refusing a file does not.
 
 ## 6. What the backend does NOT change
 
@@ -146,6 +158,8 @@ can produce bytes is unchanged by this design.
 
 ## 7. Invariants and docs amended in the same change
 
+- **services `CLAUDE.md` §2** — "Pillow has three call sites, and no more" becomes four, naming
+  `fetcher/render.py` (§5).
 - **services `CLAUDE.md` §1** — "We do not show full images" becomes: full frames are shown to the
   subject only, blurred end to end, with only the face un-blurrable on an explicit per-item tap.
 - **services `INVARIANTS.md` #23** — reveal semantics: the tap sharpens the face region, never the
@@ -174,7 +188,13 @@ Fetcher unit tests, against a synthetic image with a known bbox:
 - the sharp region uses its own margin constant, not `_MARGIN_FRACTION` — asserted by making the
   sharp area measurably tighter than `crop_to_face` would produce for the same box.
 - `crop_to_face`'s existing tests are untouched and still pass — the seed and attribution paths are
-  byte-identical. `tests/test_boundaries.py`'s Pillow call-site count is unchanged.
+  byte-identical.
+- **`tests/test_fetcher.py:101` will fail and must be updated**: it asserts
+  `blurred.size[0] < 64  # cropped, not the whole frame`, which is exactly the contract this change
+  reverses. It is a correct test of the old behaviour, not a bug.
+- **The existing test image is a flat colour** (`_png()` fills with one RGB triple), and blurring a
+  flat image returns a visually identical image — so every sharp-vs-blurred assertion against it
+  would pass vacuously. The tests need a TEXTURED fixture and a variance-based measure.
 
 ## 9. Rollout
 
