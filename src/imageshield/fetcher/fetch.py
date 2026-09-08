@@ -97,6 +97,7 @@ async def _get_guarded(
     accept_prefix: str,
     reject_code: str,
     max_bytes: int,
+    truncate_over_cap: bool = False,
     timeout_seconds: float,
     max_redirects: int,
     resolver: Resolver | None,
@@ -149,6 +150,19 @@ async def _get_guarded(
                 async for chunk in response.aiter_bytes():
                     body.extend(chunk)
                     if len(body) > max_bytes:
+                        if truncate_over_cap:
+                            # A PAGE only needs its <head>: the og:image sits
+                            # near the top, so the first max_bytes is the
+                            # answer and the rest is waste we stop paying for.
+                            # An IMAGE gets no such affordance -- half a JPEG
+                            # is not an image, and returning one would push the
+                            # failure into the decoder instead of surfacing it
+                            # here. Found in production: a 256KB refusal 413'd
+                            # YouTube, LinkedIn, Facebook, Instagram and
+                            # nearstore on the first real run (2026-09-07),
+                            # because modern platform HTML is megabytes.
+                            del body[max_bytes:]
+                            break
                         raise FetchRefused("too_large", f"exceeded {max_bytes} bytes")
             except httpx.HTTPError as exc:
                 raise FetchRefused("unfetchable", str(exc)) from exc
@@ -212,6 +226,7 @@ async def fetch_page(
         url,
         accept_prefix="text/html",
         reject_code="not_a_page",
+        truncate_over_cap=True,
         max_bytes=max_bytes,
         timeout_seconds=timeout_seconds,
         max_redirects=max_redirects,

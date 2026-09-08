@@ -73,12 +73,38 @@ def test_page_refuses_a_non_html_content_type() -> None:
     assert response.json()["error"]["code"] == "not_a_page"
 
 
-def test_page_refuses_a_body_over_the_cap() -> None:
+def test_page_truncates_at_the_cap_instead_of_refusing() -> None:
+    """A page is not a photograph. We want the <head>'s meta tags, so reading
+    the first N bytes and stopping is the CORRECT answer -- whereas a truncated
+    image is useless, which is why /v1/fetch still refuses.
+
+    Found in production, not in review: a 256KB cap refused YouTube, LinkedIn,
+    Facebook, Instagram and nearstore with 413 on the first real run (2026-09-07).
+    Modern platform HTML is megabytes; the og:image is near the top of it."""
+    head = b'<html><head><meta property="og:image" content="https://cdn.x/p.jpg">'
+    body = head + b"<!--" + b"x" * 5000
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"x" * 5000, headers={"content-type": "text/html"})
+        return httpx.Response(200, content=body, headers={"content-type": "text/html"})
 
     client = _client(handler, config=_config(page_max_bytes=1000))
     response = client.post("/v1/page", json={"url": "https://x.example/a"}, headers=AUTH)
+    assert response.status_code == 200
+    html = response.json()["html"]
+    assert len(html.encode()) <= 1000
+    # the part that matters survived, so the resolver can still do its job
+    assert "https://cdn.x/p.jpg" in html
+
+
+def test_an_image_over_the_cap_is_still_refused() -> None:
+    """Truncation is a PAGE affordance only. Half a JPEG is not an image, and
+    silently returning one would push the failure into the decoder."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 5000, headers={"content-type": "image/png"})
+
+    client = _client(handler, config=_config(fetch_max_bytes=1000))
+    response = client.post("/v1/fetch", json={"url": "https://x.example/a.png"}, headers=AUTH)
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "too_large"
 

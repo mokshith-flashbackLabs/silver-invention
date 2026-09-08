@@ -41,12 +41,20 @@ class FetcherConfig(BaseSettings):
     fetch_max_redirects: int = 2
 
     # `/v1/page` reads a page's HTML so its og:image can be resolved for a
-    # page-keyed hit. A separate, much SMALLER cap than fetch_max_bytes on
-    # purpose: we want a <head> full of meta tags, not a document, and the
-    # only consumer (confirm.og_image.page_preview_url) needs nothing past
-    # it. 256KB comfortably covers the <head> of every platform page in the
-    # 2026-09-07 sample while refusing a hostile server's endless body early.
-    page_max_bytes: int = 256 * 1024
+    # page-keyed hit. This is a READ-AT-MOST, not a refusal threshold: over
+    # the cap, `fetch_page` truncates and returns what it has, because the
+    # only consumer (confirm.og_image.page_preview_url) wants meta tags from
+    # the <head> and the og:* block sits near the top of it. /v1/fetch still
+    # REFUSES over its cap -- half a JPEG is not an image.
+    #
+    # It was a refusal at first, and that was wrong in production: 256KB
+    # 413'd YouTube, LinkedIn, Facebook, Instagram and nearstore on the very
+    # first real run (2026-09-07), because modern platform HTML is megabytes.
+    # The comment here claimed 256KB "comfortably covers the <head> of every
+    # platform page" -- an assumption that was never measured. Truncation is
+    # what makes the number safe to be wrong about: too small now costs a
+    # missed og tag on an unusually deep <head>, not a dead fetch.
+    page_max_bytes: int = 512 * 1024
     page_timeout_seconds: float = 10.0
 
     @field_validator("fetcher_token")
