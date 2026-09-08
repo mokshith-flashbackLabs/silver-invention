@@ -137,3 +137,20 @@ def test_page_refuses_an_upstream_error() -> None:
     client = _client(handler)
     response = client.post("/v1/page", json={"url": "https://x.example/a"}, headers=AUTH)
     assert response.json()["error"]["code"] == "unfetchable"
+
+
+def test_default_page_cap_is_large_enough_for_a_real_platform_page() -> None:
+    """MEASURED, not assumed — twice now the assumption has been wrong.
+
+    A YouTube watch page fetched from the ECS host on 2026-09-08 was 1,285,985
+    bytes of text/html, and `og:image` did not appear within the first 600,000
+    of them. A 256KB cap refused those pages outright (413); a 512KB cap
+    truncated before the tag. The default must clear a real page's <head>
+    wherever the platform chose to put it.
+
+    This guards the number against a well-meaning reduction: lowering it does
+    not fail loudly, it just silently stops resolving previews for the largest
+    platforms -- which is the bug this whole path exists to fix.
+    """
+    youtube_bytes_measured = 1_285_985
+    assert FetcherConfig(fetcher_token=TOKEN).page_max_bytes >= youtube_bytes_measured

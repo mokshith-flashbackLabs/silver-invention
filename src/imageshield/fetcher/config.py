@@ -42,19 +42,27 @@ class FetcherConfig(BaseSettings):
 
     # `/v1/page` reads a page's HTML so its og:image can be resolved for a
     # page-keyed hit. This is a READ-AT-MOST, not a refusal threshold: over
-    # the cap, `fetch_page` truncates and returns what it has, because the
-    # only consumer (confirm.og_image.page_preview_url) wants meta tags from
-    # the <head> and the og:* block sits near the top of it. /v1/fetch still
-    # REFUSES over its cap -- half a JPEG is not an image.
+    # the cap, `fetch_page` truncates and returns what it has. /v1/fetch still
+    # REFUSES over its own cap -- half a JPEG is not an image.
     #
-    # It was a refusal at first, and that was wrong in production: 256KB
-    # 413'd YouTube, LinkedIn, Facebook, Instagram and nearstore on the very
-    # first real run (2026-09-07), because modern platform HTML is megabytes.
-    # The comment here claimed 256KB "comfortably covers the <head> of every
-    # platform page" -- an assumption that was never measured. Truncation is
-    # what makes the number safe to be wrong about: too small now costs a
-    # missed og tag on an unusually deep <head>, not a dead fetch.
-    page_max_bytes: int = 512 * 1024
+    # THE NUMBER IS MEASURED. Two guesses were already wrong:
+    #   - 256KB, as a REFUSAL: 413'd YouTube, LinkedIn, Facebook, Instagram
+    #     and nearstore on the first real run (2026-09-07). Modern platform
+    #     HTML is megabytes.
+    #   - 512KB, truncating, justified by "the og:* block sits near the top of
+    #     the <head>". It does not. A YouTube watch page fetched from the ECS
+    #     host (2026-09-08) was 1,285,985 bytes and `og:image` did not appear
+    #     within the first 600,000 of them, so all four YouTube hits resolved
+    #     to `page_has_no_preview`.
+    # 2MB clears that measured page with headroom. `test_fetcher_page.py`
+    # pins the floor against the measurement, because lowering this does not
+    # fail loudly -- it silently stops resolving previews for the biggest
+    # platforms, which is the bug this path exists to fix.
+    #
+    # A tighter alternative, if 2MB per page fetch ever matters: stop reading
+    # at `</head>` instead of at a byte count. More code, and the cap would
+    # still be needed as the backstop for a page that never closes its head.
+    page_max_bytes: int = 2 * 1024 * 1024
     page_timeout_seconds: float = 10.0
 
     @field_validator("fetcher_token")
