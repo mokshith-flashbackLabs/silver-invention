@@ -418,6 +418,15 @@ CREATE TABLE infringements (
   url_hash         TEXT NOT NULL REFERENCES content_urls(url_hash),
   page_url         TEXT NOT NULL,
   image_url        TEXT,
+  -- 0030. The preview the PAGE publishes for itself (og:image, else
+  -- twitter:image), resolved by confirm.og_image from HTML read through the
+  -- fetcher. Set only when the provider keyed this hit on a page and so gave
+  -- no image address of its own -- Google Vision's pagesWithMatchingImages
+  -- entries carry only `url` and `pageTitle`, and storing that page address in
+  -- image_url left 11 of 12 real hits with no preview (2026-09-07). DERIVED:
+  -- image_url stays the provider's own answer so calibration replays against
+  -- what they returned (CLAUDE.md 7.2). The subject preview prefers this.
+  preview_image_url TEXT,
   keyed_on         TEXT NOT NULL DEFAULT 'page_url'
                    CHECK (keyed_on IN ('page_url', 'image_url')),
   first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),

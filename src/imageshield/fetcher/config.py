@@ -40,6 +40,15 @@ class FetcherConfig(BaseSettings):
     # enough that a chain cannot be used to walk somewhere.
     fetch_max_redirects: int = 2
 
+    # `/v1/page` reads a page's HTML so its og:image can be resolved for a
+    # page-keyed hit. A separate, much SMALLER cap than fetch_max_bytes on
+    # purpose: we want a <head> full of meta tags, not a document, and the
+    # only consumer (confirm.og_image.page_preview_url) needs nothing past
+    # it. 256KB comfortably covers the <head> of every platform page in the
+    # 2026-09-07 sample while refusing a hostile server's endless body early.
+    page_max_bytes: int = 256 * 1024
+    page_timeout_seconds: float = 10.0
+
     @field_validator("fetcher_token")
     @classmethod
     def _token(cls, value: str) -> str:
@@ -49,14 +58,14 @@ class FetcherConfig(BaseSettings):
             raise ValueError("is still set to a placeholder")
         return value
 
-    @field_validator("fetch_max_bytes", "fetch_max_redirects")
+    @field_validator("fetch_max_bytes", "fetch_max_redirects", "page_max_bytes")
     @classmethod
     def _positive(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("must be a positive integer")
         return value
 
-    @field_validator("fetch_timeout_seconds")
+    @field_validator("fetch_timeout_seconds", "page_timeout_seconds")
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:

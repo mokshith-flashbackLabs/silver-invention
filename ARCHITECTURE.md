@@ -323,6 +323,14 @@ future misconfiguration.
 - Domain allowlist sourced from `content_items.source_domain` / `content_urls.source_domain`
 - SSRF guards applied **after** DNS resolution, not before, on every redirect hop
 - 5s timeout, 10MB cap (`fetch_max_bytes`), 2 redirects
+- `POST /v1/page` (2026-09-07) returns a page's HTML to the confirm worker so
+  `confirm.og_image` can resolve the `og:image` it publishes. Added because Google's
+  `pagesWithMatchingImages` entries carry no image address, so a page-keyed hit had nothing
+  fetchable and the subject saw no picture. **Same guard as `/v1/fetch`** — one shared
+  `_get_guarded` walk, SSRF check re-run per hop, streaming cap — differing only in the
+  content-type gate (`text/html`) and a much smaller cap (`page_max_bytes`, 256KB). The HTML is
+  discarded within the request that read it; only the resolved address is persisted
+  (`infringements.preview_image_url`, migration 0030)
 - `POST /v1/fetch` returns raw bytes to the confirm worker (transient, in-memory only); `POST /v1/crop`
   returns **the whole frame, blurred end to end** — long edge capped at 1024px, Gaussian radius a
   fraction of that edge (floored), JPEG quality 80 — and `blur=false` sharpens **only** the

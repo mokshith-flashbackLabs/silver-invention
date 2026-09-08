@@ -74,12 +74,17 @@ from imageshield.attribution.models import (
 from imageshield.attribution.rekognition import RekognitionFaceAttribution
 from imageshield.attribution.resolve import resolve_face
 from imageshield.config import Config, ConfigError, load_config
-from imageshield.confirm.models import CONFIRM_REQUESTED_EVENT, REKOGNITION_CONFIRM_ID
+from imageshield.confirm.models import (
+    CONFIRM_REQUESTED_EVENT,
+    REKOGNITION_CONFIRM_ID,
+    ConfirmContext,
+)
 from imageshield.confirm.moderation import (
     ConfirmUnavailable,
     ModerationSignal,
     RekognitionModeration,
 )
+from imageshield.confirm.og_image import page_preview_url
 from imageshield.confirm.phash import bit_population, dhash
 from imageshield.confirm.store import ConfirmStore, PostgresConfirmStore
 from imageshield.confirm.triage import classify, csam_quarantine, find_duplicate, is_explicit
@@ -115,6 +120,12 @@ _PHASH_DEGENERATE_HIGH_BITS = 60
 # was not an image) and a raised transport error are both the unfetchable
 # path — record_unfetchable, delete the message.
 Fetch = Callable[[str], Awaitable[bytes | None]]
+
+# Reading a PAGE, not an image (0030). Same never-crash contract as `Fetch`:
+# `None` covers a non-200, a body that was not HTML, and any transport error,
+# because "we could not read the page" needs no finer distinction here than
+# "we could not read the image" does.
+FetchPage = Callable[[str], Awaitable[str | None]]
 
 
 class AttributionProvider(Protocol):
@@ -157,6 +168,9 @@ class ConfirmDeps:
     provider: AttributionProvider
     moderation: ModerationProvider
     fetch: Fetch
+    # 0030: used ONLY when `fetch` refuses, to resolve the og:image a page
+    # publishes for itself. See the fallback in `handle_message` step 3.
+    fetch_page: FetchPage
     face_match_threshold: float
     max_faces: int
     phash_hamming_max: int
@@ -180,6 +194,17 @@ def build_sqs_consumer(config: Config) -> SqsConsumer:
     return client
 
 
+def _host_of(url: str) -> str:
+    """Just the host, for a log line. A full infringement URL is not log
+    material (INVARIANTS #6's spirit: what lands in logs is chosen, not
+    incidental), but knowing WHICH platform refused is what makes a wave of
+    refusals diagnosable."""
+    try:
+        return httpx.URL(url).host
+    except Exception:
+        return "(unparseable)"
+
+
 def build_fetch(client: httpx.AsyncClient, *, base_url: str, token: str) -> Fetch:
     """The real fetch callable, over the fetcher deployable's HTTP API
     (``POST {base_url}/v1/fetch``, ``X-Fetcher-Token``). A non-200 becomes
@@ -198,8 +223,14 @@ def build_fetch(client: httpx.AsyncClient, *, base_url: str, token: str) -> Fetc
             headers={"X-Fetcher-Token": token},
         )
         if response.status_code != 200:
+            # The host is logged alongside the status because a bare status was
+            # not diagnosable: eleven of these on 2026-09-07 could only be tied
+            # to the eleven preview-less hits by COUNTING them. The host, not
+            # the URL -- the path of an infringement is not log material.
             log.warning(
-                "confirm.fetch_non_200", status_code=response.status_code
+                "confirm.fetch_non_200",
+                status_code=response.status_code,
+                host=_host_of(url),
             )
             return None
         return response.content
@@ -218,6 +249,11 @@ def build_deps(
         provider=RekognitionFaceAttribution(region=config.aws_region),
         moderation=RekognitionModeration(region=config.aws_region),
         fetch=build_fetch(
+            http_client,
+            base_url=config.fetcher_base_url,
+            token=config.fetcher_token,
+        ),
+        fetch_page=build_fetch_page(
             http_client,
             base_url=config.fetcher_base_url,
             token=config.fetcher_token,
@@ -260,6 +296,86 @@ async def _record_outcome_guarded(
     await deps.control.record_outcome(
         run_id, result, cost_usd=cost_usd, spend_date=spend_date, probe=probe
     )
+
+
+
+async def _fetch_via_page_preview(
+    ctx: ConfirmContext,
+    deps: ConfirmDeps,
+    worker_log: Any,
+) -> bytes | None:
+    """Second attempt at image bytes: whatever preview the PAGE publishes.
+
+    Reached only when the provider's own ``image_url`` could not be fetched.
+    The case that made this necessary is Google Vision: its
+    ``pagesWithMatchingImages`` entries carry ``url`` and ``pageTitle`` and no
+    image address at all, so the adapter stored the PAGE there and
+    ``fetch_image`` refused it as ``not_an_image``. Eleven of twelve real hits
+    on 2026-09-07 died at that point -- no triage, no ``best_face_bbox``, no
+    preview -- and the subject was still asked "is this you?" about pictures
+    they could not see.
+
+    Returns ``None`` for every failure, because the caller's next move is
+    ``record_unfetchable`` either way and this is a best-effort second try, not
+    a path that may raise. The resolved URL is persisted only once it has
+    actually produced bytes: a URL that does not fetch is worse than a null,
+    since the preview route would then serve a 404 from a non-null column.
+    """
+    try:
+        html = await deps.fetch_page(ctx.page_url)
+    except Exception as exc:  # never crash-shaped; see the Fetch contract
+        worker_log.warning("confirm.page_fetch_failed", error=str(exc))
+        return None
+    if html is None:
+        return None
+
+    resolved = page_preview_url(html, ctx.page_url)
+    if resolved is None:
+        worker_log.info("confirm.page_has_no_preview")
+        return None
+
+    try:
+        image_bytes = await deps.fetch(resolved)
+    except Exception as exc:
+        worker_log.warning("confirm.page_preview_fetch_failed", error=str(exc))
+        return None
+    if image_bytes is None:
+        return None
+
+    await deps.store.record_preview_image_url(ctx.infringement_id, url=resolved)
+    worker_log.info("confirm.page_preview_resolved")
+    return image_bytes
+
+
+def build_fetch_page(
+    client: httpx.AsyncClient, *, base_url: str, token: str
+) -> FetchPage:
+    """The real page-reading callable, over ``POST {base_url}/v1/page`` (0030).
+
+    Same never-raise contract as :func:`build_fetch`: a non-200 is ``None``,
+    because the caller's only decision is whether it got a page, and the
+    fetcher's own refusal codes (``not_a_page``, ``too_large``,
+    ``refused_private_address``) are operational detail for the fetcher rather
+    than something the review queue distinguishes.
+    """
+
+    async def fetch_page(url: str) -> str | None:
+        response = await client.post(
+            f"{base_url}/v1/page",
+            json={"url": url},
+            headers={"X-Fetcher-Token": token},
+        )
+        if response.status_code != 200:
+            log.warning(
+                "confirm.page_non_200",
+                status_code=response.status_code,
+                host=_host_of(url),
+            )
+            return None
+        html = response.json().get("html")
+        return html if isinstance(html, str) else None
+
+    return fetch_page
 
 
 async def handle_message(
@@ -310,6 +426,11 @@ async def handle_message(
                 ctx.infringement_id, detail=f"fetch failed: {exc}"
             )
             return True
+        if image_bytes is None:
+            # 0030: the provider may have keyed this hit on a page rather than
+            # an image, in which case ctx.image_url was never fetchable. Try
+            # the preview the page publishes for itself before giving up.
+            image_bytes = await _fetch_via_page_preview(ctx, deps, worker_log)
         if image_bytes is None:
             await deps.store.record_unfetchable(
                 ctx.infringement_id, detail="fetcher returned no image"

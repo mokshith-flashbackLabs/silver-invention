@@ -53,6 +53,7 @@ def _infringement(
     *,
     confirm_state: str = "machine_triaged",
     image_url: str | None = "set",
+    preview_image_url: str | None = None,
 ) -> UUID:
     url_hash = uuid4().hex + uuid4().hex
     url = f"https://example.test/{uuid4().hex}"
@@ -62,14 +63,16 @@ def _infringement(
         (url_hash, url, url),
     )
     row = conn.execute(
-        "INSERT INTO infringements (user_ref, url_hash, page_url, image_url, confirm_state)"
-        " VALUES (%s, %s, %s, %s, %s) RETURNING infringement_id",
+        "INSERT INTO infringements"
+        " (user_ref, url_hash, page_url, image_url, confirm_state, preview_image_url)"
+        " VALUES (%s, %s, %s, %s, %s, %s) RETURNING infringement_id",
         (
             user_ref,
             url_hash,
             url,
             f"{url}.jpg" if image_url == "set" else image_url,
             confirm_state,
+            preview_image_url,
         ),
     ).fetchone()
     assert row is not None
@@ -107,6 +110,58 @@ async def test_owner_gets_image_url_and_bbox(
     assert target is not None
     assert target.image_url is not None and target.image_url.endswith(".jpg")
     assert target.bbox == BBOX
+
+
+async def test_prefers_the_resolved_page_preview_over_the_provider_url(
+    migrated_db: str, store: PostgresPreviewStore
+) -> None:
+    """0030. When the provider keyed the hit on a page, `image_url` is not
+    fetchable (Google's page entries carry no image address) and the preview
+    must come from the og:image we resolved. Reading `image_url` here is what
+    left 11 of 12 real hits with no picture on 2026-09-07."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        infringement_id = _infringement(
+            conn, user_ref, preview_image_url="https://cdn.test/resolved.jpg"
+        )
+        _task(conn, infringement_id, user_ref, triage={"best_face_bbox": BBOX})
+
+    target = await store.target(infringement_id, user_ref)
+
+    assert target is not None
+    assert target.image_url == "https://cdn.test/resolved.jpg"
+
+
+async def test_falls_back_to_the_provider_url_when_nothing_was_resolved(
+    migrated_db: str, store: PostgresPreviewStore
+) -> None:
+    """The common case is unchanged: a provider that gave us a real image URL
+    needs no page resolution, and `preview_image_url` stays NULL."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        infringement_id = _infringement(conn, user_ref, preview_image_url=None)
+        _task(conn, infringement_id, user_ref, triage={"best_face_bbox": BBOX})
+
+    target = await store.target(infringement_id, user_ref)
+
+    assert target is not None
+    assert target.image_url is not None and target.image_url.endswith(".jpg")
+
+
+async def test_none_when_neither_url_is_present(
+    migrated_db: str, store: PostgresPreviewStore
+) -> None:
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        infringement_id = _infringement(
+            conn, user_ref, image_url=None, preview_image_url=None
+        )
+        _task(conn, infringement_id, user_ref, triage={"best_face_bbox": BBOX})
+
+    target = await store.target(infringement_id, user_ref)
+
+    assert target is not None
+    assert target.image_url is None
 
 
 async def test_wrong_user_ref_is_none(

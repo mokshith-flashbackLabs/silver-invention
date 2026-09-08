@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict
 from imageshield.attribution.crop import UndecodableImage
 from imageshield.attribution.models import BoundingBox
 from imageshield.fetcher.config import FetcherConfig, load_fetcher_config
-from imageshield.fetcher.fetch import FetchRefused, fetch_image
+from imageshield.fetcher.fetch import FetchRefused, fetch_image, fetch_page
 from imageshield.fetcher.render import render_preview
 from imageshield.recheck.ssrf import Resolver
 
@@ -78,6 +78,9 @@ def _install_error_handlers(app: FastAPI) -> None:
 _FETCH_REFUSED_STATUS: dict[str, int] = {
     "refused_private_address": 400,
     "not_an_image": 400,
+    # /v1/page asked for a document and got something else. Same shape as
+    # not_an_image: a policy refusal about the target, not an upstream fault.
+    "not_a_page": 400,
     "too_large": 413,
     "redirect_limit": 400,
     "unfetchable": 502,
@@ -190,6 +193,35 @@ async def fetch(
     except FetchRefused as exc:
         raise _fetch_refused_to_error(exc) from exc
     return Response(content=fetched.body, media_type=fetched.content_type)
+
+
+@router.post("/page")
+async def page(
+    body: FetchRequest,
+    client: httpx.AsyncClient = Depends(get_http_client),
+    resolver: Resolver | None = Depends(get_resolver),
+    cfg: FetcherConfig = Depends(get_fetcher_config),
+) -> dict[str, str]:
+    """A page's HTML, so the confirm worker can read the og:image it publishes.
+
+    Google's page matches carry no image URL, so without this a page-keyed hit
+    has nothing to show the subject. Same SSRF guard, redirect walk and
+    streaming byte cap as /v1/fetch — only the content-type gate and the (much
+    smaller) cap differ. The HTML is returned to the caller and kept nowhere:
+    INVARIANTS #9 covers a document exactly as it covers image bytes.
+    """
+    try:
+        fetched = await fetch_page(
+            client,
+            body.url,
+            max_bytes=cfg.page_max_bytes,
+            timeout_seconds=cfg.page_timeout_seconds,
+            max_redirects=cfg.fetch_max_redirects,
+            resolver=resolver,
+        )
+    except FetchRefused as exc:
+        raise _fetch_refused_to_error(exc) from exc
+    return {"html": fetched.html}
 
 
 @router.post("/crop")

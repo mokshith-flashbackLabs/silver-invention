@@ -1,5 +1,15 @@
-"""Fetch a URL's bytes, refusing anything that is not a public, image-typed
-resource. The only function in this repo that touches hostile bytes.
+"""Fetch a URL's bytes, refusing anything that is not a public resource of the
+one content type the caller asked for. The only module in this repo that
+touches hostile bytes.
+
+**Two public fetchers, one guard.** ``fetch_image`` takes ``image/*`` and
+``fetch_page`` takes ``text/html``; both are thin wrappers over
+``_get_guarded``, which owns the redirect walk, the SSRF check on every hop and
+the streaming byte cap. ``fetch_page`` was added 2026-09-07 because Google's
+``pagesWithMatchingImages`` entries carry no image URL, so a page-keyed hit had
+nothing fetchable and the subject saw no picture (11 of 12 real hits). It
+widens the hostile-input surface deliberately and under the same guard — the
+alternative was leaving those hits unreviewable.
 
 Mirrors ``recheck/client.py``'s hand-rolled redirect walk (same
 ``_REDIRECT_STATUSES``, same "guard, then request, on every hop" shape) for
@@ -68,18 +78,37 @@ class FetchedImage(BaseModel):
     body: bytes
 
 
-async def fetch_image(
+class FetchedPage(BaseModel):
+    """A page's HTML, in memory for one request, so its ``og:image`` can be
+    read. Never persisted and never logged — INVARIANTS #9 covers a document
+    exactly as it covers image bytes.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    content_type: str
+    html: str
+
+
+async def _get_guarded(
     client: httpx.AsyncClient,
     url: str,
     *,
+    accept_prefix: str,
+    reject_code: str,
     max_bytes: int,
     timeout_seconds: float,
     max_redirects: int,
-    resolver: Resolver | None = None,
-) -> FetchedImage:
-    """GET ``url``, following redirects by hand so the SSRF guard re-runs on
-    every hop. Raises :class:`FetchRefused` for every way this can legitimately
-    not work; nothing else should escape this function.
+    resolver: Resolver | None,
+) -> tuple[str, bytes]:
+    """The guarded GET both public fetchers are built on.
+
+    ONE implementation on purpose. ``fetch_image`` and ``fetch_page`` differ
+    only in which content type they accept and how big a body they tolerate;
+    everything that makes this safe — the hand-rolled redirect walk with
+    ``address_refusal`` re-run on every hop, the content-type check before the
+    body is read, the cap applied WHILE streaming — is identical, and a second
+    copy of it is how one of the two ends up missing a hop check later.
     """
     current = url
     for _hop in range(max_redirects + 1):
@@ -106,16 +135,14 @@ async def fetch_image(
                 continue
 
             if not 200 <= response.status_code < 300:
-                raise FetchRefused(
-                    "unfetchable", f"upstream returned {response.status_code}"
-                )
+                raise FetchRefused("unfetchable", f"upstream returned {response.status_code}")
 
             # Checked BEFORE the body is read: no point paying for bytes we
             # are about to refuse, and a hostile response can make the body
             # arbitrarily expensive to pull off the wire.
             content_type = response.headers.get("content-type", "")
-            if not content_type.startswith("image/"):
-                raise FetchRefused("not_an_image", content_type or "(missing)")
+            if not content_type.startswith(accept_prefix):
+                raise FetchRefused(reject_code, content_type or "(missing)")
 
             body = bytearray()
             try:
@@ -126,8 +153,68 @@ async def fetch_image(
             except httpx.HTTPError as exc:
                 raise FetchRefused("unfetchable", str(exc)) from exc
 
-            return FetchedImage(content_type=content_type, body=bytes(body))
+            return content_type, bytes(body)
         finally:
             await response.aclose()
 
     raise FetchRefused("redirect_limit", f"exceeded {max_redirects} redirects")
+
+
+async def fetch_image(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+    timeout_seconds: float,
+    max_redirects: int,
+    resolver: Resolver | None = None,
+) -> FetchedImage:
+    """GET ``url`` and refuse anything that is not an image. Raises
+    :class:`FetchRefused` for every way this can legitimately not work; nothing
+    else should escape.
+    """
+    content_type, body = await _get_guarded(
+        client,
+        url,
+        accept_prefix="image/",
+        reject_code="not_an_image",
+        max_bytes=max_bytes,
+        timeout_seconds=timeout_seconds,
+        max_redirects=max_redirects,
+        resolver=resolver,
+    )
+    return FetchedImage(content_type=content_type, body=body)
+
+
+async def fetch_page(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+    timeout_seconds: float,
+    max_redirects: int,
+    resolver: Resolver | None = None,
+) -> FetchedPage:
+    """GET ``url`` as HTML, so ``confirm.og_image.page_preview_url`` can read the
+    preview image the page publishes for itself.
+
+    Exists because Google's ``pagesWithMatchingImages`` entries carry no image
+    URL, which left a page-keyed hit with nothing fetchable and the subject with
+    no picture to answer "is this you?" against.
+
+    Decoded with ``errors="replace"``: the only consumer reads ASCII URLs out of
+    ``<meta>`` tags, and a mis-encoded or hostile page must yield a useless
+    string rather than an exception. The charset in ``content-type`` is
+    deliberately not honoured — trusting it would let a page choose our decoder.
+    """
+    content_type, body = await _get_guarded(
+        client,
+        url,
+        accept_prefix="text/html",
+        reject_code="not_a_page",
+        max_bytes=max_bytes,
+        timeout_seconds=timeout_seconds,
+        max_redirects=max_redirects,
+        resolver=resolver,
+    )
+    return FetchedPage(content_type=content_type, html=body.decode("utf-8", errors="replace"))

@@ -33,8 +33,16 @@ PREVIEW_RENDERED_ACTION = "preview.rendered"
 # LEFT JOIN: a hit that never triaged has no review_tasks row — that is the
 # "preview not available yet" case, not a missing hit. 0021's UNIQUE
 # (infringement_id) guarantees at most one task row.
+# coalesce, not image_url (0030): when the provider keyed this hit on a page it
+# supplied no image address at all -- Google's `pagesWithMatchingImages` entries
+# carry only `url` and `pageTitle` -- so the fetchable image is the og:image the
+# confirm pipeline resolved from the page. Reading image_url alone is what left
+# 11 of 12 real hits with no preview on 2026-09-07: the column was non-null, so
+# nothing looked broken, but it held a page address the fetcher refuses.
+# preview_image_url is NULL whenever image_url was directly fetchable, so the
+# ordinary case is unchanged.
 _TARGET_SQL = """
-    SELECT i.image_url, rt.triage -> 'best_face_bbox'
+    SELECT coalesce(i.preview_image_url, i.image_url), rt.triage -> 'best_face_bbox'
     FROM infringements i
     LEFT JOIN review_tasks rt ON rt.infringement_id = i.infringement_id
     WHERE i.infringement_id = %(infringement_id)s

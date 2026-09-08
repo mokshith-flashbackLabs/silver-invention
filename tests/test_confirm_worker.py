@@ -103,6 +103,7 @@ class FakeConfirmStore:
         self._ctx = ctx
         self._decided = decided
         self.unfetchable: list[tuple[UUID, str]] = []
+        self.preview_urls: list[tuple[UUID, str]] = []
         self.duplicates: list[tuple[UUID, UUID, int]] = []
         self.quarantines: list[tuple[UUID, int | None, list[dict[str, object]], float | None]] = []
         self.triages: list[dict[str, object]] = []
@@ -152,6 +153,9 @@ class FakeConfirmStore:
 
     async def record_unfetchable(self, infringement_id: UUID, *, detail: str) -> None:
         self.unfetchable.append((infringement_id, detail))
+
+    async def record_preview_image_url(self, infringement_id: UUID, *, url: str) -> None:
+        self.preview_urls.append((infringement_id, url))
 
     async def record_skipped(self, infringement_id: UUID, *, reason: str, detail: str) -> None:
         self.skipped.append((infringement_id, reason, detail))
@@ -208,6 +212,11 @@ async def _fetch_ok(url: str) -> bytes | None:
     return IMAGE_BYTES
 
 
+async def _fetch_page_none(url: str) -> str | None:
+    """Default: the page resolver finds nothing, so behaviour is as before 0030."""
+    return None
+
+
 def _deps(
     *,
     store: FakeConfirmStore,
@@ -215,6 +224,7 @@ def _deps(
     provider: FakeAttributionProvider | None = None,
     moderation: FakeModeration | None = None,
     fetch: object = _fetch_ok,
+    fetch_page: object = None,
 ) -> ConfirmDeps:
     default_control = FakeControlStore({REKOGNITION_CONFIRM_ID: runtime(REKOGNITION_CONFIRM_ID)})
     default_moderation = FakeModeration(ModerationSignal(labels=(), min_age_low=None))
@@ -224,6 +234,7 @@ def _deps(
         provider=provider if provider is not None else FakeAttributionProvider(),
         moderation=moderation if moderation is not None else default_moderation,
         fetch=fetch,  # type: ignore[arg-type]
+        fetch_page=fetch_page if fetch_page is not None else _fetch_page_none,  # type: ignore[arg-type]
         face_match_threshold=92.0,
         max_faces=3,
         phash_hamming_max=8,
@@ -289,6 +300,71 @@ async def test_missing_context_deletes_with_zero_side_effects() -> None:
 
     assert handled is True
     assert provider.calls == 0
+
+
+# ── 0030: the page-preview fallback ───────────────────────────────────────
+#
+# Google's `pagesWithMatchingImages` entries carry no image address, so a
+# page-keyed hit's `image_url` is a PAGE and `fetcher.fetch_image` refuses it
+# (not_an_image -> 400 -> None here). Before this fallback that ended the run:
+# no triage, no best_face_bbox, no preview, and the subject was asked "is this
+# you?" about a picture they could not see. 11 of 12 real hits, 2026-09-07.
+
+
+async def test_falls_back_to_the_pages_own_preview_when_the_image_refuses() -> None:
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+    attempted: list[str] = []
+
+    async def _fetch(url: str) -> bytes | None:
+        attempted.append(url)
+        # The provider URL is a page: refused. The resolved og:image is not.
+        return IMAGE_BYTES if url == "https://cdn.test/real.jpg" else None
+
+    async def _fetch_page(url: str) -> str | None:
+        return '<meta property="og:image" content="https://cdn.test/real.jpg">'
+
+    deps = _deps(store=store, fetch=_fetch, fetch_page=_fetch_page)
+
+    assert await handle_message(_body(ctx.infringement_id), deps) is True
+    assert store.unfetchable == []
+    assert attempted == [IMAGE_URL, "https://cdn.test/real.jpg"]
+    assert store.preview_urls == [(ctx.infringement_id, "https://cdn.test/real.jpg")]
+
+
+async def test_records_unfetchable_when_the_page_publishes_no_preview() -> None:
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+
+    async def _fetch(url: str) -> bytes | None:
+        return None
+
+    async def _fetch_page(url: str) -> str | None:
+        return "<html><head><title>no og tags</title></head></html>"
+
+    deps = _deps(store=store, fetch=_fetch, fetch_page=_fetch_page)
+
+    assert await handle_message(_body(ctx.infringement_id), deps) is True
+    assert len(store.unfetchable) == 1
+    assert store.preview_urls == []
+
+
+async def test_does_not_read_the_page_when_the_image_fetch_succeeds() -> None:
+    """The ordinary case must cost no extra request: a provider that gave us a
+    real image URL is fetched once and the page is never touched."""
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+    pages: list[str] = []
+
+    async def _fetch_page(url: str) -> str | None:
+        pages.append(url)
+        return None
+
+    deps = _deps(store=store, fetch=_fetch_ok, fetch_page=_fetch_page)
+
+    assert await handle_message(_body(ctx.infringement_id), deps) is True
+    assert pages == []
+    assert store.preview_urls == []
 
 
 async def test_no_image_url_records_unfetchable() -> None:

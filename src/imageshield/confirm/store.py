@@ -150,6 +150,18 @@ _SELECT_INFRINGEMENT_USER_SQL = """
 """
 
 
+# 0030. Sets the DERIVED preview address and nothing else -- image_url stays
+# the provider's own answer so `calibrate replay` measures what they returned
+# (CLAUDE.md 7.2). No confirm_state transition here: resolving a picture is not
+# a decision about the hit, and the triage that follows in the same run is what
+# moves state.
+_RECORD_PREVIEW_IMAGE_URL_SQL = """
+    UPDATE infringements
+       SET preview_image_url = %(preview_image_url)s
+     WHERE infringement_id = %(infringement_id)s
+"""
+
+
 class ConfirmStore(Protocol):
     async def load_context(self, infringement_id: UUID) -> ConfirmContext | None: ...
 
@@ -180,6 +192,10 @@ class ConfirmStore(Protocol):
     ) -> None: ...
 
     async def record_unfetchable(self, infringement_id: UUID, *, detail: str) -> None: ...
+
+    async def record_preview_image_url(
+        self, infringement_id: UUID, *, url: str
+    ) -> None: ...
 
     async def record_skipped(
         self, infringement_id: UUID, *, reason: str, detail: str
@@ -323,6 +339,20 @@ class PostgresConfirmStore:
                     "severity": "unassessed",
                     "triage": Jsonb({"unfetchable": detail}),
                 },
+            )
+
+    async def record_preview_image_url(self, infringement_id: UUID, *, url: str) -> None:
+        """Persist the og:image resolved from the hit's page (0030).
+
+        Called only after those bytes have actually been fetched, so a non-null
+        column always means "this address produced an image" -- otherwise the
+        subject preview route would 404 off a populated column, which is the
+        confusing state this whole change exists to remove.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                _RECORD_PREVIEW_IMAGE_URL_SQL,
+                {"infringement_id": infringement_id, "preview_image_url": url},
             )
 
     async def record_skipped(
