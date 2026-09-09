@@ -96,18 +96,22 @@ _CREATE_SEED_SQL = """
 
 _GET_SEED_SQL = """
     SELECT seed_id, user_ref, seed_kind, source_object_ref, status, created_at,
-           scan_tier, next_scan_after, consecutive_empty_scans
+           scan_tier, next_scan_after, consecutive_empty_scans,
+           tier_next_scan_after
     FROM search_seeds WHERE seed_id = %(seed_id)s
 """
 
 # Written once per completed run that actually looked (search/cadence.py).
-# All three columns move together: a tier without its next_scan_after would
-# leave the proxy stating a cadence the scheduler is not going to honour.
+# All four columns move together. next_scan_after is the SCHEDULE (the coming
+# Sunday, which jobs/search-sweep.ts acts on); tier_next_scan_after is the
+# advisory counterfactual. Splitting the write would let the proxy state a
+# cadence nothing honours, which is exactly what INVARIANTS #42 forbids.
 _UPDATE_CADENCE_SQL = """
     UPDATE search_seeds
     SET scan_tier = %(scan_tier)s,
         consecutive_empty_scans = %(consecutive_empty_scans)s,
-        next_scan_after = %(next_scan_after)s
+        next_scan_after = %(next_scan_after)s,
+        tier_next_scan_after = %(tier_next_scan_after)s
     WHERE seed_id = %(seed_id)s
 """
 
@@ -493,6 +497,7 @@ class PostgresSearchStore:
             scan_tier=row[6],
             next_scan_after=row[7],
             consecutive_empty_scans=row[8],
+            tier_next_scan_after=row[9],
         )
 
     async def create_run(
@@ -739,6 +744,11 @@ class PostgresSearchStore:
                         "scan_tier": update.scan_tier,
                         "consecutive_empty_scans": update.consecutive_empty_scans,
                         "next_scan_after": update.next_scan_after,
+                        # 0032. What tiering WOULD have chosen, recorded
+                        # alongside what actually happens, so the saving
+                        # forgone by scanning every Sunday stays a query
+                        # rather than a guess.
+                        "tier_next_scan_after": update.tier_next_scan_after,
                     },
                 )
             if enqueue_confirm:

@@ -56,6 +56,11 @@ class SeedRow(BaseModel):
     # cadence to talk about a seed.
     scan_tier: ScanTier = "standard"
     next_scan_after: datetime | None = None
+    # 0032. What the adaptive cadence would have scheduled, kept advisory so
+    # the cost of scanning every Sunday instead stays measurable. Read back so
+    # a test can prove it landed -- a column written and never read is a
+    # preservation nobody can verify.
+    tier_next_scan_after: datetime | None = None
     consecutive_empty_scans: int = 0
 
 

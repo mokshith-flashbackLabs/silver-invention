@@ -107,7 +107,15 @@ def test_should_retier_requires_at_least_one_successful_provider() -> None:
     assert should_retier(1) is True
 
 
-def test_update_for_sets_next_scan_after_from_the_new_tier_not_the_old_one() -> None:
+def test_the_tier_interval_still_lands_on_tier_next_scan_after() -> None:
+    """The adaptive interval did not go away -- it moved.
+
+    Owner's decision 2026-09-09: dispatch is every Sunday, tiers ignored. The
+    tier is still computed and its interval still recorded, on
+    `tier_next_scan_after`, so the saving forgone stays measurable (§7.8 puts
+    it at 4-10x). This test is the one that used to assert `next_scan_after`
+    carried these numbers; it now asserts the counterfactual column does.
+    """
     now = datetime(2026, 8, 9, tzinfo=UTC)
 
     demoted = update_for(
@@ -119,7 +127,7 @@ def test_update_for_sets_next_scan_after_from_the_new_tier_not_the_old_one() -> 
         policy=POLICY,
     )
     assert demoted.scan_tier == "relaxed"
-    assert (demoted.next_scan_after - now).days == 14  # relaxed's interval
+    assert (demoted.tier_next_scan_after - now).days == 14  # relaxed's interval
 
     promoted = update_for(
         current="dormant",
@@ -130,4 +138,41 @@ def test_update_for_sets_next_scan_after_from_the_new_tier_not_the_old_one() -> 
         policy=POLICY,
     )
     assert promoted.scan_tier == "priority"
-    assert (promoted.next_scan_after - now).days == 7
+    assert (promoted.tier_next_scan_after - now).days == 7
+
+
+def test_next_scan_after_is_the_coming_sunday_whatever_the_tier() -> None:
+    """What ACTUALLY dispatches. The proxy's search sweep enqueues any seed
+    whose next_scan_after has passed, so this column is the schedule -- and
+    INVARIANTS #42 means it must not carry a date nothing acts on."""
+    # 2026-08-09 is a Sunday; a run completing that day is next due the 16th.
+    sunday = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    on_sunday = update_for(
+        current="standard", consecutive_empty_scans=0, found_matches=True,
+        seed_age_days=OLD_SEED_DAYS, now=sunday, policy=POLICY,
+    )
+    assert on_sunday.next_scan_after == datetime(2026, 8, 16, 0, 0, tzinfo=UTC)
+
+    # A Wednesday run is due the coming Sunday, NOT seven days later. This is
+    # the bug: a Wednesday upload previously set the 16th (a Wednesday), so
+    # "every Sunday" never held for anyone who joined mid-week.
+    wednesday = datetime(2026, 8, 12, 9, 30, tzinfo=UTC)
+    midweek = update_for(
+        current="standard", consecutive_empty_scans=0, found_matches=True,
+        seed_age_days=OLD_SEED_DAYS, now=wednesday, policy=POLICY,
+    )
+    assert midweek.next_scan_after == datetime(2026, 8, 16, 0, 0, tzinfo=UTC)
+
+
+def test_a_dormant_seed_is_still_due_next_sunday() -> None:
+    """The whole point of ignoring tiers: a seed the adaptive policy would have
+    parked for a month is still scanned this coming Sunday."""
+    wednesday = datetime(2026, 8, 12, 9, 30, tzinfo=UTC)
+    parked = update_for(
+        current="dormant", consecutive_empty_scans=40, found_matches=False,
+        seed_age_days=OLD_SEED_DAYS, now=wednesday, policy=POLICY,
+    )
+    assert parked.scan_tier == "dormant"
+    assert parked.next_scan_after == datetime(2026, 8, 16, 0, 0, tzinfo=UTC)
+    # ...while the column that records what tiering wanted keeps saying 30 days.
+    assert (parked.tier_next_scan_after - wednesday).days == 30

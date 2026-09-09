@@ -33,7 +33,7 @@ the promotion rule stays.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -63,7 +63,15 @@ class CadenceUpdate(BaseModel):
 
     scan_tier: ScanTier
     consecutive_empty_scans: int
+    # WHAT WILL ACTUALLY HAPPEN: the coming Sunday. The proxy's search sweep
+    # (jobs/search-sweep.ts) enqueues any seed whose mirror of this has passed,
+    # so this column IS the schedule -- and INVARIANTS #42 means it must never
+    # carry a date nothing acts on.
     next_scan_after: datetime
+    # WHAT TIERING WOULD HAVE CHOSEN. Advisory since 2026-09-09 (0032). Kept so
+    # the cost of diverging stays measurable: §7.8 puts adaptive cadence at a
+    # 4-10x reduction, and dropping this makes that claim unfalsifiable.
+    tier_next_scan_after: datetime
 
 
 class CadenceInput(BaseModel):
@@ -160,6 +168,30 @@ def should_retier(providers_succeeded: int) -> bool:
     return providers_succeeded > 0
 
 
+# Monday is 0 in `weekday()`, so Sunday is 6.
+_SUNDAY = 6
+
+
+def next_sunday(now: datetime) -> datetime:
+    """The next Sunday at 00:00 UTC, strictly after ``now``'s day.
+
+    Strictly after, so a run completing ON a Sunday is due the FOLLOWING one --
+    returning today would advertise a scan that already ran, and the sweep
+    would re-enqueue the seed within minutes.
+
+    UTC, deliberately. A scan is not a user-facing event: nothing is delivered
+    when it runs, and the digest that follows carries its own quiet-hours rule
+    in the proxy. Per-subject local Sundays would buy nothing a subject could
+    perceive and would make "did this week run?" unanswerable without a
+    timezone per row.
+    """
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise ValueError("now must be timezone-aware; the dispatch day is defined in UTC")
+    days_ahead = (_SUNDAY - now.weekday()) % 7 or 7
+    target = (now + timedelta(days=days_ahead)).date()
+    return datetime.combine(target, time.min, tzinfo=now.tzinfo)
+
+
 def update_for(
     *,
     current: ScanTier,
@@ -179,7 +211,13 @@ def update_for(
     return CadenceUpdate(
         scan_tier=tier,
         consecutive_empty_scans=empties,
-        next_scan_after=now + timedelta(days=interval_days(tier, policy)),
+        # EVERY SUNDAY, TIERS IGNORED -- owner's decision 2026-09-09. Before
+        # this, a Wednesday run set next_scan_after to the following
+        # Wednesday, so "every Sunday" never held for anyone who joined
+        # mid-week; the day drifted with whenever the subject happened to
+        # upload.
+        next_scan_after=next_sunday(now),
+        tier_next_scan_after=now + timedelta(days=interval_days(tier, policy)),
     )
 
 

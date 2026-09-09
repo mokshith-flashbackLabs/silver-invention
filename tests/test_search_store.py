@@ -243,8 +243,17 @@ async def test_completion_and_cadence_are_one_transaction(
     assert seed.consecutive_empty_scans == 1
     assert seed.next_scan_after is not None
     # A tier without its due date would leave the proxy quoting a cadence the
-    # scheduler is not going to honour, so all three columns move as one write.
+    # scheduler is not going to honour, so all four columns move as one write.
     assert abs((seed.next_scan_after - update.next_scan_after).total_seconds()) < 1
+    # 0032: and the counterfactual landed too. Without this the diverted
+    # adaptive interval would be written and never verified -- a preservation
+    # nobody can check is not one.
+    assert seed.tier_next_scan_after is not None
+    assert (
+        abs((seed.tier_next_scan_after - update.tier_next_scan_after).total_seconds()) < 1
+    )
+    # The two must genuinely differ, or the Sunday alignment is not happening.
+    assert seed.next_scan_after != seed.tier_next_scan_after
 
 
 async def test_a_run_with_no_successful_provider_leaves_the_tier_alone(
