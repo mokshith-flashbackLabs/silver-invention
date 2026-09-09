@@ -427,11 +427,21 @@ async def handle_message(
             )
             return True
         if image_bytes is None:
-            # 0030: the provider may have keyed this hit on a page rather than
-            # an image, in which case ctx.image_url was never fetchable. Try
-            # the preview the page publishes for itself before giving up.
-            image_bytes = await _fetch_via_page_preview(ctx, deps, worker_log)
-        if image_bytes is None:
+            # 0030 fell back to the page's own og:image here. UNWIRED 0031.
+            #
+            # Measured on 12 real hits: the og:image is the page's SHARE CARD,
+            # not the matched image. Four of six resolved images had no
+            # detectable face; all six yielded `likely_not_subject` -- a
+            # confident verdict from the wrong picture, replacing an honest
+            # `unassessed`. And a preview needs a face box, so boxing a face
+            # from someone else's share card would show the subject a
+            # STRANGER's face (CLAUDE.md §1).
+            #
+            # `_fetch_via_page_preview`, `fetcher /v1/page` and
+            # `confirm.og_image` all remain, tested, for a future surface that
+            # can label page context as page context. Nothing calls them in
+            # the verdict path, and that is deliberate rather than an
+            # oversight -- see the tests named in this module's 0031 block.
             await deps.store.record_unfetchable(
                 ctx.infringement_id, detail="fetcher returned no image"
             )

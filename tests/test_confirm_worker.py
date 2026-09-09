@@ -302,68 +302,55 @@ async def test_missing_context_deletes_with_zero_side_effects() -> None:
     assert provider.calls == 0
 
 
-# ── 0030: the page-preview fallback ───────────────────────────────────────
+# ── 0031: a page-derived image never feeds the verdict pipeline ──────────
 #
-# Google's `pagesWithMatchingImages` entries carry no image address, so a
-# page-keyed hit's `image_url` is a PAGE and `fetcher.fetch_image` refuses it
-# (not_an_image -> 400 -> None here). Before this fallback that ended the run:
-# no triage, no best_face_bbox, no preview, and the subject was asked "is this
-# you?" about a picture they could not see. 11 of 12 real hits, 2026-09-07.
+# 0030 fell back to the page's own og:image when the provider's image_url was
+# unfetchable. Measured on 12 real hits (2026-09-08) that was a mistake: the
+# og:image is the page's SHARE CARD, not the matched image. Four of six
+# resolved images had no detectable face at all, and all six produced a
+# `likely_not_subject` severity -- a confident-sounding verdict derived from
+# the wrong picture. Before the fallback those hits were honestly
+# `unassessed`; after it they carried a false signal.
+#
+# Rendering one as the hit's preview is worse still: the preview needs a face
+# box, so boxing a face found in somebody else's share card would show the
+# subject a STRANGER's face -- the harm CLAUDE.md §1 names.
+#
+# So the page fetch stays in the codebase (fetcher /v1/page, og_image.py, both
+# tested) but is NOT wired to the confirm pipeline. A hit whose provider image
+# cannot be fetched is unfetchable, full stop.
 
 
-async def test_falls_back_to_the_pages_own_preview_when_the_image_refuses() -> None:
-    ctx = _ctx()
-    store = FakeConfirmStore(ctx)
-    attempted: list[str] = []
-
-    async def _fetch(url: str) -> bytes | None:
-        attempted.append(url)
-        # The provider URL is a page: refused. The resolved og:image is not.
-        return IMAGE_BYTES if url == "https://cdn.test/real.jpg" else None
-
-    async def _fetch_page(url: str) -> str | None:
-        return '<meta property="og:image" content="https://cdn.test/real.jpg">'
-
-    deps = _deps(store=store, fetch=_fetch, fetch_page=_fetch_page)
-
-    assert await handle_message(_body(ctx.infringement_id), deps) is True
-    assert store.unfetchable == []
-    assert attempted == [IMAGE_URL, "https://cdn.test/real.jpg"]
-    assert store.preview_urls == [(ctx.infringement_id, "https://cdn.test/real.jpg")]
-
-
-async def test_records_unfetchable_when_the_page_publishes_no_preview() -> None:
-    ctx = _ctx()
-    store = FakeConfirmStore(ctx)
-
-    async def _fetch(url: str) -> bytes | None:
-        return None
-
-    async def _fetch_page(url: str) -> str | None:
-        return "<html><head><title>no og tags</title></head></html>"
-
-    deps = _deps(store=store, fetch=_fetch, fetch_page=_fetch_page)
-
-    assert await handle_message(_body(ctx.infringement_id), deps) is True
-    assert len(store.unfetchable) == 1
-    assert store.preview_urls == []
-
-
-async def test_does_not_read_the_page_when_the_image_fetch_succeeds() -> None:
-    """The ordinary case must cost no extra request: a provider that gave us a
-    real image URL is fetched once and the page is never touched."""
+async def test_an_unfetchable_image_does_not_reach_for_the_page() -> None:
     ctx = _ctx()
     store = FakeConfirmStore(ctx)
     pages: list[str] = []
 
-    async def _fetch_page(url: str) -> str | None:
-        pages.append(url)
+    async def _fetch(url: str) -> bytes | None:
         return None
 
-    deps = _deps(store=store, fetch=_fetch_ok, fetch_page=_fetch_page)
+    async def _fetch_page(url: str) -> str | None:
+        pages.append(url)
+        return '<meta property="og:image" content="https://cdn.test/share-card.jpg">'
+
+    deps = _deps(store=store, fetch=_fetch, fetch_page=_fetch_page)
 
     assert await handle_message(_body(ctx.infringement_id), deps) is True
-    assert pages == []
+    assert pages == [], "the page must not be fetched to stand in for the hit image"
+    assert len(store.unfetchable) == 1
+    assert store.preview_urls == [], "no page-derived URL may be persisted as the preview"
+
+
+async def test_a_fetchable_provider_image_still_triages_normally() -> None:
+    """The ordinary path is untouched: a real provider image is verified and
+    gets its verdict exactly as before."""
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+
+    deps = _deps(store=store, fetch=_fetch_ok)
+
+    assert await handle_message(_body(ctx.infringement_id), deps) is True
+    assert store.unfetchable == []
     assert store.preview_urls == []
 
 
