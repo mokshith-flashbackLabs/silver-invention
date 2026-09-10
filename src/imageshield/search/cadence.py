@@ -216,15 +216,7 @@ def update_for(
         # Wednesday, so "every Sunday" never held for anyone who joined
         # mid-week; the day drifted with whenever the subject happened to
         # upload.
-        # ══ TESTING ONLY -- REVERT WITH image_backend migration 0037 ═══════
-        # `next_sunday(now)` is the product rule (owner, 2026-09-09). It is
-        # replaced by a fixed 5-minute interval so a seed becomes due again
-        # inside a test session; without this, the backend's 5-minute report
-        # periods would every one of them close as `not_due` after the first,
-        # because dueSeeds honours next_scan_after and nothing else re-scans.
-        # next_sunday() is left defined and tested so the revert is this line.
-        next_scan_after=now + timedelta(minutes=5),
-        # ═══════════════════════════════════════════════════════════════════
+        next_scan_after=next_sunday(now),
         tier_next_scan_after=now + timedelta(days=interval_days(tier, policy)),
     )
 
