@@ -209,6 +209,17 @@ image, from any caller.
 - Every successful call writes an audit row naming the operator *before* rendering. A refusal
   writes none.
 
+**The render is identical to the subject's; what a reviewer may OPEN is not. Do not infer
+symmetry.** The subject's own preview additionally refuses a `duplicate` hit and a *restricted*
+one (a confirmed `ncii_suspected` finding — marked infringing without asking them, so they are
+shown nothing and asked nothing). This route refuses **neither**: a duplicate is an ordinary hit
+collapsed onto an earlier identical picture, and a restricted finding is the one class
+auto-confirmed with no human in the loop, which makes it exactly what a false-positive review
+must be able to check. The single exclusion that binds both viewers is `quarantined`. So a hit
+that 404s for its subject may well render here, and that is deliberate rather than a leak — the
+subject-side refusal protects the subject from their own abuse imagery; it was never a claim
+that the image is unviewable by anyone.
+
 ### `GET /v1/admin/review/stats`
 Query `since` (ISO-8601, default 30 days ago). The measurement, three ways:
 ```json

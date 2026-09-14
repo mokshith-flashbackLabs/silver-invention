@@ -268,6 +268,14 @@ _LIST_HITS_SQL = """
            seed.source_object_ref, seed.seed_kind
     FROM infringements i
     JOIN content_urls cu ON cu.url_hash = i.url_hash
+    -- A PLAIN LEFT JOIN, and it cannot fan out: 0021 declares
+    -- `UNIQUE (infringement_id)` on review_tasks, so there is at most one task
+    -- row per hit by constraint rather than by convention. That matters more
+    -- here than on the svc view it mirrors -- a second task row would silently
+    -- duplicate a feed row, and a duplicated row inside a keyset page shifts
+    -- the cursor's position, so the NEXT page would skip a hit. LEFT because a
+    -- hit that never triaged has no task row: that is "no preview yet", not a
+    -- missing hit.
     LEFT JOIN review_tasks rt ON rt.infringement_id = i.infringement_id
     LEFT JOIN LATERAL (
         SELECT v.verdict_id, v.operator, v.verdict, v.note, v.created_at
