@@ -20,6 +20,7 @@ import psycopg
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.confirm.models import AUTO_CONFIRM_DECIDED_BY
 from imageshield.db.connection import make_async_pool
 from imageshield.score.engine import ScoreWeights
 from imageshield.score.store import PostgresScoreStore
@@ -478,3 +479,61 @@ async def test_a_subject_decision_is_not_awaiting_their_feedback(
     # The operator-decided hit legitimately awaits the user's feedback; the
     # subject-decided one does not -- they already said it.
     assert decided_by_subject.components.posture > decided_by_operator.components.posture
+
+
+async def test_an_auto_confirmed_hit_costs_exposure_but_is_not_awaiting_feedback(
+    migrated_db: str, store: PostgresScoreStore, pool: AsyncConnectionPool
+) -> None:
+    """INVARIANTS #45, auto-confirm lane (2026-09-14, owner decision D4).
+
+    An auto-confirmed hit is never shown to its subject and never takes an
+    answer from them, so it can never RECEIVE `infringement_feedback`.
+    Counting it as "awaiting the subject's feedback" would cost them
+    SCORE_POSTURE_FEEDBACK for not answering a question nobody asked -- the
+    exact shape #45's amendment forbids -- and would fire the
+    `respond_to_hits` recommendation about a hit they cannot open.
+
+    Exposure is the half that DOES carry over: the exposure is real whoever
+    decided it, so the auto-confirmed and operator-confirmed subjects must
+    lose the same exposure points. Both halves are asserted, because a change
+    that withheld exposure too would pass a posture-only check while
+    understating a real harm.
+    """
+    auto_user = _user()
+    operator_user = _user()
+    await ensure_subject(pool, auto_user)
+    await ensure_subject(pool, operator_user)
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _infringement(conn, auto_user, confirm_decided_by=AUTO_CONFIRM_DECIDED_BY)
+        _infringement(conn, operator_user, confirm_decided_by="test-reviewer")
+
+    auto = await store.recompute(auto_user, cause_kind="test")
+    operator = await store.recompute(operator_user, cause_kind="test")
+    assert auto is not None and operator is not None
+
+    # Posture: the operator-confirmed hit legitimately awaits an answer; the
+    # auto-confirmed one never will, so it must not be charged for one.
+    assert auto.components.posture > operator.components.posture
+
+    # Exposure: identical. The hit is real and counts for both.
+    assert auto.components.exposure == operator.components.exposure
+
+    # And the recommendation that reads the same counter stays silent.
+    kinds = {
+        row["kind"]
+        for row in _rows(
+            migrated_db,
+            "SELECT kind FROM recommendations WHERE user_ref = %s AND status = 'open'",
+            (auto_user,),
+        )
+    }
+    assert "respond_to_hits" not in kinds
+    operator_kinds = {
+        row["kind"]
+        for row in _rows(
+            migrated_db,
+            "SELECT kind FROM recommendations WHERE user_ref = %s AND status = 'open'",
+            (operator_user,),
+        )
+    }
+    assert "respond_to_hits" in operator_kinds

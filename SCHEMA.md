@@ -925,7 +925,7 @@ the retry path:
 |---|---|---|
 | `unconfirmed` | (default) | Enqueued to `confirm:hits` or not yet even that |
 | `machine_triaged` | worker triage step | Fetched, hashed, face-matched, moderated; sitting in `review_tasks` |
-| `confirmed` | a human `review/store.py::decide` | User-visible, scores Exposure. **Requires `confirm_decided_by`/`confirm_decided_at` by CHECK — not by application discipline** |
+| `confirmed` | a human `review/store.py::decide` or `::subject_decide`; **or, since 2026-09-14, the confirm worker itself via `confirm/store.py::record_auto_confirmed` — for `severity = 'ncii_suspected'` ONLY** | User-visible, scores Exposure. **Requires `confirm_decided_by`/`confirm_decided_at` by CHECK — not by application discipline.** The machine path satisfies it with the constant `'auto:nsfw'`, the only non-human value that column may carry; it leaves `status` at `'new'` and still writes a `pending` `review_tasks` row so an operator can reject it (INVARIANTS #19/#47) |
 | `rejected` | a human decision | Reviewed and dismissed; never reaches a user, never scores |
 | `duplicate` | pHash match against an already-decided row for the same user | Inherits `duplicate_of`'s decision; no second review, no second score movement |
 | `quarantined` | the CSAM tripwire (moderation labels suggesting minors + explicit) | Excluded from every `svc` view and the default review queue; no score effect; escalation is a manual legal process (`docs/OPERATIONS.md`) |
@@ -941,9 +941,11 @@ complement). This passes both parts of the schema lint that matter here: no `byt
 `phash` does not match the name gate's `/_(data|blob|bytes|b64)$|thumbnail|local_path/` pattern.
 INVARIANTS #9 stands untouched — the pixels themselves are never written anywhere, only a 64-bit
 fingerprint of them. `infringements_decided_phash_idx` is a partial index scoped to
-`WHERE phash IS NOT NULL AND confirm_state IN ('confirmed', 'rejected')` — "has a human already
-decided this picture for this user" — and the lookup is always scoped by `user_ref`, so a duplicate
-can never be inherited across users (`tests/test_confirm_store.py::test_decided_phashes_is_isolated_per_user`).
+`WHERE phash IS NOT NULL AND confirm_state IN ('confirmed', 'rejected')` — "is this picture already
+decided for this user" (that read "already decided *by a human*" until 2026-09-14, when the one
+sanctioned machine confirm joined the set, deliberately: near-duplicates of an auto-confirmed image
+collapse onto it instead of being auto-confirmed N times over) — and the lookup is always scoped by
+`user_ref`, so a duplicate can never be inherited across users (`tests/test_confirm_store.py::test_decided_phashes_is_isolated_per_user`).
 
 `review_tasks` (new table, distinct from — and replacing the intent of — the unbuilt §3 sketch below):
 
@@ -1297,6 +1299,12 @@ There is no `sessions` table here — the proxy owns sessions entirely.
 
 `audit_log` is append-only. No `UPDATE` or `DELETE` grant on it for the application role. Every crop
 render gets a row — it is the only way to detect a compromised account being used as a search console.
+
+The `action` vocabulary this repo writes, for reference: `confirm.quarantined` and
+`confirm.auto_confirmed` (`actor_type = 'service'`, the confirm worker — the second added
+2026-09-14 for the one sanctioned machine confirm, metadata `{severity, face_match_score,
+decided_by}`); `review.decided` (`'operator'`); `review.subject_decided` and `preview.rendered`
+(`'subject'`); plus `discovery.refused` from `subjects/store.py`.
 
 It is readable, though, and that is newer than the append-only rule: migration `0025` grants `SELECT`
 to `audit_w` because two features read their own audit rows back — the preview render ceiling

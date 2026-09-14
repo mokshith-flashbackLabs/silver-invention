@@ -35,6 +35,13 @@ NCMEC's Take It Down, Loti, and Ceartas — not reverse image search. Several ru
   a face box strips the context a person needs to answer "is this you?" honestly; the blur, the tap
   and the subject-only access are what make showing it safe, and §0.2 of that spec records the
   `likely_not_subject` exposure the owner accepted.)*
+- **One kind of hit is shown to nobody at all: a confirmed `ncii_suspected` finding.** Explicit
+  content that also face-matched the subject is marked infringing by us — the subject sees no
+  preview and is asked no question (owner decision, 2026-09-14, spec
+  `docs/superpowers/specs/2026-09-14-auto-confirm-and-reviewer-feed-design.md`; INVARIANTS #19/#47
+  amended the same day). Putting "is this your photo?" in front of someone about an image already
+  established as explicit and as them is the thing this reverses. An operator can still overturn
+  it. The safety consequence of confirming without a human is legal review's, not this repo's.
 - We do **not** do takedown in v1. Detection only. The product must say so in onboarding, in plain
   words — not buried in a ToS.
 - We do **not** serve users under 18 in v1. A hit on a minor is CSAM, which is a mandatory-reporting
@@ -211,6 +218,11 @@ code being written **now**, carrying the same numbers.
    valid deciding human for their own hits* (`subject_decide`, `decided_by='subject'`): they see a
    blurred face crop — the subject, and only the subject; staff never see hit imagery — and their
    yes/not-me IS the confirm/reject. Operators remain the quarantine lane and the override path.
+   *Amended 2026-09-14:* the confirm worker itself writes `confirmed` for exactly one severity,
+   `ncii_suspected`, under `confirm_decided_by = 'auto:nsfw'` — the only non-human value that
+   column may carry. Such a hit is never shown to its subject and takes no answer from them, and a
+   `pending` review task is still created so `decide` stays the override. Full text in
+   `INVARIANTS.md` #19.
 21. **Scores are computed server-side, once.** The old system computes one client-side and one
    server-side that disagree by −18 per active report. For a product whose entire output is a score,
    that is disqualifying.
@@ -263,7 +275,12 @@ code being written **now**, carrying the same numbers.
 44–47. **Protection score, threat events and machine triage** *(2026-08-19 push)* — the score journal
    is append-only and the only writer is `score/store.py`; no feedback signal ever lowers the score;
    threat penalties are bounded, decaying, relevance-scoped, and reverse exactly on retraction; and
-   machine triage orders the review queue but a `confirmed` state requires a human by schema CHECK.
+   machine triage orders the review queue, confirming exactly one severity and dropping none.
+   *Amended 2026-09-14* — #47 used to read "a `confirmed` state requires a human by schema CHECK".
+   The CHECK is unchanged; what changed is that `record_auto_confirmed` satisfies it with the
+   machine marker `'auto:nsfw'` rather than a person's name, for `ncii_suspected` only. An
+   auto-confirmed hit costs Exposure like any other but is never counted as awaiting the subject's
+   feedback — we refuse to let them answer, so charging posture for their silence is #45's shape.
    Full text in `INVARIANTS.md` §G, #44–47.
 
 ---
@@ -315,7 +332,7 @@ decisions behind the new rows.
 | **Face-crop seeds** — on a photo with 2+ faces each subject's seed is a crop of their own face, so a bystander who never consented is not transmitted to Hive/Google every cycle. `attribution/seeds.py` + `crop_upload.py`, `seed_kind='face_crop'` (0029). A failed crop upload registers NO seed, never a photo seed. Built 2026-09-01, dark until the proxy sets its crop bucket; the §6 recall measurement has not run | |
 | The four `svc` contract views (0016) | |
 | `GET /v1/config/floors` | |
-| **Adjudication queue + reviewer tooling (minimal)** — `review/`, `review_tasks`, `/v1/admin/review/*`, the panel via the backend proxy. Human-only `confirmed`/`rejected`/`uncertain`; no auto-promotion (INVARIANTS #19, #47) | |
+| **Adjudication queue + reviewer tooling (minimal)** — `review/`, `review_tasks`, `/v1/admin/review/*`, the panel via the backend proxy. Reviewer decisions are `confirmed`/`rejected`/`uncertain` and no queue item auto-promotes. **Amended 2026-09-14:** "human-only `confirmed`" no longer holds — the confirm worker auto-confirms `ncii_suspected` (`confirm_decided_by = 'auto:nsfw'`), which the subject is never shown and never asked about, and which still lands a `pending` task so `decide` is the override (INVARIANTS #19, #47) | |
 | **Crop fetcher deployable** — `ARCHITECTURE.md` §3.7, pulled into scope; hands the confirm worker image bytes and renders blurred review crops live; no DB credentials | |
 | **Confirm pipeline** — `confirm/` worker on `confirm:hits`: fetch → pHash dedup → face-match (through `attribution/`, never a direct Rekognition search call) → moderation → severity triage | |
 | **Protection score + recommendations** — `score/` (engine, journaled store, `tick` drift-healer), `recommendations/` catalog. Journal is the product surface (INVARIANTS #44) | |

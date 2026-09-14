@@ -316,6 +316,35 @@ on their own likeness** — `subject_decide` writes `confirm_decided_by = 'subje
 `infringements_confirmed_needs_human` CHECK. A blurred face crop may be shown **to the subject — and
 only the subject — for the purpose of deciding**; staff surfaces never render hit imagery, anywhere.
 Machine triage still decides nothing (#47); what changed is who the deciding human is.
+*(That last clause was superseded on 2026-09-14 — see the next amendment.)*
+
+*Amended 2026-09-14 (owner decision; spec
+`docs/superpowers/specs/2026-09-14-auto-confirm-and-reviewer-feed-design.md`).* **The confirm
+worker may now write `confirmed` itself, for exactly one severity.** A hit classified
+`ncii_suspected` — explicit content AND a face match at or above
+`confirm_face_match_threshold` — is auto-confirmed by
+`confirm/store.py::record_auto_confirmed` with `confirm_decided_by = 'auto:nsfw'`, the only
+non-human value that column may ever carry. The other four severities are untouched and still
+decide nothing.
+
+Three properties hold it in place, and none of them is optional:
+
+- **The subject is never shown such a hit and never asked about it.** No preview
+  (`GET /v1/infringements/{id}/preview` answers `404 preview_unavailable`, before the render
+  ceiling and before the audit row) and no decision (`subject_decide` answers conflict → `409`).
+  Asking someone "is this your photo?" about an image we have already established is explicit
+  and is them is the product call this reverses; the backend refuses its half of the surface in
+  parallel.
+- **A `pending` `review_tasks` row is still created.** That is the override lane: an operator
+  `rejected` through `review/store.py::decide` overwrites the machine's decision and its
+  decider. There is still no timeout that auto-promotes anything, and nothing machine-writes a
+  dropped or invisible state.
+- **It is not a review-band promotion.** The band machinery (#47, §7.3) is unchanged; this is a
+  confirm-pipeline verdict on a hit that was already surfaced.
+
+**The safety consequence of confirming without a human belongs to legal review, not to this
+repo.** It was raised, named and taken by the owner on that basis. What this file records is
+that the rule was amended rather than quietly broken.
 
 **20. Backfill is priority-tiered and rate-limited per user.**
 A new enrolment triggers a search across the entire content index. Without a cap, ten signups
@@ -353,9 +382,14 @@ The frame widened because a face box strips the context a person needs to answer
 honestly. §0.2 of that spec records the accepted cost: on a `likely_not_subject` hit the frame may
 be a stranger's, and a blurred stranger's scene is now shown where a blurred stranger's face was.
 
+*Unchanged 2026-09-14, and worth stating because the auto-confirm change (#19) sits next to it:*
+a confirmed `ncii_suspected` hit is **refused rather than rendered** — its subject gets a `404`,
+not a blurred frame. No code path returns a sharp frame; this one returns no frame at all.
+
 Check: `tests/test_fetcher_render.py::test_no_reveal_returns_a_fully_sharp_frame`, plus
 `test_reveal_leaves_everything_outside_the_face_blurred` — the surround must be as blurred as it is
-in the default render, not merely less sharp than the face.
+in the default render, not merely less sharp than the face. The refusal:
+`tests/test_preview_routes.py::test_a_restricted_finding_is_refused_and_never_rendered`.
 
 **24. Notifications are batched digests. Never real-time, never between 22:00 and 08:00 local.**
 "New match found" at 2am is a harm. Cadence here is a safety decision, not a growth lever.
@@ -585,7 +619,13 @@ delivery, so the run would be retried forever instead of refused once.
 else — no `UPDATE`, no `DELETE` — so an editable journal cannot exist even as a bug. The materialized
 `protection_scores.score` always equals the sum of that user's `score_events.delta`, and no delta is
 ever written without a `cause_kind` (`feedback`, `enrolment`, `seed_registered`, `run_completed`,
-`review_decision`, `threat_event`, `threat_retracted`, `tick`). `score/store.py` is the **only** writer
+`review_decision`, `subject_decision`, `auto_confirm`, `threat_event`, `threat_retracted`, `tick`).
+`auto_confirm` is new on 2026-09-14 (#19's amendment: the machine confirming an `ncii_suspected`
+hit moves that person's Exposure, so it journals under its own cause rather than borrowing
+`review_decision`'s, which names a human). `subject_decision` was shipped 2026-08-21 and simply
+missing from this list until the same date — the vocabulary was wrong, not the code.
+`score_events.cause_kind` carries no CHECK constraint, so this list is the record; keep it
+honest. `score/store.py` is the **only** writer
 of either table (INVARIANTS #21 extended) — enforced by grep, not trusted, the same shape as the
 face-search and S3 boundary tests.
 
@@ -627,19 +667,38 @@ has no path back out of `retracted`, so a second retraction is a no-op rather th
 Check: `tests/test_threats.py::test_event_retraction_restores_exactly_the_pre_event_score`;
 `tests/test_threats.py::test_a_dead_url_on_a_matching_domain_is_not_matched`.
 
-**47. Machine triage orders review but can neither confirm nor drop.**
-The `confirm/` worker's severity classification (`ncii_suspected`, `explicit_unmatched`, `unassessed`,
-`benign_copy`, `likely_not_subject`) only orders `review_tasks` by priority — it never writes
-`infringements.confirm_state = 'confirmed'`, and nothing machine-writes a dropped/invisible state
-either (§7.3's reasoning applies unchanged: a real infringement made invisible is worse than one left
-in front of a human late). `confirmed` requires a human by construction: migration 0021's
-`infringements_confirmed_needs_human` CHECK enforces `confirm_state <> 'confirmed' OR
-(confirm_decided_by IS NOT NULL AND confirm_decided_at IS NOT NULL)` at the database — the same
-schema-over-discipline shape #19 already takes for the (unbuilt) match module's review band.
-`review/store.py::decide` and `review/store.py::subject_decide` are the only writers of a
-`confirmed` transition — the first supplies `decided_by` from the authenticated operator baked into
-the request; the second (added 2026-08-21) writes the constant `'subject'` for the hit's own
-`user_ref`, ownership enforced in the locking `WHERE`. Machine triage still cannot confirm or drop;
-the *subject* now can.
+**47. Machine triage orders review. It may confirm exactly one severity, and may never drop.**
+*Retitled and rewritten 2026-09-14.* This previously read "can neither confirm nor drop"; the
+confirm half is no longer true, and the honest form of the rule is narrower rather than absent.
 
-Check: `tests/test_review.py::test_decide_never_trips_the_infringements_confirmed_needs_human_check`.
+The `confirm/` worker's severity classification is five values (`ncii_suspected`,
+`explicit_unmatched`, `unassessed`, `benign_copy`, `likely_not_subject`).
+
+- **Four of them decide nothing.** They order `review_tasks` by priority and leave
+  `confirm_state = 'machine_triaged'`, exactly as before. `explicit_unmatched` is deliberately
+  among them: explicit content whose face match FAILED is the strongest false-positive signal this
+  pipeline has, and it stays a human decision (owner decision D3).
+- **`ncii_suspected` — explicit AND face-matched — is auto-confirmed**, by
+  `confirm/store.py::record_auto_confirmed`, under `confirm_decided_by = 'auto:nsfw'`. See #19 for
+  the three properties that hold it in place (the subject is shown nothing and asked nothing; a
+  `pending` review task keeps `decide` as the override; the safety consequence is legal review's).
+
+So there are now **three** writers of a `confirmed` transition, and exactly one of them is a
+machine: `review/store.py::decide` (an authenticated operator's name off the request),
+`review/store.py::subject_decide` (the constant `'subject'`, ownership enforced in the locking
+`WHERE`), and `record_auto_confirmed` (the constant `'auto:nsfw'`, the only non-human value the
+column may ever carry). Migration 0021's `infringements_confirmed_needs_human` CHECK is unchanged
+and still enforces `confirm_state <> 'confirmed' OR (confirm_decided_by IS NOT NULL AND
+confirm_decided_at IS NOT NULL)` at the database — what the machine marker does is satisfy that
+CHECK honestly, by naming *what* decided rather than pretending a person did.
+
+**Nothing machine-writes a dropped or invisible state, and that half is untouched.** §7.3's
+reasoning applies unchanged: a real infringement made invisible is worse than one left in front of
+a human late. There is still no timeout that auto-promotes anything (#19).
+
+Check: `tests/test_review.py::test_decide_never_trips_the_infringements_confirmed_needs_human_check`;
+`tests/test_confirm_store.py::test_record_auto_confirmed_writes_a_confirmed_row_with_the_machine_marker`
+(the CHECK held on a row no human touched, and the task stayed `pending`);
+`tests/test_confirm_worker.py::test_explicit_but_unmatched_still_only_triages` (the four that do
+not confirm); `tests/test_review.py::test_an_operator_can_reject_an_auto_confirmed_hit` (the
+override lane) and `::test_a_subject_cannot_overturn_a_machine_confirm`.

@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
+from imageshield.confirm.models import AUTO_CONFIRM_DECIDED_BY
 from imageshield.confirm.store import PostgresConfirmStore
 from imageshield.db.connection import make_async_pool
 from imageshield.review.store import (
@@ -138,6 +139,28 @@ async def _seeded_infringement(
         face_match_score=91.25,
         moderation_labels=[{"name": "Explicit Nudity", "confidence": 90.0}],
         triage={"face_match_score": 91.25, "best_face_bbox": {"left": 0.1, "top": 0.2}},
+    )
+    return user_ref, infringement_id
+
+
+async def _auto_confirmed_infringement(
+    migrated_db: str, confirm_store: PostgresConfirmStore
+) -> tuple[UserRef, UUID]:
+    """One AUTO-CONFIRMED hit, produced the real way -- through
+    ``record_auto_confirmed`` rather than a hand-written UPDATE, so these
+    tests exercise the row shape the confirm worker actually writes."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _subject(conn, user_ref)
+        seed_id = _seed(conn, user_ref)
+        run_id = _run(conn, user_ref, seed_id)
+        infringement_id = _infringement(conn, user_ref, run_id)
+    await confirm_store.record_auto_confirmed(
+        infringement_id,
+        phash=77,
+        face_match_score=98.0,
+        moderation_labels=[{"name": "Explicit Nudity", "confidence": 96.0}],
+        triage={"face_match_score": 98.0, "best_face_bbox": {"x": 0.1}},
     )
     return user_ref, infringement_id
 
@@ -852,3 +875,91 @@ async def test_a_redelivered_machine_triage_cannot_clobber_a_subject_decision(
     assert task["status"] == "decided"
     assert task["decided_by"] == "subject"
     assert "redelivered" not in task["triage"]  # the decided task was not reopened
+
+
+# ── the auto-confirm override lane (2026-09-14, owner decision D3) ──────────
+#
+# Neither of these needed a code change: `decide` locks on `status = 'pending'`
+# and its infringement UPDATE carries no `confirm_state` guard, and
+# `subject_decide`'s conflict predicate is "decided by somebody who is not the
+# subject". `record_auto_confirmed` leaves the task `pending` and writes a
+# decider that is not `'subject'`, so both already fall out. They are pinned
+# here because they are the two properties D3 and D4 rest on, and either could
+# be broken by an innocuous-looking change to the other module.
+
+
+async def test_an_operator_can_reject_an_auto_confirmed_hit(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """The override D3 requires. The machine's confirm is not final: the task
+    is still queued, and an operator's `rejected` overwrites both the state
+    and the decider."""
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _auto_confirmed_infringement(
+        migrated_db, confirm_store
+    )
+
+    task = await review_store.next_task()
+    assert task is not None, "an auto-confirmed hit must still be queued for review"
+    assert task["infringement_id"] == infringement_id
+    assert task["severity"] == "ncii_suspected"
+
+    outcome = await review_store.decide(
+        task["task_id"], decision="rejected", operator="frank", severity=None
+    )
+
+    assert outcome is not None
+    assert outcome.decision == "rejected"
+
+    infr = _row(
+        migrated_db,
+        "SELECT confirm_state, confirm_decided_by FROM infringements"
+        " WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infr["confirm_state"] == "rejected"
+    assert infr["confirm_decided_by"] == "frank"
+    assert infr["confirm_decided_by"] != AUTO_CONFIRM_DECIDED_BY
+
+    task_row = _row(
+        migrated_db,
+        "SELECT status, decision, decided_by FROM review_tasks WHERE task_id = %s",
+        (task["task_id"],),
+    )
+    assert task_row["status"] == "decided"
+    assert task_row["decision"] == "rejected"
+    assert task_row["decided_by"] == "frank"
+
+
+@pytest.mark.parametrize("decision", ["confirmed", "rejected"])
+async def test_a_subject_cannot_overturn_a_machine_confirm(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+    decision: str,
+) -> None:
+    """D4's other half. The subject is never shown this hit and never asked
+    about it -- but if a request for one reaches the decision endpoint anyway,
+    it must not be taken. `'auto:nsfw'` is not `'subject'`, so the existing
+    never-overturn-a-non-subject-decision predicate already answers conflict,
+    which the route maps to 409 decision_conflict. Both values, because the
+    "same answer replays" branch must not swallow `confirmed` either."""
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _auto_confirmed_infringement(
+        migrated_db, confirm_store
+    )
+
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision=decision
+    )
+
+    assert outcome is not None
+    assert outcome.outcome == "conflict"
+
+    infr = _row(
+        migrated_db,
+        "SELECT confirm_state, confirm_decided_by FROM infringements"
+        " WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infr["confirm_state"] == "confirmed"
+    assert infr["confirm_decided_by"] == AUTO_CONFIRM_DECIDED_BY

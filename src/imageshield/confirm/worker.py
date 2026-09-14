@@ -37,7 +37,15 @@ The orchestration, in order (design doc §7 step 9, task-9 brief):
    the labels already live on the infringement row (CLAUDE.md §7.2).
 8. The CSAM tripwire. A quarantine hit gets no triage and no score effect;
    ``confirm.quarantined`` at error level is the ops alarm.
-9. Severity classification and the machine triage record.
+9. Severity classification. ``ncii_suspected`` -- explicit AND face-matched --
+   AUTO-CONFIRMS (``record_auto_confirmed``) and then recomputes the subject's
+   protection score; every other severity records a machine triage exactly as
+   before. That fork is the 2026-09-14 owner decision D3 (spec
+   ``docs/superpowers/specs/2026-09-14-auto-confirm-and-reviewer-feed-design.md``,
+   INVARIANTS #19/#47 amended the same day): a hit that is both explicit and a
+   face match is marked infringing by us rather than put to the subject as a
+   question, and the subject is never shown it. A ``pending`` review task is
+   still written, so an operator can still reject it.
 
 ``run_id`` on the loaded context can be ``None`` — a provenance gap the write
 path makes near-impossible, but not one this worker may assume away. Steps 5
@@ -75,6 +83,7 @@ from imageshield.attribution.rekognition import RekognitionFaceAttribution
 from imageshield.attribution.resolve import resolve_face
 from imageshield.config import Config, ConfigError, load_config
 from imageshield.confirm.models import (
+    AUTO_CONFIRM_SEVERITY,
     CONFIRM_REQUESTED_EVENT,
     REKOGNITION_CONFIRM_ID,
     ConfirmContext,
@@ -95,6 +104,8 @@ from imageshield.providers.gate import decide
 from imageshield.providers.models import Dispatch, Skip
 from imageshield.providers.store import ProviderControlStore, utc_spend_date
 from imageshield.relay import _localstack_endpoint_url
+from imageshield.score.engine import ScoreWeights
+from imageshield.score.store import PostgresScoreStore, ScoreStore
 from imageshield.search.provider import ProviderResult
 from imageshield.search.worker import SqsConsumer, build_control_store
 
@@ -167,6 +178,10 @@ class ConfirmDeps:
     control: ProviderControlStore
     provider: AttributionProvider
     moderation: ModerationProvider
+    # Only step 9's auto-confirm branch uses it: a confirm the subject will
+    # never be asked about still moves their Exposure, so the score has to be
+    # recomputed here rather than waiting for the next run_completed.
+    score: ScoreStore
     fetch: Fetch
     # 0030: used ONLY when `fetch` refuses, to resolve the og:image a page
     # publishes for itself. See the fallback in `handle_message` step 3.
@@ -248,6 +263,14 @@ def build_deps(
         control=build_control_store(config, pool),
         provider=RekognitionFaceAttribution(region=config.aws_region),
         moderation=RekognitionModeration(region=config.aws_region),
+        # Same construction as search/worker.py's run_forever -- weights and
+        # config_version off the same Config, so the two workers can never
+        # journal under different rulesets.
+        score=PostgresScoreStore(
+            pool,
+            weights=ScoreWeights.from_config(config),
+            config_version=config.score_config_version,
+        ),
         fetch=build_fetch(
             http_client,
             base_url=config.fetcher_base_url,
@@ -613,25 +636,65 @@ async def handle_message(
             )
             return True
 
-        # ── 9. Severity classification + machine triage ──────────────────────
+        # ── 9. Severity classification: auto-confirm, or machine triage ──────
         severity = classify(
             explicit=explicit,
             face_match_score=best_score,
             face_match_threshold=deps.face_match_threshold,
         )
+        triage_payload = {
+            "image_url": ctx.image_url,
+            "best_face_bbox": best_bbox.as_dict() if best_bbox is not None else None,
+            "face_match_score": best_score,
+            "moderation_labels": [label.name for label in moderation.labels],
+            "phash_degenerate": phash_degenerate,
+        }
+
+        if severity == AUTO_CONFIRM_SEVERITY:
+            # Explicit AND face-matched. Owner decision D3 (2026-09-14): we
+            # mark this infringing ourselves rather than asking the subject
+            # "is this your photo?" about their own abuse imagery, and D4
+            # says they are shown nothing and asked nothing. The `pending`
+            # review task record_auto_confirmed writes is the override lane.
+            await deps.store.record_auto_confirmed(
+                ctx.infringement_id,
+                phash=new_phash,
+                face_match_score=best_score,
+                moderation_labels=moderation_label_dicts,
+                triage=triage_payload,
+            )
+            worker_log.info(
+                "confirm.auto_confirmed",
+                infringement_id=str(ctx.infringement_id),
+                face_match_score=best_score,
+            )
+            try:
+                await deps.score.recompute(
+                    ctx.user_ref,
+                    cause_kind="auto_confirm",
+                    cause_ref=str(ctx.infringement_id),
+                )
+            except Exception:
+                # Deliberate, and the same shape search/worker.py uses after
+                # execute_run: the confirm has ALREADY COMMITTED, so letting
+                # this raise would redeliver the message and re-run steps 3-8
+                # (a second fetch, a second Rekognition bundle, a second bill)
+                # to no purpose -- the guarded UPDATE would refuse the write
+                # the second time round. The score tick heals the drift.
+                worker_log.warning(
+                    "score.recompute_failed",
+                    user_ref=str(ctx.user_ref),
+                    cause="auto_confirm",
+                )
+            return True
+
         await deps.store.record_triage(
             ctx.infringement_id,
             severity=severity,
             phash=new_phash,
             face_match_score=best_score,
             moderation_labels=moderation_label_dicts,
-            triage={
-                "image_url": ctx.image_url,
-                "best_face_bbox": best_bbox.as_dict() if best_bbox is not None else None,
-                "face_match_score": best_score,
-                "moderation_labels": [label.name for label in moderation.labels],
-                "phash_degenerate": phash_degenerate,
-            },
+            triage=triage_payload,
         )
         return True
     except Exception as exc:  # broad on purpose: the outer net, same shape as

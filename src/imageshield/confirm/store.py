@@ -2,12 +2,24 @@
 
 Every write method is **one transaction**. The guarded transitions
 (``record_duplicate``, ``record_quarantine``, ``record_triage``,
-``record_unfetchable``) share one shape: an ``UPDATE ... WHERE
-infringement_id = %s AND confirm_state IN ('unconfirmed', 'machine_triaged')``
-that only fires on a hit still open to a machine decision. A rowcount of zero
-means the hit was already decided by a human (or already duplicate/quarantined)
-and the method returns silently — idempotent under SQS at-least-once delivery,
-and a human decision can never be clobbered by a re-delivered message.
+``record_unfetchable``, ``record_auto_confirmed``) share one shape: an
+``UPDATE ... WHERE infringement_id = %s AND confirm_state IN ('unconfirmed',
+'machine_triaged')`` that only fires on a hit still open to a machine
+decision. A rowcount of zero means the hit was already decided by a human (or
+already duplicate/quarantined) and the method returns silently — idempotent
+under SQS at-least-once delivery, and a human decision can never be clobbered
+by a re-delivered message.
+
+``record_auto_confirmed`` is the newest of them and the only one that writes
+``confirm_state = 'confirmed'`` (2026-09-14, owner decision D3; INVARIANTS #19
+and #47 amended the same day). It applies to exactly one severity,
+``ncii_suspected`` — explicit AND face-matched — and stamps
+``confirm_decided_by`` with the machine marker
+:data:`~imageshield.confirm.models.AUTO_CONFIRM_DECIDED_BY`, which is what
+satisfies 0021's ``infringements_confirmed_needs_human`` CHECK. It still
+creates a ``pending`` review task: that is the reviewer's override lane, and
+``review/store.py::decide`` can reject the hit off it exactly as it could
+before.
 
 ``record_skipped`` is the one exception, added by a plan amendment: it never
 touches ``infringements.confirm_state`` at all. It exists for the case where
@@ -37,12 +49,17 @@ from uuid import UUID
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from imageshield.confirm.models import ConfirmContext
+from imageshield.confirm.models import (
+    AUTO_CONFIRM_DECIDED_BY,
+    AUTO_CONFIRM_SEVERITY,
+    ConfirmContext,
+)
 from imageshield.types import UserRef, parse_user_ref
 
 # actor_type 'service': the caller is the confirm worker acting on a hit, not
 # an operator at a console (mirrors subjects/store.py's DISCOVERY_REFUSED_ACTION).
 CONFIRM_QUARANTINED_ACTION = "confirm.quarantined"
+CONFIRM_AUTO_CONFIRMED_ACTION = "confirm.auto_confirmed"
 
 _LOAD_CONTEXT_SQL = """
     SELECT i.infringement_id, i.user_ref, i.confirm_state, i.image_url, i.page_url,
@@ -62,9 +79,16 @@ _LOAD_CONTEXT_SQL = """
 """
 
 # The partial index from 0021 (infringements_decided_phash_idx) is built for
-# exactly this predicate. Only THIS user's rows, and only a HUMAN decision —
+# exactly this predicate. Only THIS user's rows, and only a DECIDED one —
 # 'machine_triaged' is deliberately excluded so nothing inherits a phash match
 # from a hit nobody has looked at yet.
+#
+# Until 2026-09-14 "decided" meant "decided by a human", because nothing else
+# could reach 'confirmed' or 'rejected'. `record_auto_confirmed` now can, for
+# the one sanctioned severity, and its rows belong in this set on purpose:
+# near-duplicates of an already auto-confirmed image collapse onto it as a
+# `duplicate` instead of being auto-confirmed N times over. One picture, one
+# finding — the same reason a human confirm seeds the set.
 _DECIDED_PHASHES_SQL = """
     SELECT infringement_id, phash FROM infringements
     WHERE user_ref = %(user_ref)s
@@ -108,7 +132,10 @@ _UPSERT_QUARANTINE_REVIEW_TASK_SQL = """
     WHERE review_tasks.status = 'pending'
 """
 
-_QUARANTINE_AUDIT_SQL = """
+# Shared by record_quarantine and record_auto_confirmed: both are the confirm
+# worker acting on a hit, so both write actor_type 'service' and differ only
+# in the `action` they pass.
+_SERVICE_AUDIT_SQL = """
     INSERT INTO audit_log (actor_type, action, subject_ref, resource_id, metadata)
     VALUES ('service', %(action)s, %(subject_ref)s, %(resource_id)s, %(metadata)s)
 """
@@ -117,6 +144,29 @@ _RECORD_TRIAGE_INFRINGEMENT_SQL = """
     UPDATE infringements
     SET confirm_state = 'machine_triaged', severity = %(severity)s, phash = %(phash)s,
         face_match_score = %(face_match_score)s, moderation_labels = %(moderation_labels)s
+    WHERE infringement_id = %(infringement_id)s
+      AND confirm_state IN ('unconfirmed', 'machine_triaged')
+    RETURNING user_ref
+"""
+
+# The one machine-written 'confirmed' transition (2026-09-14, owner decision
+# D3). Same guard as every other transition here, so a human decision is never
+# clobbered and a redelivered SQS message is a no-op.
+#
+# `status` is deliberately NOT touched -- it stays 'new'. `status` is the
+# SUBJECT's own position on the hit (acknowledged / dismissed_not_me /
+# authorised / user_resolved) and nothing the machine does may author it;
+# `confirm_state` is the lifecycle column and it is the only one moving here.
+#
+# confirm_decided_by + confirm_decided_at are written in the SAME statement as
+# confirm_state, which is what makes 0021's infringements_confirmed_needs_human
+# CHECK unfalsifiable rather than a thing application code remembers.
+_RECORD_AUTO_CONFIRMED_INFRINGEMENT_SQL = """
+    UPDATE infringements
+    SET confirm_state = 'confirmed', severity = %(severity)s, phash = %(phash)s,
+        face_match_score = %(face_match_score)s,
+        moderation_labels = %(moderation_labels)s,
+        confirm_decided_by = %(decided_by)s, confirm_decided_at = now()
     WHERE infringement_id = %(infringement_id)s
       AND confirm_state IN ('unconfirmed', 'machine_triaged')
     RETURNING user_ref
@@ -185,6 +235,16 @@ class ConfirmStore(Protocol):
         infringement_id: UUID,
         *,
         severity: str,
+        phash: int | None,
+        face_match_score: float | None,
+        moderation_labels: list[dict[str, Any]] | None,
+        triage: dict[str, Any],
+    ) -> None: ...
+
+    async def record_auto_confirmed(
+        self,
+        infringement_id: UUID,
+        *,
         phash: int | None,
         face_match_score: float | None,
         moderation_labels: list[dict[str, Any]] | None,
@@ -276,7 +336,7 @@ class PostgresConfirmStore:
                 },
             )
             await conn.execute(
-                _QUARANTINE_AUDIT_SQL,
+                _SERVICE_AUDIT_SQL,
                 {
                     "action": CONFIRM_QUARANTINED_ACTION,
                     "subject_ref": user_ref,
@@ -319,6 +379,76 @@ class PostgresConfirmStore:
                     "user_ref": user_ref,
                     "severity": severity,
                     "triage": Jsonb(triage),
+                },
+            )
+
+    async def record_auto_confirmed(
+        self,
+        infringement_id: UUID,
+        *,
+        phash: int | None,
+        face_match_score: float | None,
+        moderation_labels: list[dict[str, Any]] | None,
+        triage: dict[str, Any],
+    ) -> None:
+        """The one sanctioned machine confirm: ``ncii_suspected`` only.
+
+        Three writes in one transaction, mirroring ``record_quarantine``:
+
+        1. The guarded UPDATE above. Rowcount zero (a human already decided,
+           or the hit is duplicate/quarantined) returns silently, so a
+           redelivered message is a no-op.
+        2. The review-task upsert, ``pending`` and severity-ranked first, with
+           ``auto_confirmed`` on the triage payload. **This is the override
+           lane**: the task staying ``pending`` is exactly what lets
+           ``review/store.py::decide`` reject the hit afterwards.
+        3. One ``audit_log`` row. The machine confirming a hit on a person's
+           behalf is a decision about them and is recorded as one.
+
+        The subject is never asked about this hit and never shown it -- the
+        route refusal lives in ``http/routes/infringements.py`` and the
+        backend's card lane refuses in parallel.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                _RECORD_AUTO_CONFIRMED_INFRINGEMENT_SQL,
+                {
+                    "infringement_id": infringement_id,
+                    "severity": AUTO_CONFIRM_SEVERITY,
+                    "phash": phash,
+                    "face_match_score": face_match_score,
+                    "moderation_labels": (
+                        Jsonb(moderation_labels) if moderation_labels is not None else None
+                    ),
+                    "decided_by": AUTO_CONFIRM_DECIDED_BY,
+                },
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return
+            user_ref = row[0]
+            await conn.execute(
+                _UPSERT_REVIEW_TASK_SQL,
+                {
+                    "infringement_id": infringement_id,
+                    "user_ref": user_ref,
+                    "severity": AUTO_CONFIRM_SEVERITY,
+                    "triage": Jsonb({**triage, "auto_confirmed": True}),
+                },
+            )
+            await conn.execute(
+                _SERVICE_AUDIT_SQL,
+                {
+                    "action": CONFIRM_AUTO_CONFIRMED_ACTION,
+                    "subject_ref": user_ref,
+                    "resource_id": infringement_id,
+                    "metadata": Jsonb(
+                        {
+                            "severity": AUTO_CONFIRM_SEVERITY,
+                            "face_match_score": face_match_score,
+                            "decided_by": AUTO_CONFIRM_DECIDED_BY,
+                        }
+                    ),
                 },
             )
 

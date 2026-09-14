@@ -17,6 +17,7 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
+from imageshield.confirm.models import AUTO_CONFIRM_DECIDED_BY
 from imageshield.db.connection import make_async_pool
 from imageshield.preview.store import PostgresPreviewStore
 from imageshield.types import UserRef
@@ -54,6 +55,8 @@ def _infringement(
     confirm_state: str = "machine_triaged",
     image_url: str | None = "set",
     preview_image_url: str | None = None,
+    severity: str | None = None,
+    confirm_decided_by: str | None = None,
 ) -> UUID:
     url_hash = uuid4().hex + uuid4().hex
     url = f"https://example.test/{uuid4().hex}"
@@ -62,10 +65,15 @@ def _infringement(
         " VALUES (%s, %s, 'example.test', %s)",
         (url_hash, url, url),
     )
+    # 0021's infringements_confirmed_needs_human CHECK wants BOTH decided
+    # columns whenever confirm_state is 'confirmed'.
+    decided_at = "now()" if confirm_decided_by else "NULL"
     row = conn.execute(
         "INSERT INTO infringements"
-        " (user_ref, url_hash, page_url, image_url, confirm_state, preview_image_url)"
-        " VALUES (%s, %s, %s, %s, %s, %s) RETURNING infringement_id",
+        " (user_ref, url_hash, page_url, image_url, confirm_state, preview_image_url,"
+        " severity, confirm_decided_by, confirm_decided_at)"
+        f" VALUES (%s, %s, %s, %s, %s, %s, %s, %s, {decided_at})"
+        " RETURNING infringement_id",
         (
             user_ref,
             url_hash,
@@ -73,6 +81,8 @@ def _infringement(
             f"{url}.jpg" if image_url == "set" else image_url,
             confirm_state,
             preview_image_url,
+            severity,
+            confirm_decided_by,
         ),
     ).fetchone()
     assert row is not None
@@ -231,6 +241,75 @@ async def test_malformed_bbox_degrades_to_none(
 
     assert target is not None
     assert target.bbox is None
+
+
+@pytest.mark.parametrize("decided_by", [AUTO_CONFIRM_DECIDED_BY, "ops@imageshield"])
+async def test_a_confirmed_ncii_hit_is_flagged_restricted(
+    migrated_db: str, store: PostgresPreviewStore, decided_by: str
+) -> None:
+    """2026-09-14. The flag is keyed on confirm_state + severity, NOT on the
+    `auto:nsfw` marker, so an OPERATOR-confirmed `ncii_suspected` hit is
+    restricted too -- which is how the backend presents the same two columns.
+    One predicate on both sides is what stops them drifting apart.
+
+    `target()` still answers, and still reports a renderable picture: the
+    refusal is the route's. `svc.v_person_hits.preview_available` mirrors this
+    query's renderability logic row by row (0031) and that column means "a
+    picture exists" -- collapsing this to None would silently redefine it.
+    """
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        infringement_id = _infringement(
+            conn,
+            user_ref,
+            confirm_state="confirmed",
+            severity="ncii_suspected",
+            confirm_decided_by=decided_by,
+        )
+        _task(conn, infringement_id, user_ref, triage={"best_face_bbox": BBOX})
+
+    target = await store.target(infringement_id, user_ref)
+
+    assert target is not None
+    assert target.restricted is True
+    assert target.image_url is not None
+    assert target.bbox == BBOX
+
+
+@pytest.mark.parametrize(
+    "confirm_state,severity,decided_by",
+    [
+        ("machine_triaged", "ncii_suspected", None),
+        ("confirmed", "explicit_unmatched", "ops@imageshield"),
+        ("machine_triaged", "likely_not_subject", None),
+    ],
+)
+async def test_every_other_hit_is_not_restricted(
+    migrated_db: str,
+    store: PostgresPreviewStore,
+    confirm_state: str,
+    severity: str,
+    decided_by: str | None,
+) -> None:
+    """Both halves of the predicate are load-bearing. A machine-triaged
+    `ncii_suspected` hit is still the ordinary ask-card -- nothing has decided
+    it -- and a confirmed `explicit_unmatched` one is a hit the subject
+    answered themselves, which they may still look at."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        infringement_id = _infringement(
+            conn,
+            user_ref,
+            confirm_state=confirm_state,
+            severity=severity,
+            confirm_decided_by=decided_by,
+        )
+        _task(conn, infringement_id, user_ref, triage={"best_face_bbox": BBOX})
+
+    target = await store.target(infringement_id, user_ref)
+
+    assert target is not None
+    assert target.restricted is False
 
 
 # ── render audit + ceiling ────────────────────────────────────────────────

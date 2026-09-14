@@ -53,6 +53,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict
 
+from imageshield.confirm.models import AUTO_CONFIRM_DECIDED_BY
 from imageshield.recommendations.catalog import EventNeedingScan, RecSpec, desired
 from imageshield.score.engine import (
     Components,
@@ -132,8 +133,20 @@ _MONITORED_SOURCES_SQL = """
     WHERE sr.status = 'completed' AND sr.user_ref = %(user_ref)s
 """
 
-# Only HUMAN-confirmed hits feed exposure (INVARIANTS #19/#47 — never machine
-# triage). `counts` folds three independent reasons a confirmed hit stops
+# Exposure is fed by CONFIRMED hits. That used to mean human-confirmed and
+# nothing else (INVARIANTS #19/#47 — never machine triage); since 2026-09-14
+# it also includes the one sanctioned machine confirm, `ncii_suspected`
+# written by `confirm/store.py::record_auto_confirmed`. **The exposure is
+# real either way**, so those hits count here exactly as an operator's or the
+# subject's own confirm would — see the `no_feedback` clause below for the
+# half that does NOT carry over.
+#
+# (The auto-confirm exclusion in `no_feedback` below is dated 2026-09-14. The
+# date is kept out here rather than in the SQL string on purpose:
+# tests/test_boundaries.py's phone-shaped-literal gate reads whole string
+# constants, `--` comments included, and an 8-digit run inside one trips it.)
+#
+# `counts` folds three independent reasons a confirmed hit stops
 # costing exposure points into one boolean the engine can just read:
 #   - the URL died (recheck loop sets url_alive false — not built in v1, but
 #     the column exists and a test writes it directly);
@@ -179,9 +192,18 @@ _CONFIRMED_HITS_SQL = """
       -- Exposure move — and the app asks them to respond to a hit they have
       -- just responded to. The literal matches `review/store.py`'s
       -- `confirm_decided_by = 'subject'`; both sides are pinned by tests.
+      --
+      -- The auto-confirm marker is excluded for the mirror-image
+      -- reason: an auto-confirmed hit can never RECEIVE the subject's
+      -- feedback, because we refuse to show it to them and refuse to take
+      -- their answer (owner decision D4). Charging posture for it would
+      -- penalise a person for not answering a question nobody asked them —
+      -- the exact shape #45's amendment forbids. Exposure still counts it
+      -- (see the comment above this SQL); only posture is withheld.
       (
         COALESCE(fc.n, 0) = 0
         AND i.confirm_decided_by IS DISTINCT FROM 'subject'
+        AND i.confirm_decided_by IS DISTINCT FROM %(auto_marker)s
       ) AS no_feedback
     FROM infringements i
     LEFT JOIN latest_feedback lf ON lf.infringement_id = i.infringement_id
@@ -456,7 +478,10 @@ class PostgresScoreStore:
         assert row is not None
         monitored_sources = row[0]
 
-        cur = await conn.execute(_CONFIRMED_HITS_SQL, {"user_ref": user_ref})
+        cur = await conn.execute(
+            _CONFIRMED_HITS_SQL,
+            {"user_ref": user_ref, "auto_marker": AUTO_CONFIRM_DECIDED_BY},
+        )
         hit_rows = await cur.fetchall()
         confirmed_hits = tuple(
             ConfirmedHit(severity=severity, counts=bool(counts))

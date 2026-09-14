@@ -110,6 +110,41 @@ def test_no_bbox_is_preview_unavailable() -> None:
     assert crop.calls == []
 
 
+def test_a_restricted_finding_is_refused_and_never_rendered() -> None:
+    """2026-09-14, owner decision D4: a confirmed `ncii_suspected` hit is never
+    shown to its subject. The refusal lands BEFORE the ceiling and BEFORE the
+    audit row -- a render that was refused is not an attempt, so it neither
+    charges the daily ceiling (#32) nor appears in the audit trail as one
+    (#31), and it must not reach the fetcher at all."""
+    client, store, crop = make_client(
+        PreviewTarget(image_url=IMAGE_URL, bbox=BBOX, restricted=True)
+    )
+
+    response = _get(client, uuid4(), uuid4())
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "preview_unavailable"
+    assert crop.calls == []
+    assert store.recorded == []
+
+
+def test_the_restricted_refusal_is_byte_identical_to_the_no_bbox_one() -> None:
+    """The same code and message as an ordinary unrenderable hit: nothing in
+    the response tells a caller that THIS hit is restricted rather than merely
+    not renderable yet."""
+    restricted, _s1, _c1 = make_client(
+        PreviewTarget(image_url=IMAGE_URL, bbox=BBOX, restricted=True)
+    )
+    no_bbox, _s2, _c2 = make_client(PreviewTarget(image_url=IMAGE_URL, bbox=None))
+
+    first = _get(restricted, uuid4(), uuid4()).json()
+    second = _get(no_bbox, uuid4(), uuid4()).json()
+    first["error"].pop("request_id", None)
+    second["error"].pop("request_id", None)
+
+    assert first == second
+
+
 def test_happy_path_streams_blurred_jpeg_with_no_store() -> None:
     client, store, crop = make_client(PreviewTarget(image_url=IMAGE_URL, bbox=BBOX))
     infringement_id, user_ref = uuid4(), uuid4()

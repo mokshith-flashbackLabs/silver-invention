@@ -12,7 +12,12 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
-from imageshield.confirm.store import CONFIRM_QUARANTINED_ACTION, PostgresConfirmStore
+from imageshield.confirm.models import AUTO_CONFIRM_DECIDED_BY
+from imageshield.confirm.store import (
+    CONFIRM_AUTO_CONFIRMED_ACTION,
+    CONFIRM_QUARANTINED_ACTION,
+    PostgresConfirmStore,
+)
 from imageshield.db.connection import make_async_pool
 from imageshield.types import UserRef
 from tests.db import run_migrate
@@ -452,6 +457,165 @@ async def test_record_quarantine_writes_the_audit_row_and_review_task(
     assert audit["action"] == CONFIRM_QUARANTINED_ACTION == "confirm.quarantined"
     assert audit["subject_ref"] == user_ref
     assert audit["metadata"] == {"min_age_low": 11.5}
+
+
+# ── record_auto_confirmed (2026-09-14, owner decision D3) ────────────────
+
+
+async def test_record_auto_confirmed_writes_a_confirmed_row_with_the_machine_marker(
+    migrated_db: str, store: PostgresConfirmStore
+) -> None:
+    """The whole shape in one place: `confirmed` with BOTH decided columns
+    non-null (so 0021's infringements_confirmed_needs_human CHECK held on a
+    row no human touched), `status` left alone at 'new' because the subject's
+    own position is not ours to author, a PENDING review task carrying the
+    auto_confirmed marker -- the override lane -- and one audit row."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _subject(conn, user_ref)
+        seed = _seed(conn, user_ref)
+        run_id = _run(conn, user_ref, seed)
+        infringement_id = _infringement(conn, user_ref, run_id)
+
+    await store.record_auto_confirmed(
+        infringement_id,
+        phash=4242,
+        face_match_score=97.5,
+        moderation_labels=[{"name": "Explicit Nudity", "confidence": 96.0}],
+        triage={"face_match_score": 97.5, "best_face_bbox": {"x": 0.1}},
+    )
+
+    infr = _row(
+        migrated_db,
+        "SELECT confirm_state, severity, phash, face_match_score, moderation_labels,"
+        " confirm_decided_by, confirm_decided_at, status"
+        " FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infr["confirm_state"] == "confirmed"
+    assert infr["severity"] == "ncii_suspected"
+    assert infr["phash"] == 4242
+    assert float(infr["face_match_score"]) == 97.5
+    assert infr["moderation_labels"] == [{"name": "Explicit Nudity", "confidence": 96.0}]
+    # The CHECK needs BOTH, and a machine confirm is the one row shape that
+    # could plausibly have been written without them.
+    assert infr["confirm_decided_by"] == AUTO_CONFIRM_DECIDED_BY == "auto:nsfw"
+    assert infr["confirm_decided_at"] is not None
+    # `status` is the SUBJECT's position on the hit and stays untouched.
+    assert infr["status"] == "new"
+
+    task = _row(
+        migrated_db,
+        "SELECT severity, status, triage FROM review_tasks WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert task["severity"] == "ncii_suspected"
+    assert task["status"] == "pending", "the reviewer override lane must stay open"
+    assert task["triage"]["auto_confirmed"] is True
+    assert task["triage"]["face_match_score"] == 97.5
+
+    audit = _row(
+        migrated_db,
+        "SELECT actor_type, action, subject_ref, resource_id, metadata FROM audit_log"
+        " WHERE resource_id = %s",
+        (infringement_id,),
+    )
+    assert audit["actor_type"] == "service"
+    assert audit["action"] == CONFIRM_AUTO_CONFIRMED_ACTION == "confirm.auto_confirmed"
+    assert audit["subject_ref"] == user_ref
+    assert audit["metadata"] == {
+        "severity": "ncii_suspected",
+        "face_match_score": 97.5,
+        "decided_by": "auto:nsfw",
+    }
+    assert (
+        len(
+            _rows(
+                migrated_db,
+                "SELECT 1 FROM audit_log WHERE resource_id = %s",
+                (infringement_id,),
+            )
+        )
+        == 1
+    )
+
+
+async def test_record_auto_confirmed_refuses_on_an_already_decided_row(
+    migrated_db: str, store: PostgresConfirmStore
+) -> None:
+    """The same guard every other transition here carries: a human decision is
+    never clobbered, and a redelivered SQS message is a no-op."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _subject(conn, user_ref)
+        seed = _seed(conn, user_ref)
+        run_id = _run(conn, user_ref, seed)
+        infringement_id = _infringement(
+            conn,
+            user_ref,
+            run_id,
+            confirm_state="rejected",
+            confirm_decided_by="reviewer",
+            severity="explicit_unmatched",
+        )
+
+    await store.record_auto_confirmed(
+        infringement_id,
+        phash=1,
+        face_match_score=99.0,
+        moderation_labels=None,
+        triage={"x": 1},
+    )
+
+    infr = _row(
+        migrated_db,
+        "SELECT confirm_state, severity, confirm_decided_by, phash"
+        " FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infr["confirm_state"] == "rejected"
+    assert infr["severity"] == "explicit_unmatched"
+    assert infr["confirm_decided_by"] == "reviewer"
+    assert infr["phash"] is None
+    assert (
+        _rows(
+            migrated_db,
+            "SELECT 1 FROM review_tasks WHERE infringement_id = %s",
+            (infringement_id,),
+        )
+        == []
+    )
+    assert (
+        _rows(
+            migrated_db, "SELECT 1 FROM audit_log WHERE resource_id = %s", (infringement_id,)
+        )
+        == []
+    )
+
+
+async def test_an_auto_confirmed_row_seeds_the_decided_phash_dedup_set(
+    migrated_db: str, store: PostgresConfirmStore
+) -> None:
+    """Near-duplicates of an auto-confirmed image must collapse onto it rather
+    than each being auto-confirmed in turn. `decided_phashes` selects on
+    confirm_state, not on who decided, so the machine confirm joins the set
+    for the same reason a human one does -- one picture, one finding."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _subject(conn, user_ref)
+        seed = _seed(conn, user_ref)
+        run_id = _run(conn, user_ref, seed)
+        infringement_id = _infringement(conn, user_ref, run_id)
+
+    await store.record_auto_confirmed(
+        infringement_id,
+        phash=5150,
+        face_match_score=98.0,
+        moderation_labels=None,
+        triage={},
+    )
+
+    assert await store.decided_phashes(user_ref) == ((infringement_id, 5150),)
 
 
 # ── record_unfetchable ───────────────────────────────────────────────────

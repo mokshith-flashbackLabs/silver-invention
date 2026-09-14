@@ -25,6 +25,26 @@ CONFIRM_REQUESTED_EVENT = "confirm.hit_requested"
 # budget/breaker/spend machinery governs the confirm pass (INVARIANTS #37-41).
 REKOGNITION_CONFIRM_ID = ProviderId("rekognition_confirm")
 
+# ── the one sanctioned machine confirm (2026-09-14) ───────────────────────
+#
+# Spec docs/superpowers/specs/2026-09-14-auto-confirm-and-reviewer-feed-design.md;
+# INVARIANTS #19/#47 as amended the same day.
+
+# The ONLY non-human value `infringements.confirm_decided_by` may ever carry.
+# Every other confirmed row names a person: the `operator` string the review
+# console authenticated, or the constant 'subject'. Written only by
+# `confirm/store.py::record_auto_confirmed`, and read by `score/store.py` to
+# tell "nobody has answered yet" apart from "nobody will ever be asked".
+AUTO_CONFIRM_DECIDED_BY = "auto:nsfw"
+
+# The ONE severity the machine may confirm on its own: explicit content AND a
+# face match at or above `confirm_face_match_threshold` (owner decision D3).
+# `explicit_unmatched` -- explicit, but the face match FAILED -- deliberately
+# stays a human decision, because a failed face match is the strongest
+# false-positive signal this pipeline has. The other four severities are
+# unchanged: they order the review queue and decide nothing.
+AUTO_CONFIRM_SEVERITY = "ncii_suspected"
+
 
 class ConfirmContext(BaseModel):
     """Everything the confirm worker needs about one hit, re-read from
