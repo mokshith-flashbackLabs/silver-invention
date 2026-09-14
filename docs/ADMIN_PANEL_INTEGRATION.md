@@ -42,12 +42,23 @@ either way — it is still the contract the backend's admin routes mirror.
    tokens server-side and exposes browser forms must protect the forms. The retired console used
    HTTP Basic with per-operator tokens plus CSRF double-submit; the backend proxy sits behind its
    own session model instead.
-5. **Pixels are never shown to staff.** Since 2026-08-21 the subject decides their own hits and
-   staff never see hit imagery, blurred or otherwise; the fetcher's crop route is not part of
-   this contract. `image_url` still ships on the review card (§3) as **evidence for
-   URL-context review only** — a panel must never persist, proxy, cache, render, or hotlink
-   `image_url` or any infringing image. Article pictures (below) are operator-pasted URLs
-   rendered as links, not images.
+5. **Staff see ONE image, through ONE route, audited — and `image_url` is never it.**
+   *Rewritten 2026-09-14 (spec `2026-09-14-auto-confirm-and-reviewer-feed-design.md`); this
+   rule previously read "pixels are never shown to staff".* Face matching runs on Rekognition
+   today and is being replaced, and a false-positive rate cannot be measured by a reviewer who
+   cannot see the face. So a reviewer may render **the identical blurred image the subject
+   would see** — whole frame blurred, the matched face sharpened only on `reveal=true` — and
+   only through `GET /v1/admin/infringements/{id}/preview` (§3b). Every view writes an audit
+   row naming the operator *before* it renders, and each operator has a daily render ceiling
+   (`429 preview_rate_limited`). A quarantined hit renders to nobody, ever.
+
+   **`image_url` remains text-only evidence.** It ships on the reviewer feed and the review
+   card for URL-context review, and a panel must **never fetch, proxy, cache, render, hotlink
+   or persist** it — nor any other infringing address. The only pixels a panel may display are
+   the bytes the preview route returns, and it must send them `Cache-Control: no-store,
+   private` onward: do not put them in a blob URL that outlives the view, a service worker
+   cache, or a CDN. Article pictures (below) are operator-pasted URLs rendered as links, not
+   images.
 6. **Errors** (4xx/5xx) arrive as `{"error": {"code", "message", "retryable", "request_id"}}`.
    `422` adds `error.details` (`loc` + `msg`). Show `request_id` in error toasts — it is the
    log-correlation handle.
@@ -114,12 +125,107 @@ queue-depth widget.
 - `404 review_task_not_found`: the task is not pending any more (another operator decided it,
   or it was quarantined). Refresh `/next` — this is the normal two-operators race, not a bug.
 
-**UI obligations:** **SUPERSEDED 2026-08-21 (rule 5) — staff never see hit imagery.** No crop,
-no image of any kind: `image_url` and `triage.best_face_bbox` are evidence, shown as plain
-text/numbers for URL-context review, never fetched, proxied, cached, rendered, or hotlinked. The
+**UI obligations:** **Rewritten 2026-09-14 — see rule 5.** `image_url` and
+`triage.best_face_bbox` are still evidence, shown as plain text/numbers, never fetched,
+proxied, cached, rendered or hotlinked. What changed is that a reviewer may now render the
+hit's blurred preview through `GET /v1/admin/infringements/{id}/preview` (§3b) — the same
+image the subject would see, audited per view. That route, and nothing else. The
 severity override select defaults to the triage value; `confirmed` on an `ncii_suspected` hit is
 the highest-consequence action in the whole product — make it deliberate, never one accidental
 click.
+
+## 3b. The reviewer hit feed, verdicts, the preview and the stats *(2026-09-14)*
+
+**Why this exists:** face matching runs on Rekognition today and the team is replacing it with
+its own models. Before that swap they need a *measured* false-positive rate, which means a human
+looking at real hits and recording whether the machine was right. §3's queue shows one task at a
+time and no image; this surface shows every hit, the picture, and a place to record the answer.
+
+**A verdict is a LABEL, not a decision** (owner decision D6). It never changes `confirm_state`
+and never touches a review task — §3's decision route is still the only override. A panel must
+present the two as different actions with different words; "reject" and "the machine was wrong"
+are not the same claim, and conflating them in the UI is how the measurement gets poisoned.
+
+### `GET /v1/admin/hits`
+Query: `limit` (default 50, 1–200), `cursor`, `severity`, `confirm_state` (one of
+`unconfirmed | machine_triaged | confirmed | rejected | duplicate`), `user_ref`, `since`
+(ISO-8601). Every filter is optional and they compose.
+
+```json
+200 {
+  "hits": [{
+    "infringement_id": "uuid", "user_ref": "uuid",
+    "source_domain": "example.com", "page_url": "https://...",
+    "image_url": "https://... | null",        // TEXT EVIDENCE. Never rendered — rule 5.
+    "first_seen_at": "…", "status": "new",
+    "confirm_state": "machine_triaged", "severity": "explicit_unmatched | … | null",
+    "confirm_decided_by": "subject | <operator> | auto:nsfw | null",
+    "confirm_decided_at": "… | null",
+    "face_match_score": 91.25,
+    "moderation_labels": ["Explicit Nudity"],  // names only
+    "duplicate_of": "uuid | null",
+    "preview_available": true,                 // can §3b's preview actually render this?
+    "review_task":      { "task_id", "status", "decision", "decided_by", "decided_at", "severity" } | null,
+    "subject_decision": { "decision", "decided_at" } | null,   // iff the SUBJECT answered
+    "latest_verdict":   { "verdict_id", "operator", "verdict", "note", "created_at" } | null,
+    "source_object_ref": "photo/… | null", "seed_kind": "face_crop | user_supplied | … | null"
+  }],
+  "next_cursor": "opaque string | null"
+}
+```
+- **`quarantined` hits never appear**, whatever the filters say, and `quarantined` is not an
+  accepted `confirm_state` value (it is a `422`). A quarantined hit is CSAM-suspected;
+  escalation out of one is a manual legal process, not a listing.
+- **Paging is keyset, and the cursor is opaque.** Pass the `next_cursor` you were given, byte
+  for byte. `null` means last page. A cursor you construct or mangle is a
+  `422 invalid_cursor` — deliberately not ignored, because silently restarting at page one
+  would have a reviewer re-read the same fifty hits believing they had reached the tail.
+- `preview_available: false` means the hit has no image address or no face box. Do not offer a
+  preview button for it; the route would answer `404 preview_unavailable`.
+
+### `POST /v1/admin/hits/{infringement_id}/verdict` → `201`
+```json
+{ "verdict": "true_positive | false_positive | unsure", "operator": "alice", "note": "optional" }
+```
+Returns the created row, including the snapshot of what the machine said **at the moment of the
+verdict** (`machine_severity`, `face_match_score`, `confirm_state_at_verdict`) — so a later
+severity override cannot rewrite what was measured. `404 infringement_not_found` for an absent
+or quarantined hit. `operator` is required (rule 3): a measurement nobody signed is not a
+measurement. Verdicts are append-only — a second look writes a second row and the feed shows the
+latest.
+
+### `GET /v1/admin/infringements/{id}/preview`
+Query `operator` (**required**) and `reveal` (default `false`). Returns `image/jpeg` with
+`Cache-Control: no-store, private`.
+
+The same render the subject would get: whole frame blurred, and on `reveal=true` **only the
+matched face box** is sharpened — never the frame. There is no parameter that returns a sharp
+image, from any caller.
+
+- `404 infringement_not_found` — absent, or quarantined.
+- `404 preview_unavailable` — no image address or no face box (i.e. `preview_available: false`).
+- `429 preview_rate_limited` — this operator's daily render ceiling. Surface it as "you have
+  viewed a lot of hits today", not as an outage; nothing is broken.
+- Every successful call writes an audit row naming the operator *before* rendering. A refusal
+  writes none.
+
+### `GET /v1/admin/review/stats`
+Query `since` (ISO-8601, default 30 days ago). The measurement, three ways:
+```json
+200 {
+  "since": "…",
+  "by_severity": [{ "machine_severity", "total", "true_positive", "false_positive",
+                    "unsure", "false_positive_rate": 0.5 | null }],
+  "subject_agreement": { "compared", "agreed", "disagreed", "agreement_rate": 0.5 | null },
+  "by_operator":  [{ "operator", "total", "true_positive", "false_positive", "unsure" }]
+}
+```
+- `by_severity` and `subject_agreement` count the **latest verdict per hit**; `by_operator`
+  counts every verdict row, because it is throughput rather than measurement.
+- **A `null` rate means nothing was measured. Render it as "—", never as 0%.** `unsure` counts
+  in `total` and on neither side of a rate; `subject_agreement` compares only hits the subject
+  themselves decided, and excludes `unsure`.
+- Rates are plain floats. (Rule 7's decimal-string rule is about money, not rates.)
 
 ## 4. Threat events
 

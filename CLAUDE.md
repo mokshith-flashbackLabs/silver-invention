@@ -35,6 +35,17 @@ NCMEC's Take It Down, Loti, and Ceartas — not reverse image search. Several ru
   a face box strips the context a person needs to answer "is this you?" honestly; the blur, the tap
   and the subject-only access are what make showing it safe, and §0.2 of that spec records the
   `likely_not_subject` exposure the owner accepted.)*
+  *(Amended again 2026-09-14, spec
+  `docs/superpowers/specs/2026-09-14-auto-confirm-and-reviewer-feed-design.md` — "staff never
+  see hit imagery at all" is no longer true and is replaced rather than quietly dropped. A
+  REVIEWER sees the **identical blurred render the subject would see**, through the audited
+  `GET /v1/admin/infringements/{id}/preview`, for false-positive review: face matching runs on
+  Rekognition today, the team is replacing it, and nobody can measure a false-positive rate
+  without a human who can see the face. It is the same render function with the same arguments —
+  there is still no code path and no request parameter that returns a fully sharp frame — and
+  every view is audited with the operator's name before it happens and ceilinged per operator. A
+  quarantined hit is still rendered to nobody, and `image_url` is still never fetched or
+  rendered by a panel.)*
 - **One kind of hit is shown to nobody at all: a confirmed `ncii_suspected` finding.** Explicit
   content that also face-matched the subject is marked infringing by us — the subject sees no
   preview and is asked no question (owner decision, 2026-09-14, spec

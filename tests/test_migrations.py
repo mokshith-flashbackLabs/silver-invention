@@ -1830,3 +1830,95 @@ def test_0029_down_restores_the_absence_of_a_price(throwaway_db: str) -> None:
             "SELECT cost_per_call_usd FROM providers WHERE provider_id = 'hive'"
         ).fetchone()
     assert cost is not None and cost[0] is None
+
+
+# ── 0033: reviewer verdicts ────────────────────────────────────────────────
+
+
+def test_0033_review_verdicts_is_insert_only_for_search_rw(throwaway_db: str) -> None:
+    """A verdict is a MEASUREMENT, and an editable measurement is not one —
+    the same reasoning (and the same grant shape) as ``score_events`` under
+    0022. ``SET ROLE`` is what carries the weight: the suite connects as the
+    database owner, which reads and writes everything, so without it this test
+    would go green against a missing grant.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        infringement_id, _user_ref = _seed_infringement(conn)
+        conn.execute("SET ROLE search_rw")
+        conn.execute(
+            "INSERT INTO review_verdicts"
+            " (infringement_id, operator, verdict, machine_severity,"
+            "  face_match_score, confirm_state_at_verdict)"
+            " VALUES (%s, 'alice', 'false_positive', 'benign_copy', 91.25, 'machine_triaged')",
+            (infringement_id,),
+        )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE review_verdicts SET verdict = 'true_positive'")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM review_verdicts")
+        conn.execute("RESET ROLE")
+
+
+def test_0033_refuses_an_unnamed_operator_and_an_unknown_verdict(throwaway_db: str) -> None:
+    """The two CHECKs that keep the measurement honest: a verdict nobody
+    signed, and a value outside the three the stats query knows how to count.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        infringement_id, _user_ref = _seed_infringement(conn)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO review_verdicts"
+                " (infringement_id, operator, verdict, confirm_state_at_verdict)"
+                " VALUES (%s, '', 'true_positive', 'machine_triaged')",
+                (infringement_id,),
+            )
+    with (
+        psycopg.connect(throwaway_db, autocommit=True) as conn,
+        pytest.raises(psycopg.errors.CheckViolation),
+    ):
+        conn.execute(
+            "INSERT INTO review_verdicts"
+            " (infringement_id, operator, verdict, confirm_state_at_verdict)"
+            " VALUES (%s, 'alice', 'probably', 'machine_triaged')",
+            (infringement_id,),
+        )
+
+
+def test_0033_creates_the_feed_and_operator_render_indexes(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        indexes = {
+            row[0]
+            for row in conn.execute("SELECT indexname FROM pg_indexes").fetchall()
+        }
+    assert "infringements_feed_keyset_idx" in indexes
+    assert "audit_operator_preview_renders_idx" in indexes
+    # 0024's subject-side index is untouched: there are two ceilings now, not
+    # one moved one.
+    assert "audit_preview_renders_idx" in indexes
+
+
+def test_0033_down_drops_the_table_and_both_indexes(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+    # 0032_, not 0033_: the helper lands with the NAMED migration still
+    # applied, so asking for 0033 would revert nothing and pass vacuously.
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0032_"))
+    assert back.returncode == 0, back.stderr
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        assert "review_verdicts" not in _table_names(conn)  # type: ignore[arg-type]
+        indexes = {
+            row[0]
+            for row in conn.execute("SELECT indexname FROM pg_indexes").fetchall()
+        }
+    assert "infringements_feed_keyset_idx" not in indexes
+    assert "audit_operator_preview_renders_idx" not in indexes
+    assert "audit_preview_renders_idx" in indexes
+
+    forward = run_migrate(throwaway_db, "up")
+    assert forward.returncode == 0, forward.stderr

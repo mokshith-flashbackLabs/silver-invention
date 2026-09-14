@@ -346,6 +346,43 @@ Three properties hold it in place, and none of them is optional:
 repo.** It was raised, named and taken by the owner on that basis. What this file records is
 that the rule was amended rather than quietly broken.
 
+*Amended again, 2026-09-14, same spec — the "staff surfaces never render hit imagery" clause.*
+**Staff now see the IDENTICAL blurred render the subject would see**, through
+`GET /v1/admin/infringements/{id}/preview`, for the purpose of false-positive review. The
+clause it replaces was written when the only staff need was adjudication; it is the wrong rule
+for the need that arrived, which is measurement. Face matching runs on Rekognition today and
+the team is replacing it, and a false-positive rate cannot be measured by a reviewer who
+cannot see the face — that is not review, it is guessing.
+
+Four properties bound it, and the first is the one that keeps #23 intact:
+
+- **The same render, not a staff render.** The admin route calls the same
+  `crop_client.crop(url=…, bbox=…, blur=not reveal)` the subject route builds, from the same
+  `review_tasks.triage` bbox and the same resolved image address. There is **no operator render
+  mode and no request parameter that returns a sharp frame** — whole frame blurred, the matched
+  face sharpened on tap, exactly as for the subject. #23 is unchanged, and it is unchanged
+  structurally rather than by promise, because there is nothing here to configure differently.
+- **Every view is audited, with the operator's name, BEFORE the render** (#31). One
+  `preview.rendered` action for both viewers, distinguished by `actor_type`, so "every render of
+  this hit, by anybody" stays one filter.
+- **Ceilinged per operator** (#32, now two ceilings) — `REVIEW_OPERATOR_DAILY_RENDER_CEILING`,
+  counted separately from the subject's, so a reviewer never spends somebody's own allowance.
+- **`image_url` is still never rendered by a panel.** It ships on the reviewer feed as
+  text-only evidence for URL-context review; the audited preview is the only path by which
+  pixels reach a reviewer, and a quarantined hit reaches nobody at all.
+
+**A reviewer's verdict is a LABEL, not a decision** (owner decision D6). `review_verdicts` is
+append-only (`SELECT, INSERT` only for `search_rw`, migration 0033, the `score_events` shape) and
+records `true_positive` / `false_positive` / `unsure` against a snapshot of the machine's severity
+and score. It never writes `infringements` and never writes `review_tasks`:
+`review/store.py::decide` remains the only override, and this rule's "human decision" still means
+that call or `subject_decide`.
+
+Check: `tests/test_admin_hits_routes.py` — the audit row precedes the crop call and names the
+operator, `reveal=true` passes the subject path's own argument, the ceiling refuses with **no**
+audit row; `tests/test_review.py::test_a_verdict_moves_no_state_and_writes_one_audit_row` (both
+rows byte-identical either side); `tests/test_migrations.py::test_0033_review_verdicts_is_insert_only_for_search_rw`.
+
 **20. Backfill is priority-tiered and rate-limited per user.**
 A new enrolment triggers a search across the entire content index. Without a cap, ten signups
 saturate the cluster.
@@ -385,6 +422,12 @@ be a stranger's, and a blurred stranger's scene is now shown where a blurred str
 *Unchanged 2026-09-14, and worth stating because the auto-confirm change (#19) sits next to it:*
 a confirmed `ncii_suspected` hit is **refused rather than rendered** — its subject gets a `404`,
 not a blurred frame. No code path returns a sharp frame; this one returns no frame at all.
+
+*Still unchanged by the operator preview, same date.* #19 now lets staff see a hit's render, and
+this rule survives it for one structural reason: `GET /v1/admin/infringements/{id}/preview`
+calls the **same render function with the same arguments** the subject route builds
+(`blur=not reveal`). There is no second render path to widen and no operator-only parameter, so
+"no code path returns a fully sharp frame" is still a statement about one code path.
 
 Check: `tests/test_fetcher_render.py::test_no_reveal_returns_a_fully_sharp_frame`, plus
 `test_reveal_leaves_everything_outside_the_face_blurred` — the surround must be as blurred as it is
@@ -453,6 +496,17 @@ writes a row.
 **32. Rate limits on enrolment, liveness attempts, and crop renders are per-`user_id`, not per-IP.**
 A compromised account used as a search console is the abuse case. IP limits do not catch it; a
 per-user crop-render ceiling does.
+
+*Two ceilings as of 2026-09-14, not one.* #19's operator preview creates a second viewer, and it
+has the same abuse case with a worse blast radius: a compromised OPERATOR account replayed as a
+browsing console reaches everybody's hits, not one person's.
+`REVIEW_OPERATOR_DAILY_RENDER_CEILING` (default 500, config — invariant 1b) counts that
+operator's `preview.rendered` rows over the rolling 24h, against migration 0033's partial index
+on `metadata ->> 'operator'`. The subject's count now filters `actor_type = 'subject'`, so a
+reviewer working through somebody's hits can never spend that person's own allowance and lock
+them out of their report. Both are abuse brakes, not quotas: the operator default is far above
+honest review throughput, because a ceiling that binds on somebody doing the work gets raised
+until it does not.
 
 ---
 

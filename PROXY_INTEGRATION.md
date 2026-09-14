@@ -222,6 +222,20 @@ Step 8 adds five and changes one:
 | `POST /v1/admin/providers/{id}/breaker/reset` | Force the breaker closed and clear the failure counter. Body `{ reason }`. Both tokens. Separate from `enable` on purpose: "this provider is fixed, let it back in before the cooldown" and "this provider should be receiving traffic at all" are different decisions |
 | `GET /v1/admin/providers/health` | Per-provider per-day calls, cost, success rate, p50/p99 latency, breaker state, budget headroom, and every firing alarm. Both tokens. Money crosses as decimal **strings** |
 
+The reviewer-feed push (2026-09-14, spec
+`docs/superpowers/specs/2026-09-14-auto-confirm-and-reviewer-feed-design.md`) adds four, all
+admin-gated. They exist because face matching runs on Rekognition today, the team is replacing
+it, and a false-positive rate cannot be measured without a human recording one. The backend's
+`/v1/admin/*` operator proxy is the only client; it injects `operator` from the granted
+`display_name` (its admin-proxy design §5), so no panel sends that field itself.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/admin/hits` | The reviewer feed: every hit, newest first, keyset-paged. Query `limit` (default 50, 1–200), `cursor`, `severity`, `confirm_state` (the five non-quarantined values), `user_ref`, `since`. Returns `{hits: [...], next_cursor: string\|null}`. **Quarantined hits never appear, whatever the filters say** — CSAM-suspected, excluded from every surface, escalation is a manual legal process. The cursor is opaque: pass back what you were given; a mangled one is `422 invalid_cursor`, never ignored. Each row carries `preview_available` — the same fact `svc.v_person_hits` publishes — plus the review task, the subject's decision and the latest reviewer verdict as nested objects. `image_url` ships as **text evidence only**, never to be fetched or rendered by a panel. Both tokens |
+| `POST /v1/admin/hits/{infringement_id}/verdict` | Body `{verdict: "true_positive"\|"false_positive"\|"unsure", operator, note?}`, `extra='forbid'`. `201` with the created row, carrying a snapshot of the machine's severity, face-match score and `confirm_state` **as they were at the moment of the verdict**. **A verdict is a LABEL: it never changes `confirm_state` and never touches `review_tasks`** — `POST /v1/admin/review/{task_id}/decision` remains the only override (owner decision D6). Append-only; a second look writes a second row. `404 infringement_not_found` for absent or quarantined. Both tokens |
+| `GET /v1/admin/infringements/{id}/preview` | The reviewer's view of a hit: **byte-for-byte the render the subject would get** — whole frame blurred, the matched face sharpened only on `reveal=true`, `image/jpeg` with `Cache-Control: no-store, private`. Query `operator` (required) and `reveal` (default false). INVARIANTS #19's "staff never see hit imagery" clause is amended for this route and nothing else; #23 is unchanged because there is no second render path. Every view is audited with the operator's name **before** the render, and ceilinged per operator (`429 preview_rate_limited`). `404 infringement_not_found` (absent/quarantined), `404 preview_unavailable` (no image address or no face box), `502 preview_unavailable_upstream`. Both tokens |
+| `GET /v1/admin/review/stats` | The measurement. Query `since` (default 30 days ago). `{since, by_severity[], subject_agreement, by_operator[]}` — false-positive rate per machine severity over the latest verdict per hit, agreement between subject decisions and reviewer verdicts, and throughput per reviewer. **A rate with a zero denominator is `null`, never `0.0`**: "we measured no false positives" and "we measured nothing" are different claims. Rates are plain floats — the decimal-string rule is about money. Both tokens |
+
 Task 06 adds one more, and it is not admin-gated:
 
 | Endpoint | Purpose |

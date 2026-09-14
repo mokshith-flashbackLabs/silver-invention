@@ -674,17 +674,22 @@ async def handle_message(
                     cause_kind="auto_confirm",
                     cause_ref=str(ctx.infringement_id),
                 )
-            except Exception:
+            except Exception as exc:
                 # Deliberate, and the same shape search/worker.py uses after
                 # execute_run: the confirm has ALREADY COMMITTED, so letting
                 # this raise would redeliver the message and re-run steps 3-8
                 # (a second fetch, a second Rekognition bundle, a second bill)
                 # to no purpose -- the guarded UPDATE would refuse the write
                 # the second time round. The score tick heals the drift.
+                #
+                # `error=str(exc)` because the sibling handler above logs it:
+                # without it a persistently failing recompute is a warning
+                # nobody can diagnose, only count.
                 worker_log.warning(
                     "score.recompute_failed",
                     user_ref=str(ctx.user_ref),
                     cause="auto_confirm",
+                    error=str(exc),
                 )
             return True
 

@@ -981,6 +981,46 @@ under the **existing** budget/breaker/spend machinery unmodified (INVARIANTS #37
 `SearchFacesByImage` calls, capped by config + 1 `DetectModerationLabels`) so the one-row budget check
 stays conservative without special-casing a multi-call unit of work.
 
+### Reviewer verdicts (migration 0033)
+
+```sql
+CREATE TABLE review_verdicts (       -- APPEND-ONLY; a LABEL, never a decision.
+  verdict_id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  infringement_id          UUID NOT NULL REFERENCES infringements(infringement_id) ON DELETE CASCADE,
+  operator                 TEXT NOT NULL CHECK (operator <> ''),
+  verdict                  TEXT NOT NULL CHECK (verdict IN ('true_positive','false_positive','unsure')),
+  note                     TEXT,
+  machine_severity         TEXT CHECK (machine_severity IN (...the five)),
+  face_match_score         NUMERIC(5,2),
+  confirm_state_at_verdict TEXT NOT NULL CHECK (confirm_state_at_verdict IN (...the six)),
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX review_verdicts_latest_idx ON review_verdicts (infringement_id, created_at DESC);
+CREATE INDEX review_verdicts_window_idx ON review_verdicts (created_at DESC);
+GRANT SELECT, INSERT ON review_verdicts TO search_rw;
+```
+
+**Append-only; a label, never a decision.** The grant is `SELECT, INSERT` only — the
+`score_events` shape (0022), for the same reason: an editable measurement is not a measurement.
+And nothing that writes this table writes `infringements` or `review_tasks`, so a verdict cannot
+move a hit's state; `review/store.py::decide` is still the only override (owner decision D6,
+2026-09-14).
+
+Why it is a table rather than two columns on `infringements`: "was the machine right about this
+hit" is a different question from "is this hit infringing", two reviewers may answer the first
+about one hit, and a reviewer may change their mind — the stats read the latest verdict per hit
+and every row survives. Face matching runs on Rekognition today and the team is replacing it;
+this table is how the swap gets a measured false-positive rate instead of an impression.
+
+The three snapshot columns are copied **at the moment of the verdict** rather than joined at read
+time: a rate computed against a severity an operator later overrode would measure the override.
+
+Two indexes beside it, both on existing tables:
+`infringements_feed_keyset_idx (first_seen_at DESC, infringement_id DESC)` for the feed's cursor,
+and `audit_operator_preview_renders_idx` — 0024's partial-index shape keyed on
+`metadata ->> 'operator'` and filtered to `action = 'preview.rendered' AND actor_type =
+'operator'` — for the per-operator render ceiling (INVARIANTS #32, now two ceilings).
+
 ### Protection score, recommendations, threat events (migration 0022)
 
 New role `score_rw`, granted `SELECT, INSERT, UPDATE` on `protection_scores`, `recommendations`,
@@ -1303,12 +1343,20 @@ render gets a row — it is the only way to detect a compromised account being u
 The `action` vocabulary this repo writes, for reference: `confirm.quarantined` and
 `confirm.auto_confirmed` (`actor_type = 'service'`, the confirm worker — the second added
 2026-09-14 for the one sanctioned machine confirm, metadata `{severity, face_match_score,
-decided_by}`); `review.decided` (`'operator'`); `review.subject_decided` and `preview.rendered`
-(`'subject'`); plus `discovery.refused` from `subjects/store.py`.
+decided_by}`); `review.decided` and `review.verdict_recorded` (`'operator'`; the second added
+2026-09-14, metadata `{verdict, operator, machine_severity, confirm_state}` — a LABEL, and its own
+action rather than `review.decided`'s, because only one of the two moved any state);
+`review.subject_decided` (`'subject'`); `preview.rendered` under **both** `'subject'` and
+`'operator'` (one action for two viewers, so "every render of this hit, by anybody" is one filter
+— the operator's name rides in the metadata, and `subject_ref` names whose hit was rendered in
+either case); plus `discovery.refused` from `subjects/store.py`.
 
 It is readable, though, and that is newer than the append-only rule: migration `0025` grants `SELECT`
 to `audit_w` because two features read their own audit rows back — the preview render ceiling
-(INVARIANTS #32, counting `preview.rendered` per `user_ref` over 24h, against `0024`'s partial index)
+(INVARIANTS #32, counting `preview.rendered` per `user_ref` over 24h, against `0024`'s partial index
+— and, since 2026-09-14, a second ceiling counting the same action per OPERATOR against `0033`'s,
+with the subject's count narrowed to `actor_type = 'subject'` so a reviewer never spends somebody
+else's allowance)
 and the subject-decisions observer feed (`review.subject_decided`) — read by the control-room
 console until its 2026-08-29 retirement, now by the panel via the backend's `/v1/admin/*` proxy.
 Both shipped in the 2026-08-21 push against a table no role could read, so both failed with

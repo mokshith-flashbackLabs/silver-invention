@@ -8,6 +8,7 @@ level.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -39,6 +40,7 @@ class FakeReviewStore:
         self._hits = hits
         self.decide_calls: list[dict[str, Any]] = []
         self.limits: list[tuple[str, int]] = []
+        self.stats_calls: list[datetime] = []
 
     async def next_task(self) -> dict[str, Any] | None:
         return self._task
@@ -64,6 +66,45 @@ class FakeReviewStore:
     async def open_hits(self, *, limit: int) -> tuple[dict[str, Any], ...]:
         self.limits.append(("hits", limit))
         return self._hits
+
+    async def verdict_stats(self, *, since: datetime) -> dict[str, Any]:
+        self.stats_calls.append(since)
+        return {
+            "since": since,
+            "by_severity": [
+                {
+                    "machine_severity": "explicit_unmatched",
+                    "total": 3,
+                    "true_positive": 1,
+                    "false_positive": 1,
+                    "unsure": 1,
+                    "false_positive_rate": 0.5,
+                },
+                {
+                    "machine_severity": "benign_copy",
+                    "total": 1,
+                    "true_positive": 0,
+                    "false_positive": 0,
+                    "unsure": 1,
+                    "false_positive_rate": None,
+                },
+            ],
+            "subject_agreement": {
+                "compared": 0,
+                "agreed": 0,
+                "disagreed": 0,
+                "agreement_rate": None,
+            },
+            "by_operator": [
+                {
+                    "operator": "alice",
+                    "total": 4,
+                    "true_positive": 1,
+                    "false_positive": 1,
+                    "unsure": 2,
+                },
+            ],
+        }
 
 
 class FakeScoreStore:
@@ -382,3 +423,48 @@ def test_the_new_feeds_need_both_tokens() -> None:
 
     assert client.get("/v1/admin/review/subject-decisions").status_code == 401
     assert client.get("/v1/admin/review/open-hits", headers=AUTH).status_code == 401
+
+
+# ── GET /v1/admin/review/stats (2026-09-14) ──────────────────────────────
+
+
+def test_stats_defaults_to_a_thirty_day_window() -> None:
+    """The default is computed per request, not at import: a module constant
+    would freeze the window on a long-lived process and the numbers would
+    quietly stop moving."""
+    client, review, _score = make_client()
+
+    before = datetime.now(UTC)
+    response = client.get("/v1/admin/review/stats", headers=ADMIN)
+    after = datetime.now(UTC)
+
+    assert response.status_code == 200
+    (since,) = review.stats_calls
+    assert before - timedelta(days=30) <= since <= after - timedelta(days=30)
+
+
+def test_stats_serialises_a_null_rate_as_null() -> None:
+    """The one field this endpoint must never fabricate. 0.0 would read as
+    "no false positives" out of a window where nobody decided anything."""
+    client, review, _score = make_client()
+
+    body = client.get(
+        "/v1/admin/review/stats",
+        params={"since": "2026-09-01T00:00:00Z"},
+        headers=ADMIN,
+    ).json()
+
+    assert review.stats_calls == [datetime(2026, 9, 1, tzinfo=UTC)]
+    measured, unmeasured = body["by_severity"]
+    assert measured["false_positive_rate"] == 0.5
+    assert unmeasured["false_positive_rate"] is None
+    assert body["subject_agreement"]["agreement_rate"] is None
+    assert body["by_operator"][0]["operator"] == "alice"
+
+
+def test_stats_needs_both_tokens() -> None:
+    client, review, _score = make_client()
+
+    assert client.get("/v1/admin/review/stats").status_code == 401
+    assert client.get("/v1/admin/review/stats", headers=AUTH).status_code == 401
+    assert review.stats_calls == []
