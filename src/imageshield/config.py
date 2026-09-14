@@ -435,6 +435,17 @@ class Config(BaseSettings):
     # product quota.
     preview_daily_render_ceiling: int = 200
 
+    # Per-OPERATOR crop renders per rolling 24h on the admin preview
+    # (INVARIANTS #32, now two ceilings; owner ruling 2026-09-14). The abuse
+    # case is the same one the subject ceiling guards -- a compromised
+    # account replayed as a browsing console -- and the audit row names the
+    # operator, so the ceiling is what stops it rather than what detects it.
+    # 500 is deliberately far above honest review throughput: a reviewer who
+    # opened a different hit every minute for a full eight-hour shift would
+    # reach 480. It is a brake, not a quota, and it must never bind on
+    # somebody doing the work.
+    review_operator_daily_render_ceiling: int = 500
+
     # The CSAM tripwire's low-end age band (moderation labels suggesting a
     # minor, design §7 step 7). Required, with NO default: the age-literal
     # gate in tests/test_boundaries.py bans an inline age comparison in this
@@ -569,6 +580,7 @@ class Config(BaseSettings):
         "confirm_max_faces",
         "confirm_phash_hamming_max",
         "preview_daily_render_ceiling",
+        "review_operator_daily_render_ceiling",
     )
     @classmethod
     def _positive(cls, value: int) -> int:

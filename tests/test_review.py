@@ -10,16 +10,19 @@ actually writes.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 
+from imageshield.confirm.models import AUTO_CONFIRM_DECIDED_BY
 from imageshield.confirm.store import PostgresConfirmStore
 from imageshield.db.connection import make_async_pool
 from imageshield.review.store import (
     REVIEW_DECIDED_ACTION,
+    REVIEW_VERDICT_ACTION,
     SUBJECT_DECIDED_ACTION,
     PostgresReviewStore,
 )
@@ -138,6 +141,28 @@ async def _seeded_infringement(
         face_match_score=91.25,
         moderation_labels=[{"name": "Explicit Nudity", "confidence": 90.0}],
         triage={"face_match_score": 91.25, "best_face_bbox": {"left": 0.1, "top": 0.2}},
+    )
+    return user_ref, infringement_id
+
+
+async def _auto_confirmed_infringement(
+    migrated_db: str, confirm_store: PostgresConfirmStore
+) -> tuple[UserRef, UUID]:
+    """One AUTO-CONFIRMED hit, produced the real way -- through
+    ``record_auto_confirmed`` rather than a hand-written UPDATE, so these
+    tests exercise the row shape the confirm worker actually writes."""
+    user_ref = _user()
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _subject(conn, user_ref)
+        seed_id = _seed(conn, user_ref)
+        run_id = _run(conn, user_ref, seed_id)
+        infringement_id = _infringement(conn, user_ref, run_id)
+    await confirm_store.record_auto_confirmed(
+        infringement_id,
+        phash=77,
+        face_match_score=98.0,
+        moderation_labels=[{"name": "Explicit Nudity", "confidence": 96.0}],
+        triage={"face_match_score": 98.0, "best_face_bbox": {"x": 0.1}},
     )
     return user_ref, infringement_id
 
@@ -852,3 +877,636 @@ async def test_a_redelivered_machine_triage_cannot_clobber_a_subject_decision(
     assert task["status"] == "decided"
     assert task["decided_by"] == "subject"
     assert "redelivered" not in task["triage"]  # the decided task was not reopened
+
+
+# ── the auto-confirm override lane (2026-09-14, owner decision D3) ──────────
+#
+# Neither of these needed a code change: `decide` locks on `status = 'pending'`
+# and its infringement UPDATE carries no `confirm_state` guard, and
+# `subject_decide`'s conflict predicate is "decided by somebody who is not the
+# subject". `record_auto_confirmed` leaves the task `pending` and writes a
+# decider that is not `'subject'`, so both already fall out. They are pinned
+# here because they are the two properties D3 and D4 rest on, and either could
+# be broken by an innocuous-looking change to the other module.
+
+
+async def test_an_operator_can_reject_an_auto_confirmed_hit(
+    migrated_db: str, stores: tuple[PostgresConfirmStore, PostgresReviewStore]
+) -> None:
+    """The override D3 requires. The machine's confirm is not final: the task
+    is still queued, and an operator's `rejected` overwrites both the state
+    and the decider."""
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _auto_confirmed_infringement(
+        migrated_db, confirm_store
+    )
+
+    task = await review_store.next_task()
+    assert task is not None, "an auto-confirmed hit must still be queued for review"
+    assert task["infringement_id"] == infringement_id
+    assert task["severity"] == "ncii_suspected"
+
+    outcome = await review_store.decide(
+        task["task_id"], decision="rejected", operator="frank", severity=None
+    )
+
+    assert outcome is not None
+    assert outcome.decision == "rejected"
+
+    infr = _row(
+        migrated_db,
+        "SELECT confirm_state, confirm_decided_by FROM infringements"
+        " WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infr["confirm_state"] == "rejected"
+    assert infr["confirm_decided_by"] == "frank"
+    assert infr["confirm_decided_by"] != AUTO_CONFIRM_DECIDED_BY
+
+    task_row = _row(
+        migrated_db,
+        "SELECT status, decision, decided_by FROM review_tasks WHERE task_id = %s",
+        (task["task_id"],),
+    )
+    assert task_row["status"] == "decided"
+    assert task_row["decision"] == "rejected"
+    assert task_row["decided_by"] == "frank"
+
+
+@pytest.mark.parametrize("decision", ["confirmed", "rejected"])
+async def test_a_subject_cannot_overturn_a_machine_confirm(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+    decision: str,
+) -> None:
+    """D4's other half. The subject is never shown this hit and never asked
+    about it -- but if a request for one reaches the decision endpoint anyway,
+    it must not be taken. `'auto:nsfw'` is not `'subject'`, so the existing
+    never-overturn-a-non-subject-decision predicate already answers conflict,
+    which the route maps to 409 decision_conflict. Both values, because the
+    "same answer replays" branch must not swallow `confirmed` either."""
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _auto_confirmed_infringement(
+        migrated_db, confirm_store
+    )
+
+    outcome = await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision=decision
+    )
+
+    assert outcome is not None
+    assert outcome.outcome == "conflict"
+
+    infr = _row(
+        migrated_db,
+        "SELECT confirm_state, confirm_decided_by FROM infringements"
+        " WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert infr["confirm_state"] == "confirmed"
+    assert infr["confirm_decided_by"] == AUTO_CONFIRM_DECIDED_BY
+
+
+# ── the reviewer feed (2026-09-14) ───────────────────────────────────────
+#
+# These read through PostgresReviewStore against the real database, so the
+# keyset SQL, the LATERAL joins and the quarantine filter are all exercised
+# as written rather than as remembered.
+
+
+def _set_first_seen(migrated_db: str, infringement_id: UUID, when: datetime) -> None:
+    """Move a hit in the feed's sort order. The keyset is
+    (first_seen_at, infringement_id) DESC, and a fixture that inserts three
+    rows inside one millisecond cannot prove paging is stable."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE infringements SET first_seen_at = %s WHERE infringement_id = %s",
+            (when, infringement_id),
+        )
+
+
+async def _feed_fixture(
+    migrated_db: str, confirm_store: PostgresConfirmStore, count: int
+) -> list[UUID]:
+    """``count`` triaged hits, each one minute older than the last — newest
+    first is therefore the order they were created in, reversed."""
+    base = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+    ids: list[UUID] = []
+    for index in range(count):
+        _user_ref, infringement_id = await _seeded_infringement(
+            migrated_db, confirm_store, severity="benign_copy"
+        )
+        _set_first_seen(migrated_db, infringement_id, base - timedelta(minutes=index))
+        ids.append(infringement_id)
+    return ids
+
+
+async def test_list_hits_pages_stably_across_a_boundary(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """Five hits, two pages of two then a third: every hit appears exactly
+    once, in order, and the page boundary neither repeats nor swallows one.
+
+    The property that matters is the cursor's, not the LIMIT's — an offset
+    pager would also pass a static fixture, and would still lose a row the
+    moment a new hit arrived mid-page."""
+    confirm_store, review_store = stores
+    ids = await _feed_fixture(migrated_db, confirm_store, 5)
+
+    seen: list[UUID] = []
+    after: tuple[datetime, UUID] | None = None
+    for _page in range(3):
+        page = await review_store.list_hits(limit=2, after=after)
+        seen.extend(hit["infringement_id"] for hit in page.hits)
+        if not page.has_more:
+            break
+        last = page.hits[-1]
+        after = (last["first_seen_at"], last["infringement_id"])
+
+    assert seen == ids
+    assert len(seen) == len(set(seen))
+
+
+async def test_list_hits_carries_the_whole_reviewer_row(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """One triaged hit, every field a reviewer needs — including the two that
+    come through the representative-attestation → run → seed chain, which is
+    the part of the query most likely to be silently dropped by a refactor."""
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="explicit_unmatched"
+    )
+
+    page = await review_store.list_hits(limit=10)
+
+    (hit,) = page.hits
+    assert hit["infringement_id"] == infringement_id
+    assert hit["user_ref"] == user_ref
+    assert hit["source_domain"] == "example.test"
+    assert hit["confirm_state"] == "machine_triaged"
+    assert hit["severity"] == "explicit_unmatched"
+    assert hit["face_match_score"] == 91.25
+    # Label NAMES, not the stored {name, confidence} objects.
+    assert hit["moderation_labels"] == ["Explicit Nudity"]
+    assert hit["duplicate_of"] is None
+    # image_url is set and triage carries a bbox object, so 0031's expression
+    # is true — the operator preview can actually render this one.
+    assert hit["preview_available"] is True
+    assert hit["review_task"] is not None
+    assert hit["review_task"]["status"] == "pending"
+    assert hit["review_task"]["severity"] == "explicit_unmatched"
+    # Nobody has decided or labelled it yet.
+    assert hit["subject_decision"] is None
+    assert hit["latest_verdict"] is None
+    # The seed chain: which photo was searched, and in what form.
+    assert hit["source_object_ref"] is not None
+    assert hit["seed_kind"] == "user_supplied"
+
+
+async def test_list_hits_never_shows_a_quarantined_hit_whatever_the_filters(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """A quarantined hit is CSAM-suspected. It is excluded from every svc
+    view and from the subject's surface, and it is excluded here too — by the
+    store's WHERE, so no filter can reach it. The filters are asked to reach
+    it explicitly: by its own severity, and by `confirm_state='quarantined'`,
+    which is the one value the route's Literal does not even accept."""
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="ncii_suspected"
+    )
+    await confirm_store.record_quarantine(
+        infringement_id,
+        phash=11,
+        moderation_labels=[{"name": "Explicit Nudity", "confidence": 99.0}],
+        min_age_low=8.0,
+    )
+
+    unfiltered = await review_store.list_hits(limit=50)
+    by_severity = await review_store.list_hits(limit=50, severity="ncii_suspected")
+    by_user = await review_store.list_hits(limit=50, user_ref=user_ref)
+    by_state = await review_store.list_hits(limit=50, confirm_state="quarantined")
+
+    for page in (unfiltered, by_severity, by_user, by_state):
+        assert [hit["infringement_id"] for hit in page.hits] == []
+
+
+async def test_a_duplicate_hit_IS_in_the_feed_and_is_filterable(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """ONLY `quarantined` is excluded. A `duplicate` hit appears.
+
+    This is a cross-repo contract point, which is why it has its own test
+    rather than riding on the quarantine one. A duplicate is an ordinary hit
+    the confirm pipeline collapsed onto an earlier identical picture -- it is
+    real, it is not CSAM-suspected, and it is exactly the kind of row a
+    reviewer measuring the matcher wants to see. So the feed's
+    `confirm_state` filter has FIVE accepted values, not four, and a caller
+    that offers only four silently hides a whole class of hit.
+
+    The exclusion that IS unconditional is asserted separately, and it is
+    written in the SQL (`confirm_state <> 'quarantined'`) rather than merely
+    never produced by accident.
+    """
+    confirm_store, review_store = stores
+    _original_user, original = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    _dup_user, duplicate = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    await confirm_store.record_duplicate(duplicate, duplicate_of=original, phash=42)
+
+    unfiltered = await review_store.list_hits(limit=50)
+    filtered = await review_store.list_hits(limit=50, confirm_state="duplicate")
+
+    assert duplicate in [hit["infringement_id"] for hit in unfiltered.hits]
+    (only,) = filtered.hits
+    assert only["infringement_id"] == duplicate
+    assert only["confirm_state"] == "duplicate"
+    # It carries its source, so a reviewer can see what it collapsed onto.
+    assert only["duplicate_of"] == original
+
+
+async def test_list_hits_filters_compose(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """Two people, two severities. Each filter narrows, and together they
+    narrow further — not "the last one wins", which is what a WHERE built by
+    string concatenation tends to produce."""
+    confirm_store, review_store = stores
+    wanted_user, wanted = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    _other_user, _other = await _seeded_infringement(
+        migrated_db, confirm_store, severity="unassessed"
+    )
+
+    by_user = await review_store.list_hits(limit=50, user_ref=wanted_user)
+    by_severity = await review_store.list_hits(limit=50, severity="benign_copy")
+    both = await review_store.list_hits(
+        limit=50, user_ref=wanted_user, severity="benign_copy"
+    )
+    contradictory = await review_store.list_hits(
+        limit=50, user_ref=wanted_user, severity="unassessed"
+    )
+
+    assert [hit["infringement_id"] for hit in by_user.hits] == [wanted]
+    assert [hit["infringement_id"] for hit in by_severity.hits] == [wanted]
+    assert [hit["infringement_id"] for hit in both.hits] == [wanted]
+    # Composed, not overridden. This user has no `unassessed` hit, and the
+    # OTHER user does -- so a WHERE where the last filter wins would answer
+    # with theirs.
+    assert list(contradictory.hits) == []
+
+
+async def test_list_hits_since_excludes_older_hits(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    confirm_store, review_store = stores
+    ids = await _feed_fixture(migrated_db, confirm_store, 3)
+    # ids[0] is the newest (12:00), ids[1] 11:59, ids[2] 11:58.
+    cutoff = datetime(2026, 9, 14, 11, 58, 30, tzinfo=UTC)
+
+    page = await review_store.list_hits(limit=50, since=cutoff)
+
+    assert [hit["infringement_id"] for hit in page.hits] == ids[:2]
+
+
+async def test_a_subject_decided_hit_carries_its_subject_decision(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """`subject_decision` is present iff the SUBJECT answered. A reviewer
+    measuring the machine has to be able to tell whose answer they are looking
+    at — an operator's decision and a machine confirm must not read as one."""
+    confirm_store, review_store = stores
+    user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="unassessed"
+    )
+    await review_store.subject_decide(
+        infringement_id, user_ref=user_ref, decision="rejected"
+    )
+    _auto_user, auto_id = await _auto_confirmed_infringement(migrated_db, confirm_store)
+
+    page = await review_store.list_hits(limit=50)
+    by_id = {hit["infringement_id"]: hit for hit in page.hits}
+
+    subject_hit = by_id[infringement_id]
+    assert subject_hit["confirm_decided_by"] == "subject"
+    assert subject_hit["subject_decision"] == {
+        "decision": "rejected",
+        "decided_at": subject_hit["confirm_decided_at"],
+    }
+    # The machine confirm is visible as a hit and carries NO subject decision.
+    assert by_id[auto_id]["confirm_decided_by"] == AUTO_CONFIRM_DECIDED_BY
+    assert by_id[auto_id]["subject_decision"] is None
+
+
+# ── record_verdict: a label, never a decision ────────────────────────────
+
+
+async def test_a_verdict_moves_no_state_and_writes_one_audit_row(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """Owner decision D6, asserted rather than described: the `infringements`
+    row and the `review_tasks` row are byte-identical either side of a
+    verdict. Whole rows, not a field list — a field list only catches the
+    columns somebody thought to name."""
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="explicit_unmatched"
+    )
+    before_hit = _row(
+        migrated_db,
+        "SELECT * FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    before_task = _row(
+        migrated_db,
+        "SELECT * FROM review_tasks WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+
+    record = await review_store.record_verdict(
+        infringement_id, operator="alice", verdict="false_positive", note="wrong face"
+    )
+
+    assert record is not None
+    assert record.verdict == "false_positive"
+    assert record.operator == "alice"
+    assert record.note == "wrong face"
+    # The snapshot: the hit AS IT STOOD, so a later severity override cannot
+    # rewrite what this measurement was about.
+    assert record.machine_severity == "explicit_unmatched"
+    assert record.face_match_score == 91.25
+    assert record.confirm_state_at_verdict == "machine_triaged"
+
+    after_hit = _row(
+        migrated_db,
+        "SELECT * FROM infringements WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    after_task = _row(
+        migrated_db,
+        "SELECT * FROM review_tasks WHERE infringement_id = %s",
+        (infringement_id,),
+    )
+    assert after_hit == before_hit
+    assert after_task == before_task
+
+    audit = _rows(
+        migrated_db,
+        "SELECT action, actor_type, metadata FROM audit_log WHERE resource_id = %s",
+        (infringement_id,),
+    )
+    assert len(audit) == 1
+    assert audit[0]["action"] == REVIEW_VERDICT_ACTION
+    assert audit[0]["actor_type"] == "operator"
+    assert audit[0]["metadata"]["operator"] == "alice"
+    assert audit[0]["metadata"]["verdict"] == "false_positive"
+    assert audit[0]["metadata"]["machine_severity"] == "explicit_unmatched"
+
+
+async def test_two_verdicts_both_survive_and_the_feed_shows_the_latest(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """Append-only in behaviour, not only in grant: a second look writes a
+    second row, and the feed reads the newer one."""
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+
+    await review_store.record_verdict(
+        infringement_id, operator="alice", verdict="false_positive", note=None
+    )
+    second = await review_store.record_verdict(
+        infringement_id, operator="bob", verdict="true_positive", note="on reflection"
+    )
+
+    rows = _rows(
+        migrated_db,
+        "SELECT verdict FROM review_verdicts WHERE infringement_id = %s"
+        " ORDER BY created_at",
+        (infringement_id,),
+    )
+    assert [row["verdict"] for row in rows] == ["false_positive", "true_positive"]
+
+    page = await review_store.list_hits(limit=10)
+    (hit,) = page.hits
+    assert second is not None
+    assert hit["latest_verdict"]["verdict_id"] == second.verdict_id
+    assert hit["latest_verdict"]["verdict"] == "true_positive"
+    assert hit["latest_verdict"]["operator"] == "bob"
+
+
+async def test_record_verdict_is_none_for_an_absent_or_quarantined_hit(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """Both answer None, which the route maps to the same 404. A quarantined
+    hit is excluded from every surface; labelling one would be looking at it."""
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="ncii_suspected"
+    )
+    await confirm_store.record_quarantine(
+        infringement_id,
+        phash=11,
+        moderation_labels=[{"name": "Explicit Nudity", "confidence": 99.0}],
+        min_age_low=8.0,
+    )
+
+    absent = await review_store.record_verdict(
+        uuid4(), operator="alice", verdict="unsure", note=None
+    )
+    quarantined = await review_store.record_verdict(
+        infringement_id, operator="alice", verdict="unsure", note=None
+    )
+
+    assert absent is None
+    assert quarantined is None
+    assert (
+        _rows(migrated_db, "SELECT verdict_id FROM review_verdicts WHERE true", ()) == []
+    )
+
+
+# ── verdict_stats ────────────────────────────────────────────────────────
+
+_WINDOW_START = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+async def test_verdict_stats_counts_the_latest_verdict_per_hit(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """Two hits, three verdicts — one reviewer changed their mind. The rate
+    must describe two hits, not three labels, or a reviewer who looked twice
+    would move the machine's measured accuracy."""
+    confirm_store, review_store = stores
+    _u1, first = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    _u2, second = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    await review_store.record_verdict(
+        first, operator="alice", verdict="false_positive", note=None
+    )
+    # The same hit, looked at again: only this one counts.
+    await review_store.record_verdict(
+        first, operator="alice", verdict="true_positive", note=None
+    )
+    await review_store.record_verdict(
+        second, operator="bob", verdict="false_positive", note=None
+    )
+
+    stats = await review_store.verdict_stats(since=_WINDOW_START)
+
+    (band,) = stats["by_severity"]
+    assert band["machine_severity"] == "benign_copy"
+    assert band["total"] == 2
+    assert band["true_positive"] == 1
+    assert band["false_positive"] == 1
+    assert band["false_positive_rate"] == 0.5
+    # by_operator is EVERY row: alice did two looks, bob one.
+    assert stats["by_operator"] == [
+        {
+            "operator": "alice",
+            "total": 2,
+            "true_positive": 1,
+            "false_positive": 1,
+            "unsure": 0,
+        },
+        {
+            "operator": "bob",
+            "total": 1,
+            "true_positive": 0,
+            "false_positive": 1,
+            "unsure": 0,
+        },
+    ]
+
+
+async def test_verdict_stats_rate_is_none_when_nothing_was_decided(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """`unsure` counts in the total and in NEITHER side of the rate, so a
+    window of nothing but `unsure` has a zero denominator. It must answer
+    None: "we measured no false positives" and "we measured nothing" are
+    different claims, and only one is safe in front of a decision about
+    replacing the matcher."""
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="unassessed"
+    )
+    await review_store.record_verdict(
+        infringement_id, operator="alice", verdict="unsure", note=None
+    )
+
+    stats = await review_store.verdict_stats(since=_WINDOW_START)
+
+    (band,) = stats["by_severity"]
+    assert band["total"] == 1
+    assert band["unsure"] == 1
+    assert band["false_positive_rate"] is None
+    assert stats["subject_agreement"]["compared"] == 0
+    assert stats["subject_agreement"]["agreement_rate"] is None
+
+
+async def test_verdict_stats_measures_subject_agreement(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """Four hits the subject decided and one an operator did.
+
+    Agreement is confirmed-with-true_positive or rejected-with-false_positive.
+    `unsure` is excluded from the comparison rather than scored as a
+    disagreement — it is the absence of an opinion, and counting it would make
+    a cautious reviewer look wrong. The operator-decided hit is excluded too:
+    comparing a reviewer to a reviewer measures nothing.
+    """
+    confirm_store, review_store = stores
+    agree_user, agreeing = await _seeded_infringement(
+        migrated_db, confirm_store, severity="unassessed"
+    )
+    disagree_user, disagreeing = await _seeded_infringement(
+        migrated_db, confirm_store, severity="unassessed"
+    )
+    unsure_user, unsure = await _seeded_infringement(
+        migrated_db, confirm_store, severity="unassessed"
+    )
+    _op_user, operator_decided = await _seeded_infringement(
+        migrated_db, confirm_store, severity="unassessed"
+    )
+
+    await review_store.subject_decide(
+        agreeing, user_ref=agree_user, decision="confirmed"
+    )
+    await review_store.record_verdict(
+        agreeing, operator="alice", verdict="true_positive", note=None
+    )
+    await review_store.subject_decide(
+        disagreeing, user_ref=disagree_user, decision="confirmed"
+    )
+    await review_store.record_verdict(
+        disagreeing, operator="alice", verdict="false_positive", note=None
+    )
+    await review_store.subject_decide(unsure, user_ref=unsure_user, decision="rejected")
+    await review_store.record_verdict(
+        unsure, operator="alice", verdict="unsure", note=None
+    )
+    task_id = _row(
+        migrated_db,
+        "SELECT task_id FROM review_tasks WHERE infringement_id = %s",
+        (operator_decided,),
+    )["task_id"]
+    await review_store.decide(
+        task_id, decision="confirmed", operator="bob", severity=None
+    )
+    await review_store.record_verdict(
+        operator_decided, operator="alice", verdict="true_positive", note=None
+    )
+
+    agreement = (await review_store.verdict_stats(since=_WINDOW_START))[
+        "subject_agreement"
+    ]
+
+    assert agreement == {
+        "compared": 2,
+        "agreed": 1,
+        "disagreed": 1,
+        "agreement_rate": 0.5,
+    }
+
+
+async def test_verdict_stats_window_excludes_older_verdicts(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    await review_store.record_verdict(
+        infringement_id, operator="alice", verdict="false_positive", note=None
+    )
+
+    stats = await review_store.verdict_stats(
+        since=datetime.now(UTC) + timedelta(minutes=1)
+    )
+
+    assert stats["by_severity"] == []
+    assert stats["by_operator"] == []
+    assert stats["subject_agreement"]["compared"] == 0

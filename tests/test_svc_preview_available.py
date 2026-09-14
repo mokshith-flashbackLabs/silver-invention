@@ -61,6 +61,8 @@ def _hit(
     preview_image_url: str | None,
     triage: dict[str, Any] | None,
     confirm_state: str = "machine_triaged",
+    severity: str | None = None,
+    confirm_decided_by: str | None = None,
 ) -> UUID:
     url_hash = uuid4().hex + uuid4().hex
     url = f"https://example.test/{uuid4().hex}"
@@ -69,11 +71,25 @@ def _hit(
         " VALUES (%s, %s, 'example.test', %s)",
         (url_hash, url, url),
     )
+    # 0021's infringements_confirmed_needs_human CHECK wants both decided
+    # columns whenever confirm_state is 'confirmed'.
+    decided_at = "now()" if confirm_decided_by else "NULL"
     row = conn.execute(
         "INSERT INTO infringements"
-        " (user_ref, url_hash, page_url, image_url, preview_image_url, confirm_state)"
-        " VALUES (%s, %s, %s, %s, %s, %s) RETURNING infringement_id",
-        (user_ref, url_hash, url, image_url, preview_image_url, confirm_state),
+        " (user_ref, url_hash, page_url, image_url, preview_image_url, confirm_state,"
+        " severity, confirm_decided_by, confirm_decided_at)"
+        f" VALUES (%s, %s, %s, %s, %s, %s, %s, %s, {decided_at})"
+        " RETURNING infringement_id",
+        (
+            user_ref,
+            url_hash,
+            url,
+            image_url,
+            preview_image_url,
+            confirm_state,
+            severity,
+            confirm_decided_by,
+        ),
     ).fetchone()
     assert row is not None
     infringement_id: UUID = row[0]
@@ -139,3 +155,43 @@ async def test_view_column_matches_the_render_path(
         f"(view={from_view}, render={renderable}) — a card would promise an "
         f"image the preview cannot serve"
     )
+
+
+async def test_a_restricted_finding_still_reports_that_a_picture_exists(
+    migrated_db: str, store: PostgresPreviewStore
+) -> None:
+    """2026-09-14. A confirmed `ncii_suspected` hit is never shown to its
+    subject (owner decision D4) -- but `preview_available` does NOT mean "the
+    subject may look at this", it means "a picture exists", and that is what
+    it must keep meaning.
+
+    The refusal lives in the route (`http/routes/infringements.py`), not in
+    `_TARGET_SQL` and not in the view. Teaching either of those about the
+    restriction would make this column answer a different question from the
+    one 0031 published, and the proxy reads it to decide whether a hit can be
+    rendered at all -- a question whose answer here is still yes.
+    """
+    user_ref = UserRef(uuid4())
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        hit_id = _hit(
+            conn,
+            user_ref,
+            image_url="https://cdn.test/restricted.jpg",
+            preview_image_url=None,
+            triage={"best_face_bbox": BBOX},
+            confirm_state="confirmed",
+            severity="ncii_suspected",
+            confirm_decided_by="auto:nsfw",
+        )
+        from_view = _view_says(conn, hit_id)
+
+    target = await store.target(hit_id, user_ref)
+    assert target is not None
+    renderable = target.image_url is not None and target.bbox is not None
+
+    assert from_view is True
+    assert renderable is True
+    assert from_view is renderable
+
+    # And the flag the route refuses on rides beside it, unconflated.
+    assert target.restricted is True

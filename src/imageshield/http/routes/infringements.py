@@ -67,6 +67,22 @@ def _not_found() -> ServiceError:
     )
 
 
+def _preview_unavailable() -> ServiceError:
+    # Shared by the two pre-render refusals: a RESTRICTED hit (confirmed +
+    # ncii_suspected -- the subject is shown nothing, 2026-09-14) and a hit
+    # with nothing to render yet. They must stay byte-identical, or the
+    # difference becomes a signal telling a caller which of the two they hit,
+    # and "this one is restricted" is a disclosure about somebody's abuse.
+    # One constructor is what makes that true rather than a coincidence of
+    # two matching literals (tests/test_preview_routes.py asserts it).
+    return ServiceError(
+        404,
+        "preview_unavailable",
+        "No renderable crop for this hit yet.",
+        retryable=False,
+    )
+
+
 @router.post("/infringements/{infringement_id}/feedback")
 async def record_feedback(
     infringement_id: UUID,
@@ -108,21 +124,34 @@ async def preview(
     app's per-item explicit tap, INVARIANTS #23); every render is audited
     before it happens (#31) and rate-ceilinged per user (#32); the JPEG is
     streamed with ``no-store`` and persisted nowhere (#9/#10). The bbox and
-    image_url are looked up server-side and never reach the client (#13)."""
+    image_url are looked up server-side and never reach the client (#13).
+
+    Since 2026-09-14 a confirmed ``ncii_suspected`` hit is refused outright --
+    the subject never sees it and is never asked about it. INVARIANTS #23 is
+    unchanged by that: no code path returns a sharp frame, and this one
+    returns no frame at all."""
     subject = parse_user_ref(user_ref)
     target = await store.target(infringement_id, subject)
     if target is None:
         raise _not_found()
+    if target.restricted:
+        # A confirmed `ncii_suspected` finding: explicit AND a face match to
+        # this subject. Owner decision D4 (2026-09-14) -- we marked it
+        # infringing ourselves, so the subject is shown nothing and asked
+        # nothing; the backend refuses its half of the surface in parallel and
+        # this is the defence in depth behind it.
+        #
+        # BEFORE the ceiling and BEFORE record_render on purpose: a refused
+        # render is not an attempt, so nothing is audited (INVARIANTS #31 is
+        # about renders that happened) and nothing is charged to the daily
+        # ceiling (#32). Same code and message as the no-bbox case below, so
+        # this adds no signal a caller could read the restriction off.
+        raise _preview_unavailable()
     if target.image_url is None or target.bbox is None:
         # Only reachable once ownership passed, so the distinct code leaks
         # nothing cross-user. The app falls back to domain + "no preview";
         # the subject can still decide.
-        raise ServiceError(
-            404,
-            "preview_unavailable",
-            "No renderable crop for this hit yet.",
-            retryable=False,
-        )
+        raise _preview_unavailable()
     if await store.renders_last_24h(subject) >= cfg.preview_daily_render_ceiling:
         raise ServiceError(
             429,

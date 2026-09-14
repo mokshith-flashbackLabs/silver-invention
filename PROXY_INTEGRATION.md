@@ -208,8 +208,8 @@ Full shapes in `docs/services/identity.md`. Summary:
 | `GET /v1/liveness/{sid}` | Read session status, `enrolled`, and `consent_ref` (built, steps 3–4). Pure read — no side effects; enrolment is triggered by the result call |
 | `DELETE /v1/enrolments/{user_ref}` | `DeleteFaces` → verify via `ListFaces` → tombstone (built, step 4). Idempotent 204; nothing calls it in v1. Full user deletion (`DELETE /v1/users/{id}`) remains specified-not-built — this is the enrolment-owning piece of it |
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |
-| `GET /v1/infringements/{id}/preview` | **Built (2026-08-21; supersedes the `GET /v1/hits/{hit_id}/crop` entry that was specified here earlier).** The subject's blurred face crop, streamed `image/jpeg`, `Cache-Control: no-store, private`. Query: `user_ref` (required), `reveal` (bool, default false — the per-item explicit tap unblurs). Errors: `404 infringement_not_found` (absent/not-yours/invisible — one indistinguishable answer), `404 preview_unavailable` (no crop renderable yet — render domain + "no preview"; the subject can still decide), `429 preview_rate_limited` (per-user daily ceiling, retryable), `502 preview_unavailable_upstream` (retryable). Every render is audit-logged |
-| `POST /v1/infringements/{id}/decision` | **Built (2026-08-21).** Body `{user_ref, decision: "confirmed"\|"rejected"}`. The subject's answer IS the confirm/reject (`decided_by='subject'`). Idempotent: the same decision repeated → `200` with `idempotent_replay: true`; a different one, or one against an operator decision → `409 decision_conflict` (no re-decide in v1). `rejected` also sets `status='dismissed_not_me'`. Triggers a score recompute (`cause_kind='subject_decision'`) — a subject's `confirmed` moves Exposure like an operator confirm |
+| `GET /v1/infringements/{id}/preview` | **Built (2026-08-21; supersedes the `GET /v1/hits/{hit_id}/crop` entry that was specified here earlier).** The subject's blurred face crop, streamed `image/jpeg`, `Cache-Control: no-store, private`. Query: `user_ref` (required), `reveal` (bool, default false — the per-item explicit tap unblurs). Errors: `404 infringement_not_found` (absent/not-yours/invisible — one indistinguishable answer), `404 preview_unavailable` (no crop renderable yet — render domain + "no preview"; the subject can still decide), `429 preview_rate_limited` (per-user daily ceiling, retryable), `502 preview_unavailable_upstream` (retryable). Every render is audit-logged. **Since 2026-09-14 a hit with `confirm_state = 'confirmed'` AND `severity = 'ncii_suspected'` is REFUSED here** with the same `404 preview_unavailable` — the subject is never shown it (owner decision; INVARIANTS #19/#47 amended). The refusal lands before the ceiling and before the audit row, so it neither charges a render nor records one. Same code and message as an unrenderable hit, deliberately: nothing in the response distinguishes the two. Derive the restricted card from the two columns you already read on `v_person_hits`; `preview_available` still means "a picture exists" and is unaffected |
+| `POST /v1/infringements/{id}/decision` | **Built (2026-08-21).** Body `{user_ref, decision: "confirmed"\|"rejected"}`. The subject's answer IS the confirm/reject (`decided_by='subject'`). Idempotent: the same decision repeated → `200` with `idempotent_replay: true`; a different one, or one against an operator decision → `409 decision_conflict` (no re-decide in v1). **Since 2026-09-14 the same `409` also covers a MACHINE confirm** — an auto-confirmed `ncii_suspected` hit carries `confirm_decided_by = 'auto:nsfw'`, which is not `'subject'`, so either decision value answers conflict. Do not offer the ask-card for such a hit at all; this is the backstop, not the surface. `rejected` also sets `status='dismissed_not_me'`. Triggers a score recompute (`cause_kind='subject_decision'`) — a subject's `confirmed` moves Exposure like an operator confirm |
 | `POST /v1/admin/backfill` | Trigger a backfill run. Admin token required |
 
 Step 8 adds five and changes one:
@@ -221,6 +221,20 @@ Step 8 adds five and changes one:
 | `POST /v1/admin/providers/{id}/enable` | Body `{ reason }`. Both tokens |
 | `POST /v1/admin/providers/{id}/breaker/reset` | Force the breaker closed and clear the failure counter. Body `{ reason }`. Both tokens. Separate from `enable` on purpose: "this provider is fixed, let it back in before the cooldown" and "this provider should be receiving traffic at all" are different decisions |
 | `GET /v1/admin/providers/health` | Per-provider per-day calls, cost, success rate, p50/p99 latency, breaker state, budget headroom, and every firing alarm. Both tokens. Money crosses as decimal **strings** |
+
+The reviewer-feed push (2026-09-14, spec
+`docs/superpowers/specs/2026-09-14-auto-confirm-and-reviewer-feed-design.md`) adds four, all
+admin-gated. They exist because face matching runs on Rekognition today, the team is replacing
+it, and a false-positive rate cannot be measured without a human recording one. The backend's
+`/v1/admin/*` operator proxy is the only client; it injects `operator` from the granted
+`display_name` (its admin-proxy design §5), so no panel sends that field itself.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/admin/hits` | The reviewer feed: every hit, newest first, keyset-paged. Query `limit` (default 50, 1–200), `cursor`, `severity`, `confirm_state` (the five non-quarantined values), `user_ref`, `since`. Returns `{hits: [...], next_cursor: string\|null}`. **Quarantined hits never appear, whatever the filters say** — CSAM-suspected, excluded from every surface, escalation is a manual legal process. The cursor is opaque: pass back what you were given; a mangled one is `422 invalid_cursor`, never ignored. Each row carries `preview_available` — the same fact `svc.v_person_hits` publishes — plus the review task, the subject's decision and the latest reviewer verdict as nested objects. `image_url` ships as **text evidence only**, never to be fetched or rendered by a panel. Both tokens |
+| `POST /v1/admin/hits/{infringement_id}/verdict` | Body `{verdict: "true_positive"\|"false_positive"\|"unsure", operator, note?}`, `extra='forbid'`. `201` with the created row, carrying a snapshot of the machine's severity, face-match score and `confirm_state` **as they were at the moment of the verdict**. **A verdict is a LABEL: it never changes `confirm_state` and never touches `review_tasks`** — `POST /v1/admin/review/{task_id}/decision` remains the only override (owner decision D6). Append-only; a second look writes a second row. `404 infringement_not_found` for absent or quarantined. Both tokens |
+| `GET /v1/admin/infringements/{id}/preview` | The reviewer's view of a hit: **byte-for-byte the render the subject would get** — whole frame blurred, the matched face sharpened only on `reveal=true`, `image/jpeg` with `Cache-Control: no-store, private`. Query `operator` (required) and `reveal` (default false). INVARIANTS #19's "staff never see hit imagery" clause is amended for this route and nothing else; #23 is unchanged because there is no second render path. Every view is audited with the operator's name **before** the render, and ceilinged per operator (`429 preview_rate_limited`). `404 infringement_not_found` (absent/quarantined), `404 preview_unavailable` (no image address or no face box), `502 preview_unavailable_upstream`. Both tokens |
+| `GET /v1/admin/review/stats` | The measurement. Query `since` (default 30 days ago). `{since, by_severity[], subject_agreement, by_operator[]}` — false-positive rate per machine severity over the latest verdict per hit, agreement between subject decisions and reviewer verdicts, and throughput per reviewer. **A rate with a zero denominator is `null`, never `0.0`**: "we measured no false positives" and "we measured nothing" are different claims. Rates are plain floats — the decimal-string rule is about money. Both tokens |
 
 Task 06 adds one more, and it is not admin-gated:
 
@@ -495,7 +509,16 @@ decision endpoint. Copy is keyed on the machine outcome, and `severity` is **not
 `unconfirmed` (not yet triaged, or the spend gate skipped it) renders "being checked", ask-able
 without an image — it may stay there indefinitely and must not time out or auto-promote.
 `confirmed` presents as a finding with severity-driven urgency copy; note `severity` can be `null`
-on a hit decided before triage ran. `rejected` and `dismissed_not_me` retire from default views.
+on a hit decided before triage ran.
+
+**`confirmed` + `ncii_suspected` is a RESTRICTED finding, as of 2026-09-14.** We marked it
+infringing without asking the subject — explicit content that also face-matched them — and they are
+shown nothing and asked nothing about it: no preview, no decision, no action. The contract is
+deliberately narrow: **no `svc` view changed**, and you derive this from the two columns you already
+read, `confirm_state` and `severity`. It is not keyed on `confirm_decided_by`, so an
+OPERATOR-confirmed `ncii_suspected` hit presents identically — one predicate on both sides is what
+stops the two repos drifting. It still counts as a finding and still moves the score; what it has is
+no ask-card and no pixels. `rejected` and `dismissed_not_me` retire from default views.
 Quarantined and duplicate rows never appear anywhere. Scope discipline (#26) still applies to every
 state's copy.
 

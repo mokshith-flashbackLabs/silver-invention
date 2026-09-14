@@ -107,6 +107,7 @@ class FakeConfirmStore:
         self.duplicates: list[tuple[UUID, UUID, int]] = []
         self.quarantines: list[tuple[UUID, int | None, list[dict[str, object]], float | None]] = []
         self.triages: list[dict[str, object]] = []
+        self.auto_confirmed: list[dict[str, object]] = []
         self.skipped: list[tuple[UUID, str, str]] = []
 
     async def load_context(self, infringement_id: UUID) -> ConfirmContext | None:
@@ -144,6 +145,25 @@ class FakeConfirmStore:
             {
                 "infringement_id": infringement_id,
                 "severity": severity,
+                "phash": phash,
+                "face_match_score": face_match_score,
+                "moderation_labels": moderation_labels,
+                "triage": triage,
+            }
+        )
+
+    async def record_auto_confirmed(
+        self,
+        infringement_id: UUID,
+        *,
+        phash: int | None,
+        face_match_score: float | None,
+        moderation_labels: list[dict[str, object]] | None,
+        triage: dict[str, object],
+    ) -> None:
+        self.auto_confirmed.append(
+            {
+                "infringement_id": infringement_id,
                 "phash": phash,
                 "face_match_score": face_match_score,
                 "moderation_labels": moderation_labels,
@@ -208,6 +228,28 @@ class FakeModeration:
         return self._signal
 
 
+class FakeScoreStore:
+    """Only ``recompute`` is reached from the worker; the rest of the
+    ``ScoreStore`` Protocol is unimplemented on purpose -- a fake that grows
+    methods nothing calls stops being evidence about the caller."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self._error = error
+        self.recomputes: list[tuple[UserRef, str, str | None]] = []
+
+    async def recompute(
+        self,
+        user_ref: UserRef,
+        *,
+        cause_kind: str,
+        cause_ref: str | None = None,
+        now: object = None,
+    ) -> None:
+        self.recomputes.append((user_ref, cause_kind, cause_ref))
+        if self._error is not None:
+            raise self._error
+
+
 async def _fetch_ok(url: str) -> bytes | None:
     return IMAGE_BYTES
 
@@ -225,6 +267,7 @@ def _deps(
     moderation: FakeModeration | None = None,
     fetch: object = _fetch_ok,
     fetch_page: object = None,
+    score: FakeScoreStore | None = None,
 ) -> ConfirmDeps:
     default_control = FakeControlStore({REKOGNITION_CONFIRM_ID: runtime(REKOGNITION_CONFIRM_ID)})
     default_moderation = FakeModeration(ModerationSignal(labels=(), min_age_low=None))
@@ -235,6 +278,7 @@ def _deps(
         moderation=moderation if moderation is not None else default_moderation,
         fetch=fetch,  # type: ignore[arg-type]
         fetch_page=fetch_page if fetch_page is not None else _fetch_page_none,  # type: ignore[arg-type]
+        score=score if score is not None else FakeScoreStore(),  # type: ignore[arg-type]
         face_match_threshold=92.0,
         max_faces=3,
         phash_hamming_max=8,
@@ -489,21 +533,78 @@ async def test_skip_with_no_run_id_skips_control_record_but_still_records_skippe
     assert len(store.skipped) == 1
 
 
-async def test_happy_path_ncii_records_triage_with_ncii_suspected() -> None:
+# ── 2026-09-14: ncii_suspected auto-confirms; the other four still triage ──
+#
+# Owner decision D3. `explicit_unmatched` -- explicit but the face match
+# FAILED -- deliberately stays a human decision, because a failed face match
+# is the strongest false-positive signal this pipeline has.
+
+
+async def test_happy_path_ncii_auto_confirms_and_never_triages() -> None:
     ctx = _ctx()
     store = FakeConfirmStore(ctx)
+    score = FakeScoreStore()
     provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
     moderation = FakeModeration(ModerationSignal(labels=(EXPLICIT_LABEL,), min_age_low=30.0))
-    deps = _deps(store=store, provider=provider, moderation=moderation)
+    deps = _deps(store=store, provider=provider, moderation=moderation, score=score)
 
     handled = await handle_message(_body(ctx.infringement_id), deps)
 
     assert handled is True
-    assert len(store.triages) == 1
-    triage = store.triages[0]
-    assert triage["severity"] == "ncii_suspected"
-    assert triage["face_match_score"] == 97.0
+    assert store.triages == [], "an auto-confirmed hit is never machine-triaged as well"
+    assert len(store.auto_confirmed) == 1
+    recorded = store.auto_confirmed[0]
+    assert recorded["infringement_id"] == ctx.infringement_id
+    assert recorded["face_match_score"] == 97.0
+    # The triage payload is the one record_triage would have built -- the
+    # reviewer's working notes are the same whichever branch ran.
+    triage = recorded["triage"]
+    assert isinstance(triage, dict)
+    assert triage["best_face_bbox"] == {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}
+    assert triage["moderation_labels"] == ["Explicit Nudity"]
     assert store.quarantines == []
+    # The exposure is real, so the score moves now rather than at the next run.
+    assert score.recomputes == [(USER_REF, "auto_confirm", str(ctx.infringement_id))]
+
+
+async def test_explicit_but_unmatched_still_only_triages() -> None:
+    """D3's boundary, asserted from the other side: explicit content whose
+    face match did NOT clear the threshold goes to a human, not to the
+    auto-confirm branch."""
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+    score = FakeScoreStore()
+    # No matches at all -> resolve_face yields match_score None -> unmatched.
+    provider = FakeAttributionProvider(faces=(_face(),), matches=())
+    moderation = FakeModeration(ModerationSignal(labels=(EXPLICIT_LABEL,), min_age_low=30.0))
+    deps = _deps(store=store, provider=provider, moderation=moderation, score=score)
+
+    handled = await handle_message(_body(ctx.infringement_id), deps)
+
+    assert handled is True
+    assert store.auto_confirmed == []
+    assert len(store.triages) == 1
+    assert store.triages[0]["severity"] == "explicit_unmatched"
+    assert score.recomputes == [], "a triage is not a confirm and moves no score"
+
+
+async def test_a_failing_score_store_does_not_redeliver_the_message() -> None:
+    """The confirm has already COMMITTED by the time the recompute runs, so a
+    redelivery would re-fetch and re-bill the Rekognition bundle to write
+    nothing (the guarded UPDATE refuses the second time). Log, delete, let
+    the score tick heal the drift -- the same contract search/worker.py takes
+    after execute_run."""
+    ctx = _ctx()
+    store = FakeConfirmStore(ctx)
+    score = FakeScoreStore(error=RuntimeError("score store down"))
+    provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
+    moderation = FakeModeration(ModerationSignal(labels=(EXPLICIT_LABEL,), min_age_low=30.0))
+    deps = _deps(store=store, provider=provider, moderation=moderation, score=score)
+
+    handled = await handle_message(_body(ctx.infringement_id), deps)
+
+    assert handled is True, "a failed recompute must not redeliver a committed confirm"
+    assert len(store.auto_confirmed) == 1
 
 
 async def test_csam_path_quarantines_and_never_triages() -> None:

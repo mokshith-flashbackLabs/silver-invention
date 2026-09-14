@@ -727,6 +727,157 @@ class ReviewTaskResponse(BaseModel):
     source_domain: str
 
 
+# ── the reviewer hit feed, verdicts and stats (2026-09-14) ───────────────
+#
+# A VERDICT IS A LABEL, NOT A DECISION (owner decision D6). Nothing in this
+# section can move `confirm_state`; `ReviewDecisionRequest` above is still the
+# only thing that can. They are near-neighbours in this file and read
+# similarly, which is exactly why it is worth saying here too.
+
+ReviewVerdict = Literal["true_positive", "false_positive", "unsure"]
+
+# The five confirm_states a reviewer may filter on. `quarantined` is the sixth
+# and is deliberately absent: a quarantined hit is excluded from the feed
+# whatever the filter says, so offering it as a filter value would be offering
+# a query that can only ever return nothing.
+HitFilterConfirmState = Literal[
+    "unconfirmed", "machine_triaged", "confirmed", "rejected", "duplicate"
+]
+
+
+class ReviewVerdictRequest(ServiceModel):
+    """``operator`` is data, not auth (ADMIN_PANEL_INTEGRATION rule 3): the
+    backend proxy authenticates its human and injects the granted
+    ``display_name``. It is required because a measurement nobody signed is
+    not a measurement."""
+
+    verdict: ReviewVerdict
+    operator: str = Field(min_length=1, max_length=64)
+    note: str | None = None
+
+
+class ReviewVerdictResponse(BaseModel):
+    verdict_id: UUID
+    infringement_id: UUID
+    operator: str
+    verdict: str
+    note: str | None
+    # The hit AS IT STOOD when the verdict was written — see
+    # review/store.py's _VERDICT_TARGET_SQL for why these are snapshots.
+    machine_severity: str | None
+    face_match_score: float | None
+    confirm_state_at_verdict: str
+    created_at: datetime
+
+
+class AdminHitReviewTask(BaseModel):
+    task_id: UUID
+    status: str
+    decision: str | None
+    decided_by: str | None
+    decided_at: datetime | None
+    severity: str
+
+
+class AdminHitSubjectDecision(BaseModel):
+    """Present only when ``confirm_decided_by = 'subject'`` — the person in
+    the photo answered. An operator-decided or machine-confirmed hit has none,
+    which is what makes this field readable as "whose answer is this"."""
+
+    decision: str
+    decided_at: datetime | None
+
+
+class AdminHitVerdict(BaseModel):
+    verdict_id: UUID
+    operator: str
+    verdict: str
+    note: str | None
+    created_at: datetime
+
+
+class AdminHitItem(BaseModel):
+    """One row of the reviewer feed.
+
+    ``image_url`` ships here and NOWHERE user-facing (contrast
+    ``InfringementItem`` above, which had it removed). It is evidence for
+    URL-context review — a panel must never fetch, proxy, cache, render or
+    hotlink it (ADMIN_PANEL_INTEGRATION rule 5). The only way pixels reach a
+    reviewer is ``GET /v1/admin/infringements/{id}/preview``, which renders
+    the same blurred frame the subject would get and audits every view.
+
+    ``preview_available`` says whether that route can render at all: an
+    address AND a face box must both exist. It is the same expression
+    ``svc.v_person_hits`` publishes (migration 0031).
+    """
+
+    infringement_id: UUID
+    user_ref: UserRef
+    source_domain: str
+    page_url: str
+    image_url: str | None
+    first_seen_at: datetime
+    status: str
+    confirm_state: str
+    severity: str | None
+    confirm_decided_by: str | None
+    confirm_decided_at: datetime | None
+    face_match_score: float | None
+    # Label NAMES only — text about the image, never the image (INVARIANTS #9).
+    moderation_labels: list[str]
+    duplicate_of: UUID | None
+    preview_available: bool
+    review_task: AdminHitReviewTask | None
+    subject_decision: AdminHitSubjectDecision | None
+    latest_verdict: AdminHitVerdict | None
+    # The seed this hit came back from: which photo of theirs was searched,
+    # and whether it was the whole photo or a face crop (0029). A reviewer
+    # measuring false positives needs to know which.
+    source_object_ref: str | None
+    seed_kind: str | None
+
+
+class AdminHitsResponse(BaseModel):
+    hits: list[AdminHitItem]
+    # Opaque and keyset-based. Null means this is the last page — never an
+    # empty string, which a client would have to special-case.
+    next_cursor: str | None
+
+
+class ReviewStatsSeverityItem(BaseModel):
+    machine_severity: str | None
+    total: int
+    true_positive: int
+    false_positive: int
+    unsure: int
+    # fp / (tp + fp), or NULL when nobody has decided either way in the
+    # window. Never 0.0 for an empty window: "we measured no false positives"
+    # and "we measured nothing" are different claims.
+    false_positive_rate: float | None
+
+
+class ReviewStatsSubjectAgreement(BaseModel):
+    compared: int
+    agreed: int
+    disagreed: int
+    agreement_rate: float | None
+
+
+class ReviewStatsOperatorItem(BaseModel):
+    operator: str
+    total: int
+    true_positive: int
+    false_positive: int
+    unsure: int
+
+
+class ReviewStatsResponse(BaseModel):
+    since: datetime
+    by_severity: list[ReviewStatsSeverityItem]
+    subject_agreement: ReviewStatsSubjectAgreement
+    by_operator: list[ReviewStatsOperatorItem]
+
+
 # ── scores (Task 15) ─────────────────────────────────────────────────────
 
 

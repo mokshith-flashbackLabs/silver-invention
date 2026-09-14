@@ -18,6 +18,7 @@ recomputing on a no-op write would just be a wasted read.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +31,7 @@ from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
     ReviewDecisionRequest,
     ReviewDecisionResponse,
+    ReviewStatsResponse,
     ReviewTaskResponse,
 )
 from imageshield.review.store import ReviewStore
@@ -91,6 +93,40 @@ async def open_hits(
     sees THAT a person has a hit (owner requirement, 2026-08-21) — what it
     never sees is the hit's pixels."""
     return {"hits": list(await store.open_hits(limit=limit))}
+
+
+# The stats window's default, 30 days. A function rather than a module
+# constant: a constant is evaluated at import, so on a long-lived process the
+# window would silently stop moving.
+_DEFAULT_STATS_DAYS = 30
+
+
+def _default_since() -> datetime:
+    return datetime.now(UTC) - timedelta(days=_DEFAULT_STATS_DAYS)
+
+
+@router.get("/stats")
+async def verdict_stats(
+    since: datetime | None = Query(None),
+    store: ReviewStore = Depends(get_review_store),
+) -> ReviewStatsResponse:
+    """How often the machine was right, by severity, against the subject, and
+    by reviewer (2026-09-14).
+
+    This route is the reason `review_verdicts` exists: face matching runs on
+    Rekognition today and is being replaced, and the swap needs a measured
+    false-positive rate rather than an impression. It lives on the REVIEW
+    router rather than beside the feed in ``admin_hits.py`` because it is a
+    statement about reviewing, not about hits.
+
+    A rate whose denominator is zero comes back ``null``. Never 0.0 — "we
+    measured no false positives" and "we measured nothing" are different
+    claims, and only one of them should be allowed anywhere near a decision
+    about replacing a matcher.
+    """
+    return ReviewStatsResponse(
+        **await store.verdict_stats(since=since if since is not None else _default_since())
+    )
 
 
 @router.post("/{task_id}/decision")
