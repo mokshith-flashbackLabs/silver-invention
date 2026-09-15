@@ -810,7 +810,7 @@ GRANT SELECT ON svc.v_person_enrolment_state, svc.v_person_report_summary,
 |---|---|---|
 | `v_person_enrolment_state` | `enrolments` (active only) | Feeds the proxy's `v_covered_persons`. Status, `model_id`, timestamp — never a vector, never an `external_face_id` (INVARIANTS #14) |
 | `v_person_report_summary` | `subjects` LEFT JOIN aggregates | The home-screen numbers, including `live_exposure_count` |
-| `v_person_hits` | `infringements` + representative attestation | One row per hit, with provenance to the seed and the attributed face |
+| `v_person_hits` | `infringements` + representative attestation | One row per hit, with provenance to the seed and the attributed face. **0034 appends `face_match_score`** — the raw NUMERIC(5,2) off `infringements`, NULL when no check ever ran. The proxy's report-inclusion floor is 80 and `confirm_face_match_threshold` is 92; they answer different questions ("worth telling them about" vs "confident enough to call it them"), so the view publishes the quantity and each side keeps its own threshold |
 | `v_person_liveness_attempts` | `liveness_sessions`, 24h window | The rate-limit pre-check |
 
 **Why views and not HTTP.** The proxy's own views JOIN against `v_person_enrolment_state`, and their

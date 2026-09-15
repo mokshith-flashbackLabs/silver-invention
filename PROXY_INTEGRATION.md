@@ -704,7 +704,7 @@ feedback signal and a new `hit_status` value threaded through both `v_person_hit
 |---|---|
 | `svc.v_person_enrolment_state` | `person_ref`, `status`, `model_id`, `enrolled_at` |
 | `svc.v_person_report_summary` | `person_ref`, `active_reports`, `unresolved_matches`, `live_exposure_count`, `last_run_at`, `first_scan_completed_at`, `monitored_sources` |
-| `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score`, `confirm_state`, `severity`, `decided_at`, `keyed_on` *(0027)* |
+| `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score`, `confirm_state`, `severity`, `decided_at`, `keyed_on` *(0027)*, `preview_available` *(0031)*, `face_match_score` *(0034)* |
 | `svc.v_person_liveness_attempts` | `person_ref`, `attempts_24h`, `last_attempt_at` |
 | `svc.v_person_score` *(0023)* | `person_ref`, `score`, `components`, `config_version`, `computed_at` |
 | `svc.v_person_score_events` *(0023)* | `score_event_id`, `person_ref`, `delta`, `component`, `cause_kind`, `cause_ref`, `score_after`, `created_at` |
@@ -715,6 +715,24 @@ feedback signal and a new `hit_status` value threaded through both `v_person_hit
 **`v_articles` is optional on the proxy side by agreement:** their `GET /v1/articles` serves an empty
 feed with a warn log while the view is absent, so a database migrated one release behind does not hold
 their api off.
+
+**0034 appended `face_match_score` to `v_person_hits`** (2026-09-15). DROP + CREATE, so the
+grant is re-issued; deploy services first, and on a rollback deploy the proxy first, because a
+proxy still selecting it gets `42703 undefined_column` and that FAILS its `/readyz` — a
+wrong-shaped required view is not excused the way a missing optional one is.
+
+It is the raw `NUMERIC(5,2)` off `infringements`, and **NULL is not zero**: it means no face
+match ever ran, because the image could not be fetched or the hit is page-keyed and has no
+image at all. The proxy's rule, from its owner on 2026-09-15, is that a report carries hits
+whose face matched at **80** or better and discards the rest, and discards a hit with no image
+separately. That 80 is not a relaxation of our `confirm_face_match_threshold` (92): 92 answers
+"are we confident enough to CALL this them", 80 answers "is this worth putting in front of
+them at all", and a hit scoring 85 is legitimately both *not confidently them* and *worth
+asking about*. One threshold per purpose (INVARIANTS #1b, their P22), so we publish the
+quantity rather than a second band.
+
+The same migration added `preview_available` to `svc_contract.py`'s column map, where it had
+been missing since 0031 — the readiness gate had not been checking a column the proxy reads.
 
 **0027 appended `keyed_on` to `v_person_hits`** (2026-08-29, additive, same OR REPLACE idiom as 0023).
 You now hand the subject `host_page_url` once they have marked a hit as abuse. That column is the

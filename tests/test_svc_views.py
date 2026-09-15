@@ -112,6 +112,12 @@ FROZEN_CONTRACT_COLUMNS: dict[str, set[str]] = {
         "severity",
         "decided_at",
         "keyed_on",
+        # 0031, absent from both copies until 0034 — see the note in
+        # svc_contract.py. The proxy has been reading it for a week.
+        "preview_available",
+        # 0034: the raw face-match score. The proxy's report floor is 80 and
+        # ours is 92; publishing the number is what lets both be true.
+        "face_match_score",
     },
     "v_person_liveness_attempts": {
         "person_ref",
@@ -595,6 +601,43 @@ def test_one_row_per_hit_however_many_providers_attested(migrated_db: str) -> No
     # — provider A's 0.90 and provider B's 0.90 are different quantities
     # (INVARIANTS #15c).
     assert row["score"] == Decimal("0.9000")
+
+
+def test_hits_publish_the_raw_face_match_score_and_null_when_none_ran(
+    migrated_db: str,
+) -> None:
+    """0034: the NUMBER, not a band, and NULL is not zero.
+
+    The proxy's report-inclusion floor is 80 and our adjudication threshold is
+    92. Publishing the quantity is what lets both be true without either side
+    inheriting the other's question. A hit that never face-matched -- the image
+    could not be fetched, or it is page-keyed and has no image at all -- reads
+    NULL, and the proxy discards those on the "no image found" half of its rule
+    rather than by comparing a missing number against a floor.
+    """
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        user_ref = _subject(conn)
+        seed = _seed(conn, user_ref)
+        run = _run(conn, user_ref, seed)
+        scored = _infringement(conn, user_ref, run, domain="scored.test")
+        _infringement(conn, user_ref, run, domain="unchecked.test")
+        conn.execute(
+            "UPDATE infringements SET face_match_score = 85.50 WHERE infringement_id = %s",
+            (scored,),
+        )
+
+    rows = {
+        row["source_domain"]: row
+        for row in _rows(
+            migrated_db,
+            "SELECT * FROM svc.v_person_hits WHERE person_ref = %s",
+            (user_ref,),
+        )
+    }
+    # BELOW our 92 and ABOVE their 80: the case the two thresholds disagree on,
+    # and the reason the column exists.
+    assert rows["scored.test"]["face_match_score"] == Decimal("85.50")
+    assert rows["unchecked.test"]["face_match_score"] is None
 
 
 def test_hits_carry_provenance_to_the_seed_and_the_attributed_face(

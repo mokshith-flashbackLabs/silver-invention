@@ -129,6 +129,19 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         # backlink) or 'image_url' (no backlink, so host_page_url is the raw
         # image address). Appended at the end of the select list; additive.
         "keyed_on": "text",
+        # 0031, AND IT WAS MISSING FROM THIS MAP UNTIL 0034. The proxy has read
+        # `preview_available` since 2026-09-08 -- it decides whether a card
+        # promises a picture and whether the score charges for the hit -- and
+        # the readiness gate has not been checking it, so a botched view could
+        # have dropped it and /readyz would have said the contract was intact.
+        # Added here with 0034 rather than left for a tidier moment, because
+        # the whole point of this map is "the columns the proxy reads".
+        "preview_available": "boolean",
+        # 0034: the raw face-match number, so the proxy can apply its own
+        # report-inclusion floor without inheriting our adjudication threshold.
+        # NUMERIC(5,2), inherited from infringements.face_match_score. NULL
+        # means no check ever ran, which is NOT a low score.
+        "face_match_score": "numeric(5,2)",
     },
     "v_person_liveness_attempts": {
         "person_ref": "uuid",
