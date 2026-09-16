@@ -107,7 +107,7 @@ def _urls_from(node: Any, into: set[str]) -> None:
     on what it found.
     """
     if isinstance(node, dict):
-        for key, value in node.items():
+        for value in node.values():
             if isinstance(value, str) and value.startswith("http"):
                 into.add(value.split("?")[0])
             else:
@@ -180,7 +180,11 @@ async def measure(photo_dir: Path, out_dir: Path) -> int:
                     results[(provider, shape)] = outcome
                     detail = outcome.error or f"{len(outcome.urls)} url(s)"
                     print(f"  {provider:7} {shape:9} {detail}")
-                    (out_dir / f"{photo_path.stem}.{provider}.{shape.replace(':', '')}.json").write_text(
+                    out_path = (
+                        out_dir
+                        / f"{photo_path.stem}.{provider}.{shape.replace(':', '')}.json"
+                    )
+                    out_path.write_text(
                         json.dumps(outcome.raw, indent=2)[:2_000_000], encoding="utf-8"
                     )
 

@@ -1,0 +1,75 @@
+{
+  "family": "imageshield-prod-services",
+  "x-notes": "PRODUCTION. Generated from infra/ecs/imageshield-dev-services.json by applying only the environment-specific values, so a diff against the dev file shows exactly what differs and nothing else. Secret ARNs carry a random six-character suffix that AWS assigns, so they are ${PLACEHOLDERS} looked up at render time rather than literals that go stale silently — see infra/ecs/prod/README.md. FETCHER_BASE_URL stays localhost DELIBERATELY: every long-running container shares one instance under host networking. ENVIRONMENT=production and SEARCH_PROVIDER=hive are not a free choice — config.py refuses to boot on production+stub (the stub searches nothing, so every report would read 'no matches in monitored sources' with nothing failing anywhere) and equally refuses development+hive. LOG_LEVEL is likewise forced: config.py refuses production+debug. DEV_FACE_CEILING is gone from both environments: it was a required config field that no code path read, so it enforced nothing while forcing every container to carry it. The scheduled face-count tripwire docs/DEPLOY-DEV.md describes was never built; if one is wanted it belongs in dev tooling, not in the boot-validated set. ATTRIBUTION_MATCH_THRESHOLD and ATTRIBUTION_MAX_CANDIDATES are set explicitly here although dev leaves them on their code defaults (92 and 5): GET /v1/config/floors publishes both to the backend, whose own production task definition declares 99 and 20, and an unset default is a silent second opinion on a number two repos have to agree on. CONFIRM WITH THE BACKEND TEAM before first deploy.",
+  "networkMode": "host",
+  "requiresCompatibilities": ["EC2"],
+  "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-prod-exec",
+  "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-prod-services",
+  "containerDefinitions": [
+    {
+      "name": "services",
+      "image": "225989356895.dkr.ecr.us-east-1.amazonaws.com/imageshield/services:${IMAGE_TAG}",
+      "essential": true,
+      "memory": 576,
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "HTTP_HOST", "value": "0.0.0.0" },
+        { "name": "HTTP_PORT", "value": "8081" },
+        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "REKOGNITION_REGION", "value": "us-east-1" },
+        { "name": "IDENTITY_COLLECTION", "value": "identity-prod-v1" },
+        { "name": "DISCOVERED_COLLECTION", "value": "discovered-prod-v1" },
+        { "name": "ENROLMENT_QUALITY_FILTER", "value": "HIGH" },
+        { "name": "SEARCH_PROVIDER", "value": "hive" },
+        { "name": "PREVIEW_DAILY_RENDER_CEILING", "value": "2000" },
+        { "name": "ATTRIBUTION_MAX_INFLIGHT", "value": "4" },
+        { "name": "ATTRIBUTION_MATCH_THRESHOLD", "value": "99" },
+        { "name": "ATTRIBUTION_MAX_CANDIDATES", "value": "20" },
+        { "name": "SEARCH_MATCH_THRESHOLD", "value": "95" },
+        { "name": "FACE_MATCH_THRESHOLD", "value": "95" },
+        { "name": "ENROLMENT_COLLISION_THRESHOLD", "value": "99" },
+        { "name": "MIN_ENROLMENT_AGE", "value": "13" },
+        { "name": "MIN_DISCOVERY_AGE", "value": "18" },
+        { "name": "LIVENESS_MIN_CONFIDENCE", "value": "90" },
+        { "name": "LIVENESS_SESSION_TTL_SECONDS", "value": "600" },
+        { "name": "LIVENESS_MAX_ATTEMPTS_24H", "value": "5" },
+        { "name": "DB_POOL_MAX_SIZE", "value": "5" },
+        { "name": "DB_SSLMODE", "value": "require" },
+        { "name": "HIVE_BASE_URL", "value": "https://api.thehive.ai" },
+        { "name": "SQS_IDENTITY_INDEX_URL", "value": "https://sqs.us-east-1.amazonaws.com/225989356895/imageshield-prod-identity-index" },
+        { "name": "SQS_SEARCH_RUNS_URL", "value": "https://sqs.us-east-1.amazonaws.com/225989356895/imageshield-prod-search-runs" },
+        { "name": "SQS_CONFIRM_HITS_URL", "value": "https://sqs.us-east-1.amazonaws.com/225989356895/imageshield-prod-confirm-hits" },
+        { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" },
+        { "name": "CSAM_AGE_LOW_THRESHOLD", "value": "18" }
+      ],
+      "secrets": [
+        { "name": "DB_HOST", "valueFrom": "${SECRET_DB_APP_SERVICES}:host::" },
+        { "name": "DB_PORT", "valueFrom": "${SECRET_DB_APP_SERVICES}:port::" },
+        { "name": "DB_NAME", "valueFrom": "${SECRET_DB_APP_SERVICES}:dbname::" },
+        { "name": "DB_USER", "valueFrom": "${SECRET_DB_APP_SERVICES}:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "${SECRET_DB_APP_SERVICES}:password::" },
+        { "name": "SERVICE_TOKEN", "valueFrom": "${SECRET_SERVICE_TOKEN_BACKEND}:token::" },
+        { "name": "ADMIN_SERVICE_TOKEN", "valueFrom": "${SECRET_SERVICE_TOKEN_ADMIN}:token::" },
+        { "name": "HIVE_API_KEY", "valueFrom": "${SECRET_HIVE}:api_key::" },
+        { "name": "GOOGLE_VISION_API_KEY", "valueFrom": "${SECRET_GOOGLE_VISION}:api_key::" },
+        { "name": "FETCHER_TOKEN", "valueFrom": "${SECRET_SERVICE_TOKEN_BACKEND}:FETCHER_TOKEN::" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8081/health').status==200 else 1)\""],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/imageshield/prod",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "services"
+        }
+      }
+    }
+  ]
+}

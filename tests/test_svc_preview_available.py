@@ -114,8 +114,20 @@ def _view_says(conn: psycopg.Connection[Any], infringement_id: UUID) -> bool:
 _CASES: list[tuple[str, str | None, str | None, dict[str, Any] | None, bool]] = [
     # name, image_url, preview_image_url, triage, expected
     ("provider image + real bbox", "https://cdn.test/a.jpg", None, {"best_face_bbox": BBOX}, True),
-    ("resolved preview + real bbox", None, "https://cdn.test/b.jpg", {"best_face_bbox": BBOX}, True),
-    ("both urls present", "https://cdn.test/a.jpg", "https://cdn.test/b.jpg", {"best_face_bbox": BBOX}, True),
+    (
+        "resolved preview + real bbox",
+        None,
+        "https://cdn.test/b.jpg",
+        {"best_face_bbox": BBOX},
+        True,
+    ),
+    (
+        "both urls present",
+        "https://cdn.test/a.jpg",
+        "https://cdn.test/b.jpg",
+        {"best_face_bbox": BBOX},
+        True,
+    ),
     ("no url at all", None, None, {"best_face_bbox": BBOX}, False),
     ("bbox is JSONB null", "https://cdn.test/a.jpg", None, {"best_face_bbox": None}, False),
     ("bbox key absent", "https://cdn.test/a.jpg", None, {"unfetchable": "nope"}, False),

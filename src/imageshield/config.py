@@ -170,10 +170,6 @@ class Config(BaseSettings):
     # failing anywhere).
     search_provider: Literal["stub", "hive", "google"] = "stub"
 
-    # Dev-only guard on collection size, so a runaway test cannot enrol
-    # thousands of faces into a shared dev collection.
-    dev_face_ceiling: int
-
     log_level: Literal["debug", "info", "warning", "error"] = "info"
 
     liveness_min_confidence: float
@@ -557,7 +553,6 @@ class Config(BaseSettings):
         "recheck_interval_days",
         "recheck_batch_size",
         "attribution_max_inflight",
-        "dev_face_ceiling",
         "score_weight_posture",
         "score_weight_coverage",
         "score_weight_exposure",

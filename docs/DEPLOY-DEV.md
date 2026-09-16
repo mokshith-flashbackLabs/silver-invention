@@ -533,12 +533,14 @@ What this obliges:
    not consent to hold a user's. No snapshot-share or cross-region restore
    resource exists in dev; adding one is a reviewable diff.
 
-The face-count tripwire runs **inside `services`**, on a schedule, asserting
-`DescribeCollection('identity-dev-v1').FaceCount < DEV_FACE_CEILING` (50 — you
-know how many people are on the team). It is not a backend Lambda, because
-`ARCHITECTURE.md` §1 is explicit: *"the credentials are not present, so the
-mistake cannot be made."* A second Rekognition-credentialed principal would
-break that (D15).
+The face-count tripwire was specified to run **inside `services`**, on a
+schedule, asserting `DescribeCollection('identity-dev-v1').FaceCount` against a
+ceiling. **It was never built**, and `DEV_FACE_CEILING` — the config key it
+would have read — was removed on 2026-09-16 rather than left standing as a
+required value that enforced nothing. If the tripwire is wanted, it stays inside
+`services` rather than becoming a backend Lambda, because `ARCHITECTURE.md` §1
+is explicit: *"the credentials are not present, so the mistake cannot be
+made."* A second Rekognition-credentialed principal would break that (D15).
 
 Redaction applies at every log level including `debug`, because dev holds real
 faces and real consent records.
@@ -593,10 +595,11 @@ reads.
 | `REKOGNITION_REGION` | **services** | `ap-south-1`, must equal deployment region |
 | `ATTRIBUTION_MAX_INFLIGHT` | **services** | `4` |
 | `SEARCH_PROVIDER` | **services** | `stub` |
-| `DEV_FACE_CEILING` | services tooling, **not** §9 | `50` |
 
-`DEV_FACE_CEILING` stays out of the boot-validated set — a dev-only threshold in
-`ARCHITECTURE.md` §9 would make production refuse to start without it.
+`DEV_FACE_CEILING` was removed on 2026-09-16. It had landed as a REQUIRED
+`Config` field with no default — exactly the failure this section warned against,
+since production refused to start without a dev-only threshold — and nothing ever
+read it.
 
 ---
 

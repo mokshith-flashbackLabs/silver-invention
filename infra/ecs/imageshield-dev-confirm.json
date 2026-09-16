@@ -51,10 +51,6 @@
           "value": "hive"
         },
         {
-          "name": "DEV_FACE_CEILING",
-          "value": "50"
-        },
-        {
           "name": "ATTRIBUTION_MAX_INFLIGHT",
           "value": "4"
         },
@@ -217,10 +213,6 @@
         {
           "name": "SEARCH_PROVIDER",
           "value": "hive"
-        },
-        {
-          "name": "DEV_FACE_CEILING",
-          "value": "50"
         },
         {
           "name": "ATTRIBUTION_MAX_INFLIGHT",

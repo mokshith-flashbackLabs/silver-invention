@@ -1,0 +1,49 @@
+{
+  "family": "imageshield-prod-fetcher",
+  "x-notes": "PRODUCTION. The crop fetcher: it takes a URL from the confirm worker, fetches the bytes, hands them back and renders the blurred preview. It holds NO database credentials and NO AWS credentials, which is why its task role is imageshield-prod-no-aws rather than imageshield-prod-services. Pointing it at the services role would hand a component that fetches unauthenticated URLs the identity collection. It loads FetcherConfig, not Config, so it needs exactly one secret and no ENVIRONMENT, LOG_LEVEL or provider settings. Generated from infra/ecs/imageshield-dev-fetcher.json by applying only the environment-specific values.",
+  "networkMode": "host",
+  "requiresCompatibilities": [
+    "EC2"
+  ],
+  "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-prod-exec",
+  "taskRoleArn": "arn:aws:iam::225989356895:role/imageshield-prod-no-aws",
+  "containerDefinitions": [
+    {
+      "name": "fetcher",
+      "image": "225989356895.dkr.ecr.us-east-1.amazonaws.com/imageshield/services:${IMAGE_TAG}",
+      "essential": true,
+      "memory": 192,
+      "command": [
+        "sh",
+        "-c",
+        "uvicorn imageshield.fetcher.app:create_app --factory --host 0.0.0.0 --port 8083"
+      ],
+      "environment": [],
+      "secrets": [
+        {
+          "name": "FETCHER_TOKEN",
+          "valueFrom": "${SECRET_SERVICE_TOKEN_BACKEND}:FETCHER_TOKEN::"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8083/health').status==200 else 1)\""
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/imageshield/prod",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "fetcher"
+        }
+      },
+      "memoryReservation": 128
+    }
+  ]
+}

@@ -21,7 +21,6 @@
         { "name": "DISCOVERED_COLLECTION", "value": "discovered-dev-v1" },
         { "name": "ENROLMENT_QUALITY_FILTER", "value": "HIGH" },
         { "name": "SEARCH_PROVIDER", "value": "stub" },
-        { "name": "DEV_FACE_CEILING", "value": "50" },
         { "name": "PREVIEW_DAILY_RENDER_CEILING", "value": "2000" },
         { "name": "ATTRIBUTION_MAX_INFLIGHT", "value": "4" },
         { "name": "SEARCH_MATCH_THRESHOLD", "value": "95" },
