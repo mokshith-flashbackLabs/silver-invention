@@ -219,7 +219,8 @@ code being written **now**, carrying the same numbers.
    succeeds and the Rekognition call fails, the face stays searchable with no record pointing at it.
    The old repo calls `DeleteFaces` nowhere, under a comment claiming BIPA compliance.
 8. **Both age floors are read from config at request time.** There are two, and the split is
-   load-bearing: `MIN_ENROLMENT_AGE = 13` (who may enrol — consent, guardianship, household seats)
+   load-bearing: `MIN_ENROLMENT_AGE = 0` (who may enrol — consent, guardianship, household seats;
+   **was 13 until 2026-09-16**, changed to match the proxy, which is where the rule actually lives)
    and `MIN_DISCOVERY_AGE = 18` (who may be *searched*). Neither inline. Boot refuses if discovery
    sits below enrolment.
 8b. **Discovery never runs for an ineligible subject, and the refusal rests on data we own.**
@@ -477,8 +478,10 @@ Two things to know before touching it:
   the agreement guarantees — a tier change or a bundled endpoint moves it and nothing here fails.
   Prefer the signed figure over it if the two disagree. Google's is list price (0.003500). It was
   NULL until 0029 precisely because a budget enforced against an unsourced number is worse than none;
-  now that a figure exists, **Hive spend is priced but still uncapped** — `daily_budget_usd` is NULL
-  and setting it is the remaining finance decision.
+  now that a figure exists, **Hive spend is priced and stays uncapped** — `daily_budget_usd` is NULL
+  and the owner decided on 2026-09-16 to leave it that way, so this is a settled decision rather
+  than an open one. The breaker and the kill switch still bound a runaway; the budget guard is the
+  one control not in play, and #38's fail-closed behaviour never fires because no cap is set.
 - **`monthly_budget_usd` is reported, not enforced at dispatch.** The dispatch guard is one indexed
   row by design; a month is a range scan. Month-to-date is an admin read.
 
@@ -573,7 +576,12 @@ Full detail in `PROXY_INTEGRATION.md`. The shape:
 
 - `GET /v1/config/floors` publishes `MIN_DISCOVERY_AGE`, `MIN_ENROLMENT_AGE`,
   `ATTRIBUTION_MAX_CANDIDATES` and `ATTRIBUTION_MATCH_THRESHOLD`, read from config at request time.
-  The proxy asserts against it at boot and refuses to start on a mismatch. Never serve these from a
+  The proxy was asked to assert against it at boot and refuse to start on a mismatch. **It does not
+  — confirmed by the backend team on 2026-09-16.** It reads this endpoint nowhere, and it does not
+  send either attribution value to us (our API rejects them as request fields); its copies exist only
+  as provenance on its own `attribution_runs` rows. So a divergence is detected by nobody, and the
+  real cost of one is a history claiming a threshold no search ever ran at. Treat the endpoint as the
+  thing to check the two repos against, not as a gate that checks them for you. Never serve these from a
   constant declared beside the route — that is a second copy, and it starts lying the moment somebody
   edits one and not the other.
 - `GET /readyz` — unauthenticated, `503` when the `svc` contract is broken. Deploy gate, not a

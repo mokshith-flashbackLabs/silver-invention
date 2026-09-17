@@ -240,7 +240,7 @@ Task 06 adds one more, and it is not admin-gated:
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/config/floors` | `{ min_discovery_age, min_enrolment_age, attribution_max_candidates, attribution_match_threshold }`. Read straight from our config at request time, never from a constant. Assert against it at boot and refuse to start on a mismatch — that turns a silent divergence into a failed deploy. `attribution_match_threshold` crosses as a decimal **string** (`"92.00"`), matching `GET /v1/admin/providers/health` |
+| `GET /v1/config/floors` | `{ min_discovery_age, min_enrolment_age, attribution_max_candidates, attribution_match_threshold }`. Read straight from our config at request time, never from a constant. We asked you to assert against it at boot and refuse to start on a mismatch; **as of 2026-09-16 you do not read it at all**, so nothing detects a divergence and the two repos are kept in step by hand. Worth revisiting: the cost of a divergence is your `attribution_runs` rows recording a threshold no search ever ran at. `attribution_match_threshold` crosses as a decimal **string** (`"92.00"`), matching `GET /v1/admin/providers/health` |
 
 It is deliberately on the plain service token rather than the admin one. It publishes four policy
 numbers already written down in `INVARIANTS.md`, and you need them on **every boot** — requiring the
@@ -267,8 +267,10 @@ There is no default in either direction, and that is deliberate. Defaulting `tru
 defaulting `false` silently stops monitoring an adult. Both fail quietly, which is exactly why the
 field is mandatory rather than inferred.
 
-`MIN_ENROLMENT_AGE` is now **13**, not 18: minors enrol in v1 — consent, guardianship and household
-seats all work. What they must not get is discovery.
+`MIN_ENROLMENT_AGE` is now **0** (13 until 2026-09-16, 18 before that): minors enrol in v1 —
+consent, guardianship and household seats all work, and the age rule is enforced on your side,
+where DOB and `v_consent_eligibility` live. We publish the number, we do not apply it. What minors
+must not get is discovery, and that is `MIN_DISCOVERY_AGE` plus `subjects.discovery_eligible`.
 
 ### ⚠ BREAKING — `POST /v1/liveness/{sid}/result` gains three required consent fields
 

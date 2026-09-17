@@ -153,9 +153,10 @@ class FloorsResponse(BaseModel):
     Today `ATTRIBUTION_MAX_CANDIDATES` on the proxy side *documents* our floor
     and enforces nothing, and `MIN_DISCOVERY_AGE` is carried independently in
     both repos — so if v2 moves it, `subject_is_adult` means something different
-    on each side of the boundary and nothing detects that. The proxy asserts
-    against this at boot and refuses to start on a mismatch, which turns a
-    silent divergence into a failed deploy.
+    on each side of the boundary and nothing detects that. The proxy was asked to
+    assert against this at boot and refuse to start on a mismatch; as of
+    2026-09-16 it does not read this endpoint at all, so nothing detects a
+    divergence and the check is a human one.
 
     Every field is read from :class:`Config` at request time, never from a
     separate constant — a constant here is a second copy that lies the moment
@@ -168,7 +169,8 @@ class FloorsResponse(BaseModel):
     attribution_max_candidates: int
     # A decimal crosses as a STRING, matching GET /v1/admin/providers/health.
     # A float round-trip is exactly the drift the NUMERIC columns exist to
-    # avoid, and the proxy compares this for equality.
+    # avoid. Written for a proxy-side equality comparison that was never built;
+    # the string form costs nothing and is still the right shape for one.
     attribution_match_threshold: str
 
 

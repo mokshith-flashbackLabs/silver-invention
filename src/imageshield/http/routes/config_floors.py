@@ -5,9 +5,12 @@ One read. It exists because neither repo could verify the other's numbers.
 enforces nothing; ``MIN_DISCOVERY_AGE`` is carried independently in both repos,
 so if v2 moves it, the ``subject_is_adult`` boolean on
 ``POST /v1/liveness/{sid}/result`` means something different on each side of the
-boundary and nothing detects that. The proxy asserts against this endpoint at
-boot and refuses to start on a mismatch, which converts a silent divergence into
-a failed deploy.
+boundary and nothing detects that. The proxy was asked to assert against this
+endpoint at boot and refuse to start on a mismatch, which would have converted a
+silent divergence into a failed deploy. **It never did** — confirmed by the
+backend team on 2026-09-16. Nothing reads this endpoint today, so a divergence
+is caught only by a person comparing two task definitions, which is how the
+92-versus-99 attribution split was in fact found.
 
 **Read straight from config, never from a constant declared here.** A constant
 would be a second copy of each number, and it would start lying the moment
@@ -15,10 +18,14 @@ somebody edits one and not the other — the exact class of drift this endpoint
 exists to catch. There is nothing to test about the values; the test worth
 having is that changing config changes the response.
 
-Not admin-gated. It publishes four policy numbers already documented in
-``INVARIANTS.md``, and the proxy needs them on every boot — putting the admin
-token on a boot-time dependency means the admin token lives in the proxy's
-normal runtime environment, which is a worse trade than the disclosure.
+Not admin-gated, and still behind ``X-Service-Token`` like every other route.
+The original reason — the proxy needs these on every boot, so requiring the admin
+token would put that token in the proxy's ordinary runtime environment — no
+longer applies, because the proxy does not call this at boot or at all. What
+remains is a weaker but sufficient reason: four policy numbers already documented
+in ``INVARIANTS.md``, disclosed to a caller that already holds the service token.
+Admin-gating is now available without the boot-dependency cost, and is a decision
+somebody could take; it has not been taken.
 """
 
 from __future__ import annotations

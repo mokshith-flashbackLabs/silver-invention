@@ -68,7 +68,7 @@
         },
         {
           "name": "MIN_ENROLMENT_AGE",
-          "value": "13"
+          "value": "0"
         },
         {
           "name": "MIN_DISCOVERY_AGE",
@@ -232,7 +232,7 @@
         },
         {
           "name": "MIN_ENROLMENT_AGE",
-          "value": "13"
+          "value": "0"
         },
         {
           "name": "MIN_DISCOVERY_AGE",

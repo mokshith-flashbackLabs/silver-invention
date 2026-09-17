@@ -126,12 +126,21 @@ CI that `DeleteFaces` has at least one call site.
 Not constants, not inlined. There are **two**, and the split is load-bearing (step 8):
 
 ```
-MIN_ENROLMENT_AGE = 13   # who may enrol: consent, guardianship, household seats
+MIN_ENROLMENT_AGE = 0    # who may enrol: consent, guardianship, household seats
 MIN_DISCOVERY_AGE = 18   # who may be SEARCHED
 ```
 
 They were one number until step 8, which is why minors were blocked from enrolling at all. Minors
 enrol in v1; **discovery must not run for them** (#8b). `MIN_DISCOVERY_AGE` drops in v2.
+
+`MIN_ENROLMENT_AGE` was 13 until 2026-09-16 and is now **0**. The floor itself is the proxy's: it
+holds DOB, `profile.guardianships` and `v_consent_eligibility`, and it is the only side that can
+refuse an enrolment on age. This repo publishes the number on `/v1/config/floors` and records it
+as metadata on a discovery refusal — nothing here compares an age against it — so a higher value
+here was a floor that gated nobody while disagreeing with the proxy's own config, which declares
+0 in both environments. **Nothing about discovery changed**: `MIN_DISCOVERY_AGE` is still 18, and
+#8b's minor -> ineligible mapping is unconditional in `subjects/eligibility.py`. The boot check
+still holds — 18 is not below 0.
 
 Check: `grep -rn "\b18\b"` over `src/imageshield/{subjects,http}/` and `config.py` finds no age
 literal in executable code (`tests/test_boundaries.py` enforces this with `tokenize`, so prose
