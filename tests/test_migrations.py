@@ -176,6 +176,52 @@ def test_imageshield_app_role_is_insert_only_on_audit_log(throwaway_db: str) -> 
         assert count == 1
 
 
+def test_outbox_is_reachable_by_a_granted_role(throwaway_db: str) -> None:
+    """0035. `outbox` went unGRANTed from 0001 until production.
+
+    The relay connects as a login role, not the owner, and every migration
+    through 0034 left `outbox` with no grants at all — so the relay died on its
+    first poll with InsufficientPrivilege, took its task down with it (essential
+    container), and killed the healthy `search-worker` sharing that task. Dev
+    never showed it because the privilege was granted there by hand.
+
+    Asserting the three verbs the code actually uses, not the grant statement:
+    a test that reads the migration back proves only that the file exists.
+    """
+    run_migrate(throwaway_db, "down", "--all")
+    up_result = run_migrate(throwaway_db, "up")
+    assert up_result.returncode == 0, up_result.stderr
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute("SET ROLE outbox_rw")
+
+        # Producers: imageshield/outbox.py and search/store.py. BIGSERIAL, so
+        # this also exercises USAGE on outbox_outbox_id_seq — without it the
+        # INSERT fails on the sequence rather than the table.
+        conn.execute(
+            "INSERT INTO outbox (queue_name, payload) VALUES ('identity:index', '{}'::jsonb)"
+        )
+
+        # Relay: the poll query, then the mark-published update.
+        (outbox_id,) = conn.execute(  # type: ignore[misc]
+            "SELECT outbox_id FROM outbox WHERE published_at IS NULL"
+        ).fetchone()
+        conn.execute(
+            "UPDATE outbox SET published_at = now() WHERE outbox_id = %s", (outbox_id,)
+        )
+
+        # DELETE is deliberately withheld: dead letters are evidence of what
+        # failed to publish, and a relay that can delete them can erase it.
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM outbox")
+
+        conn.execute("RESET ROLE")
+        (published,) = conn.execute(  # type: ignore[misc]
+            "SELECT count(*) FROM outbox WHERE published_at IS NOT NULL"
+        ).fetchone()
+        assert published == 1
+
+
 def test_0004_score_shape_check_constraint(throwaway_db: str) -> None:
     """A match row must carry a numeric score OR a category — never neither.
 

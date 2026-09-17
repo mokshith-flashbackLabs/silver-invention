@@ -2,10 +2,16 @@
 # Runs ON THE HOST via SSM. The master credential is fetched here and never
 # leaves the instance — it is not in the SSM command text and not in any log.
 #
-# RUN AS ROOT: `sudo bash`, then paste. An interactive SSM session is `ssm-user`,
-# which is not in the docker group, so `docker run` fails with "permission denied
-# while trying to connect to the Docker daemon socket". A non-interactive
-# send-command runs as root already, which is why it worked there and not here.
+# RUN AS ROOT: `sudo bash -s <dev|prod>`, then paste, then Ctrl-D. An interactive
+# SSM session is `ssm-user`, which is not in the docker group, so `docker run`
+# fails with "permission denied while trying to connect to the Docker daemon
+# socket". A non-interactive send-command runs as root already, which is why it
+# worked there and not here.
+#
+# The `-s <env>` matters: since 2026-09-17 this script takes the environment as
+# an argument, and a bare `sudo bash` leaves $1 unset, so it refuses with its
+# usage message rather than doing anything. `bash -s prod` reads the script from
+# stdin with $1 set, which is the paste-friendly form.
 #
 # NOTE there is deliberately no `set -e` here. Under an interactive shell any
 # non-zero command would terminate the SSM session itself, which is how a docker
@@ -29,14 +35,44 @@ set -uo pipefail
 # for the same reason; this line covers the case where someone re-quotes it.
 set +H
 
-REGION=ap-south-1
-DB_HOST=imageshield-dev.cdk8oguayyeg.ap-south-1.rds.amazonaws.com
-DB_NAME=imageshield
+# The environment is an explicit argument with NO default. Both environments are
+# in one account and the only difference between wiping the right database and
+# the wrong one is four constants; a default here would eventually be taken.
+ENVIRONMENT="${1:-}"
+case "$ENVIRONMENT" in
+  dev)
+    REGION=ap-south-1
+    DB_HOST=imageshield-dev.cdk8oguayyeg.ap-south-1.rds.amazonaws.com
+    DB_NAME=imageshield
+    REGISTRY=225989356895.dkr.ecr.ap-south-1.amazonaws.com
+    # Hardcoded, not looked up: the host's instance role holds GetSecretValue and
+    # DescribeSecret on `rds!db-*` but NOT ListSecrets, so a lookup here fails with
+    # AccessDenied. Resolved once from an operator session and pinned.
+    MASTER_ARN="arn:aws:secretsmanager:ap-south-1:225989356895:secret:rds!db-9ef90c0b-67fb-4c28-b944-21f449f273ba-83e3We"
+    IMAGE="$REGISTRY/imageshield/services:d93b3fa"
+    ;;
+  prod)
+    # Added 2026-09-17, after the first production migration failed with
+    # `InvalidSchemaName: no schema has been selected to create in` — the exact
+    # failure this script was written for in dev. Production was bootstrapped
+    # the same way, so it needs the same two grants.
+    REGION=us-east-1
+    DB_HOST=imageshield-prod.czuuo8emoiqv.us-east-1.rds.amazonaws.com
+    DB_NAME=imageshield
+    REGISTRY=225989356895.dkr.ecr.us-east-1.amazonaws.com
+    MASTER_ARN="arn:aws:secretsmanager:us-east-1:225989356895:secret:rds!db-c97c88f5-ab02-4e75-8dfa-cef98161c765-XaE3mH"
+    IMAGE="$REGISTRY/imageshield/services:98c1d6d"
+    ;;
+  *)
+    echo "usage: grant-public-schema.sh <dev|prod>" >&2
+    echo "  no default: the two environments differ only in constants, and this" >&2
+    echo "  script runs as the RDS master user." >&2
+    exit 1
+    ;;
+esac
 
-# Hardcoded, not looked up: the host's instance role holds GetSecretValue and
-# DescribeSecret on `rds!db-*` but NOT ListSecrets, so a lookup here fails with
-# AccessDenied. Resolved once from an operator session and pinned.
-MASTER_ARN="arn:aws:secretsmanager:ap-south-1:225989356895:secret:rds!db-9ef90c0b-67fb-4c28-b944-21f449f273ba-83e3We"
+echo "environment:   $ENVIRONMENT"
+echo "database:      $DB_NAME @ $DB_HOST"
 echo "master secret: ${MASTER_ARN##*:}"
 
 SECRET=$(aws secretsmanager get-secret-value --region "$REGION" \
@@ -48,9 +84,8 @@ unset SECRET
 echo "master user: $MASTER_USER"
 
 # psql is not on the ECS-optimized AMI; use the service image, which has psycopg.
-IMAGE=225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:d93b3fa
 aws ecr get-login-password --region "$REGION" \
-  | docker login --username AWS --password-stdin 225989356895.dkr.ecr.ap-south-1.amazonaws.com >/dev/null 2>&1
+  | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null 2>&1
 
 # -i is REQUIRED. Without it docker does not attach stdin, the heredoc is
 # discarded, `python -` reads EOF and exits 0 — so the script reports success
