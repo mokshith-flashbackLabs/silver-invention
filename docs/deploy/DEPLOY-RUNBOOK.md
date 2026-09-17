@@ -82,14 +82,24 @@ on purpose — the builder stage installs the venv, so building on amd64 and
 copying to an arm64 runtime ships amd64 wheels (`psycopg[binary]`, `Pillow`) into
 an arm64 container. `buildx` warns `FromPlatformFlagConstDisallowed`; ignore it.
 
+**For production, use `infra/ecs/prod/build-push.sh`** — it does everything below
+and refuses the three failure modes this section used to walk you into (§12.10):
+
+```sh
+infra/ecs/prod/build-push.sh              # tag = short SHA of HEAD
+infra/ecs/prod/build-push.sh --dry-run    # check the tag is free, build nothing
+```
+
+The manual form, for dev or for understanding what the script does:
+
 ```bash
 cd <repo root>
 SHA=$(git rev-parse --short HEAD)
 aws ecr get-login-password | docker login --username AWS --password-stdin $REGISTRY
 
-docker buildx build --platform linux/arm64 \
+docker buildx build --platform linux/arm64 --provenance=false --sbom=false \
   -t $REGISTRY/imageshield/services:$SHA . --push
-echo "buildx exit=$?"          # MUST be 0 — see §12.2, this bit us
+echo "buildx exit=$?"          # informational ONLY against prod — see §12.10
 ```
 
 **Never pipe `docker buildx` into `tail`/`grep` and then `&& echo success`.** The
@@ -97,11 +107,28 @@ pipeline returns the *filter's* exit code, so a failed push reports as a pass.
 That happened here: a transient DNS failure produced `PUSHED` while nothing was
 uploaded. Capture the exit code explicitly, as above.
 
-Verify the artifact in the registry, not locally:
+**But do not treat a non-zero buildx exit as a failed push against the production
+registry.** That repository is `IMMUTABLE` and buildx exits 1 on a push that
+fully succeeded. This section said `MUST be 0` until 2026-09-17 and it was wrong
+in a way that invites deleting a good image — §12.10.
+
+`--provenance=false --sbom=false` keeps the result a single plain manifest,
+matching the backend's image. Without it buildx attaches a provenance
+attestation, which forces an OCI index wrapper and strands 0-byte orphan
+manifests on every retry.
+
+Verify the artifact **in the registry, not locally, and not from buildx's exit
+code**:
 
 ```bash
-docker manifest inspect $REGISTRY/imageshield/services:$SHA | grep -m1 architecture
+aws ecr describe-images --repository-name imageshield/services \
+  --image-ids imageTag=$SHA \
+  --query 'imageDetails[0].{digest:imageDigest,size:imageSizeInBytes}'
+docker buildx imagetools inspect $REGISTRY/imageshield/services:$SHA
 ```
+
+A non-zero `imageSizeInBytes` is the real signal: ECR computes it by summing the
+layer blobs it actually holds.
 
 **Tag with the git SHA, never `latest`.** ECS caches by tag, so `latest` gives
 deploys that silently do nothing.
@@ -760,6 +787,54 @@ DROP ROLE IF EXISTS <leftover>;
 
 The suite is ~7 minutes idle. Run alongside emulated builds it took **9h37m**.
 Sequence them; never run both.
+
+### 12.10 `buildx` exits 1 on a push that SUCCEEDED, against an immutable repo
+
+**Production, 2026-09-17.** The first push of `d97fff7` to `us-east-1` ended:
+
+```
+ERROR: failed commit on ref "manifest-sha256:5b883a9f…": unexpected status from
+PUT request to …/imageshield/services/manifests/d97fff7: 400 Bad Request
+```
+
+Every layer had uploaded and the tag was written correctly. buildx then issued a
+follow-up manifest PUT to the *same tag*, which `IMAGE_TAG_MUTABILITY=IMMUTABLE`
+rejected. The push had already succeeded; only the redundant second PUT failed.
+
+`ap-south-1` (dev) is `MUTABLE`, which is why this never appeared in dev. It is
+not a transient error and retrying cannot clear it — every retry fails at the
+same point, now for the plainer reason that the tag exists.
+
+Three ways this wastes an afternoon:
+
+- **`400 Bad Request` names nothing.** Not immutability, not the tag. It is
+  indistinguishable from a malformed manifest, which sends you chasing the
+  provenance attestation. Disabling it (`--provenance=false`) does not help,
+  because the attestation was never the cause — a plain manifest 400s too.
+- **§2 used to say `buildx exit MUST be 0`.** Following that, you conclude a
+  good push failed. The obvious remedy — delete the tag and re-push — takes a
+  working image out of the registry to fix nothing.
+- **Retries leave orphans.** Each attempt strands a 0-byte manifest. Harmless,
+  unreferenced, but they make the repository look broken when it is not.
+
+**Decide from the registry, never from the exit code:**
+
+```bash
+aws ecr describe-images --repository-name imageshield/services \
+  --image-ids imageTag=$SHA \
+  --query 'imageDetails[0].{digest:imageDigest,size:imageSizeInBytes}'
+```
+
+A non-zero `imageSizeInBytes` means ECR holds every layer — it sums the blobs it
+actually has. That is the artifact ECS will pull.
+
+`infra/ecs/prod/build-push.sh` encodes all of this: it refuses a tag that already
+exists *before* building, passes `--provenance=false`, and takes its verdict from
+`describe-images` while reporting buildx's exit code as informational.
+
+Deleting a tag is still allowed under immutability — it only blocks overwriting a
+tag that exists. So a genuinely bad image can be replaced: delete the tag, then
+push again.
 
 ---
 

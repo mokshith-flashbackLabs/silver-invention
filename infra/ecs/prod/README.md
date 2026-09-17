@@ -107,3 +107,18 @@ build and push both images
   -> the backend's migration
   -> start all eight services
 ```
+
+`build-push.sh` builds and pushes this repo's image; `render.sh` registers one task definition
+against a tag:
+
+```sh
+infra/ecs/prod/build-push.sh --dry-run    # is the tag free, is the tree clean
+infra/ecs/prod/build-push.sh              # build linux/arm64, push, verify in ECR
+for f in migrate-services services services-worker confirm fetcher; do
+  infra/ecs/prod/render.sh "$f" <tag>
+done
+```
+
+Read `DEPLOY-RUNBOOK.md` §12.10 before doing this by hand. This repository is **IMMUTABLE**, unlike
+dev's, and `docker buildx` exits 1 on a push that fully succeeded — the exit code is not the signal,
+`aws ecr describe-images` is. `build-push.sh` exists so that is settled once rather than rediscovered.
