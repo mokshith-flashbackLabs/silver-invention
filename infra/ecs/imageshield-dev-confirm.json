@@ -64,7 +64,7 @@
         },
         {
           "name": "ENROLMENT_COLLISION_THRESHOLD",
-          "value": "99"
+          "value": "97"
         },
         {
           "name": "MIN_ENROLMENT_AGE",
@@ -228,7 +228,7 @@
         },
         {
           "name": "ENROLMENT_COLLISION_THRESHOLD",
-          "value": "99"
+          "value": "97"
         },
         {
           "name": "MIN_ENROLMENT_AGE",
