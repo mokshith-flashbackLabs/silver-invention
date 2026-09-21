@@ -100,9 +100,9 @@ IDENTITY_CONFLICT_REASON = "identity_conflict"
 
 @dataclass(frozen=True, slots=True)
 class FaceHit:
-    """One SearchFacesByImage match, raw. ``external_image_id`` is whatever the
-    collection holds — parsed into a UserRef by the collision module, never
-    trusted here."""
+    """One match from the collision search, raw. ``external_image_id`` is
+    whatever the collection holds — parsed into a UserRef by the collision
+    module, never trusted here."""
 
     external_image_id: str
     similarity: float

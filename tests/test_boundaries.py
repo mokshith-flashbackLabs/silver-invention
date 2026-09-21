@@ -46,6 +46,33 @@ ENROLMENT_PATH_FILES = (
 # is the whole point of naming it here rather than passing an exclude list.
 ATTRIBUTION_DIR = "attribution"
 
+# The SECOND exemption (INVARIANTS #1 as reworded 2026-09-22). The collision
+# gate searches the identity collection with the liveness frame BEFORE
+# IndexFaces and may REFUSE the enrolment; it can never assign one, and
+# test_the_collision_module_cannot_assign is what makes that structural rather
+# than promised. Two files, named individually: the module that decides, and
+# the Rekognition wrapper that carries the call. Adding a third is a code
+# change and a review — the same rule as ATTRIBUTION_DIR.
+COLLISION_FILES = (
+    "enrolment/collision.py",
+    "enrolment/faceindex.py",
+)
+
+# What the collision module may NOT reach. A module that imports no store, no
+# face-index wrapper and no database driver, and calls nothing named like a
+# write, cannot mint, overwrite or merge a user_ref whatever its search
+# returns. Checked on the AST — imports and call names — not on prose, so a
+# docstring that SAYS "no IndexFaces" does not trip it.
+COLLISION_FORBIDDEN_IMPORTS = (
+    "imageshield.liveness.store",
+    "imageshield.enrolment.store",
+    "imageshield.enrolment.faceindex",
+    "imageshield.subjects",
+    "psycopg",
+    "psycopg_pool",
+)
+COLLISION_FORBIDDEN_CALLS = frozenset({"index_face", "delete_faces", "execute", "upsert_subject"})
+
 # No S3 client, ever (CLAUDE.md §3.3): presigned URLs via httpx are the only
 # path to bytes.
 FORBIDDEN_S3 = re.compile(r"""boto3\.client\(\s*["']s3["']|boto3\.resource\(\s*["']s3["']""")
@@ -77,9 +104,9 @@ FORBIDDEN_S3 = re.compile(r"""boto3\.client\(\s*["']s3["']|boto3\.resource\(\s*[
 # explanation rather than the arithmetic.
 _MATHS_TOKEN = r"(?:mean|average|avg)"
 FORBIDDEN_CROSS_PROVIDER_MATHS = re.compile(
-    rf"(?i:\b{_MATHS_TOKEN}\b)"        # bare word:         "average them"
-    rf"|(?i:\b{_MATHS_TOKEN})_"        # identifier prefix: avg_score
-    rf"|_(?i:{_MATHS_TOKEN}\b)"        # identifier suffix: score_avg
+    rf"(?i:\b{_MATHS_TOKEN}\b)"  # bare word:         "average them"
+    rf"|(?i:\b{_MATHS_TOKEN})_"  # identifier prefix: avg_score
+    rf"|_(?i:{_MATHS_TOKEN}\b)"  # identifier suffix: score_avg
     rf"|(?i:\b{_MATHS_TOKEN})(?=[A-Z])"  # camelCase:       avgScore
 )
 
@@ -100,7 +127,16 @@ def _source_files() -> list[Path]:
     return files
 
 
+def _is_collision_file(path: Path) -> bool:
+    rel = path.relative_to(SRC / "imageshield").as_posix()
+    return rel in COLLISION_FILES
+
+
 def _enrolment_path_files() -> list[Path]:
+    return [p for p in __enrolment_path_files_unfiltered() if not _is_collision_file(p)]
+
+
+def __enrolment_path_files_unfiltered() -> list[Path]:
     """Every module where identity is established."""
     package = SRC / "imageshield"
     files = [p for d in ENROLMENT_PATH for p in sorted((package / d).rglob("*.py"))]
@@ -111,6 +147,10 @@ def _enrolment_path_files() -> list[Path]:
 
 
 def _files_outside_attribution() -> list[Path]:
+    return [p for p in __files_outside_attribution_unfiltered() if not _is_collision_file(p)]
+
+
+def __files_outside_attribution_unfiltered() -> list[Path]:
     """All of src/ except the one exempt directory."""
     exempt = SRC / "imageshield" / ATTRIBUTION_DIR
     files = [p for p in sorted(SRC.rglob("*.py")) if exempt not in p.parents]
@@ -194,6 +234,9 @@ def test_no_face_search_in_the_enrolment_path() -> None:
     which in the old system minted a fresh user_ref for a returning user
     scoring 92 against a 95 threshold, orphaning their monitoring history and
     leaving their old faces in the collection under a dead ID.
+
+    The collision gate is exempt file by file (COLLISION_FILES) and separately
+    proven unable to write (test_the_collision_module_cannot_assign).
     """
     offenders = [
         str(path)
@@ -276,6 +319,7 @@ def test_no_cross_provider_averaging_in_scoring_code() -> None:
 # redactor would scrub could sit in source unnoticed.
 _PHONE_CANDIDATE_RE = re.compile(r"\+?\d[\d\-\s().]{4,18}\d")
 
+
 # STRING LITERALS ONLY, and never docstrings or comments. Verified against the
 # whole repo before being narrowed: the naive line-wise version found fourteen
 # hits and every one was prose — money literals (0.003500), citations into the
@@ -291,9 +335,7 @@ def _string_literals(path: Path) -> list[tuple[int, str]]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     docstrings: set[int] = set()
     for node in ast.walk(tree):
-        if not isinstance(
-            node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
-        ):
+        if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         first = node.body[0] if node.body else None
         if (
@@ -389,3 +431,46 @@ def test_no_phone_shaped_literal_in_migrations() -> None:
         if (shape := _phone_shaped(value)) is not None
     ]
     assert offenders == []
+
+
+def test_the_collision_module_cannot_assign() -> None:
+    """PERMANENT. INVARIANTS #1, reworded 2026-09-22: a search may refuse,
+    never assign.
+
+    The exemption above is safe only while the module holding the search has
+    no way to write. If someone gives collision.py a store, a face-index
+    wrapper or a driver, this fails before the first enrolment is minted from
+    a similarity score.
+    """
+    module = SRC / "imageshield" / "enrolment" / "collision.py"
+    tree = ast.parse(module.read_text(encoding="utf-8"))
+    imported: list[str] = []
+    called: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            called.append(name)
+    bad_imports = sorted(
+        m
+        for m in imported
+        if any(m == f or m.startswith(f + ".") for f in COLLISION_FORBIDDEN_IMPORTS)
+    )
+    bad_calls = sorted(set(called) & COLLISION_FORBIDDEN_CALLS)
+    assert bad_imports == [], f"collision.py imports a write path: {bad_imports}"
+    assert bad_calls == [], f"collision.py calls a write: {bad_calls}"
+
+
+def test_the_collision_exemption_is_actually_used() -> None:
+    """PERMANENT. An exemption nobody uses should be DELETED, not widened."""
+    module = SRC / "imageshield" / "enrolment" / "collision.py"
+    assert module.is_file(), "collision.py is gone — remove COLLISION_FILES"
+    wrapper = SRC / "imageshield" / "enrolment" / "faceindex.py"
+    assert FORBIDDEN_SEARCH.search(wrapper.read_text(encoding="utf-8")), (
+        "faceindex.py no longer calls face search — delete the exemption"
+    )
+    assert "search_face" in module.read_text(encoding="utf-8")
