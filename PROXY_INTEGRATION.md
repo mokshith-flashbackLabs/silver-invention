@@ -262,6 +262,13 @@ Before `IndexFaces`, the reference frame is searched against `identity-v1`. A ma
 |---|---|---|---|
 | `409` | `identity_conflict` | This face is already enrolled to somebody else. Nothing was indexed, no `subjects` row was written, the session is consumed. | Terminal. Your `IDENTITY_CONFLICT` mapping (phase 7) fires at last. Start a **fresh** session with the right person in front of the camera. The envelope carries `conflict_id` — a support handle to quote; **the matched person is never on the wire.** A same-key replay returns the same `409`, never a `200`. |
 
+**Scope it with `collision_candidates: [user_ref…]` on the result body (optional, list of UUIDs).**
+Rekognition cannot scope a search, so the household is a RESULT filter — the attribution pattern
+(INVARIANTS #1a): name every other active member of the subject's household, and a match outside that
+list is discarded before it can influence anything. Send it always: absent means the WHOLE collection
+counts (the strict fallback), and an empty list means "nobody but the subject" — a solo user can never
+conflict. Never include the subject themself; re-enrolment must keep working.
+
 Why: an on-device member's liveness runs on the OWNER's phone, and until now whoever was in front of the
 camera became the member. The same person re-enrolling (their own `user_ref` matching) is not a
 conflict. If the search itself is unavailable you get the existing `503 face_index_unavailable` with

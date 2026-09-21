@@ -258,3 +258,26 @@ backend needs no deploy unless the optional gateway change ships. Set `ENROLMENT
 to the agreed value in the services task definition before the roll; the key is already present and
 validated, so a deploy with the old `99` runs the gate at a value that rarely fires — worse than
 either choosing 97 or leaving the gate off, because it looks protected.
+
+
+---
+
+## 10. Amendment, same day — the household is the scope
+
+The owner's rule, stated after §1–§9 were built: *"we are not searching globally — we are searching
+within the household."* As built, §3 searched the whole `identity-v1` collection and treated any other
+enrolled `user_ref` as a conflict. Rekognition cannot scope a search, so the household becomes a RESULT
+filter, the way attribution already does it (INVARIANTS #1a):
+
+- `POST /v1/liveness/{sid}/result` gains optional `collision_candidates: list[UUID]`. The proxy names
+  every other active member of the household covering the subject — never the subject themself.
+- `collision_check(..., candidates=frozenset | None)`: a hit outside the list is discarded before it can
+  influence anything. `None` (field absent) → the whole collection counts, the strict fallback, so a
+  missing field can never WEAKEN the gate. An EMPTY list → nobody but the subject, so a solo user cannot
+  conflict.
+- What this gives up, knowingly: a person already enrolled in another household who is scanned as an
+  on-device member elsewhere is no longer refused. What it buys: a lookalike in another household never
+  blocks an enrolment, and the `409` never leaks that such a face exists anywhere in the system.
+
+Backend half: `PostResultRequest.collisionCandidates`, computed from `billing.household_members` on the
+subject's covering household at result time, always sent.
