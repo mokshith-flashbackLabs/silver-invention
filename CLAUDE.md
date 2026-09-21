@@ -195,6 +195,12 @@ code being written **now**, carrying the same numbers.
    code path where a face search result determines who someone is. The old system's
    `processFaceRecognition` (`server.js:9585`) does exactly this with thresholds varying 90/95/99 —
    that's the fragmentation bug. `SearchFacesByImage` must not appear in the enrolment path.
+   **Amended 2026-09-22:** the one exception is `enrolment/collision.py`, which may REFUSE an
+   enrolment whose frame already matches a different `user_ref` (`409 identity_conflict`, before
+   `IndexFaces`, nothing indexed) and is structurally unable to assign one — `test_boundaries.py`
+   exempts exactly two named files and separately asserts the module imports no store. Everywhere
+   else in the enrolment path the grep still stands. Spec
+   `docs/superpowers/specs/2026-09-22-enrolment-collision-gate-design.md`.
 1a. **Face search is permitted for attribution, and only in `attribution/`.** Matching a face in a
    *third-party photo* against a caller-supplied list of *already-enrolled* `user_ref`s cannot
    corrupt an identity: nothing is created or reassigned, and the worst case is a seed not

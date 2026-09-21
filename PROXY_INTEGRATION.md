@@ -204,7 +204,7 @@ Full shapes in `docs/services/identity.md`. Summary:
 | `GET /v1/users/{id}` | Enrolment status. Never returns vectors or face IDs. Consent status is the proxy's own — we can echo the `consent_ref` an enrolment was bound to, nothing more |
 | `PATCH /v1/users/{id}` | Profile fields. Partial — absent fields untouched |
 | `POST /v1/liveness/sessions` | Create session (built, step 3). Returns `provider_session_id` for the client SDK. Rejects `Idempotency-Key` — see §3 |
-| `POST /v1/liveness/{sid}/result` | Retrieve + persist the result, index on pass (built, steps 3–4). Requires `Idempotency-Key`, presigned PUT URLs, `subject_is_adult`, and the three consent fields below. `enrolled: true` once `IndexFaces` succeeds; `passed` + `enrolled: false` + `reason: 'quality_rejected'` means the frame failed the HIGH quality gate — start a FRESH session. 503 (`face_index_unavailable`) means retry with the same key |
+| `POST /v1/liveness/{sid}/result` | Retrieve + persist the result, index on pass (built, steps 3–4). Requires `Idempotency-Key`, presigned PUT URLs, `subject_is_adult`, and the three consent fields below. `enrolled: true` once `IndexFaces` succeeds; `passed` + `enrolled: false` + `reason: 'quality_rejected'` means the frame failed the HIGH quality gate — start a FRESH session. 503 (`face_index_unavailable`) means retry with the same key **`409 identity_conflict` (2026-09-22):** the frame matched a DIFFERENT `user_ref` at or above `ENROLMENT_COLLISION_THRESHOLD`; nothing indexed, no subject, session consumed; the envelope carries `conflict_id` (a support handle) and never the matched person. Terminal — start a fresh session with the right person. A same-key replay returns the same 409 |
 | `GET /v1/liveness/{sid}` | Read session status, `enrolled`, and `consent_ref` (built, steps 3–4). Pure read — no side effects; enrolment is triggered by the result call |
 | `DELETE /v1/enrolments/{user_ref}` | `DeleteFaces` → verify via `ListFaces` → tombstone (built, step 4). Idempotent 204; nothing calls it in v1. Full user deletion (`DELETE /v1/users/{id}`) remains specified-not-built — this is the enrolment-owning piece of it |
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |
@@ -252,6 +252,21 @@ step-8 provider routes and the long-specified `POST /v1/admin/backfill` above ag
 placeholder `/admin/ping` moved to `/v1/admin/ping` at the same time rather than leaving a second
 prefix behind. Step 9's route-auth CI gate then has one prefix to walk — a gate that covers one of two
 admin surfaces is worse than no gate, because it reads as coverage.
+
+### `POST /v1/liveness/{sid}/result` can now REFUSE the frame — `409 identity_conflict` (2026-09-22)
+
+Before `IndexFaces`, the reference frame is searched against `identity-v1`. A match to a **different**
+`user_ref` at or above `ENROLMENT_COLLISION_THRESHOLD` is refused:
+
+| Status | Code | Meaning | Proxy action |
+|---|---|---|---|
+| `409` | `identity_conflict` | This face is already enrolled to somebody else. Nothing was indexed, no `subjects` row was written, the session is consumed. | Terminal. Your `IDENTITY_CONFLICT` mapping (phase 7) fires at last. Start a **fresh** session with the right person in front of the camera. The envelope carries `conflict_id` — a support handle to quote; **the matched person is never on the wire.** A same-key replay returns the same `409`, never a `200`. |
+
+Why: an on-device member's liveness runs on the OWNER's phone, and until now whoever was in front of the
+camera became the member. The same person re-enrolling (their own `user_ref` matching) is not a
+conflict. If the search itself is unavailable you get the existing `503 face_index_unavailable` with
+nothing written — fail closed, retry with the same key. Spec:
+`docs/superpowers/specs/2026-09-22-enrolment-collision-gate-design.md`.
 
 ### ⚠ BREAKING — `POST /v1/liveness/{sid}/result` gains a required field
 

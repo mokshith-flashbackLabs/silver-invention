@@ -29,6 +29,19 @@ Both are the same root cause. Deriving identity from the session fixes both.
 Check: grep the enrolment path for `SearchFacesByImage` and `searchUsersByImage`. Neither may appear.
 `tests/test_boundaries.py::test_no_face_search_in_the_enrolment_path`.
 
+**Reworded 2026-09-22 (spec `docs/superpowers/specs/2026-09-22-enrolment-collision-gate-design.md`):**
+a face search in the enrolment path may **refuse** an enrolment; it may never **assign, mint, merge or
+overwrite** a `user_ref`. The one such search lives in `enrolment/collision.py`: it runs before
+`IndexFaces`, returns only "this face already belongs to a different `user_ref`", and that module
+cannot write — `tests/test_boundaries.py::test_the_collision_module_cannot_assign` is the proof, and
+the enrolment-path grep exempts exactly two named files (`COLLISION_FILES`). Why it was added: an
+on-device member's liveness runs on the owner's phone, and without this the owner's own face could be
+indexed as the member — two identities sharing one vector, with attribution handing the owner's
+photos and hits to the member. The old rule was right that a score must not CHOOSE an identity and
+wrong that it may not REFUSE to duplicate one. The refusal is `409 identity_conflict`, the session is
+consumed, nothing is indexed, and the matched `user_ref` stays on `enrolment_conflicts` — never on
+the wire.
+
 **1a. Face search is permitted for ATTRIBUTION, and only there.**
 
 The two operations look alike and are distinguished by what a wrong answer costs:
