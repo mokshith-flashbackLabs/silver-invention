@@ -135,12 +135,18 @@ class Config(BaseSettings):
     # discovered_collection: `discovered-v1` and clustering are "specified, do
     # not build yet" (CLAUDE.md §6).
     discovered_collection: str
-    # enrolment_collision_threshold: THERE IS NO COLLISION CHECK, deliberately.
-    # Wiring this to one means a similarity score influencing enrolment, which is
-    # invariant #1 ("identity never comes from a similarity score") and the
-    # fragmentation bug the old system shipped. Read #1 and #1a before giving
-    # this a reader.
+    # enrolment_collision_threshold: the ONE face search allowed in the
+    # enrolment path (enrolment/collision.py, spec 2026-09-22) refuses to index
+    # a frame that matches a DIFFERENT user_ref at or above this. It may block
+    # an enrolment; it can never assign one — INVARIANTS #1 as reworded that
+    # day. Before 2026-09-22 this field was declared and unread, and the
+    # comment here said the check must never exist; that reasoning was right
+    # about a score CHOOSING a user_ref and wrong about a score REFUSING one.
     enrolment_collision_threshold: float
+    # How many matches the collision search asks for. The question is "is
+    # anyone else above threshold", and one page answers it. A default, so
+    # the deployed env blocks need not change; still config, not a literal.
+    enrolment_collision_max_faces: int = 5
 
     # Threshold for provider face-search matching. DISTINCT from
     # face_match_threshold (enrolment) and attribution_match_threshold
@@ -522,6 +528,13 @@ class Config(BaseSettings):
     def _confidence(cls, value: float) -> float:
         if not 0 <= value <= 100:
             raise ValueError("must be between 0 and 100")
+        return value
+
+    @field_validator("enrolment_collision_max_faces")
+    @classmethod
+    def _at_least_one(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("must be at least 1")
         return value
 
     @field_validator("min_enrolment_age", "min_discovery_age", "csam_age_low_threshold")

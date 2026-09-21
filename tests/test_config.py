@@ -387,8 +387,9 @@ def test_identity_collection_replaces_the_old_name() -> None:
 
 
 def test_unread_fields_are_still_validated() -> None:
-    """DISCOVERED_COLLECTION and ENROLMENT_COLLISION_THRESHOLD have no reader in
-    v1, but a blank or out-of-range value must still refuse to boot."""
+    """DISCOVERED_COLLECTION has no reader in v1. ENROLMENT_COLLISION_THRESHOLD
+    gained one on 2026-09-22 (enrolment/collision.py). Either way a blank or
+    out-of-range value must refuse to boot."""
     with pytest.raises(ValidationError):
         make_config(discovered_collection="   ")
     with pytest.raises(ValidationError):
@@ -588,3 +589,11 @@ def test_new_required_fields_refuse_absence(
     with pytest.raises(ConfigError) as excinfo:
         load_config()
     assert missing_key in str(excinfo.value)
+
+
+def test_collision_max_faces_defaults_to_a_page_and_must_be_positive() -> None:
+    """The gate asks 'is anyone ELSE above threshold' — one page answers it.
+    Zero would search for nobody and pass every frame: a silent fail-open."""
+    assert make_config().enrolment_collision_max_faces == 5
+    with pytest.raises(ValidationError):
+        make_config(enrolment_collision_max_faces=0)
