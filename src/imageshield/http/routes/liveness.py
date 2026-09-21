@@ -2,9 +2,12 @@
 
 Hard rules enforced here:
 
-- Identity is the ``user_ref`` in the request. No search-by-face call, no
-  "does this face already exist" check — that is the old system's
-  fragmentation bug (INVARIANTS.md #1) and it must not reappear.
+- Identity is the ``user_ref`` in the request. The ONE face search in this
+  path — ``enrolment/collision.py``, run before IndexFaces — may REFUSE to
+  index a frame that already belongs to a different user_ref (409
+  identity_conflict). It can never assign one: INVARIANTS.md #1 as reworded
+  2026-09-22. The old fragmentation bug (a score choosing who you are) stays
+  forbidden; this is its opposite failure's cure.
 - ``LIVENESS_MIN_CONFIDENCE`` comes from config; no inline threshold
   literals (INVARIANTS.md #1b).
 - No S3 client. The ReferenceImage and AuditImages are PUT through
@@ -46,9 +49,12 @@ import structlog
 from fastapi import APIRouter, Depends, Header
 
 from imageshield.config import Config
+from imageshield.enrolment.collision import collision_check
 from imageshield.enrolment.faceindex import FaceIndex
 from imageshield.enrolment.models import (
+    IDENTITY_CONFLICT_REASON,
     QUALITY_REJECTED_REASON,
+    EnrolmentConflictRow,
     FaceIndexUnavailable,
     IndexRejected,
     NewEnrolment,
@@ -123,9 +129,34 @@ def _require_presigned(url: str) -> None:
 
 
 def _enrolled(row: LivenessSessionRow) -> bool:
-    # A consumed session was necessarily passed — only the enrolment and
-    # quality-rejected paths consume, and the latter sets failure_reason.
+    # A consumed session was necessarily passed — only the enrolment,
+    # quality-rejected and identity-conflict paths consume, and the latter two
+    # set failure_reason.
     return row.consumed_at is not None and row.failure_reason is None
+
+
+def _conflict_error(conflict: EnrolmentConflictRow) -> ServiceError:
+    # conflict_id ONLY. The matched person is on enrolment_conflicts for staff
+    # with a reason and never on the wire — the proxy's own audit promises it.
+    return ServiceError(
+        409,
+        "identity_conflict",
+        "This face is already enrolled to a different person. Nothing was"
+        " indexed; start a fresh session with the right person and quote the"
+        " conflict_id to support.",
+        retryable=False,
+        extra={"conflict_id": str(conflict.conflict_id)},
+    )
+
+
+async def _replay(store: LivenessStore, row: LivenessSessionRow) -> LivenessResultResponse:
+    """A same-key replay reproduces the ORIGINAL answer. A conflicted session
+    replays its 409 — never a 200 that would read as 'passed, not enrolled'."""
+    if row.failure_reason == IDENTITY_CONFLICT_REASON:
+        conflict = await store.get_conflict(SessionId(row.session_id))
+        if conflict is not None:
+            raise _conflict_error(conflict)
+    return _result_response(row)
 
 
 def _result_response(row: LivenessSessionRow) -> LivenessResultResponse:
@@ -137,9 +168,7 @@ def _result_response(row: LivenessSessionRow) -> LivenessResultResponse:
             f"Session finalised with unexpected status {row.status!r}.",
             retryable=True,
         )
-    reason = (
-        "quality_rejected" if row.failure_reason == QUALITY_REJECTED_REASON else None
-    )
+    reason = "quality_rejected" if row.failure_reason == QUALITY_REJECTED_REASON else None
     return LivenessResultResponse(
         status=status, confidence=row.confidence, enrolled=_enrolled(row), reason=reason
     )
@@ -271,7 +300,7 @@ async def post_liveness_result(
     # that consumed it must replay the stored outcome, not 410.
     if row.completed_at is not None:
         if row.result_idempotency_key == idempotency_key:
-            return _result_response(row)  # idempotent replay of the same request
+            return await _replay(store, row)  # idempotent replay of the same request
         raise ServiceError(
             410,
             "liveness_consumed",
@@ -378,10 +407,50 @@ async def post_liveness_result(
             retryable=True,
         ) from None
 
-    # Liveness passed and the frames are persisted. Index the ReferenceImage —
-    # the bytes already in memory from GetFaceLivenessSessionResults; there is
-    # no S3 client to re-fetch with, by design (CLAUDE.md §3.3).
     source_object_uri = _strip_query(body.reference_put_url)
+
+    # THE COLLISION GATE (spec 2026-09-22), BEFORE IndexFaces: a frame that
+    # already belongs to a different user_ref is refused and nothing is
+    # indexed, so a conflict leaves the collection untouched — the same
+    # guarantee quality_rejected gives. Same bytes IndexFaces is about to use.
+    try:
+        collision = await collision_check(
+            face_index, cfg, UserRef(row.user_ref), result.reference_image
+        )
+    except FaceIndexUnavailable:
+        # FAIL CLOSED. An unavailable check must not become a skipped check.
+        # Nothing written, nothing consumed: a same-key retry re-runs from
+        # the top.
+        raise ServiceError(
+            503,
+            "face_index_unavailable",
+            "Face indexing is temporarily unavailable; retry with the same Idempotency-Key.",
+            retryable=True,
+        ) from None
+    if collision is not None:
+        conflicted = await store.finalize_conflict(
+            sid,
+            confidence=result.confidence,
+            reference_image_uri=source_object_uri,
+            audit_image_uris=tuple(stored_audit_uris),
+            collection_id=cfg.identity_collection,
+            collision=collision,
+        )
+        if conflicted is None:
+            return await _completed_replay(store, sid, idempotency_key)
+        _, conflict = conflicted
+        log.info(
+            "liveness.enrolment_identity_conflict",
+            session_id=str(sid),
+            conflict_id=str(conflict.conflict_id),
+            similarity=collision.similarity,
+        )
+        raise _conflict_error(conflict)
+
+    # Liveness passed, the frames are persisted and the gate is clear. Index
+    # the ReferenceImage — the bytes already in memory from
+    # GetFaceLivenessSessionResults; there is no S3 client to re-fetch with,
+    # by design (CLAUDE.md §3.3).
     try:
         indexed = await face_index.index_face(
             collection_id=cfg.identity_collection,
@@ -394,8 +463,7 @@ async def post_liveness_result(
         raise ServiceError(
             503,
             "face_index_unavailable",
-            "Face indexing is temporarily unavailable; retry with the same"
-            " Idempotency-Key.",
+            "Face indexing is temporarily unavailable; retry with the same Idempotency-Key.",
             retryable=True,
         ) from None
 
@@ -457,9 +525,7 @@ async def post_liveness_result(
     try:
         await score_store.recompute(UserRef(row.user_ref), cause_kind="enrolment")
     except Exception:  # deliberate: the trigger already committed; tick will heal
-        log.warning(
-            "score.recompute_failed", user_ref=str(row.user_ref), cause="enrolment"
-        )
+        log.warning("score.recompute_failed", user_ref=str(row.user_ref), cause="enrolment")
     return _finish(final, cfg)
 
 
@@ -469,7 +535,7 @@ async def _completed_replay(
     """Race loser's exit: someone else finalized this session mid-flight."""
     row = await store.get_session(sid)
     if row is not None and row.result_idempotency_key == idempotency_key:
-        return _result_response(row)
+        return await _replay(store, row)
     raise ServiceError(
         410,
         "liveness_consumed",

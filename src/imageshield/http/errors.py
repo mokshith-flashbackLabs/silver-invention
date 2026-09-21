@@ -24,6 +24,7 @@ place.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import structlog
@@ -34,12 +35,24 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
 class ServiceError(Exception):
-    def __init__(self, status_code: int, code: str, message: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
         self.retryable = retryable
+        # Additional envelope fields (e.g. conflict_id). Never a user_ref, a
+        # phone, or anything the request sent us — the envelope is what the
+        # proxy logs.
+        self.extra: dict[str, Any] = dict(extra or {})
 
 
 # Stable codes for the errors the framework raises rather than our routes. Kept
@@ -71,7 +84,9 @@ def _envelope(
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ServiceError)
     async def _service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
-        return _envelope(exc.status_code, exc.code, exc.message, retryable=exc.retryable)
+        return _envelope(
+            exc.status_code, exc.code, exc.message, retryable=exc.retryable, **exc.extra
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(

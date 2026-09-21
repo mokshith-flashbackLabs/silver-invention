@@ -35,10 +35,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.enrolment.models import (
+    IDENTITY_CONFLICT_REASON,
     QUALITY_REJECTED_REASON,
     SENTINEL_CONSENT_REF,
+    EnrolmentConflictRow,
     EnrolmentRow,
+    FaceHit,
     FaceIndexUnavailable,
+    FaceSearchResult,
     IndexedFace,
     IndexRejected,
     NewEnrolment,
@@ -101,6 +105,7 @@ class FakeLivenessStore:
     def __init__(self) -> None:
         self.rows: dict[UUID, LivenessSessionRow] = {}
         self.enrolments: dict[UUID, EnrolmentRow] = {}  # keyed by session_id
+        self.conflicts: dict[UUID, EnrolmentConflictRow] = {}  # keyed by session_id
         self.notifies: list[str] = []
         # Written only by finalize_enrolled, in the same call that writes the
         # enrolment row — the fake mirrors the real store's one transaction.
@@ -231,6 +236,45 @@ class FakeLivenessStore:
         enrolment = self.enrolments.get(session_id)
         return enrolment.consent_ref if enrolment is not None else None
 
+    async def finalize_conflict(
+        self,
+        session_id: UUID,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+        collection_id: str,
+        collision: Any,
+    ) -> tuple[LivenessSessionRow, EnrolmentConflictRow] | None:
+        if self.rows[session_id].completed_at is not None:
+            return None
+        row = self.set(
+            session_id,
+            status="consumed",
+            confidence=confidence,
+            failure_reason=IDENTITY_CONFLICT_REASON,
+            reference_image_uri=reference_image_uri,
+            audit_image_uris=audit_image_uris,
+            completed_at=_now(),
+            consumed_at=_now(),
+        )
+        conflict = EnrolmentConflictRow(
+            conflict_id=uuid4(),
+            session_id=session_id,
+            attempted_user_ref=row.user_ref,
+            matched_user_ref=collision.matched_user_ref,
+            similarity=collision.similarity,
+            threshold_used=collision.threshold_used,
+            model_id=collision.model_id,
+            collection_id=collection_id,
+            occurred_at=_now(),
+        )
+        self.conflicts[session_id] = conflict
+        return row, conflict
+
+    async def get_conflict(self, session_id: UUID) -> EnrolmentConflictRow | None:
+        return self.conflicts.get(session_id)
+
     async def finalize_quality_rejected(
         self,
         session_id: UUID,
@@ -286,14 +330,37 @@ class FakeUploader:
 class FakeFaceIndex:
     """In-memory Rekognition collection. Every accepted index mints a fresh
     FaceId — exactly like the real thing, which is why two lookalikes can
-    never collapse into one identity here: nothing ever searches (this class,
-    like the production FaceIndex protocol, has no search method at all)."""
+    never collapse into one identity here.
+
+    Since 2026-09-22 it also answers ``search_face`` for the collision gate
+    (enrolment/collision.py). That search can REFUSE an enrolment and cannot
+    assign one; the default result matches nothing, so every test written
+    before the gate still enrols exactly as it did."""
 
     def __init__(self) -> None:
         self.index_calls: list[dict[str, Any]] = []
         self.faces: dict[str, tuple[str, str]] = {}  # face_id -> (collection, external_image_id)
         self.next_result: IndexRejected | Exception | None = None
         self._counter = 0
+        self.search_calls: list[dict[str, Any]] = []
+        self.search_result: FaceSearchResult | Exception = FaceSearchResult(
+            hits=(), model_id="rekognition:7.0"
+        )
+
+    async def search_face(
+        self, *, collection_id: str, image_bytes: bytes, threshold: float, max_faces: int
+    ) -> FaceSearchResult:
+        self.search_calls.append(
+            {
+                "collection_id": collection_id,
+                "image_bytes": image_bytes,
+                "threshold": threshold,
+                "max_faces": max_faces,
+            }
+        )
+        if isinstance(self.search_result, Exception):
+            raise self.search_result
+        return self.search_result
 
     async def index_face(
         self, *, collection_id: str, external_image_id: str, image_bytes: bytes
@@ -318,9 +385,7 @@ class FakeFaceIndex:
         for face_id in face_ids:
             self.faces.pop(face_id, None)
 
-    async def list_face_ids(
-        self, collection_id: str, face_ids: tuple[str, ...]
-    ) -> tuple[str, ...]:
+    async def list_face_ids(self, collection_id: str, face_ids: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(face_id for face_id in face_ids if face_id in self.faces)
 
 
@@ -348,9 +413,7 @@ class FakeScoreStore:
     async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
         raise NotImplementedError
 
-    async def list_events(
-        self, user_ref: UserRef, *, limit: int = 50
-    ) -> list[dict[str, Any]]:
+    async def list_events(self, user_ref: UserRef, *, limit: int = 50) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     async def all_subject_refs(self) -> tuple[UserRef, ...]:
@@ -516,9 +579,7 @@ def test_create_unknown_body_field_is_422() -> None:
 
 def test_create_non_uuid_user_ref_is_422() -> None:
     h = Harness()
-    response = h.client.post(
-        "/v1/liveness/sessions", json={"user_ref": "not-a-uuid"}, headers=AUTH
-    )
+    response = h.client.post("/v1/liveness/sessions", json={"user_ref": "not-a-uuid"}, headers=AUTH)
     assert response.status_code == 422
 
 
@@ -979,7 +1040,7 @@ def test_a_missing_subject_is_adult_is_400_and_writes_no_enrolment() -> None:
 
 
 def test_a_non_boolean_subject_is_adult_is_a_422_not_a_coerced_true() -> None:
-    """"yes" and 1 must not silently become True. The whole reason this field is
+    """ "yes" and 1 must not silently become True. The whole reason this field is
     mandatory is that a wrong value is invisible."""
     h = Harness()
     row = h.store.add(make_row())
@@ -1172,9 +1233,7 @@ def test_get_status_reports_enrolled() -> None:
 # ── consent_ref: the proxy owns consent, we hold the reference ───────────────
 
 
-@pytest.mark.parametrize(
-    "field", ["consent_ref", "consent_document_sha256", "consent_signed_at"]
-)
+@pytest.mark.parametrize("field", ["consent_ref", "consent_document_sha256", "consent_signed_at"])
 def test_a_missing_consent_field_is_400_and_writes_nothing(field: str) -> None:
     """Done-when: an enrolment attempt with no consent_ref returns
     400 consent_required and writes NO row.
@@ -1339,9 +1398,7 @@ def _code_without_prose(path: Path) -> str:
     and function."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
-        if not isinstance(
-            node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
-        ):
+        if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         first = node.body[0] if node.body else None
         if (
@@ -1351,3 +1408,109 @@ def _code_without_prose(path: Path) -> str:
         ):
             node.body.pop(0)
     return ast.unparse(tree).lower()
+
+
+# ── The collision gate (spec 2026-09-22) ─────────────────────────────────────
+
+
+def conflict_body(response: Any) -> dict[str, Any]:
+    body = response.json()
+    assert set(body) == {"error"}, f"expected the error envelope, got {body}"
+    envelope: dict[str, Any] = body["error"]
+    assert set(envelope) == {"code", "message", "retryable", "request_id", "conflict_id"}
+    return envelope
+
+
+def _foreign_match(ref: UUID, similarity: float = 98.4) -> FaceSearchResult:
+    return FaceSearchResult(
+        hits=(FaceHit(external_image_id=str(ref), similarity=similarity, face_id="f-x"),),
+        model_id="rekognition:7.0",
+    )
+
+
+def test_result_refuses_a_frame_already_enrolled_to_someone_else() -> None:
+    """THE GATE. The owner scans their own face as the member: 409, nothing
+    indexed, no enrolment, no subject, session consumed, one conflict row —
+    and the matched person is nowhere in the response."""
+    h = Harness(enrolment_collision_threshold=97.0)
+    owner = uuid4()
+    h.face_index.search_result = _foreign_match(owner)
+    row = h.store.add(make_row())  # a DIFFERENT user_ref: the member
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 409
+    envelope = conflict_body(response)
+    assert envelope["code"] == "identity_conflict"
+    assert envelope["retryable"] is False
+    UUID(envelope["conflict_id"])
+    assert str(owner) not in response.text
+    assert h.face_index.index_calls == []  # nothing indexed
+    assert h.store.enrolments == {}  # no enrolment
+    assert h.store.subjects == {}  # no subject
+    stored = h.store.rows[row.session_id]
+    assert stored.status == "consumed"
+    assert stored.failure_reason == IDENTITY_CONFLICT_REASON
+    assert row.session_id in h.store.conflicts
+
+
+def test_result_indexes_when_the_only_match_is_the_same_person() -> None:
+    """Re-enrolment must keep working."""
+    h = Harness()
+    row = h.store.add(make_row())
+    h.face_index.search_result = _foreign_match(row.user_ref, similarity=99.7)
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 200
+    assert response.json()["enrolled"] is True
+    assert len(h.face_index.index_calls) == 1
+
+
+def test_result_gate_runs_before_index_faces_and_reads_the_collision_threshold() -> None:
+    """One threshold per purpose (#1b), same bytes IndexFaces is about to use."""
+    h = Harness(enrolment_collision_threshold=97.0, face_match_threshold=95.0)
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    h.result(row.session_id)
+
+    assert h.face_index.search_calls == [
+        {
+            "collection_id": "identity-v1",
+            "image_bytes": b"reference-jpeg-bytes",
+            "threshold": 97.0,
+            "max_faces": 5,
+        }
+    ]
+
+
+def test_result_search_failure_fails_closed_with_503_and_writes_nothing() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.face_index.search_result = FaceIndexUnavailable("SearchFacesByImage failed")
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id)
+
+    assert response.status_code == 503
+    assert error_body(response)["code"] == "face_index_unavailable"
+    assert h.face_index.index_calls == []
+    assert h.store.rows[row.session_id].completed_at is None  # not consumed: retry works
+
+
+def test_result_replay_of_a_conflict_is_the_same_409_never_a_200() -> None:
+    h = Harness()
+    h.face_index.search_result = _foreign_match(uuid4())
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+    first = h.result(row.session_id, key="k1")
+    assert first.status_code == 409
+
+    replay = h.result(row.session_id, key="k1")
+
+    assert replay.status_code == 409
+    assert conflict_body(replay)["conflict_id"] == conflict_body(first)["conflict_id"]
+    assert len(h.provider.get_calls) == 1  # the replay did not hit the provider again
