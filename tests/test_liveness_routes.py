@@ -1514,3 +1514,56 @@ def test_result_replay_of_a_conflict_is_the_same_409_never_a_200() -> None:
     assert replay.status_code == 409
     assert conflict_body(replay)["conflict_id"] == conflict_body(first)["conflict_id"]
     assert len(h.provider.get_calls) == 1  # the replay did not hit the provider again
+
+
+def _result_body_with(candidates: list[str]) -> dict[str, Any]:
+    return {
+        "reference_put_url": "https://proxy-s3.example/ref.jpg?X-Amz-Signature=abc",
+        "audit_put_urls": [
+            "https://proxy-s3.example/audit-0.jpg?X-Amz-Signature=def",
+            "https://proxy-s3.example/audit-1.jpg?X-Amz-Signature=ghi",
+        ],
+        "subject_is_adult": True,
+        **CONSENT_FIELDS,
+        "collision_candidates": candidates,
+    }
+
+
+def test_result_collision_candidates_scope_the_gate_to_the_household() -> None:
+    """The proxy names the household; a match OUTSIDE it is discarded and the
+    enrolment proceeds. Same frame, same collection — only the list differs."""
+    h = Harness()
+    stranger = uuid4()
+    h.face_index.search_result = _foreign_match(stranger, similarity=99.9)
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id, _result_body_with([str(uuid4())]))
+
+    assert response.status_code == 200
+    assert response.json()["enrolled"] is True
+    assert len(h.face_index.index_calls) == 1
+
+
+def test_result_collision_candidates_still_refuse_a_housemate() -> None:
+    h = Harness()
+    owner = uuid4()
+    h.face_index.search_result = _foreign_match(owner)
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id, _result_body_with([str(owner), str(uuid4())]))
+
+    assert response.status_code == 409
+    assert conflict_body(response)["code"] == "identity_conflict"
+    assert h.face_index.index_calls == []
+
+
+def test_result_collision_candidates_must_be_user_refs() -> None:
+    h = Harness()
+    row = h.store.add(make_row())
+    h.passed_provider_result(row.provider_session_id)
+
+    response = h.result(row.session_id, _result_body_with(["not-a-uuid"]))
+
+    assert response.status_code == 422

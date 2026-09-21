@@ -84,6 +84,13 @@ class LivenessResultRequest(ServiceModel):
     consent_ref: UUID | None = None
     consent_document_sha256: str | None = None
     consent_signed_at: datetime | None = None
+    # The collision gate's household (spec 2026-09-22, amended the same day):
+    # the user_refs whose faces may REFUSE this enrolment. Named by the proxy,
+    # which knows households; this service does not. Absent -> the whole
+    # collection counts (the strict fallback). Present -> a match outside the
+    # list is discarded before it can influence anything, the attribution
+    # pattern (INVARIANTS #1a).
+    collision_candidates: list[UUID] | None = None
 
     @field_validator("consent_ref")
     @classmethod

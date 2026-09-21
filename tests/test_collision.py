@@ -118,6 +118,42 @@ async def test_a_search_failure_propagates_so_the_route_fails_closed() -> None:
         await collision_check(searcher, make_config(), UserRef(uuid4()), b"frame")
 
 
+async def test_candidates_scope_the_check_to_the_household() -> None:
+    """Rekognition cannot scope a search, so the household is a RESULT filter —
+    the same load-bearing move attribution makes (INVARIANTS #1a). A match
+    outside the named candidates is discarded before it can influence anything:
+    a lookalike in another household never blocks an enrolment, and never
+    leaks that such a face exists."""
+    me, housemate, stranger = UserRef(uuid4()), UserRef(uuid4()), UserRef(uuid4())
+    searcher = FakeSearcher(result(hit(stranger, 99.9), hit(housemate, 97.5)))
+
+    collision = await collision_check(
+        searcher, make_config(), me, b"frame", candidates=frozenset({housemate})
+    )
+
+    assert collision is not None and collision.matched_user_ref == housemate
+
+
+async def test_a_match_outside_the_candidates_is_not_a_collision() -> None:
+    me, stranger = UserRef(uuid4()), UserRef(uuid4())
+    searcher = FakeSearcher(result(hit(stranger, 99.9)))
+
+    assert (
+        await collision_check(searcher, make_config(), me, b"frame", candidates=frozenset()) is None
+    )
+
+
+async def test_no_candidate_list_means_the_whole_collection() -> None:
+    """The strict fallback: a proxy that sends no list gets the global check,
+    so a missing field can never WEAKEN the gate."""
+    me, stranger = UserRef(uuid4()), UserRef(uuid4())
+    searcher = FakeSearcher(result(hit(stranger, 99.9)))
+
+    collision = await collision_check(searcher, make_config(), me, b"frame", candidates=None)
+
+    assert collision is not None and collision.matched_user_ref == stranger
+
+
 # ── RekognitionFaceIndex.search_face — the wrapper that carries the call ────
 
 

@@ -415,7 +415,15 @@ async def post_liveness_result(
     # guarantee quality_rejected gives. Same bytes IndexFaces is about to use.
     try:
         collision = await collision_check(
-            face_index, cfg, UserRef(row.user_ref), result.reference_image
+            face_index,
+            cfg,
+            UserRef(row.user_ref),
+            result.reference_image,
+            candidates=(
+                None
+                if body.collision_candidates is None
+                else frozenset(UserRef(c) for c in body.collision_candidates)
+            ),
         )
     except FaceIndexUnavailable:
         # FAIL CLOSED. An unavailable check must not become a skipped check.

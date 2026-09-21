@@ -38,9 +38,22 @@ class FaceSearcher(Protocol):
 
 
 async def collision_check(
-    searcher: FaceSearcher, cfg: Config, own_ref: UserRef, image_bytes: bytes
+    searcher: FaceSearcher,
+    cfg: Config,
+    own_ref: UserRef,
+    image_bytes: bytes,
+    *,
+    candidates: frozenset[UserRef] | None = None,
 ) -> Collision | None:
     """Return the strongest match belonging to somebody ELSE, or None.
+
+    ``candidates`` is the household, named by the proxy. Rekognition cannot
+    scope a search, so the household is a RESULT filter — the same load-bearing
+    move attribution makes (INVARIANTS #1a): a match outside the list is
+    discarded before it can influence anything. A lookalike in another
+    household never blocks an enrolment and never leaks that such a face
+    exists. ``None`` means no list was sent and the whole collection counts —
+    the strict fallback, so a missing field can never WEAKEN the gate.
 
     - ``own_ref`` hits are ignored: re-enrolment must keep working.
     - An ExternalImageId that does not parse as a UserRef is discarded: we set
@@ -65,6 +78,8 @@ async def collision_check(
         except ValueError:
             continue
         if ref == own_ref:
+            continue
+        if candidates is not None and ref not in candidates:
             continue
         if best is None or hit.similarity > best[0]:
             best = (hit.similarity, ref)
