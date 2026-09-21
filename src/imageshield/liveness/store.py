@@ -13,9 +13,17 @@ from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
 
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from imageshield.enrolment.models import QUALITY_REJECTED_REASON, EnrolmentRow, NewEnrolment
+from imageshield.enrolment.models import (
+    IDENTITY_CONFLICT_REASON,
+    QUALITY_REJECTED_REASON,
+    Collision,
+    EnrolmentConflictRow,
+    EnrolmentRow,
+    NewEnrolment,
+)
 from imageshield.enrolment.store import to_enrolment_row
 from imageshield.liveness.models import CreateRejection, LivenessSessionRow
 from imageshield.subjects.models import Eligibility
@@ -105,6 +113,64 @@ _ENROLMENT_COLUMNS = (
     " consent_ref, consent_document_sha256, consent_signed_at"
 )
 
+_CONFLICT_COLUMNS = (
+    "conflict_id, session_id, attempted_user_ref, matched_user_ref, similarity,"
+    " threshold_used, model_id, collection_id, occurred_at"
+)
+
+# Written in the SAME transaction as the session consume (spec 2026-09-22 §4):
+# a refused frame is traceable to the search that refused it, with the
+# threshold and model in force at the time — the same reason attribution_runs
+# carries match_threshold.
+_INSERT_CONFLICT_SQL = f"""
+    INSERT INTO enrolment_conflicts
+      (session_id, attempted_user_ref, matched_user_ref, similarity, threshold_used,
+       model_id, collection_id)
+    VALUES
+      (%(session_id)s, %(attempted_user_ref)s, %(matched_user_ref)s, %(similarity)s,
+       %(threshold_used)s, %(model_id)s, %(collection_id)s)
+    RETURNING {_CONFLICT_COLUMNS}
+"""
+
+_SELECT_CONFLICT_SQL = f"""
+    SELECT {_CONFLICT_COLUMNS} FROM enrolment_conflicts WHERE session_id = %(session_id)s
+"""
+
+# actor_type 'service' as in subjects/store.py: the proxy acting for a user.
+# subject_ref is the ATTEMPTED user_ref; the matched one is on the conflicts
+# table, for staff with a reason, and not in an audit trail read more widely.
+_AUDIT_CONFLICT_SQL = """
+    INSERT INTO audit_log (actor_type, action, subject_ref, resource_id, metadata)
+    VALUES ('service', 'enrolment.identity_conflict', %(subject_ref)s, %(resource_id)s,
+            %(metadata)s)
+"""
+
+
+def _to_conflict_row(record: tuple[Any, ...]) -> EnrolmentConflictRow:
+    (
+        conflict_id,
+        session_id,
+        attempted,
+        matched,
+        similarity,
+        threshold,
+        model_id,
+        collection_id,
+        occurred_at,
+    ) = record
+    return EnrolmentConflictRow(
+        conflict_id=conflict_id,
+        session_id=session_id,
+        attempted_user_ref=attempted,
+        matched_user_ref=matched,
+        similarity=float(similarity),
+        threshold_used=float(threshold),
+        model_id=model_id,
+        collection_id=collection_id,
+        occurred_at=occurred_at,
+    )
+
+
 _INSERT_ENROLMENT_SQL = f"""
     INSERT INTO enrolments
       (session_id, session_status, user_ref, collection_id, external_face_id,
@@ -180,6 +246,19 @@ class LivenessStore(Protocol):
     ) -> LivenessSessionRow | None: ...
 
     async def get_enrolment_consent_ref(self, session_id: SessionId) -> UUID | None: ...
+
+    async def finalize_conflict(
+        self,
+        session_id: SessionId,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+        collection_id: str,
+        collision: Collision,
+    ) -> tuple[LivenessSessionRow, EnrolmentConflictRow] | None: ...
+
+    async def get_conflict(self, session_id: SessionId) -> EnrolmentConflictRow | None: ...
 
 
 def _to_row(record: tuple[Any, ...]) -> LivenessSessionRow:
@@ -409,6 +488,75 @@ class PostgresLivenessStore:
             )
             record = await cur.fetchone()
         return _to_row(record) if record is not None else None
+
+    async def finalize_conflict(
+        self,
+        session_id: SessionId,
+        *,
+        confidence: float | None,
+        reference_image_uri: str,
+        audit_image_uris: tuple[str, ...],
+        collection_id: str,
+        collision: Collision,
+    ) -> tuple[LivenessSessionRow, EnrolmentConflictRow] | None:
+        """Consume the session, record WHY, audit it — one transaction.
+
+        Mirrors finalize_quality_rejected: liveness passed, enrolment did not,
+        the session is spent so the person can start the fresh one that is the
+        remedy. Unlike it, provenance is written: the search that refused this
+        frame is on enrolment_conflicts with its threshold and model. NO
+        enrolment, NO subject row, NO IndexFaces happened.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                _CONSUME_SQL,
+                {
+                    "session_id": session_id,
+                    "confidence": confidence,
+                    "failure_reason": IDENTITY_CONFLICT_REASON,
+                    "reference_image_uri": reference_image_uri,
+                    "audit_image_uris": list(audit_image_uris),
+                },
+            )
+            session_record = await cur.fetchone()
+            if session_record is None:
+                return None  # concurrent finalizer won; caller compensates
+            session = _to_row(session_record)
+            cur = await conn.execute(
+                _INSERT_CONFLICT_SQL,
+                {
+                    "session_id": session_id,
+                    "attempted_user_ref": session.user_ref,
+                    "matched_user_ref": collision.matched_user_ref,
+                    "similarity": collision.similarity,
+                    "threshold_used": collision.threshold_used,
+                    "model_id": collision.model_id,
+                    "collection_id": collection_id,
+                },
+            )
+            conflict_record = await cur.fetchone()
+            assert conflict_record is not None
+            conflict = _to_conflict_row(conflict_record)
+            await conn.execute(
+                _AUDIT_CONFLICT_SQL,
+                {
+                    "subject_ref": session.user_ref,
+                    "resource_id": conflict.conflict_id,
+                    "metadata": Jsonb(
+                        {
+                            "similarity": collision.similarity,
+                            "threshold": collision.threshold_used,
+                        }
+                    ),
+                },
+            )
+        return session, conflict
+
+    async def get_conflict(self, session_id: SessionId) -> EnrolmentConflictRow | None:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_SELECT_CONFLICT_SQL, {"session_id": session_id})
+            record = await cur.fetchone()
+        return _to_conflict_row(record) if record is not None else None
 
     async def get_enrolment_consent_ref(self, session_id: SessionId) -> UUID | None:
         async with self._pool.connection() as conn:
