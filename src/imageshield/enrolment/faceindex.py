@@ -29,7 +29,13 @@ import boto3
 import structlog
 from botocore.exceptions import ClientError
 
-from imageshield.enrolment.models import FaceIndexUnavailable, IndexedFace, IndexRejected
+from imageshield.enrolment.models import (
+    FaceHit,
+    FaceIndexUnavailable,
+    FaceSearchResult,
+    IndexedFace,
+    IndexRejected,
+)
 
 log = structlog.get_logger("imageshield.enrolment")
 
@@ -40,6 +46,10 @@ class FaceIndex(Protocol):
     ) -> IndexedFace | IndexRejected: ...
 
     async def delete_faces(self, collection_id: str, face_ids: tuple[str, ...]) -> None: ...
+
+    async def search_face(
+        self, *, collection_id: str, image_bytes: bytes, threshold: float, max_faces: int
+    ) -> FaceSearchResult: ...
 
     async def list_face_ids(
         self, collection_id: str, face_ids: tuple[str, ...]
@@ -85,6 +95,46 @@ class RekognitionFaceIndex:
             face_id=str(face["FaceId"]),
             quality_score=float(confidence) if confidence is not None else None,
             model_id=f"rekognition:{response.get('FaceModelVersion', 'unknown')}",
+        )
+
+    async def search_face(
+        self, *, collection_id: str, image_bytes: bytes, threshold: float, max_faces: int
+    ) -> FaceSearchResult:
+        """SearchFacesByImage for the collision gate (enrolment/collision.py).
+
+        THE ONLY CALLER IS THE COLLISION MODULE, which can refuse an enrolment
+        and cannot assign one. Nothing else in the enrolment path may call
+        this — tests/test_boundaries.py names the exemption file by file.
+        """
+        try:
+            response = await asyncio.to_thread(
+                self._client.search_faces_by_image,
+                CollectionId=collection_id,
+                Image={"Bytes": image_bytes},
+                FaceMatchThreshold=threshold,
+                MaxFaces=max_faces,
+                # NONE on the SEARCH, deliberately: HIGH belongs to IndexFaces.
+                # A frame that would fail HIGH must still be checked, not
+                # skipped past.
+                QualityFilter="NONE",
+            )
+        except ClientError as exc:
+            if self._error_code(exc) == "InvalidParameterException":
+                # No searchable face in the frame. Not an outage: IndexFaces
+                # will answer the same frame with quality_rejected.
+                return FaceSearchResult(hits=(), model_id="rekognition:unknown")
+            raise self._unavailable("SearchFacesByImage", exc) from exc
+
+        hits = tuple(
+            FaceHit(
+                external_image_id=str(match.get("Face", {}).get("ExternalImageId", "")),
+                similarity=float(match.get("Similarity", 0.0)),
+                face_id=str(match.get("Face", {}).get("FaceId", "")),
+            )
+            for match in response.get("FaceMatches") or []
+        )
+        return FaceSearchResult(
+            hits=hits, model_id=f"rekognition:{response.get('FaceModelVersion', 'unknown')}"
         )
 
     async def delete_faces(self, collection_id: str, face_ids: tuple[str, ...]) -> None:

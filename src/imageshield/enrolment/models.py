@@ -90,3 +90,50 @@ class FaceIndexUnavailable(RuntimeError):
     """A Rekognition face-index call failed. The route maps this to 503:
     nothing was written, the session is not consumed, and the proxy retries
     the whole result call with the same Idempotency-Key."""
+
+
+# Stored in liveness_sessions.failure_reason when the collision gate refused
+# the frame (spec 2026-09-22). Like QUALITY_REJECTED_REASON the session is
+# consumed and no enrolment exists; unlike it, the replay is a 409, not a 200.
+IDENTITY_CONFLICT_REASON = "identity_conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class FaceHit:
+    """One SearchFacesByImage match, raw. ``external_image_id`` is whatever the
+    collection holds — parsed into a UserRef by the collision module, never
+    trusted here."""
+
+    external_image_id: str
+    similarity: float
+    face_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class FaceSearchResult:
+    hits: tuple[FaceHit, ...]
+    model_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class Collision:
+    """The frame already belongs to somebody else. This is a REFUSAL, carried
+    to the store for provenance — it is never an identity for the session."""
+
+    matched_user_ref: UserRef
+    similarity: float
+    model_id: str
+    threshold_used: float
+
+
+@dataclass(frozen=True, slots=True)
+class EnrolmentConflictRow:
+    conflict_id: UUID
+    session_id: UUID
+    attempted_user_ref: UUID
+    matched_user_ref: UUID
+    similarity: float
+    threshold_used: float
+    model_id: str
+    collection_id: str
+    occurred_at: datetime
