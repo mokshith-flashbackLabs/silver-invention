@@ -98,3 +98,21 @@ def test_consumed_session_status_is_pinned_while_enrolment_exists(
                 "UPDATE liveness_sessions SET status = 'passed' WHERE session_id = %s",
                 (session_id,),
             )
+
+
+def test_enrolment_conflicts_is_one_row_per_session(migrated_db: str) -> None:
+    """Migration 0036. A session conflicts at most once: the UNIQUE on
+    session_id is the provenance rule, and the FK means a conflict can never
+    outlive its session."""
+    insert = (
+        "INSERT INTO enrolment_conflicts (session_id, attempted_user_ref, matched_user_ref,"
+        " similarity, threshold_used, model_id, collection_id)"
+        " VALUES (%s, %s, %s, 98.4, 97.0, 'rekognition:7.0', 'identity-v1')"
+    )
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        session_id, _ = _insert_session(conn, "created")
+        conn.execute(insert, (session_id, uuid4(), uuid4()))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, (session_id, uuid4(), uuid4()))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute(insert, (uuid4(), uuid4(), uuid4()))
