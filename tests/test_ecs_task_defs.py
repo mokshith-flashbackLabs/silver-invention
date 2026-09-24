@@ -394,9 +394,9 @@ def test_confirm_task_runs_exactly_the_confirm_worker() -> None:
 
 
 def test_confirm_containers_serve_no_http() -> None:
-    """Neither process has an HTTP surface, same reasoning as the search
-    worker's pairing: a bound port would collide on the host-network
-    instance, and a health check against nothing is a restart loop."""
+    """The confirm worker has no HTTP surface, same reasoning as the search
+    worker: a bound port would collide on the host-network instance, and a
+    health check against nothing is a restart loop."""
     for container in _confirm_containers().values():
         assert not container.get("portMappings"), (
             f"{container['name']} maps a port it never binds"

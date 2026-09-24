@@ -335,24 +335,17 @@ async def test_list_events_returns_newest_first(
 # ── THE reversal test ────────────────────────────────────────────────────
 
 
-async def test_event_retraction_restores_exactly_the_pre_event_score(
+async def test_event_retraction_removes_it_from_the_threat_context_view(
     migrated_db: str,
     store: PostgresThreatStore,
     pool: AsyncConnectionPool,
 ) -> None:
     """Build a well-set-up user (enrolled, fresh seed), match them with a
-    threat event, then retract it and confirm the match set the retraction
-    reversed is exactly the match set the event created.
-
-    NOTE (2026-09-24, Task S3): this test used to also recompute the
-    protection score before, during and after the event and assert it
-    dropped then returned to baseline exactly, before Task S1 trimmed that to
-    a matcher/retract-only check because the score store could no longer read
-    a penalty-free event. Task S3 deletes the score subsystem itself, so
-    there is no score left to recompute — this test's name is now a
-    description of what it used to also prove, not of what it currently
-    does.
-    """
+    threat event, then retract it and confirm both that the match set the
+    retraction reversed is exactly the match set the event created, and that
+    the matched person disappears from ``svc.v_person_threat_context`` — the
+    view the backend's score relies on (migration
+    ``0023_svc_score_views.up.sql``, filtered to ``status = 'active'``)."""
     user_ref = _user()
     await ensure_subject(pool, user_ref)
     with psycopg.connect(migrated_db, autocommit=True) as conn:
@@ -363,7 +356,23 @@ async def test_event_retraction_restores_exactly_the_pre_event_score(
     event_id, matched = await _create(store, domains=("evil.example",))
     assert user_ref in matched
 
+    before = _row(
+        migrated_db,
+        "SELECT count(*) AS n FROM svc.v_person_threat_context"
+        " WHERE person_ref = %s AND event_id = %s",
+        (user_ref, event_id),
+    )
+    assert before["n"] == 1
+
     reversed_ = await store.retract_event(event_id, operator="ops", reason="retracted")
     assert reversed_ is not None
     assert user_ref in reversed_
     assert set(reversed_) == set(matched)
+
+    after = _row(
+        migrated_db,
+        "SELECT count(*) AS n FROM svc.v_person_threat_context"
+        " WHERE person_ref = %s AND event_id = %s",
+        (user_ref, event_id),
+    )
+    assert after["n"] == 0

@@ -33,7 +33,7 @@ REKOGNITION_CONFIRM_ID = ProviderId("rekognition_confirm")
 # The ONLY non-human value `infringements.confirm_decided_by` may ever carry.
 # Every other confirmed row names a person: the `operator` string the review
 # console authenticated, or the constant 'subject'. Written only by
-# `confirm/store.py::record_auto_confirmed`, and read by `score/store.py` to
+# `confirm/store.py::record_auto_confirmed`, and read by `review/store.py` to
 # tell "nobody has answered yet" apart from "nobody will ever be asked".
 AUTO_CONFIRM_DECIDED_BY = "auto:nsfw"
 

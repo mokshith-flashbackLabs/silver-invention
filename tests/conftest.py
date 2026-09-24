@@ -74,7 +74,7 @@ VALID_ENV: dict[str, str] = {
     "GOOGLE_VISION_API_KEY": "google-key-for-tests",
     "SQS_IDENTITY_INDEX_URL": "http://localhost:14566/000000000000/imageshield-identity-index",
     "SQS_SEARCH_RUNS_URL": "http://localhost:14566/000000000000/imageshield-search-runs",
-    # Protection score / confirm pipeline (design 2026-08-19, Task 3).
+    # Confirm pipeline (design 2026-08-19, Task 3).
     "SQS_CONFIRM_HITS_URL": (
         "https://sqs.ap-south-1.amazonaws.com/000000000000/imageshield-confirm-hits"
     ),
