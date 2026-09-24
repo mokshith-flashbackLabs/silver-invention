@@ -1,10 +1,9 @@
 """Admin threat-event routes — behaviour over in-memory fakes (Task 14).
 
 Same convention as ``tests/test_admin_providers.py``: ``TestClient`` never
-runs the lifespan, both ``ThreatStore`` and ``ScoreStore`` are pre-wired
-fakes on ``app.state``, and the auth assertion is load-bearing — a threat
-event can penalise every enrolled person's score in one call, so both tokens
-are required at router level.
+runs the lifespan, ``ThreatStore`` is a pre-wired fake on ``app.state``, and
+the auth assertion is load-bearing — a threat event can name hundreds of
+``user_ref``s in one call, so both tokens are required at router level.
 """
 
 from __future__ import annotations
@@ -25,9 +24,9 @@ ADMIN = {**AUTH, "X-Admin-Service-Token": ADMIN_SERVICE_TOKEN}
 class FakeThreatStore:
     """Records every create/retract call. ``matched`` is what ``create_event``
     hands back for every call — enough for these route tests, which are about
-    the route's own behaviour (status codes, the recompute fan-out, 404
-    shape) rather than the matcher, which ``tests/test_threats.py`` covers
-    against real Postgres."""
+    the route's own behaviour (status codes, ``matched_count``, 404 shape)
+    rather than the matcher, which ``tests/test_threats.py`` covers against
+    real Postgres."""
 
     def __init__(self, *, matched: tuple[UserRef, ...] = ()) -> None:
         self._matched = matched
@@ -51,52 +50,11 @@ class FakeThreatStore:
         return []
 
 
-class FakeScoreStore:
-    """Records every ``recompute`` call as ``(user_ref, cause_kind)`` — same
-    shape as ``tests/test_search_routes.py``'s fake, kept local here so this
-    file has no cross-module test coupling."""
-
-    def __init__(self, *, raise_error: bool = False) -> None:
-        self._raise_error = raise_error
-        self.calls: list[tuple[UserRef, str]] = []
-
-    async def recompute(
-        self,
-        user_ref: UserRef,
-        *,
-        cause_kind: str,
-        cause_ref: str | None = None,
-        now: Any = None,
-    ) -> Any:
-        if self._raise_error:
-            raise RuntimeError("score store unavailable")
-        self.calls.append((user_ref, cause_kind))
-        return None
-
-    async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
-        raise NotImplementedError
-
-    async def list_events(
-        self, user_ref: UserRef, *, limit: int = 50
-    ) -> list[dict[str, Any]]:
-        raise NotImplementedError
-
-    async def all_subject_refs(self) -> tuple[UserRef, ...]:
-        raise NotImplementedError
-
-    async def expire_due_threat_events(self, *, now: Any) -> int:
-        raise NotImplementedError
-
-
-def make_client(
-    *, matched: tuple[UserRef, ...] = (), raising_score_store: bool = False
-) -> tuple[TestClient, FakeThreatStore, FakeScoreStore]:
+def make_client(*, matched: tuple[UserRef, ...] = ()) -> tuple[TestClient, FakeThreatStore]:
     app = create_app(config=make_config())
     threats = FakeThreatStore(matched=matched)
-    score = FakeScoreStore(raise_error=raising_score_store)
     app.state.threat_store = threats
-    app.state.score_store = score
-    return TestClient(app), threats, score
+    return TestClient(app), threats
 
 
 def _body(**overrides: Any) -> dict[str, Any]:
@@ -115,7 +73,7 @@ def _body(**overrides: Any) -> dict[str, Any]:
 
 
 def test_every_route_needs_both_tokens() -> None:
-    client, threats, score = make_client()
+    client, threats = make_client()
 
     create_body = _body()
     assert client.post("/v1/admin/threat-events", json=create_body).status_code == 401
@@ -134,12 +92,11 @@ def test_every_route_needs_both_tokens() -> None:
 
     assert threats.create_calls == []
     assert threats.retract_calls == []
-    assert score.calls == []
 
 
-def test_create_returns_201_with_matched_count_and_recomputes_each_matched_ref() -> None:
+def test_create_returns_201_with_matched_count() -> None:
     matched = (UserRef(uuid4()), UserRef(uuid4()))
-    client, threats, score = make_client(matched=matched)
+    client, threats = make_client(matched=matched)
 
     response = client.post("/v1/admin/threat-events", json=_body(), headers=ADMIN)
 
@@ -148,15 +105,11 @@ def test_create_returns_201_with_matched_count_and_recomputes_each_matched_ref()
     event_id = UUID(body["event_id"])
     assert body["matched_count"] == 2
     assert len(threats.create_calls) == 1
-    assert sorted(score.calls) == sorted((u, "threat_event") for u in matched)
-    # Every recompute is tagged with this event as its cause_ref via the
-    # store's own call, exercised at the store level in test_threats.py —
-    # here we only need the fan-out itself and that the id round-trips.
     assert str(event_id) != ""
 
 
 def test_create_needs_no_penalty() -> None:
-    client, threats, _score = make_client()
+    client, threats = make_client()
 
     response = client.post("/v1/admin/threat-events", json=_body(), headers=ADMIN)
 
@@ -166,7 +119,7 @@ def test_create_needs_no_penalty() -> None:
 
 def test_create_ignores_a_sent_penalty() -> None:
     # An older backend still sends one for a release; new services ignore it.
-    client, threats, _score = make_client()
+    client, threats = make_client()
 
     response = client.post("/v1/admin/threat-events", json=_body(penalty="5.00"), headers=ADMIN)
 
@@ -174,28 +127,17 @@ def test_create_ignores_a_sent_penalty() -> None:
     assert "penalty" not in threats.create_calls[0]
 
 
-def test_create_zero_matches_triggers_no_recompute() -> None:
-    client, _threats, score = make_client(matched=())
+def test_create_zero_matches_returns_zero_matched_count() -> None:
+    client, _threats = make_client(matched=())
 
     response = client.post("/v1/admin/threat-events", json=_body(), headers=ADMIN)
 
     assert response.status_code == 201
     assert response.json()["matched_count"] == 0
-    assert score.calls == []
-
-
-def test_a_raising_score_store_does_not_change_the_create_response() -> None:
-    matched = (UserRef(uuid4()),)
-    client, _threats, _score = make_client(matched=matched, raising_score_store=True)
-
-    response = client.post("/v1/admin/threat-events", json=_body(), headers=ADMIN)
-
-    assert response.status_code == 201
-    assert response.json()["matched_count"] == 1
 
 
 def test_retract_404s_on_an_unknown_event() -> None:
-    client, _threats, score = make_client()
+    client, _threats = make_client()
 
     response = client.post(
         f"/v1/admin/threat-events/{uuid4()}/retract",
@@ -205,15 +147,13 @@ def test_retract_404s_on_an_unknown_event() -> None:
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "threat_event_not_found"
-    assert score.calls == []
 
 
-def test_retract_success_recomputes_each_matched_ref() -> None:
+def test_retract_success_returns_matched_count() -> None:
     matched = (UserRef(uuid4()), UserRef(uuid4()))
-    client, _threats, score = make_client(matched=matched)
+    client, _threats = make_client(matched=matched)
     create_response = client.post("/v1/admin/threat-events", json=_body(), headers=ADMIN)
     event_id = create_response.json()["event_id"]
-    score.calls.clear()  # isolate the retract fan-out from the create fan-out
 
     response = client.post(
         f"/v1/admin/threat-events/{event_id}/retract",
@@ -224,11 +164,10 @@ def test_retract_success_recomputes_each_matched_ref() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["matched_count"] == 2
-    assert sorted(score.calls) == sorted((u, "threat_retracted") for u in matched)
 
 
 def test_extra_field_is_rejected_with_422() -> None:
-    client, threats, _score = make_client()
+    client, threats = make_client()
 
     response = client.post(
         "/v1/admin/threat-events", json=_body(unexpected="field"), headers=ADMIN
@@ -239,7 +178,7 @@ def test_extra_field_is_rejected_with_422() -> None:
 
 
 def test_domains_required_unless_global() -> None:
-    client, threats, _score = make_client()
+    client, threats = make_client()
 
     response = client.post(
         "/v1/admin/threat-events",
@@ -252,7 +191,7 @@ def test_domains_required_unless_global() -> None:
 
 
 def test_list_returns_200() -> None:
-    client, _threats, _score = make_client()
+    client, _threats = make_client()
 
     response = client.get("/v1/admin/threat-events", headers=ADMIN)
 

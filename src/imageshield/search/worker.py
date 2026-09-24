@@ -47,8 +47,6 @@ from imageshield.providers.store import (
     ProviderControlStore,
 )
 from imageshield.relay import _localstack_endpoint_url
-from imageshield.score.engine import ScoreWeights
-from imageshield.score.store import PostgresScoreStore, ScoreStore
 from imageshield.search.cadence import CadencePolicy
 from imageshield.search.cadence import policy_from_config as cadence_policy_from_config
 from imageshield.search.google import GoogleWebDetectionProvider
@@ -141,7 +139,6 @@ async def handle_message(
     calibration_store: CalibrationStore,
     control: ProviderControlStore,
     cadence: CadencePolicy,
-    score_store: ScoreStore,
     *,
     logger: structlog.stdlib.BoundLogger | Any = None,
 ) -> bool:
@@ -183,14 +180,6 @@ async def handle_message(
     except Exception as exc:  # broad on purpose: crash = leave for redelivery
         log.error("worker.run_execution_failed", run_id=str(payload.id), error=str(exc))
         return False
-    try:
-        await score_store.recompute(
-            claim.user_ref, cause_kind="run_completed", cause_ref=str(claim.run_id)
-        )
-    except Exception:  # deliberate: the trigger already committed; tick will heal
-        log.warning(
-            "score.recompute_failed", user_ref=str(claim.user_ref), cause="run_completed"
-        )
     return True
 
 
@@ -210,11 +199,6 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
     calibration_store = PostgresCalibrationStore(pool)
     control = build_control_store(config, pool)
     cadence = cadence_policy_from_config(config)
-    score_store = PostgresScoreStore(
-        pool,
-        weights=ScoreWeights.from_config(config),
-        config_version=config.score_config_version,
-    )
     stop_requested = False
 
     def _handle_stop(signum: int, _frame: object) -> None:
@@ -242,7 +226,6 @@ async def run_forever(config: Config, *, consumer: SqsConsumer | None = None) ->
                     calibration_store,
                     control,
                     cadence,
-                    score_store,
                     logger=log,
                 )
                 if handled:

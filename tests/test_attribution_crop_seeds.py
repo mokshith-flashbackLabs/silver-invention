@@ -224,18 +224,6 @@ def test_a_subject_with_no_target_is_skipped_rather_than_photo_seeded() -> None:
     ]
 
 
-def test_a_skipped_subject_gets_no_score_recompute() -> None:
-    """No seed was registered, so nothing about their protection changed."""
-    owner = uuid4()
-    client, _p, _s, _f = _two_face_client(
-        owner, upload_fails_for=frozenset({"abc"})
-    )
-
-    _post(client, _body([owner], crop_targets=[_target(owner, "abc")]))
-
-    assert client.app.state.score_store.calls == []
-
-
 # ── when cropping is not what the run calls for ──────────────────────────────
 
 

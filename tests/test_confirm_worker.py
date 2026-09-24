@@ -228,28 +228,6 @@ class FakeModeration:
         return self._signal
 
 
-class FakeScoreStore:
-    """Only ``recompute`` is reached from the worker; the rest of the
-    ``ScoreStore`` Protocol is unimplemented on purpose -- a fake that grows
-    methods nothing calls stops being evidence about the caller."""
-
-    def __init__(self, *, error: Exception | None = None) -> None:
-        self._error = error
-        self.recomputes: list[tuple[UserRef, str, str | None]] = []
-
-    async def recompute(
-        self,
-        user_ref: UserRef,
-        *,
-        cause_kind: str,
-        cause_ref: str | None = None,
-        now: object = None,
-    ) -> None:
-        self.recomputes.append((user_ref, cause_kind, cause_ref))
-        if self._error is not None:
-            raise self._error
-
-
 async def _fetch_ok(url: str) -> bytes | None:
     return IMAGE_BYTES
 
@@ -267,7 +245,6 @@ def _deps(
     moderation: FakeModeration | None = None,
     fetch: object = _fetch_ok,
     fetch_page: object = None,
-    score: FakeScoreStore | None = None,
 ) -> ConfirmDeps:
     default_control = FakeControlStore({REKOGNITION_CONFIRM_ID: runtime(REKOGNITION_CONFIRM_ID)})
     default_moderation = FakeModeration(ModerationSignal(labels=(), min_age_low=None))
@@ -278,7 +255,6 @@ def _deps(
         moderation=moderation if moderation is not None else default_moderation,
         fetch=fetch,  # type: ignore[arg-type]
         fetch_page=fetch_page if fetch_page is not None else _fetch_page_none,  # type: ignore[arg-type]
-        score=score if score is not None else FakeScoreStore(),  # type: ignore[arg-type]
         face_match_threshold=92.0,
         max_faces=3,
         phash_hamming_max=8,
@@ -543,10 +519,9 @@ async def test_skip_with_no_run_id_skips_control_record_but_still_records_skippe
 async def test_happy_path_ncii_auto_confirms_and_never_triages() -> None:
     ctx = _ctx()
     store = FakeConfirmStore(ctx)
-    score = FakeScoreStore()
     provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
     moderation = FakeModeration(ModerationSignal(labels=(EXPLICIT_LABEL,), min_age_low=30.0))
-    deps = _deps(store=store, provider=provider, moderation=moderation, score=score)
+    deps = _deps(store=store, provider=provider, moderation=moderation)
 
     handled = await handle_message(_body(ctx.infringement_id), deps)
 
@@ -563,8 +538,6 @@ async def test_happy_path_ncii_auto_confirms_and_never_triages() -> None:
     assert triage["best_face_bbox"] == {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}
     assert triage["moderation_labels"] == ["Explicit Nudity"]
     assert store.quarantines == []
-    # The exposure is real, so the score moves now rather than at the next run.
-    assert score.recomputes == [(USER_REF, "auto_confirm", str(ctx.infringement_id))]
 
 
 async def test_explicit_but_unmatched_still_only_triages() -> None:
@@ -573,11 +546,10 @@ async def test_explicit_but_unmatched_still_only_triages() -> None:
     auto-confirm branch."""
     ctx = _ctx()
     store = FakeConfirmStore(ctx)
-    score = FakeScoreStore()
     # No matches at all -> resolve_face yields match_score None -> unmatched.
     provider = FakeAttributionProvider(faces=(_face(),), matches=())
     moderation = FakeModeration(ModerationSignal(labels=(EXPLICIT_LABEL,), min_age_low=30.0))
-    deps = _deps(store=store, provider=provider, moderation=moderation, score=score)
+    deps = _deps(store=store, provider=provider, moderation=moderation)
 
     handled = await handle_message(_body(ctx.infringement_id), deps)
 
@@ -585,26 +557,6 @@ async def test_explicit_but_unmatched_still_only_triages() -> None:
     assert store.auto_confirmed == []
     assert len(store.triages) == 1
     assert store.triages[0]["severity"] == "explicit_unmatched"
-    assert score.recomputes == [], "a triage is not a confirm and moves no score"
-
-
-async def test_a_failing_score_store_does_not_redeliver_the_message() -> None:
-    """The confirm has already COMMITTED by the time the recompute runs, so a
-    redelivery would re-fetch and re-bill the Rekognition bundle to write
-    nothing (the guarded UPDATE refuses the second time). Log, delete, let
-    the score tick heal the drift -- the same contract search/worker.py takes
-    after execute_run."""
-    ctx = _ctx()
-    store = FakeConfirmStore(ctx)
-    score = FakeScoreStore(error=RuntimeError("score store down"))
-    provider = FakeAttributionProvider(faces=(_face(),), matches=(_matching_face_match(),))
-    moderation = FakeModeration(ModerationSignal(labels=(EXPLICIT_LABEL,), min_age_low=30.0))
-    deps = _deps(store=store, provider=provider, moderation=moderation, score=score)
-
-    handled = await handle_message(_body(ctx.infringement_id), deps)
-
-    assert handled is True, "a failed recompute must not redeliver a committed confirm"
-    assert len(store.auto_confirmed) == 1
 
 
 async def test_csam_path_quarantines_and_never_triages() -> None:

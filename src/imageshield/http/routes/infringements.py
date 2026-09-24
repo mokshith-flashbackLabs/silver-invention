@@ -33,7 +33,6 @@ from imageshield.http.deps import (
     get_crop_client,
     get_preview_store,
     get_review_store,
-    get_score_store,
     get_search_store,
 )
 from imageshield.http.errors import ServiceError
@@ -46,7 +45,6 @@ from imageshield.http.models import (
 from imageshield.preview.client import CropUnavailable, FetcherCropClient
 from imageshield.preview.store import PreviewStore
 from imageshield.review.store import ReviewStore
-from imageshield.score.store import ScoreStore
 from imageshield.search.store import SearchStore
 from imageshield.types import parse_user_ref
 
@@ -88,7 +86,6 @@ async def record_feedback(
     infringement_id: UUID,
     body: FeedbackRequest,
     store: SearchStore = Depends(get_search_store),
-    score_store: ScoreStore = Depends(get_score_store),
 ) -> FeedbackResponse:
     status = await store.record_feedback(infringement_id, body.user_ref, body.signal)
     if status is None:
@@ -99,14 +96,6 @@ async def record_feedback(
         signal=body.signal,
         status=status,
     )
-    try:
-        await score_store.recompute(
-            body.user_ref, cause_kind="feedback", cause_ref=str(infringement_id)
-        )
-    except Exception:  # deliberate: the trigger already committed; tick will heal
-        log.warning(
-            "score.recompute_failed", user_ref=str(body.user_ref), cause="feedback"
-        )
     return FeedbackResponse(status=status)
 
 
@@ -192,7 +181,6 @@ async def subject_decision(
     infringement_id: UUID,
     body: SubjectDecisionRequest,
     review_store: ReviewStore = Depends(get_review_store),
-    score_store: ScoreStore = Depends(get_score_store),
 ) -> SubjectDecisionResponse:
     """The answer IS the decision (spec 2026-08-21 §5): the subject is the
     deciding human for their own likeness. 'confirmed' moves Exposure exactly
@@ -221,19 +209,6 @@ async def subject_decision(
         decision=outcome.decision,
         replay=outcome.outcome == "replay",
     )
-    if outcome.outcome == "decided":
-        try:
-            await score_store.recompute(
-                body.user_ref,
-                cause_kind="subject_decision",
-                cause_ref=str(infringement_id),
-            )
-        except Exception:  # deliberate: the decision already committed; tick will heal
-            log.warning(
-                "score.recompute_failed",
-                user_ref=str(body.user_ref),
-                cause="subject_decision",
-            )
     return SubjectDecisionResponse(
         infringement_id=infringement_id,
         decision=outcome.decision,

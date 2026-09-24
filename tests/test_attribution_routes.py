@@ -25,8 +25,6 @@ from imageshield.attribution.models import (
 )
 from imageshield.http.app import create_app
 from imageshield.liveness.models import UploadError
-from imageshield.score.store import ScoreResult
-from imageshield.types import UserRef
 from tests.conftest import SERVICE_TOKEN, make_config
 
 AUTH = {"X-Service-Token": SERVICE_TOKEN}
@@ -121,52 +119,10 @@ class FakeStore:
         return uuid4()
 
 
-class FakeScoreStore:
-    """Records every ``recompute`` call, keyed on ``app.state`` so it needs no
-    change to ``make_client``'s callers: fetch it back via
-    ``client.app.state.score_store``. ``raise_error`` proves the
-    swallow-and-log wrapper never changes the route's response."""
-
-    def __init__(self, *, raise_error: bool = False) -> None:
-        self._raise_error = raise_error
-        self.calls: list[tuple[UserRef, str]] = []
-        # Kept alongside `calls` rather than replacing it, same reasoning as
-        # test_search_routes.py's fake: existing 2-tuple assertions stay put.
-        self.calls_with_ref: list[tuple[UserRef, str, str | None]] = []
-
-    async def recompute(
-        self,
-        user_ref: UserRef,
-        *,
-        cause_kind: str,
-        cause_ref: str | None = None,
-        now: Any = None,
-    ) -> ScoreResult | None:
-        if self._raise_error:
-            raise RuntimeError("score store unavailable")
-        self.calls.append((user_ref, cause_kind))
-        self.calls_with_ref.append((user_ref, cause_kind, cause_ref))
-        return None
-
-    async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
-        raise NotImplementedError
-
-    async def list_events(
-        self, user_ref: UserRef, *, limit: int = 50
-    ) -> list[dict[str, Any]]:
-        raise NotImplementedError
-
-    async def all_subject_refs(self) -> tuple[UserRef, ...]:
-        raise NotImplementedError
-
-    async def expire_due_threat_events(self, *, now: Any) -> int:
-        raise NotImplementedError
-
-
 class FakeUploader:
     """Records every presigned PUT. Reachable as
-    ``client.app.state.object_uploader``, the same trick FakeScoreStore uses so
-    ``make_client``'s existing 4-tuple callers need no change.
+    ``client.app.state.object_uploader``, so ``make_client``'s existing
+    4-tuple callers need no change.
 
     ``fail_for`` names crop_refs whose PUT raises, which is how the
     no-seed-on-upload-failure rule gets exercised without a network.
@@ -189,7 +145,6 @@ def make_client(
     provider_error: Exception | None = None,
     fetch_error: Exception | None = None,
     fetch_payload: bytes | None = None,
-    raising_score_store: bool = False,
     upload_fails_for: frozenset[str] = frozenset(),
     **config_overrides: Any,
 ) -> tuple[TestClient, FakeProvider, FakeStore, FakeFetcher]:
@@ -200,7 +155,6 @@ def make_client(
     app.state.attribution_provider = provider
     app.state.attribution_store = store
     app.state.photo_fetcher = fetcher
-    app.state.score_store = FakeScoreStore(raise_error=raising_score_store)
     app.state.object_uploader = FakeUploader(upload_fails_for)
     return TestClient(app), provider, store, fetcher
 
@@ -244,13 +198,6 @@ def test_one_enrolled_face_among_two_strangers_registers_one_seed() -> None:
     assert [f["face_index"] for f in payload["faces"]] == [0, 1, 2]
     assert [f["resolved_user_ref"] for f in payload["faces"]] == [None, str(owner), None]
     assert all(f["bbox"] == {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4} for f in payload["faces"])
-    # score.recompute fires exactly once, with the seed-registered cause.
-    assert client.app.state.score_store.calls == [(UserRef(owner), "seed_registered")]
-    # INVARIANTS #44: the cause is readable -- the attribution run that
-    # registered the seed, the natural id this route has in scope.
-    assert client.app.state.score_store.calls_with_ref == [
-        (UserRef(owner), "seed_registered", payload["run_id"])
-    ]
 
 
 def test_two_household_members_register_two_seeds() -> None:
@@ -266,47 +213,6 @@ def test_two_household_members_register_two_seeds() -> None:
     payload = _post(client, _body([alice, bob])).json()
 
     assert {s["user_ref"] for s in payload["seeds_registered"]} == {str(alice), str(bob)}
-    # Once per DISTINCT registered seed user_ref.
-    assert set(client.app.state.score_store.calls) == {
-        (UserRef(alice), "seed_registered"),
-        (UserRef(bob), "seed_registered"),
-    }
-    assert len(client.app.state.score_store.calls) == 2
-    # Same attribution run for both -- one outcome, two registered seeds.
-    assert set(client.app.state.score_store.calls_with_ref) == {
-        (UserRef(alice), "seed_registered", payload["run_id"]),
-        (UserRef(bob), "seed_registered", payload["run_id"]),
-    }
-
-
-def test_no_enrolled_faces_registers_no_seeds_and_recomputes_nothing() -> None:
-    owner, stranger = uuid4(), uuid4()
-    client, _p, _s, _f = make_client(
-        faces=(_face(0),),
-        matches={0: (FaceMatch(external_image_id=str(stranger), similarity=99.9),)},
-    )
-
-    response = _post(client, _body([owner]))
-
-    assert response.status_code == 200
-    assert client.app.state.score_store.calls == []
-
-
-def test_response_is_unchanged_when_score_recompute_raises() -> None:
-    """The swallow-and-log wrapper: a broken score store must never turn a
-    successful attribution into a failed request."""
-    owner = uuid4()
-    client, _p, _s, _f = make_client(
-        faces=(_face(0),),
-        matches={0: (FaceMatch(external_image_id=str(owner), similarity=95.0),)},
-        raising_score_store=True,
-    )
-
-    response = _post(client, _body([owner]))
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert len(payload["seeds_registered"]) == 1
 
 
 def test_no_enrolled_faces_returns_200_with_zero_seeds() -> None:

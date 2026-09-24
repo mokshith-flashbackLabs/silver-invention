@@ -1,9 +1,8 @@
 """Admin review-queue routes — behaviour over in-memory fakes (Task 15).
 
 Same convention as ``tests/test_admin_threat_routes.py``: ``TestClient``
-never runs the lifespan, both ``ReviewStore`` and ``ScoreStore`` are
-pre-wired fakes on ``app.state``, and both tokens are required at router
-level.
+never runs the lifespan, ``ReviewStore`` is a pre-wired fake on
+``app.state``, and both tokens are required at router level.
 """
 
 from __future__ import annotations
@@ -107,39 +106,6 @@ class FakeReviewStore:
         }
 
 
-class FakeScoreStore:
-    def __init__(self, *, raise_error: bool = False) -> None:
-        self._raise_error = raise_error
-        self.calls: list[tuple[UserRef, str, str | None]] = []
-
-    async def recompute(
-        self,
-        user_ref: UserRef,
-        *,
-        cause_kind: str,
-        cause_ref: str | None = None,
-        now: Any = None,
-    ) -> Any:
-        if self._raise_error:
-            raise RuntimeError("score store unavailable")
-        self.calls.append((user_ref, cause_kind, cause_ref))
-        return None
-
-    async def get_score(self, user_ref: UserRef) -> dict[str, Any] | None:
-        raise NotImplementedError
-
-    async def list_events(
-        self, user_ref: UserRef, *, limit: int = 50
-    ) -> list[dict[str, Any]]:
-        raise NotImplementedError
-
-    async def all_subject_refs(self) -> tuple[UserRef, ...]:
-        raise NotImplementedError
-
-    async def expire_due_threat_events(self, *, now: Any) -> int:
-        raise NotImplementedError
-
-
 def _task(**overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "task_id": uuid4(),
@@ -161,18 +127,15 @@ def make_client(
     task: dict[str, Any] | None = None,
     depths: dict[str, int] | None = None,
     outcome: DecisionOutcome | Exception | None = None,
-    raising_score_store: bool = False,
     decisions: tuple[dict[str, Any], ...] = (),
     hits: tuple[dict[str, Any], ...] = (),
-) -> tuple[TestClient, FakeReviewStore, FakeScoreStore]:
+) -> tuple[TestClient, FakeReviewStore]:
     app = create_app(config=make_config())
     review = FakeReviewStore(
         task=task, depths=depths, outcome=outcome, decisions=decisions, hits=hits
     )
-    score = FakeScoreStore(raise_error=raising_score_store)
     app.state.review_store = review
-    app.state.score_store = score
-    return TestClient(app), review, score
+    return TestClient(app), review
 
 
 def _decision_body(**overrides: Any) -> dict[str, Any]:
@@ -182,7 +145,7 @@ def _decision_body(**overrides: Any) -> dict[str, Any]:
 
 
 def test_every_route_needs_both_tokens() -> None:
-    client, review, score = make_client(task=_task())
+    client, review = make_client(task=_task())
 
     assert client.get("/v1/admin/review/next").status_code == 401
     assert client.get("/v1/admin/review/next", headers=AUTH).status_code == 401
@@ -196,12 +159,11 @@ def test_every_route_needs_both_tokens() -> None:
     )
 
     assert review.decide_calls == []
-    assert score.calls == []
 
 
 def test_next_returns_200_with_the_task_json() -> None:
     task = _task()
-    client, _review, _score = make_client(task=task)
+    client, _review = make_client(task=task)
 
     response = client.get("/v1/admin/review/next", headers=ADMIN)
 
@@ -215,7 +177,7 @@ def test_next_returns_200_with_the_task_json() -> None:
 
 
 def test_next_returns_204_when_the_queue_is_empty() -> None:
-    client, _review, _score = make_client(task=None)
+    client, _review = make_client(task=None)
 
     response = client.get("/v1/admin/review/next", headers=ADMIN)
 
@@ -225,7 +187,7 @@ def test_next_returns_204_when_the_queue_is_empty() -> None:
 
 def test_queue_returns_the_depths_dict() -> None:
     depths = {"ncii_suspected": 3, "benign_copy": 1}
-    client, _review, _score = make_client(depths=depths)
+    client, _review = make_client(depths=depths)
 
     response = client.get("/v1/admin/review/queue", headers=ADMIN)
 
@@ -233,7 +195,7 @@ def test_queue_returns_the_depths_dict() -> None:
     assert response.json() == depths
 
 
-def test_decide_confirmed_triggers_recompute_with_review_decision_cause() -> None:
+def test_decide_confirmed_returns_the_outcome() -> None:
     infringement_id = uuid4()
     user_ref = UserRef(uuid4())
     outcome = DecisionOutcome(
@@ -242,7 +204,7 @@ def test_decide_confirmed_triggers_recompute_with_review_decision_cause() -> Non
         decision="confirmed",
         severity="ncii_suspected",
     )
-    client, review, score = make_client(outcome=outcome)
+    client, review = make_client(outcome=outcome)
 
     response = client.post(
         f"/v1/admin/review/{uuid4()}/decision",
@@ -255,16 +217,15 @@ def test_decide_confirmed_triggers_recompute_with_review_decision_cause() -> Non
     assert body["infringement_id"] == str(infringement_id)
     assert body["decision"] == "confirmed"
     assert body["severity"] == "ncii_suspected"
-    assert score.calls == [(user_ref, "review_decision", str(infringement_id))]
     assert review.decide_calls[0]["operator"] == "alice"
     assert review.decide_calls[0]["severity"] == "ncii_suspected"
 
 
-def test_decide_rejected_also_triggers_recompute() -> None:
+def test_decide_rejected_returns_the_outcome() -> None:
     outcome = DecisionOutcome(
         infringement_id=uuid4(), user_ref=UserRef(uuid4()), decision="rejected", severity=None
     )
-    client, _review, score = make_client(outcome=outcome)
+    client, _review = make_client(outcome=outcome)
 
     response = client.post(
         f"/v1/admin/review/{uuid4()}/decision",
@@ -273,15 +234,14 @@ def test_decide_rejected_also_triggers_recompute() -> None:
     )
 
     assert response.status_code == 200
-    assert len(score.calls) == 1
-    assert score.calls[0][1] == "review_decision"
+    assert response.json()["decision"] == "rejected"
 
 
-def test_decide_uncertain_triggers_no_recompute() -> None:
+def test_decide_uncertain_returns_the_outcome() -> None:
     outcome = DecisionOutcome(
         infringement_id=uuid4(), user_ref=UserRef(uuid4()), decision="uncertain", severity=None
     )
-    client, _review, score = make_client(outcome=outcome)
+    client, _review = make_client(outcome=outcome)
 
     response = client.post(
         f"/v1/admin/review/{uuid4()}/decision",
@@ -293,11 +253,10 @@ def test_decide_uncertain_triggers_no_recompute() -> None:
     body = response.json()
     assert body["decision"] == "uncertain"
     assert body["severity"] is None
-    assert score.calls == []
 
 
 def test_decide_404s_on_an_unknown_task() -> None:
-    client, review, score = make_client(outcome=None)
+    client, review = make_client(outcome=None)
 
     response = client.post(
         f"/v1/admin/review/{uuid4()}/decision", json=_decision_body(), headers=ADMIN
@@ -305,12 +264,11 @@ def test_decide_404s_on_an_unknown_task() -> None:
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "review_task_not_found"
-    assert score.calls == []
     assert len(review.decide_calls) == 1
 
 
 def test_decide_422s_on_a_bogus_severity() -> None:
-    client, review, _score = make_client()
+    client, review = make_client()
 
     response = client.post(
         f"/v1/admin/review/{uuid4()}/decision",
@@ -323,7 +281,7 @@ def test_decide_422s_on_a_bogus_severity() -> None:
 
 
 def test_decide_422s_on_a_bogus_decision() -> None:
-    client, review, _score = make_client()
+    client, review = make_client()
 
     response = client.post(
         f"/v1/admin/review/{uuid4()}/decision",
@@ -336,7 +294,7 @@ def test_decide_422s_on_a_bogus_decision() -> None:
 
 
 def test_decide_422s_on_a_blank_operator() -> None:
-    client, review, _score = make_client()
+    client, review = make_client()
 
     response = client.post(
         f"/v1/admin/review/{uuid4()}/decision",
@@ -346,22 +304,6 @@ def test_decide_422s_on_a_blank_operator() -> None:
 
     assert response.status_code == 422
     assert review.decide_calls == []
-
-
-def test_a_raising_score_store_does_not_change_the_decide_response() -> None:
-    outcome = DecisionOutcome(
-        infringement_id=uuid4(), user_ref=UserRef(uuid4()), decision="confirmed", severity=None
-    )
-    client, _review, _score = make_client(outcome=outcome, raising_score_store=True)
-
-    response = client.post(
-        f"/v1/admin/review/{uuid4()}/decision",
-        json=_decision_body(decision="confirmed"),
-        headers=ADMIN,
-    )
-
-    assert response.status_code == 200
-    assert response.json()["decision"] == "confirmed"
 
 
 # -- the observer feed (spec 2026-08-21 s6) ----------------------------------
@@ -376,7 +318,7 @@ def test_subject_decisions_feed_returns_the_store_rows() -> None:
         "severity": "ncii_suspected",
         "source_domain": "salon.example",
     }
-    client, review, _score = make_client(decisions=(row,))
+    client, review = make_client(decisions=(row,))
 
     response = client.get("/v1/admin/review/subject-decisions", headers=ADMIN)
 
@@ -386,7 +328,7 @@ def test_subject_decisions_feed_returns_the_store_rows() -> None:
 
 
 def test_subject_decisions_limit_is_clamped() -> None:
-    client, _review, _score = make_client()
+    client, _review = make_client()
 
     assert (
         client.get(
@@ -407,7 +349,7 @@ def test_open_hits_shows_that_a_person_has_a_hit() -> None:
         "source_domain": "salon.example",
         "first_seen_at": "2026-08-20T12:48:21+00:00",
     }
-    client, review, _score = make_client(hits=(row,))
+    client, review = make_client(hits=(row,))
 
     response = client.get(
         "/v1/admin/review/open-hits", params={"limit": 10}, headers=ADMIN
@@ -419,7 +361,7 @@ def test_open_hits_shows_that_a_person_has_a_hit() -> None:
 
 
 def test_the_new_feeds_need_both_tokens() -> None:
-    client, _review, _score = make_client()
+    client, _review = make_client()
 
     assert client.get("/v1/admin/review/subject-decisions").status_code == 401
     assert client.get("/v1/admin/review/open-hits", headers=AUTH).status_code == 401
@@ -432,7 +374,7 @@ def test_stats_defaults_to_a_thirty_day_window() -> None:
     """The default is computed per request, not at import: a module constant
     would freeze the window on a long-lived process and the numbers would
     quietly stop moving."""
-    client, review, _score = make_client()
+    client, review = make_client()
 
     before = datetime.now(UTC)
     response = client.get("/v1/admin/review/stats", headers=ADMIN)
@@ -446,7 +388,7 @@ def test_stats_defaults_to_a_thirty_day_window() -> None:
 def test_stats_serialises_a_null_rate_as_null() -> None:
     """The one field this endpoint must never fabricate. 0.0 would read as
     "no false positives" out of a window where nobody decided anything."""
-    client, review, _score = make_client()
+    client, review = make_client()
 
     body = client.get(
         "/v1/admin/review/stats",
@@ -463,7 +405,7 @@ def test_stats_serialises_a_null_rate_as_null() -> None:
 
 
 def test_stats_needs_both_tokens() -> None:
-    client, review, _score = make_client()
+    client, review = make_client()
 
     assert client.get("/v1/admin/review/stats").status_code == 401
     assert client.get("/v1/admin/review/stats", headers=AUTH).status_code == 401
