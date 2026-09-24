@@ -3,12 +3,21 @@
 **Audience:** whoever builds an admin/ops panel UI against the ImageShield services admin API —
 a frontend team, another repo, or an AI agent handed the prompt at the bottom of this file.
 
-**Status of the surface:** every endpoint below is live on `main` (protection-score push,
+**Status of the surface:** every endpoint below was live on `main` (protection-score push,
 2026-08-20). The reference client used to be a minimal server-rendered console shipped in this
 repo (`src/imageshield/console/`) — **retired 2026-08-29.** Staff now reach this surface through
 the backend's `/v1/admin/*` operator proxy (`image_backend` spec `2026-08-29-admin-proxy-design.md`
 §12); the panel is the frontend team's build against that proxy. The API below does not change
 either way — it is still the contract the backend's admin routes mirror.
+
+**Corrected 2026-09-24 — the protection score itself is gone.** Services deleted it
+(`docs/superpowers/specs/2026-09-24-remove-protection-score-design.md`): the score engine, its
+route and its journal are removed and the underlying tables are dormant, pending a coordinated
+drop. §5 below (`GET /v1/admin/scores/{user_ref}`) no longer exists — struck in place rather than
+deleted from this doc, since a panel may still reference it. Threat events no longer carry a
+`penalty`, no longer move any score, and a review decision no longer recomputes one; those sections
+are corrected in place below rather than rewritten from scratch, so the history of what changed
+stays visible.
 
 ---
 
@@ -116,9 +125,10 @@ queue-depth widget.
   "severity": "ncii_suspected | ... | null"   // optional OVERRIDE; omitted keeps triage's value
 }
 ```
-- `confirmed` / `rejected`: the task closes, the infringement's `confirm_state` changes, the
-  person's protection score recomputes (`cause review_decision`). Response:
-  `{"infringement_id", "user_ref", "decision", "severity"}`.
+- `confirmed` / `rejected`: the task closes, the infringement's `confirm_state` changes. **As of
+  2026-09-24 nothing recomputes a score for it** — the protection score is gone, so `cause
+  review_decision` is a historical value in journal rows that predate the removal, not something a
+  new decision writes. Response: `{"infringement_id", "user_ref", "decision", "severity"}`.
 - `uncertain`: recorded in the audit log, the task **stays pending** and will come back from
   `/next`. Nothing else changes. There is no timeout that auto-promotes — if the queue backs
   up, the queue backs up.
@@ -240,9 +250,16 @@ Query `since` (ISO-8601, default 30 days ago). The measurement, three ways:
 
 ## 4. Threat events
 
+**Corrected 2026-09-24 — `penalty` is gone from the wire.** It fed only the protection score,
+which is deleted (see the note at the top of this doc). `GET /v1/admin/threat-events` no longer
+returns a `penalty` field on `ThreatEventItem`. On create, `penalty` is **ACCEPTED AND IGNORED for
+one release** (`src/imageshield/http/models.py`) — send it or omit it, either is fine, and it is
+dropped from the model entirely once the backend stops sending it. Severity alone prices the event
+now; there is no score to drop or reverse.
+
 ### `GET /v1/admin/threat-events`
 `{"events": [ThreatEventItem, ...]}` where each item is:
-`{event_id, kind, title, body, severity(1-5), domains[], is_global, penalty("2.00" string),
+`{event_id, kind, title, body, severity(1-5), domains[], is_global,
 starts_at, expires_at, decay_days, status(draft|active|expired|retracted), created_by,
 created_at, updated_at}`.
 
@@ -253,36 +270,30 @@ created_at, updated_at}`.
   "severity": 3,
   "domains": ["site-a.example", "site-b.example"],   // OR is_global: true — one of the two is required (422 otherwise)
   "is_global": false,
-  "penalty": "2.00",                                  // decimal STRING, > 0, NUMERIC(5,2)
   "expires_at": "2026-09-20T00:00:00Z",
   "decay_days": 14,
   "operator": "alice" }
 → { "event_id": "uuid", "matched_count": 41 }
 ```
 Creating an event immediately matches it against users' live hits on those domains (or every
-subject when global), drops their scores (bounded, decaying) and spawns their recommendations.
-`matched_count` is your confirmation copy ("this will touch 41 people" — show it AFTER, and
-consider a preview/confirm step in the UI since the API applies immediately).
+subject when global) and spawns their recommendations. `matched_count` is your confirmation copy
+("this will touch 41 people" — show it AFTER, and consider a preview/confirm step in the UI since
+the API applies immediately).
 
 ### `POST /v1/admin/threat-events/{event_id}/retract`
 `{"operator": "alice", "reason": "≥3 chars, ≤500"}` →
-`{"event_id", "matched_count", "status": "retracted"}` — reverses the score effect **exactly**
-for every matched person. `404 threat_event_not_found` when the event is not active.
+`{"event_id", "matched_count", "status": "retracted"}` — `matched_count` is the number of people
+the retraction touched. `404 threat_event_not_found` when the event is not active.
 
-## 5. Protection score inspector
+## 5. ~~Protection score inspector~~ — REMOVED 2026-09-24
 
-### `GET /v1/admin/scores/{user_ref}`
-```json
-{ "score":  { "score": 78, "components": {"posture":33,"coverage":20,"exposure":25,"threat":0},
-              "config_version": "score-v1", "computed_at": "…" },
-  "events": [ { "score_event_id": 812, "delta": -6, "component": "exposure",
-                "cause_kind": "review_decision", "cause_ref": "uuid",
-                "config_version": "score-v1", "score_after": 78, "created_at": "…" }, … ] }
-```
-`events` is the newest-first journal (limit 50) — render it as the "why the score moved" feed.
-`404 score_not_found` = nothing computed yet for that ref (a real state for new users).
-`cause_kind` vocabulary: `feedback, enrolment, seed_registered, run_completed, review_decision,
-threat_event, threat_retracted, tick`.
+**This section is struck, not built.** `GET /v1/admin/scores/{user_ref}` no longer exists — the
+route, the score engine and its journal are deleted
+(`docs/superpowers/specs/2026-09-24-remove-protection-score-design.md`). It used to return a
+`score`/`components` object plus a newest-first `events` journal keyed on `cause_kind` values
+including `review_decision`, `threat_event`, `threat_retracted` and `tick`. Do not build a score
+inspector screen; if one exists in a panel already, remove it (see the build prompt below, which no
+longer lists it).
 
 ## 6. Provider health (pre-existing, unchanged)
 
@@ -362,10 +373,10 @@ be pasted verbatim to an external team or agent.
 > override / rejected / uncertain); treat 204 as "queue empty" and 404-on-decide as the normal
 > operator race. Show
 > `GET /v1/admin/review/queue` depths in the nav. (2) **Threat events** — list, create (domains
-> or global, penalty as a decimal string, a confirm step that warns the effect is immediate),
-> retract with reason. (3) **Score inspector** — lookup by user_ref, show the score, its four
-> components, and the journal as a human-readable "why it moved" feed. (4) **Provider health**
-> — the health table plus enable/disable/breaker-reset with reasons.
+> or global, a confirm step that warns the effect is immediate — no penalty field, removed
+> 2026-09-24), retract with reason. (3) **Provider health** — the health table plus
+> enable/disable/breaker-reset with reasons. There is no score-inspector screen — removed
+> 2026-09-24 along with the score it inspected (§5).
 >
 > Constraints: the panel's backend holds `X-Service-Token` and `X-Admin-Service-Token`
 > server-side only — never in the browser, and it never needs a fetcher token: the fetcher's

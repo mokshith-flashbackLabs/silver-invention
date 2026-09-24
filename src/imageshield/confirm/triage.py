@@ -45,9 +45,12 @@ SEVERITY_RANK: dict[str, int] = {
 # parent itself as a top-level label with no parent of its own, hence the
 # `parent_name` check also matching `name`.
 #
-# Semantics-bearing: changing either constant below changes triage/score
-# semantics -- bump SCORE_CONFIG_VERSION (config) in the same commit so
-# historical journal rows stay interpretable.
+# Semantics-bearing: changing either constant below changes triage
+# semantics. There is no SCORE_CONFIG_VERSION any more (the protection score
+# it versioned was deleted 2026-09-24, spec
+# 2026-09-24-remove-protection-score-design.md) -- record a change here as a
+# dated note under INVARIANTS #47 instead, so anyone reading old journal rows
+# can still tell what produced them.
 EXPLICIT_LABEL_PARENTS = frozenset({"Explicit Nudity", "Explicit"})
 EXPLICIT_MIN_CONFIDENCE = 80.0
 

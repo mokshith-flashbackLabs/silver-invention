@@ -33,8 +33,14 @@ REKOGNITION_CONFIRM_ID = ProviderId("rekognition_confirm")
 # The ONLY non-human value `infringements.confirm_decided_by` may ever carry.
 # Every other confirmed row names a person: the `operator` string the review
 # console authenticated, or the constant 'subject'. Written only by
-# `confirm/store.py::record_auto_confirmed`, and read by `review/store.py` to
-# tell "nobody has answered yet" apart from "nobody will ever be asked".
+# `confirm/store.py::record_auto_confirmed`. Nothing in `review/` reads this
+# constant or the literal string directly, but two things there depend on it
+# never equalling `'subject'`: the schema CHECK that a `confirmed`/`rejected`
+# row names its decider (satisfied by any non-null value, human or machine),
+# and `review/store.py::subject_decide`'s conflict path, which treats any
+# `confirm_decided_by != 'subject'` — an operator's name or this marker alike
+# — as "someone else already decided this", so a subject can never overturn
+# an auto-confirmed hit either.
 AUTO_CONFIRM_DECIDED_BY = "auto:nsfw"
 
 # The ONE severity the machine may confirm on its own: explicit content AND a

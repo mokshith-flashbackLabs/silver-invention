@@ -63,9 +63,13 @@ class RekognitionModeration:
 
     async def assess(self, image: bytes) -> ModerationSignal:
         try:
-            # Semantics-bearing: changing MinConfidence changes triage/score
-            # semantics -- bump SCORE_CONFIG_VERSION (config) in the same
-            # commit so historical journal rows stay interpretable.
+            # Semantics-bearing: changing MinConfidence changes triage
+            # semantics. There is no SCORE_CONFIG_VERSION any more (the
+            # protection score it versioned was deleted 2026-09-24, spec
+            # 2026-09-24-remove-protection-score-design.md) -- record a
+            # change here as a dated note under INVARIANTS #47 instead, so
+            # anyone reading old journal rows can still tell what produced
+            # them.
             moderation_response = await asyncio.to_thread(
                 self._client.detect_moderation_labels,
                 Image={"Bytes": image},

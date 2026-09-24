@@ -572,10 +572,13 @@ the daily **score tick** (`python -m imageshield.score.tick`) was the designed h
 case. **Removed 2026-09-24 along with the rest of `score/`** — there is no tick left to pick anything
 up on its next run, and no `run_once()` to invoke out-of-band; `score/tick.py` no longer exists.
 
-**Never write directly to `protection_scores` or `score_events` to "fix" a number.** Any writer other
-than `score/store.py` is exactly the boundary violation `tests/test_boundaries.py::test_only_the_score_store_writes_the_score`
-exists to catch, and a hand-edited materialized row with no journal entry breaks the invariant that
-lets support trust the history feed at all.
+**Never write directly to `protection_scores` or `score_events` to "fix" a number.** Both tables are
+dormant as of 2026-09-24 — `score/` and its store are deleted, and nothing in `src/` should write
+either one at all. That used to be enforced by `tests/test_boundaries.py::test_only_the_score_store_writes_the_score`
+(retired along with `score/store.py`); its replacement,
+`tests/test_boundaries.py::test_nothing_writes_the_dormant_score_tables`, asserts the narrower,
+correct-for-the-dormant-window claim — zero writers, not one sanctioned writer — and a hand-edited
+row is still exactly the kind of drift that test exists to catch.
 
 ---
 

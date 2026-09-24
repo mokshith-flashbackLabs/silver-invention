@@ -101,6 +101,11 @@ alongside everything else, but not much more. If any of these grow, redo this ar
 Services migrates first: the backend reads nine `svc` views that live in this schema and fails its
 readiness check without them.
 
+**Dated, 2026-09-24.** The same rule binds the protection-score removal specifically: services
+(migration 0037, which drops the `penalty` requirement on a threat-event create) must deploy before
+the backend change that stops sending `penalty` — see `DEPLOY-RUNBOOK.md` §8's 2026-09-24 note for
+the rollback order.
+
 ```
 build and push both images
   -> imageshield-prod-migrate-services

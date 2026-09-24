@@ -118,9 +118,11 @@ _MAX_MESSAGES = 1
 # space, not evidence the two images are the same. See the dedup guard in
 # handle_message step 4.
 #
-# Semantics-bearing: changing either bound changes triage/score semantics --
-# bump SCORE_CONFIG_VERSION (config) in the same commit so historical journal
-# rows stay interpretable.
+# Semantics-bearing: changing either bound changes triage semantics. There
+# is no SCORE_CONFIG_VERSION any more (the protection score it versioned was
+# deleted 2026-09-24, spec 2026-09-24-remove-protection-score-design.md) --
+# record a change here as a dated note under INVARIANTS #47 instead, so
+# anyone reading old journal rows can still tell what produced them.
 _PHASH_DEGENERATE_LOW_BITS = 4
 _PHASH_DEGENERATE_HIGH_BITS = 60
 

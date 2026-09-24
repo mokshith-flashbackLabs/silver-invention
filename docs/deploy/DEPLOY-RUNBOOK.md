@@ -399,6 +399,17 @@ Expected output: `applied 0001_…` through `applied 0020_…`.
 
 Never run migrations on container start, and never from a laptop.
 
+**Dated, 2026-09-24 — migration 0037 and the protection-score removal.** 0037
+drops the `penalty` requirement on a threat-event create (spec
+`2026-09-24-remove-protection-score-design.md`); the backend change that stops
+sending `penalty` ships in a separate repo and separate deploy. **Deploy
+services — 0037 then the code — before that backend change goes out.** A new
+backend on old services breaks every threat-event create, because the old
+score code still requires `penalty > 0`. Rollback order is the mirror image:
+run 0037's **down** migration first, then roll the services image back — a
+rolled-back image with `penalty` still nullable (no down migration run) leaves
+NULL-penalty rows the old score code cannot read.
+
 ---
 
 ## 9. Create the service

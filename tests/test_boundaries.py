@@ -77,6 +77,21 @@ COLLISION_FORBIDDEN_CALLS = frozenset({"index_face", "delete_faces", "execute", 
 # path to bytes.
 FORBIDDEN_S3 = re.compile(r"""boto3\.client\(\s*["']s3["']|boto3\.resource\(\s*["']s3["']""")
 
+# `protection_scores`, `score_events` and `recommendations` are DORMANT as of
+# 2026-09-24 (the protection-score removal, spec
+# 2026-09-24-remove-protection-score-design.md) — kept, granted, and written
+# by nothing, for one release, so the change stays reversible (SCHEMA.md).
+# `score/` itself is deleted, so there is no sanctioned writer left either;
+# the guarantee for the dormant window is zero writers, not one. This
+# regex is a build-time backstop for that: any INSERT/UPDATE/DELETE naming
+# one of the three tables anywhere in src/ is the drift SCHEMA.md and
+# OPERATIONS.md warn about. Delete this test when the tables are dropped.
+FORBIDDEN_DORMANT_TABLE_WRITE = re.compile(
+    r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+"
+    r"(?:protection_scores|score_events|recommendations)\b",
+    re.IGNORECASE,
+)
+
 # CLAUDE.md §7.2 / INVARIANTS #15c. Provider A's 0.92 and Provider B's 0.92 are
 # different quantities with different distributions. Combining them yields a
 # number with no meaning that will look entirely plausible — and calibration is
@@ -401,6 +416,20 @@ def test_no_phone_shaped_literal_in_migrations() -> None:
         for path in migrations
         for line, value in _sql_literals(path)
         if (shape := _phone_shaped(value)) is not None
+    ]
+    assert offenders == []
+
+
+def test_nothing_writes_the_dormant_score_tables() -> None:
+    """PERMANENT for the dormant window (2026-09-24 onward), deleted only when
+    `protection_scores`, `score_events` and `recommendations` are dropped for
+    real. `score/store.py` — the one sanctioned writer — no longer exists;
+    this asserts nobody quietly became a replacement for it."""
+    offenders = [
+        f"{path}:{i}: {line.strip()}"
+        for path in _source_files()
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if FORBIDDEN_DORMANT_TABLE_WRITE.search(line)
     ]
     assert offenders == []
 

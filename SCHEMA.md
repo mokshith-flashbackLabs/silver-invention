@@ -1067,10 +1067,13 @@ CREATE TABLE score_events (          -- append-only. BIGSERIAL like audit_log: a
 `protection_scores` is one row per `user_ref`, materialized and re-written on every recompute.
 `score_events` is the history: every movement, its component, its cause, and the resulting score, so
 the proxy can render "−6 — confirmed match found on {domain}" style history without recomputing
-anything. `score/store.py` is the **only** module that writes either table
-(`tests/test_boundaries.py::test_only_the_score_store_writes_the_score`, INVARIANTS #44). Both tables
-FK to `subjects`, not to a `users` table that does not exist here — the same pattern §2b's `subjects`
-table already establishes.
+anything. `score/store.py` **was** the only module that wrote either table (INVARIANTS #44) — that
+was enforced by `tests/test_boundaries.py::test_only_the_score_store_writes_the_score`, which no
+longer exists: `score/` is deleted (2026-09-24) and the boundary test it guarded went with it, so the
+guarantee now is simply that nothing writes these tables at all
+(`tests/test_boundaries.py::test_nothing_writes_the_dormant_score_tables`). Both tables FK to
+`subjects`, not to a `users` table that does not exist here — the same
+pattern §2b's `subjects` table already establishes.
 
 ```sql
 CREATE TABLE threat_events (
@@ -1115,9 +1118,13 @@ longer returns `penalty` at all. See `PROXY_INTEGRATION.md`.
 Relevance matching (`threats/store.py`) intersects an event's `domains[]` against the `source_domain`
 of the user's own **live** hits — a dead URL under a matching domain does not match
 (`tests/test_threats.py::test_a_dead_url_on_a_matching_domain_is_not_matched`). Retraction flips
-`status` to `'retracted'` once — a second retraction on an already-retracted event is a no-op — and
-reverses the applied penalty through `score_events`, restoring exactly what was taken
-(`tests/test_threats.py::test_event_retraction_restores_exactly_the_pre_event_score`, INVARIANTS #46).
+`status` to `'retracted'` once — a second retraction on an already-retracted event is a no-op.
+**Corrected 2026-09-24:** this used to say retraction "reverses the applied penalty through
+`score_events`, restoring exactly what was taken" — there is no penalty and no `score_events` write
+any more (both deleted the same day). What retraction still does is remove the event from
+`svc.v_person_threat_context`, which is how the backend's own bounded threat deduction reverses on
+its side (`tests/test_threats.py::test_event_retraction_removes_it_from_the_threat_context_view`,
+INVARIANTS #46).
 
 ```sql
 CREATE TABLE recommendations (
