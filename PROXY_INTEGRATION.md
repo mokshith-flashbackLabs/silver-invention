@@ -209,7 +209,7 @@ Full shapes in `docs/services/identity.md`. Summary:
 | `DELETE /v1/enrolments/{user_ref}` | `DeleteFaces` → verify via `ListFaces` → tombstone (built, step 4). Idempotent 204; nothing calls it in v1. Full user deletion (`DELETE /v1/users/{id}`) remains specified-not-built — this is the enrolment-owning piece of it |
 | `GET /v1/reports/{user_id}` | Report summary. Reads may go direct to Postgres instead — §6 |
 | `GET /v1/infringements/{id}/preview` | **Built (2026-08-21; supersedes the `GET /v1/hits/{hit_id}/crop` entry that was specified here earlier).** The subject's blurred face crop, streamed `image/jpeg`, `Cache-Control: no-store, private`. Query: `user_ref` (required), `reveal` (bool, default false — the per-item explicit tap unblurs). Errors: `404 infringement_not_found` (absent/not-yours/invisible — one indistinguishable answer), `404 preview_unavailable` (no crop renderable yet — render domain + "no preview"; the subject can still decide), `429 preview_rate_limited` (per-user daily ceiling, retryable), `502 preview_unavailable_upstream` (retryable). Every render is audit-logged. **Since 2026-09-14 a hit with `confirm_state = 'confirmed'` AND `severity = 'ncii_suspected'` is REFUSED here** with the same `404 preview_unavailable` — the subject is never shown it (owner decision; INVARIANTS #19/#47 amended). The refusal lands before the ceiling and before the audit row, so it neither charges a render nor records one. Same code and message as an unrenderable hit, deliberately: nothing in the response distinguishes the two. Derive the restricted card from the two columns you already read on `v_person_hits`; `preview_available` still means "a picture exists" and is unaffected |
-| `POST /v1/infringements/{id}/decision` | **Built (2026-08-21).** Body `{user_ref, decision: "confirmed"\|"rejected"}`. The subject's answer IS the confirm/reject (`decided_by='subject'`). Idempotent: the same decision repeated → `200` with `idempotent_replay: true`; a different one, or one against an operator decision → `409 decision_conflict` (no re-decide in v1). **Since 2026-09-14 the same `409` also covers a MACHINE confirm** — an auto-confirmed `ncii_suspected` hit carries `confirm_decided_by = 'auto:nsfw'`, which is not `'subject'`, so either decision value answers conflict. Do not offer the ask-card for such a hit at all; this is the backstop, not the surface. `rejected` also sets `status='dismissed_not_me'`. Triggers a score recompute (`cause_kind='subject_decision'`) — a subject's `confirmed` moves Exposure like an operator confirm |
+| `POST /v1/infringements/{id}/decision` | **Built (2026-08-21).** Body `{user_ref, decision: "confirmed"\|"rejected"}`. The subject's answer IS the confirm/reject (`decided_by='subject'`). Idempotent: the same decision repeated → `200` with `idempotent_replay: true`; a different one, or one against an operator decision → `409 decision_conflict` (no re-decide in v1). **Since 2026-09-14 the same `409` also covers a MACHINE confirm** — an auto-confirmed `ncii_suspected` hit carries `confirm_decided_by = 'auto:nsfw'`, which is not `'subject'`, so either decision value answers conflict. Do not offer the ask-card for such a hit at all; this is the backstop, not the surface. `rejected` also sets `status='dismissed_not_me'`. **Used to trigger a score recompute (`cause_kind='subject_decision'`); removed 2026-09-24 (spec `2026-09-24-remove-protection-score-design.md`)** — the call was already swallow-and-log, ran after this response committed, and never changed it, so removing it changes no request's outcome |
 | `POST /v1/admin/backfill` | Trigger a backfill run. Admin token required |
 
 Step 8 adds five and changes one:
@@ -730,11 +730,31 @@ feedback signal and a new `hit_status` value threaded through both `v_person_hit
 | `svc.v_person_report_summary` | `person_ref`, `active_reports`, `unresolved_matches`, `live_exposure_count`, `last_run_at`, `first_scan_completed_at`, `monitored_sources` |
 | `svc.v_person_hits` | `hit_id`, `report_id`, `person_ref`, `source_photo_id`, `hit_status`, `last_checked_at`, `match_id`, `source_domain`, `host_page_url`, `face_bbox`, `title`, `detected_at`, `match_status`, `match_action`, `match_lifecycle`, `resolved_at`, `resolution_note`, `provider_count`, `score`, `confirm_state`, `severity`, `decided_at`, `keyed_on` *(0027)*, `preview_available` *(0031)*, `face_match_score` *(0034)* |
 | `svc.v_person_liveness_attempts` | `person_ref`, `attempts_24h`, `last_attempt_at` |
-| `svc.v_person_score` *(0023)* | `person_ref`, `score`, `components`, `config_version`, `computed_at` |
-| `svc.v_person_score_events` *(0023)* | `score_event_id`, `person_ref`, `delta`, `component`, `cause_kind`, `cause_ref`, `score_after`, `created_at` |
-| `svc.v_person_recommendations` *(0023)* | `rec_id`, `person_ref`, `kind`, `params`, `status`, `source_event_id`, `created_at`, `completed_at`, `expires_at` |
+| `svc.v_person_score` *(0023)* | `person_ref`, `score`, `components`, `config_version`, `computed_at` — **granted, no longer written (2026-09-24)** |
+| `svc.v_person_score_events` *(0023)* | `score_event_id`, `person_ref`, `delta`, `component`, `cause_kind`, `cause_ref`, `score_after`, `created_at` — **granted, no longer written (2026-09-24)** |
+| `svc.v_person_recommendations` *(0023)* | `rec_id`, `person_ref`, `kind`, `params`, `status`, `source_event_id`, `created_at`, `completed_at`, `expires_at` — **granted, no longer written (2026-09-24)** |
 | `svc.v_person_threat_context` *(0023)* | `person_ref`, `event_id`, `kind`, `title`, `body`, `severity`, `starts_at`, `expires_at` — pre-filtered to `status = 'active' AND expires_at > now()`; a `draft` or `retracted` event never appears here |
 | `svc.v_articles` *(0026)* | `article_id`, `title`, `summary`, `body`, `images`, `sources`, `published_at`, `updated_at` — published rows only; operator content for every user, no person column |
+
+**`v_person_score`, `v_person_score_events` and `v_person_recommendations` write no data since
+2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`) — the protection score is
+deleted (`score/`, `recommendations/`), and you were already granted these three and reading none of
+them (your `src/services/contract/views.ts` never named them, and none was in your readiness set).
+The grant, the views and their base tables are kept for one release rather than dropped, so nothing
+here needs a change on your side; the follow-up migration that drops them is recorded in `SCHEMA.md`.
+`v_person_threat_context` is untouched and still live. Also removed the same day: the one route that
+ever surfaced a score, `GET /v1/admin/scores/{user_ref}` — a developer-tier debug relay your
+`/v1/admin/*` operator proxy fronted as `AdminServicesClient.score`. Remove that client method, its
+fake and its IDOR registry entry on your side; the route now answers the byte-identical unknown-route
+`404` on both sides.
+
+**`ThreatEventCreateRequest.penalty` is accepted and ignored, for one release.** The threat-event
+create body stays `extra='forbid'`, so your `POST /v1/admin/threat-events` proxy forwarding an
+operator's `penalty` (as the console does today) still gets `201` rather than `422` — the field is
+parsed as `Decimal | None = None` and never written to `threat_events.penalty`, which is nullable
+since migration `0037_threat_penalty_optional`. **The list response no longer returns `penalty` at
+all.** Drop the field from your request body and from anything reading it off a list item once this
+side has deployed; nothing here waits on you to do that.
 
 **`v_articles` is optional on the proxy side by agreement:** their `GET /v1/articles` serves an empty
 feed with a warn log while the view is absent, so a database migrated one release behind does not hold
@@ -811,6 +831,12 @@ repos now share a database.**
   coordinated deploy, not a rollback anyone runs alone.
 
 That is tighter coupling than anything else in this architecture. It is the price of the JOIN.
+
+**A dormant view is still a contracted one.** `v_person_score`, `v_person_score_events` and
+`v_person_recommendations` are written by nothing since 2026-09-24, but the rule above still binds
+them — dropping them is a coordinated deploy against your grant, not a cleanup we can do alone, which
+is why the drop is a recorded follow-up (`SCHEMA.md`) rather than done in the same change that
+stopped writing them.
 
 ### The role, and what it deliberately cannot reach
 
@@ -922,7 +948,10 @@ pre-check passes and our refusal fires.
 
 Nothing added by 0023. The score/threat surface is all user-safe by construction: a score, its
 components, a recommendation, and an already-filtered active threat notice — no vector, no
-`external_face_id`, no image byte, no phone number, on any of the four new views.
+`external_face_id`, no image byte, no phone number, on any of the four new views. **Three of the four
+— the score and its journal, and the recommendation — carry no data worth protecting any more, since
+nothing has written a row to any of them since 2026-09-24; `v_person_threat_context` is the one still
+live.**
 
 **`v_person_hits` deliberately omits `image_url`, `thumbnail_url` and `evidence_image_url`, and it must
 stay that way.** You reached the same conclusion we did in migration 0005 and in the

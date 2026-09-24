@@ -880,7 +880,7 @@ the proxy team, not decided unilaterally.
 ---
 
 ## 2d. Confirm pipeline, protection score, recommendations, threat events — **built** (migrations
-0021–0023)
+0021–0023, 0037)
 
 The 2026-08-19 protection-score push. Design:
 `docs/superpowers/specs/2026-08-19-protection-score-design.md`. This is the section §3 and §4 below
@@ -1023,6 +1023,19 @@ and `audit_operator_preview_renders_idx` — 0024's partial-index shape keyed on
 
 ### Protection score, recommendations, threat events (migration 0022)
 
+**Dormant since 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`): nothing in this
+repo computes or reads a protection score any more. `score/` (engine, journaled store, `tick`
+drift-healer), `recommendations/` and `GET /v1/admin/scores/{user_ref}` are deleted; every
+recompute call is removed from `confirm/worker.py`, `search/worker.py` and the routes that used to
+trigger one. The user-facing score lives entirely in the proxy (`image_backend/src/score/`), which
+never read `svc.v_person_score` in the first place. The tables and role below are **kept, granted,
+and written by nothing**, for one release, so the change stays reversible (owner decision, option A
+in the spec — dropping them now would delete the score journal history on both environments and
+force a coordinated `svc` contract change). **Open follow-up:** drop `protection_scores`,
+`score_events`, `recommendations`, their three `svc` views and `threat_events.penalty` /
+`threat_event_matches.penalty_applied` in one migration, once dev and prod have both run a release
+without them.
+
 New role `score_rw`, granted `SELECT, INSERT, UPDATE` on `protection_scores`, `recommendations`,
 `threat_events`, `threat_event_matches` — and **`SELECT, INSERT` only** (no `UPDATE`, no `DELETE`) on
 `score_events`. That grant shape is the enforcement mechanism for INVARIANTS #44: an editable journal
@@ -1090,6 +1103,15 @@ CREATE TABLE threat_event_matches (
 );
 ```
 
+**`penalty` and `penalty_applied` became nullable in migration `0037_threat_penalty_optional`
+(2026-09-24)**: `CHECK (penalty IS NULL OR penalty > 0)` replaces the `NOT NULL CHECK (penalty > 0)`
+above, and `threat_event_matches.penalty_applied` drops its `NOT NULL` the same way — down migrates
+by backfilling NULLs to `0.01` before restoring `NOT NULL`, so it is reversible. The API stopped
+writing either column the same release: `ThreatEventCreateRequest.penalty` is accepted and ignored
+(`Decimal | None = None`, `extra='forbid'` still holds everywhere else on the body) so an older
+proxy that keeps sending a penalty for one release gets `201`, not `422`, and the list response no
+longer returns `penalty` at all. See `PROXY_INTEGRATION.md`.
+
 Relevance matching (`threats/store.py`) intersects an event's `domains[]` against the `source_domain`
 of the user's own **live** hits — a dead URL under a matching domain does not match
 (`tests/test_threats.py::test_a_dead_url_on_a_matching_domain_is_not_matched`). Retraction flips
@@ -1134,6 +1156,11 @@ GRANT SELECT ON svc.v_person_score, svc.v_person_score_events,
 | `v_person_score_events` | `score_events` | The history feed, read-only here as everywhere else |
 | `v_person_recommendations` | `recommendations` | Open/completed/expired/dismissed, per person |
 | `v_person_threat_context` | `threat_event_matches` JOIN `threat_events` | **Only** `status = 'active' AND expires_at > now()` — a draft or retracted event must never reach a user surface |
+
+**`v_person_score`, `v_person_score_events` and `v_person_recommendations` are dormant since
+2026-09-24** — granted exactly as before, now over tables nothing writes (the note above migration
+0022 has the reason and the follow-up drop). `v_person_threat_context` is untouched and still live;
+it never carried `penalty` in the first place, so nothing here changes with 0037.
 
 And two **existing** views change, via `CREATE OR REPLACE` (append-only column discipline, same rule
 0016 established — a replace may only append columns and add row filters, never remove or retype one):

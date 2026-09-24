@@ -301,15 +301,15 @@ code being written **now**, carrying the same numbers.
 43. **A run refused at dispatch is `refused`, never `completed`.** A completed run with zero results
    reads as "we looked and found nothing", which about a search that never ran is a false
    reassurance. Same reasoning as #8b's "no run row at all" for a refusal at the route.
-44–47. **Protection score, threat events and machine triage** *(2026-08-19 push)* — the score journal
-   is append-only and the only writer is `score/store.py`; no feedback signal ever lowers the score;
-   threat penalties are bounded, decaying, relevance-scoped, and reverse exactly on retraction; and
-   machine triage orders the review queue, confirming exactly one severity and dropping none.
+44–47. **Protection score, threat events and machine triage** *(2026-08-19 push)*. **#44–46 retired
+   2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`): no protection score exists any
+   more — the score journal, the no-lowering-on-feedback rule and the bounded/decaying/reversible
+   threat penalty all governed a number nothing computes or reads today. The user-facing score is the
+   backend's own, computed there. **#47 stands** — machine triage has nothing to do with the
+   protection score: it orders the review queue, confirms exactly one severity and drops none.
    *Amended 2026-09-14* — #47 used to read "a `confirmed` state requires a human by schema CHECK".
    The CHECK is unchanged; what changed is that `record_auto_confirmed` satisfies it with the
-   machine marker `'auto:nsfw'` rather than a person's name, for `ncii_suspected` only. An
-   auto-confirmed hit costs Exposure like any other but is never counted as awaiting the subject's
-   feedback — we refuse to let them answer, so charging posture for their silence is #45's shape.
+   machine marker `'auto:nsfw'` rather than a person's name, for `ncii_suspected` only.
    Full text in `INVARIANTS.md` §G, #44–47.
 
 ---
@@ -341,9 +341,10 @@ describes them.
 The 2026-08-19 protection-score push (see the dated note under §8) pulled a **minimal** adjudication
 queue and the crop fetcher out of "specified, do not build yet" and into scope, alongside four
 entirely new pieces (protection score, recommendations, threat events, the control-room console) that
-`ARCHITECTURE.md`'s original scope table never listed at all. The table below is the current state,
-not the v1-launch state — see `docs/superpowers/specs/2026-08-19-protection-score-design.md` for the
-decisions behind the new rows.
+`ARCHITECTURE.md`'s original scope table never listed at all — **the first two, protection score and
+recommendations, were removed 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`); see
+the struck row below. The table below is the current state, not the v1-launch state — see
+`docs/superpowers/specs/2026-08-19-protection-score-design.md` for the decisions behind the new rows.
 
 | Build now | Specified, do not build yet |
 |---|---|
@@ -364,8 +365,8 @@ decisions behind the new rows.
 | **Adjudication queue + reviewer tooling (minimal)** — `review/`, `review_tasks`, `/v1/admin/review/*`, the panel via the backend proxy. Reviewer decisions are `confirmed`/`rejected`/`uncertain` and no queue item auto-promotes. **Amended 2026-09-14:** "human-only `confirmed`" no longer holds — the confirm worker auto-confirms `ncii_suspected` (`confirm_decided_by = 'auto:nsfw'`), which the subject is never shown and never asked about, and which still lands a `pending` task so `decide` is the override (INVARIANTS #19, #47) | |
 | **Crop fetcher deployable** — `ARCHITECTURE.md` §3.7, pulled into scope; hands the confirm worker image bytes and renders blurred review crops live; no DB credentials | |
 | **Confirm pipeline** — `confirm/` worker on `confirm:hits`: fetch → pHash dedup → face-match (through `attribution/`, never a direct Rekognition search call) → moderation → severity triage | |
-| **Protection score + recommendations** — `score/` (engine, journaled store, `tick` drift-healer), `recommendations/` catalog. Journal is the product surface (INVARIANTS #44) | |
-| **Threat events** — `threats/`, admin-curated via `/v1/admin/threat-events`, bounded/decaying/reversible score effect (INVARIANTS #46) | |
+| ~~**Protection score + recommendations** — `score/` (engine, journaled store, `tick` drift-healer), `recommendations/` catalog. Journal is the product surface (INVARIANTS #44)~~ **Removed 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`): nothing read it — the backend never read `svc.v_person_score(_events)` and computes the user's Likeness Health Score itself. `score/`, `recommendations/` and `GET /v1/admin/scores/{user_ref}` are deleted; `protection_scores`, `score_events`, `recommendations` and their three `svc` views stay, granted and dormant, until a follow-up migration drops them (open item, `SCHEMA.md`) | |
+| **Threat events** — `threats/`, admin-curated via `/v1/admin/threat-events`. **As of 2026-09-24 this repo keeps no score effect of its own**: `threat_events.penalty` and `threat_event_matches.penalty_applied` are nullable and unwritten (migration 0037), accepted-and-ignored on create for one release. The backend charges the user-facing score by severity through its own term instead (its 0049, `dynamic.threat`) — INVARIANTS #46 is retired | |
 | **Control room console — retired 2026-08-29.** Staff now reach this admin API through the backend's `/v1/admin/*` operator proxy (`image_backend` spec `2026-08-29-admin-proxy-design.md`); this repo's admin routes are unchanged, only the direct-to-services client is gone | |
 | **Articles** — `articles/`, `/v1/admin/articles`, the panel's Articles pages (via the backend proxy), `svc.v_articles` (0026). Operator content for the app feed; no targeting, no score effect, no LLM (spec 2026-08-27, supersedes the 2026-08-20 campaigns spec) | |
 

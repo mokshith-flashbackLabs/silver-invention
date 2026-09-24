@@ -14,7 +14,8 @@ handoff brief for the proxy).
 > are designed here but **not built**. The crop fetcher (§3.7) and a minimal adjudication queue
 > (§3.4/§3.8) were pulled into scope by the 2026-08-19 protection-score push, alongside four pieces
 > this document did not originally describe at all — the confirm pipeline, the score engine, threat
-> events, and the control-room console (§3.8–§3.11, the console **retired** 2026-08-29 — see §3.11).
+> events, and the control-room console (§3.8–§3.11, the console **retired** 2026-08-29 — see §3.11;
+> the score engine **removed** 2026-09-24 — see §3.9).
 > See `CLAUDE.md` §6 for the current scope table
 > and `NEAR-TERM-BUILD.md` for the v1 task list. Do not build the match module or partner ingest
 > because this document describes them.
@@ -392,7 +393,17 @@ Per hit, in order:
    a **manual legal process** — a reporting pipeline (NCMEC) does not exist and is out of scope,
    consistent with the existing minor-discovery gate (INVARIANTS #8b).
 
-### 3.9 Score engine — **built** (2026-08-19)
+### 3.9 Score engine — **built 2026-08-19, removed 2026-09-24**
+
+**Removed 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`): this was the
+*services* protection score, and nothing ever read it — it stopped being the user's number on
+2026-08-26, when the app's Likeness Health Score moved entirely into
+`image_backend/src/score/`, and the backend's grant on `svc.v_person_score` /
+`v_person_score_events` / `v_person_recommendations` was never exercised. `src/imageshield/score/`
+and `src/imageshield/recommendations/` are deleted, along with every recompute call and
+`GET /v1/admin/scores/{user_ref}`. `protection_scores`, `score_events`, `recommendations` and
+their three `svc` views are kept — granted, written by nothing — for one release; dropping them is
+a recorded follow-up (`SCHEMA.md`). What follows is kept as historical record of the design.
 
 `src/imageshield/score/` owns `protection_scores` (materialized, one row per `user_ref`) and
 `score_events` (append-only journal) — exactly **one** code path writes either (`score/store.py`,
@@ -408,11 +419,12 @@ fourth application queue nobody sanctioned and recompute itself is cheap (a hand
 plus two writes). Idempotent and total: compute from state, journal the diff; an unchanged state
 journals nothing (`tests/test_score_store.py::test_recompute_twice_writes_nothing_new`).
 
-`score/tick.py` is a separate process (`python -m imageshield.score.tick`, daily interval by default)
-— the drift healer. It re-runs recompute for aging effects (stale seeds, aged-open recommendations,
-decaying threat penalties) and for any trigger whose recompute crashed after the trigger itself
-committed. It is not the primary path; it is what keeps a score from silently going stale if a
-recompute call is ever missed.
+`score/tick.py` was a separate process (`python -m imageshield.score.tick`, daily interval by
+default) — the drift healer. It re-ran recompute for aging effects (stale seeds, aged-open
+recommendations, decaying threat penalties) and for any trigger whose recompute crashed after the
+trigger itself committed. It was not the primary path; it kept a score from silently going stale if
+a recompute call was ever missed. **Gone 2026-09-24 with the rest of `score/`**, including its
+ECS container in `infra/ecs/imageshield-dev-confirm.json` and `infra/ecs/prod/confirm.json`.
 
 `recommendations/catalog.py` is the companion: typed kinds in code
 (`complete_enrolment`/`add_seed_photos`/`refresh_seeds`/`respond_to_hits`/`run_priority_scan`),
@@ -425,9 +437,16 @@ old system's −18-per-active-report bug that made reporting abuse worsen a user
 
 `src/imageshield/threats/` — `threat_events` + a relevance matcher (event `domains[]` ∩ the user's own
 **live** hit domains, or `is_global`) + `threat_event_matches`. Admin CRUD under the existing
-`/v1/admin/*` auth. A relevant event both drops the affected user's score directly (bounded, decaying,
-reversible — INVARIANTS #46) and spawns the recommendations that restore it, even while the event
-stays live. Retraction reverses through the score journal, exactly.
+`/v1/admin/*` auth. **Until 2026-09-24 a relevant event dropped the affected user's services score
+directly (bounded, decaying, reversible — INVARIANTS #46) and spawned the recommendations that
+restored it, retraction reversing through the score journal exactly — both retired with the rest of
+the protection score (§3.9, spec `2026-09-24-remove-protection-score-design.md`).** Today an event
+carries no score effect of its own: `penalty` on `threat_events` and `penalty_applied` on
+`threat_event_matches` are nullable and unwritten since migration `0037_threat_penalty_optional`,
+and the create body accepts and ignores an operator-supplied `penalty` for one release. The
+user-facing score is moved by severity instead, entirely on the backend side (its 0049,
+`dynamic.threat`) off the unchanged relevance match this repo still computes and exposes on
+`svc.v_person_threat_context`.
 
 `src/imageshield/review/` — `review_tasks` + `/v1/admin/review/*`. A human decision
 (`confirmed(severity)` / `rejected` / `uncertain`) is the only way an infringement's `confirm_state`
@@ -475,15 +494,17 @@ Manager (an audit artifact of what was granted); no code reads it any more.
 | Content index, candidates, search runs | **Services** | Postgres |
 | Review queue and decisions | **Services** | Postgres (`review_tasks`, migration 0021 — §3.10) |
 | Reports, hits, recheck state | **Services** | Postgres |
-| Protection score, journal, recommendations | **Services** | Postgres (`score_rw`, migration 0022 — §3.9). Journal is `INSERT`-only for the role |
+| ~~Protection score, journal, recommendations~~ — **removed 2026-09-24, tables dormant (§3.9)** | **Services** | Postgres (`score_rw`, migration 0022 — §3.9). Journal is `INSERT`-only for the role; nothing writes through it any more |
 | Threat events + matches | **Services** | Postgres (admin-curated — §3.10) |
 | Confirm-pipeline triage (severity, pHash, moderation labels) | **Services** | Postgres, on `infringements` (migration 0021 — §3.8). No image bytes; text and a 64-bit hash only |
 | Hostile-image fetch + live crop render | **Services** | Nothing persisted — the fetcher deployable (§3.7) holds no DB credentials at all |
 | Report reads for the UI | **Proxy** | Postgres (read-only, `svc` views — migrations 0016 + 0023) |
 | Pushing onto any queue | **Services** | SQS (via outbox) |
 
-Admin/operator reads and writes (threat events, review, provider health, score inspector) own no
-data of their own — they are Services' existing `/v1/admin/*` routes over the tables above. Until
+Admin/operator reads and writes (threat events, review, provider health) own no
+data of their own — they are Services' existing `/v1/admin/*` routes over the tables above. The
+score inspector (`GET /v1/admin/scores/{user_ref}`) was one of them; it is removed 2026-09-24 with
+the rest of the protection score (§3.9). Until
 2026-08-29 a co-located console called them directly; that deployable is retired, and the backend's
 `/v1/admin/*` proxy is now the only caller (§3.11).
 

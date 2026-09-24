@@ -27,7 +27,7 @@ now reach its admin API through the backend's `/v1/admin/*` operator proxy.
 | Search worker | `python -m imageshield.search.worker` | Consumes `search:runs`, dispatches providers |
 | Recheck worker | `python -m imageshield.recheck.worker` | Weekly HEAD sweep setting `url_alive` |
 | Confirm worker | `python -m imageshield.confirm.worker` | Consumes `confirm:hits`: fetch → pHash → face-match (via `attribution/`) → moderation → severity triage into `review_tasks` |
-| Score tick | `python -m imageshield.score.tick` | Daily drift-healer: re-runs score recompute for aging effects and any trigger whose recompute crashed after commit |
+| ~~Score tick~~ | ~~`python -m imageshield.score.tick`~~ | **Removed 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`): no protection score exists any more, so there is nothing left to drift-heal. `score/` is deleted and the container is gone from `infra/ecs/imageshield-dev-confirm.json` and `infra/ecs/prod/confirm.json` |
 | Fetcher | `uvicorn imageshield.fetcher.app:create_app --factory --port 8083` | Standalone deployable, no DB credentials. Hands the confirm worker image bytes; renders the subject's blurred face crops live (services preview endpoint — the console's crop access was removed 2026-08-21: staff never see hit imagery) |
 
 The API logs the AWS **account, region and collection** at startup as a
@@ -517,6 +517,14 @@ individual quarantine's handling.
 
 ## 11. The score looks wrong
 
+**Dormant since 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`): this repo's
+protection score is deleted — `score/` is gone, nothing writes `protection_scores` or `score_events`
+any more, and `GET /v1/admin/scores/{user_ref}` no longer exists. The **user-facing** score a support
+ticket is actually about lives entirely in the proxy (`image_backend/src/score/`) and its own
+troubleshooting is theirs, not this section's. Kept below verbatim as historical record — the SQL
+still runs against tables nothing has written since, so it will read as an empty or frozen journal on
+anyone enrolled after that date, not as "the tool is broken."
+
 **Symptom** — a user's protection score doesn't match what support or a reviewer expects, or jumped
 by an amount nobody can explain.
 
@@ -560,10 +568,9 @@ you which config produced the number being questioned.
 **If a change should have moved the score and nothing did** (no new journal row after an action that
 should trigger a recompute): the trigger path runs synchronously after commit, so a missing row means
 either the trigger call didn't fire (a bug worth filing) or it hit an exception after its own commit —
-the daily **score tick** (`python -m imageshield.score.tick`) is the designed healer for exactly this
-case and will pick it up on its next run; you do not need to force anything by hand. If it's urgent,
-the tick's `run_once()` can be invoked out-of-band rather than waiting for the interval — check
-`score/tick.py` for the entry point.
+the daily **score tick** (`python -m imageshield.score.tick`) was the designed healer for exactly this
+case. **Removed 2026-09-24 along with the rest of `score/`** — there is no tick left to pick anything
+up on its next run, and no `run_once()` to invoke out-of-band; `score/tick.py` no longer exists.
 
 **Never write directly to `protection_scores` or `score_events` to "fix" a number.** Any writer other
 than `score/store.py` is exactly the boundary violation `tests/test_boundaries.py::test_only_the_score_store_writes_the_score`

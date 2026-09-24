@@ -688,9 +688,15 @@ delivery, so the run would be retried forever instead of refused once.
 
 ---
 
-## G. Protection score, confirm pipeline, threat events *(2026-08-19 push)*
+## G. Protection score, confirm pipeline, threat events *(2026-08-19 push; #44–46 retired 2026-09-24, confirm pipeline and #47 stand)*
 
 **44. Every score movement is journaled with a user-readable cause.**
+**Retired 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`): no protection score
+exists any more — `score/` is deleted and `protection_scores` / `score_events` are written by
+nothing. The user-facing score is the backend's own, computed and journaled entirely in
+`image_backend/src/score/`. Kept below as historical record of the append-only design; the tables
+stay granted and dormant until a follow-up migration drops them (`SCHEMA.md` §2d).
+
 `score_events` is append-only: migration 0022 grants `score_rw` `SELECT, INSERT` on it and nothing
 else — no `UPDATE`, no `DELETE` — so an editable journal cannot exist even as a bug. The materialized
 `protection_scores.score` always equals the sum of that user's `score_events.delta`, and no delta is
@@ -710,6 +716,10 @@ Check: `tests/test_boundaries.py::test_only_the_score_store_writes_the_score`;
 `tests/test_migrations.py::test_0022_score_events_is_insert_only_for_score_rw`.
 
 **45. Reporting abuse never worsens any user-facing number.**
+**Retired 2026-09-24**: same reason as #44 — there is no protection score for a feedback signal to
+lower any more. The live version of this promise is the backend's own (its P13: `respond_to_hits`
+can only improve or hold the user-facing score, never lower it).
+
 Generalises the `live_exposure_count` rule (`SCHEMA.md` §2b) to the score and everything downstream of
 it: no feedback signal a user gives — `not_me`, `uncertain`, `confirmed`, `authorised`, a `rejected` or
 `uncertain` review decision — may ever lower `protection_scores.score` or any of its four components.
@@ -732,6 +742,12 @@ Check: `tests/test_score_store.py::test_user_feedback_never_lowers_the_score`;
 `tests/test_score_store.py::test_a_subject_decision_is_not_awaiting_their_feedback`.
 
 **46. Threat penalties are bounded, decaying, relevance-scoped, and reversible on retraction.**
+**Retired 2026-09-24**: threat events no longer move a services score at all — `threat_events.penalty`
+and `threat_event_matches.penalty_applied` are nullable and unwritten (migration
+`0037_threat_penalty_optional`), and `ThreatEventCreateRequest.penalty` is accepted and ignored for
+one release. The backend charges the user-facing score by severity through its own term instead (its
+0049, `dynamic.threat`, bounded and reversible on retraction the same way this rule was).
+
 A `threat_events` row only touches a user's score if the event is global or the user's own **live** hit
 domains intersect the event's `domains[]` — never a domain the user has no hit under, and never a hit
 whose URL is already dead. The penalty applied is capped by config (a global event by

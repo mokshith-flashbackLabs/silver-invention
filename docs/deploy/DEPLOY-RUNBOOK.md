@@ -516,9 +516,12 @@ aws ecs delete-service --cluster imageshield-dev --service console --force
 ```
 
 **Deployed 2026-08-19+, after §9a.** Two new task definitions in `infra/ecs/`:
-`imageshield-dev-confirm.json` (two containers: `confirm-worker` +
-`python -m imageshield.confirm.worker`, 192 MB; `score-tick` +
-`python -m imageshield.score.tick`, 96 MB), `imageshield-dev-fetcher.json` (one container, port 8083).
+`imageshield-dev-confirm.json` (originally two containers: `confirm-worker` +
+`python -m imageshield.confirm.worker`, 192 MB; ~~`score-tick` + `python -m imageshield.score.tick`,
+96 MB~~ — **the `score-tick` container is removed as of 2026-09-24** (spec
+`2026-09-24-remove-protection-score-design.md`), from both this task definition and
+`infra/ecs/prod/confirm.json`; the confirm worker is now the only container in either task),
+`imageshield-dev-fetcher.json` (one container, port 8083).
 
 ### Secrets keys to add first
 
