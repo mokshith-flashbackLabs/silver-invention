@@ -40,7 +40,6 @@ from imageshield.http.routes.admin_articles import router as admin_articles_rout
 from imageshield.http.routes.admin_hits import router as admin_hits_router
 from imageshield.http.routes.admin_providers import router as admin_providers_router
 from imageshield.http.routes.admin_review import router as admin_review_router
-from imageshield.http.routes.admin_scores import router as admin_scores_router
 from imageshield.http.routes.admin_threat_events import router as admin_threat_events_router
 from imageshield.http.routes.attribution import router as attribution_router
 from imageshield.http.routes.config_floors import router as config_floors_router
@@ -59,8 +58,6 @@ from imageshield.preview.store import PostgresPreviewStore
 from imageshield.providers.observability import PostgresProviderObservability
 from imageshield.providers.store import PostgresProviderControlStore
 from imageshield.review.store import PostgresReviewStore
-from imageshield.score.engine import ScoreWeights
-from imageshield.score.store import PostgresScoreStore
 from imageshield.search.store import PostgresSearchStore
 from imageshield.subjects.store import PostgresSubjectStore
 from imageshield.threats.store import PostgresThreatStore
@@ -113,12 +110,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Closed in the lifespan's teardown below, with the pool.
         app.state.photo_http_client = make_photo_client()
         app.state.photo_fetcher = HttpxPhotoFetcher(app.state.photo_http_client)
-    if getattr(app.state, "score_store", None) is None:
-        app.state.score_store = PostgresScoreStore(
-            pool,
-            weights=ScoreWeights.from_config(cfg),
-            config_version=cfg.score_config_version,
-        )
     if getattr(app.state, "threat_store", None) is None:
         app.state.threat_store = PostgresThreatStore(pool)
     if getattr(app.state, "article_store", None) is None:
@@ -190,5 +181,4 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(admin_articles_router)
     app.include_router(admin_review_router)
     app.include_router(admin_hits_router)
-    app.include_router(admin_scores_router)
     return app

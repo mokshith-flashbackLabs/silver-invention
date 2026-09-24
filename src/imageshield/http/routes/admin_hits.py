@@ -165,11 +165,11 @@ async def record_verdict(
 ) -> ReviewVerdictResponse:
     """Record "was the machine right about this hit".
 
-    **No score recompute, unlike every other write on this admin surface.**
     A verdict changes no user-facing fact — not the hit's state, not the
-    person's exposure, not their score — so there is nothing to recompute and
-    a recompute here would be a wasted read at best and a wrong journal entry
-    at worst. That is the whole of decision D6 expressed in code.
+    person's exposure — so there is nothing to recompute. No write on this
+    admin surface recomputes a score any more: the protection score was
+    removed (spec 2026-09-24). That is the whole of decision D6 expressed in
+    code.
     """
     record = await store.record_verdict(
         infringement_id,

@@ -1,10 +1,9 @@
 """Articles — operator CRUD for the app's feed (spec 2026-08-27 §6).
 
 Same posture as ``admin_threat_events.py``: both tokens at router level, so a
-route added here is guarded structurally. Nothing here touches a score, a
-subject or a hit — an article is operator content published to every user
-with no per-person state — so there is no recompute loop and no person
-identifier anywhere in this file.
+route added here is guarded structurally. Nothing here touches a subject or a
+hit — an article is operator content published to every user with no
+per-person state — so there is no person identifier anywhere in this file.
 """
 
 from __future__ import annotations

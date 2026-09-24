@@ -74,7 +74,6 @@ def test_equal_tokens_refuse_to_start(clean_env: pytest.MonkeyPatch) -> None:
         ("FETCHER_TOKEN", "short"),
         ("CSAM_AGE_LOW_THRESHOLD", "-5"),
         ("CONFIRM_FACE_MATCH_THRESHOLD", "101"),
-        ("SCORE_TICK_INTERVAL_SECONDS", "0"),
     ],
 )
 def test_malformed_values_are_fatal(
@@ -497,70 +496,9 @@ def test_db_sslmode_defaults_to_require(config: Config) -> None:
     assert config.db_sslmode == "require"
 
 
-# ── Protection score / confirm pipeline config (design 2026-08-19) ─────────
-
-
-def test_score_config_defaults() -> None:
-    cfg = make_config()
-    assert cfg.score_config_version == "score-v1"
-    assert (
-        cfg.score_weight_posture,
-        cfg.score_weight_coverage,
-        cfg.score_weight_exposure,
-        cfg.score_weight_threat,
-    ) == (40, 25, 25, 10)
-
-
-def test_score_weights_must_sum_to_100() -> None:
-    with pytest.raises(ValidationError, match="SCORE_WEIGHT"):
-        make_config(score_weight_posture=50)  # 50+25+25+10 = 110
-
-
-def test_posture_subweights_must_sum_to_posture() -> None:
-    with pytest.raises(ValidationError, match="SCORE_POSTURE"):
-        make_config(score_posture_seeds=25)  # 10+25+5+5 = 45 != weight_posture(40)
-
-
-def test_coverage_subweights_must_sum_to_coverage() -> None:
-    with pytest.raises(ValidationError, match="SCORE_COVERAGE"):
-        make_config(score_coverage_scan=20)  # 20+10 = 30 != weight_coverage(25)
-
-
-def test_exposure_weight_cannot_exceed_component() -> None:
-    with pytest.raises(ValidationError, match="SCORE_EXPOSURE"):
-        make_config(score_exposure_weight_ncii=30)  # > weight_exposure(25)
-
-
-def test_threat_penalty_cannot_exceed_weight_threat() -> None:
-    with pytest.raises(ValidationError, match="SCORE_THREAT_GLOBAL_MAX_PENALTY"):
-        make_config(score_threat_global_max_penalty=11)  # > weight_threat(10)
-
-
-def test_a_negative_component_weight_is_rejected_even_if_the_sum_is_100() -> None:
-    """The sum-to-100 check alone would accept a negative posture weight offset
-    by a larger coverage weight; `_positive` on every weight field is what
-    actually closes that gap."""
-    with pytest.raises(ValidationError):
-        make_config(
-            score_weight_posture=-40,
-            score_weight_coverage=65,
-            score_weight_exposure=65,
-            score_weight_threat=10,
-        )
-
-
 @pytest.mark.parametrize(
     "field",
     [
-        "score_exposure_weight_ncii",
-        "score_exposure_weight_explicit",
-        "score_exposure_weight_benign",
-        "score_exposure_weight_default",
-        "score_threat_global_max_penalty",
-        "score_seed_target",
-        "score_seed_fresh_days",
-        "score_rec_soft_age_days",
-        "score_scan_grace_days",
         "confirm_max_faces",
         "confirm_phash_hamming_max",
     ],

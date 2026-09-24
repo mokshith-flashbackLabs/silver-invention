@@ -7,7 +7,6 @@ reads; ``POST /{task_id}/decision`` is the only write in this file and it is
 also the only thing anywhere in this codebase that can move an infringement
 into ``confirmed`` or ``rejected`` — see ``imageshield.review.store`` for the
 transaction.
-
 """
 
 from __future__ import annotations

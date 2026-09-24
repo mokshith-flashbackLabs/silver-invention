@@ -8,7 +8,7 @@ exactly what differs and nothing else.
 |---|---|---|---|
 | `services.json` | `imageshield-prod-services` | `services` (8081) | `imageshield-prod-services` |
 | `services-worker.json` | `imageshield-prod-services-worker` | `relay`, `search-worker` | `imageshield-prod-services` |
-| `confirm.json` | `imageshield-prod-confirm` | `confirm-worker`, `score-tick` | `imageshield-prod-services` |
+| `confirm.json` | `imageshield-prod-confirm` | `confirm-worker` | `imageshield-prod-services` |
 | `fetcher.json` | `imageshield-prod-fetcher` | `fetcher` (8083) | `imageshield-prod-no-aws` |
 | `migrate-services.json` | `imageshield-prod-migrate-services` | `migrate-services` | `imageshield-prod-no-aws` |
 
@@ -88,12 +88,12 @@ ECS places against `memoryReservation` where set, otherwise `memory`:
 |---|---|
 | `services` | 576 |
 | `services-worker` (relay 160 + search-worker 288) | 448 |
-| `confirm` (confirm-worker 160 + score-tick 64) | 224 |
+| `confirm` (confirm-worker 160) | 160 |
 | `fetcher` | 128 |
-| **services side total** | **1376** |
+| **services side total** | **1312** |
 
-With the backend's `api` (512), `worker` (512) and `image-worker` (1024) that is 3424 MiB of the
-3835 MiB a `t4g.medium` offers — 411 MiB free, enough for the 256 MiB migration task to run
+With the backend's `api` (512), `worker` (512) and `image-worker` (1024) that is 3360 MiB of the
+3835 MiB a `t4g.medium` offers — 475 MiB free, enough for the 256 MiB migration task to run
 alongside everything else, but not much more. If any of these grow, redo this arithmetic.
 
 ## Order

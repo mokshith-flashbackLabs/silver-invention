@@ -377,18 +377,18 @@ def _confirm_containers() -> dict[str, dict[str, Any]]:
     return {c["name"]: c for c in _load(CONFIRM_TASK)["containerDefinitions"]}
 
 
-def test_confirm_task_runs_exactly_the_confirm_worker_and_the_tick() -> None:
-    """One task, two processes: the confirm pipeline consumer
-    (``confirm:hits``) and the score drift-healer tick. Both essential, same
-    reasoning as the search worker's pairing above."""
+def test_confirm_task_runs_exactly_the_confirm_worker() -> None:
+    """One task, one process: the confirm pipeline consumer (``confirm:hits``).
+
+    Used to also run the score drift-healer tick alongside it; the protection
+    score and its tick were removed (spec 2026-09-24)."""
     containers = _confirm_containers()
-    assert set(containers) == {"confirm-worker", "score-tick"}
+    assert set(containers) == {"confirm-worker"}
     assert containers["confirm-worker"]["command"] == [
         "python",
         "-m",
         "imageshield.confirm.worker",
     ]
-    assert containers["score-tick"]["command"] == ["python", "-m", "imageshield.score.tick"]
     for container in containers.values():
         assert container["essential"] is True
 

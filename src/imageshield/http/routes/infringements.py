@@ -183,10 +183,11 @@ async def subject_decision(
     review_store: ReviewStore = Depends(get_review_store),
 ) -> SubjectDecisionResponse:
     """The answer IS the decision (spec 2026-08-21 §5): the subject is the
-    deciding human for their own likeness. 'confirmed' moves Exposure exactly
+    deciding human for their own likeness. 'confirmed' decides the hit exactly
     as an operator confirm would (the decision lane, not feedback — INVARIANTS
-    #45 as amended); 'rejected' retires the hit from their counts and can only
-    ever raise the score."""
+    #45 as amended); 'rejected' retires the hit from their counts. Neither
+    moves a score any more — the protection score was removed (spec
+    2026-09-24)."""
     outcome = await review_store.subject_decide(
         infringement_id, user_ref=body.user_ref, decision=body.decision
     )

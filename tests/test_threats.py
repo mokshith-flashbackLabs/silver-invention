@@ -1,15 +1,16 @@
 """``PostgresThreatStore`` against real Postgres (Task 14).
 
-Same convention as ``tests/test_score_store.py``: direct SQL for fixtures, so
-these tests are about the store's transaction shape (the matcher, the audit
-trail, retraction) rather than re-deriving another module's write path.
+Direct SQL for fixtures, so these tests are about the store's transaction
+shape (the matcher, the audit trail, retraction) rather than re-deriving
+another module's write path.
 
 The reversal test at the bottom is the one the brief calls out by name:
-"event retraction restores exactly what it took." It reuses the enrolment /
-seed seeding helpers from ``tests/test_score_store.py`` (Task 12) rather than
-re-deriving them, since the whole point of that test is proving
-``ThreatStore`` composes correctly with ``ScoreStore.recompute`` — not
-re-testing enrolment or seeding.
+"event retraction restores exactly what it took." It keeps its own copy of
+the enrolment / seed seeding helpers (previously borrowed from the now-deleted
+protection score subsystem's own store tests, Task 12) since that whole
+subsystem was deleted in Task S3 (2026-09-24). The test now proves only the
+matcher/retract shape: that the match set a retraction reverses is exactly
+the match set the event created.
 """
 
 from __future__ import annotations
@@ -24,17 +25,13 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.db.connection import make_async_pool
-from imageshield.score.engine import ScoreWeights
-from imageshield.score.store import PostgresScoreStore
 from imageshield.threats.store import (
     THREAT_CREATED_ACTION,
     THREAT_RETRACTED_ACTION,
     PostgresThreatStore,
 )
 from imageshield.types import UserRef
-from tests.conftest import make_config
 from tests.db import ensure_subject, run_migrate
-from tests.test_score_store import _enrolment, _seed  # Task 12 seeding idioms
 
 
 @pytest.fixture
@@ -61,16 +58,40 @@ def store(pool: AsyncConnectionPool) -> PostgresThreatStore:
     return PostgresThreatStore(pool)
 
 
-@pytest.fixture
-def score_store(pool: AsyncConnectionPool) -> PostgresScoreStore:
-    cfg = make_config()
-    return PostgresScoreStore(
-        pool, weights=ScoreWeights.from_config(cfg), config_version=cfg.score_config_version
+def _user() -> UserRef:
+    return UserRef(uuid4())
+
+
+def _enrolment(conn: psycopg.Connection[Any], user_ref: UserRef) -> None:
+    """A passed-and-consumed liveness session plus its enrolment — the same
+    shape as ``tests/test_svc_views.py``'s ``_enrolment``, needed here to
+    exercise the matcher against an enrolled subject."""
+    session_id = conn.execute(
+        "INSERT INTO liveness_sessions"
+        " (user_ref, provider_session_id, status, expires_at, consumed_at)"
+        " VALUES (%s, %s, 'consumed', now() + interval '10 minutes', now())"
+        " RETURNING session_id",
+        (user_ref, uuid4().hex),
+    ).fetchone()
+    assert session_id is not None
+    conn.execute(
+        "INSERT INTO enrolments (session_id, user_ref, collection_id, external_face_id,"
+        " model_id, source_object_uri, consent_ref, consent_document_sha256,"
+        " consent_signed_at)"
+        " VALUES (%s, %s, 'identity-v1', %s, 'rek-v6', 's3://proxy/ref.jpg', %s, %s, now())",
+        (session_id[0], user_ref, uuid4().hex, uuid4(), "a" * 64),
     )
 
 
-def _user() -> UserRef:
-    return UserRef(uuid4())
+def _seed(conn: psycopg.Connection[Any], user_ref: UserRef) -> UUID:
+    row = conn.execute(
+        "INSERT INTO search_seeds (user_ref, seed_kind, source_object_ref)"
+        " VALUES (%s, 'user_supplied', %s) RETURNING seed_id",
+        (user_ref, f"photo/{uuid4().hex}"),
+    ).fetchone()
+    assert row is not None
+    seed_id: UUID = row[0]
+    return seed_id
 
 
 def _infringement_on_domain(
@@ -317,25 +338,20 @@ async def test_list_events_returns_newest_first(
 async def test_event_retraction_restores_exactly_the_pre_event_score(
     migrated_db: str,
     store: PostgresThreatStore,
-    score_store: PostgresScoreStore,
     pool: AsyncConnectionPool,
 ) -> None:
-    """Build a well-set-up user (enrolled, fresh seed — the Task 12 seeding
-    idioms), match them with a threat event, then retract it and confirm the
-    match set the retraction reversed is exactly the match set the event
-    created.
+    """Build a well-set-up user (enrolled, fresh seed), match them with a
+    threat event, then retract it and confirm the match set the retraction
+    reversed is exactly the match set the event created.
 
-    NOTE (2026-09-24, Task S1): this test used to also recompute the
+    NOTE (2026-09-24, Task S3): this test used to also recompute the
     protection score before, during and after the event and assert it
-    dropped then returned to baseline exactly. ``score/store.py``'s
-    ``_THREATS_SQL`` still reads ``threat_events.penalty`` as a required
-    ``Decimal`` and now gets ``NULL`` for a post-0037 event, which raises a
-    pydantic ``ValidationError`` out of ``ScoreStore.recompute`` rather than
-    failing an assertion — the score-store call itself cannot run against a
-    penalty-free event yet. Task S3 rewrites this file's score assertions
-    (and removes the now-unused ``score_store`` fixture) once the score
-    engine itself stops reading ``penalty``; until then this test proves only
-    the matcher/retract shape, which is this task's scope.
+    dropped then returned to baseline exactly, before Task S1 trimmed that to
+    a matcher/retract-only check because the score store could no longer read
+    a penalty-free event. Task S3 deletes the score subsystem itself, so
+    there is no score left to recompute — this test's name is now a
+    description of what it used to also prove, not of what it currently
+    does.
     """
     user_ref = _user()
     await ensure_subject(pool, user_ref)

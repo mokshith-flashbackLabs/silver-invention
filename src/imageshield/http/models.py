@@ -882,29 +882,3 @@ class ReviewStatsResponse(BaseModel):
     by_severity: list[ReviewStatsSeverityItem]
     subject_agreement: ReviewStatsSubjectAgreement
     by_operator: list[ReviewStatsOperatorItem]
-
-
-# ── scores (Task 15) ─────────────────────────────────────────────────────
-
-
-class ScoreDetailResponse(BaseModel):
-    score: int
-    components: dict[str, int]
-    config_version: str
-    computed_at: datetime
-
-
-class ScoreEventItem(BaseModel):
-    score_event_id: int
-    delta: int
-    component: str
-    cause_kind: str
-    cause_ref: str | None
-    config_version: str
-    score_after: int
-    created_at: datetime
-
-
-class ScoreResponse(BaseModel):
-    score: ScoreDetailResponse
-    events: list[ScoreEventItem]
