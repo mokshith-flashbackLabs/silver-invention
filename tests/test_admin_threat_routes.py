@@ -9,7 +9,6 @@ are required at router level.
 
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -107,7 +106,6 @@ def _body(**overrides: Any) -> dict[str, Any]:
         "severity": 3,
         "domains": ["evil.example"],
         "is_global": False,
-        "penalty": "5.00",
         "expires_at": "2026-09-01T00:00:00Z",
         "decay_days": 30,
         "operator": "alice",
@@ -157,13 +155,23 @@ def test_create_returns_201_with_matched_count_and_recomputes_each_matched_ref()
     assert str(event_id) != ""
 
 
-def test_create_carries_penalty_as_a_decimal_not_a_float() -> None:
+def test_create_needs_no_penalty() -> None:
     client, threats, _score = make_client()
 
-    client.post("/v1/admin/threat-events", json=_body(penalty="12.34"), headers=ADMIN)
+    response = client.post("/v1/admin/threat-events", json=_body(), headers=ADMIN)
 
-    assert threats.create_calls[0]["penalty"] == Decimal("12.34")
-    assert isinstance(threats.create_calls[0]["penalty"], Decimal)
+    assert response.status_code == 201
+    assert "penalty" not in threats.create_calls[0]
+
+
+def test_create_ignores_a_sent_penalty() -> None:
+    # An older backend still sends one for a release; new services ignore it.
+    client, threats, _score = make_client()
+
+    response = client.post("/v1/admin/threat-events", json=_body(penalty="5.00"), headers=ADMIN)
+
+    assert response.status_code == 201
+    assert "penalty" not in threats.create_calls[0]
 
 
 def test_create_zero_matches_triggers_no_recompute() -> None:

@@ -1968,3 +1968,37 @@ def test_0033_down_drops_the_table_and_both_indexes(throwaway_db: str) -> None:
 
     forward = run_migrate(throwaway_db, "up")
     assert forward.returncode == 0, forward.stderr
+
+
+# ── 0037: threat events stop carrying a penalty ─────────────────────────────
+
+
+def test_0037_penalty_is_optional_and_reversible(throwaway_db: str) -> None:
+    run_migrate(throwaway_db, "down", "--all")
+    assert run_migrate(throwaway_db, "up").returncode == 0
+
+    # Up: a NULL penalty inserts cleanly; a non-positive one is still refused.
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO threat_events (kind, title, severity, is_global, penalty, "
+            "expires_at, decay_days, status, created_by) VALUES "
+            "('leak','t',3,true,NULL, now() + interval '1 day', 7, 'active', 'op')"
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO threat_events (kind, title, severity, is_global, penalty, "
+                "expires_at, decay_days, status, created_by) VALUES "
+                "('leak','t',3,true,0, now() + interval '1 day', 7, 'active', 'op')"
+            )
+
+    # Down past 0037 with a NULL row present: it must not fail, and the row is backfilled.
+    back = run_migrate(throwaway_db, "down", "--steps", "1")
+    assert back.returncode == 0, back.stderr
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        assert (
+            conn.execute("SELECT count(*) FROM threat_events WHERE penalty IS NULL").fetchone()[0]
+            == 0
+        )
+
+    forward = run_migrate(throwaway_db, "up")
+    assert forward.returncode == 0, forward.stderr

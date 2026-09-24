@@ -1,21 +1,15 @@
 """Threat events — operator CRUD, the domain/global matcher, and the audit
 trail (design doc §6, migration 0022, Task 14 brief).
 
-A threat event is a console-authored fact ("this domain just had a leak",
-"this platform had an incident") that penalises the ``threat`` component of
-every matched person's protection score — see ``score/store.py``'s
-``_THREATS_SQL``, which reads only ``status = 'active'`` rows here.
+A threat event records that a wider incident (a domain leak, a platform
+incident) affects a set of matched people; the backend charges the user's
+own score for it by severity (spec 2026-09-24, remove-protection-score) — it
+no longer carries a ``penalty`` that feeds anything here.
 
-That single detail is what makes retraction reversible without a manual
-compensating entry: ``retract_event`` never touches ``score_events`` or
-``protection_scores`` directly. It flips ``threat_events.status`` to
-``'retracted'`` and returns the matched ``user_ref``s so the caller (the
-admin route) can run ``ScoreStore.recompute`` for each — the engine reads
-``status = 'active'`` on its next pass, the threat penalty vanishes from the
-computed components, and the diff-and-journal machinery in
-``score/store.py`` writes the opposite delta on its own. The reversal is a
-property of *where the engine reads its state*, not a second code path that
-has to agree with the first.
+``retract_event`` never touches ``score_events`` or ``protection_scores``
+directly. It flips ``threat_events.status`` to ``'retracted'`` and returns
+the matched ``user_ref``s so the caller (the admin route) can act on the
+reversal.
 
 ``create_event`` is one transaction: insert the event row, materialise
 matches (domain-based, plus a second global insert when ``is_global``), and
@@ -30,7 +24,6 @@ must share one audit row summarising both.
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -47,11 +40,11 @@ THREAT_RETRACTED_ACTION = "threat_event.retracted"
 
 _INSERT_EVENT_SQL = """
     INSERT INTO threat_events
-        (kind, title, body, severity, domains, is_global, penalty,
+        (kind, title, body, severity, domains, is_global,
          expires_at, decay_days, status, created_by)
     VALUES
         (%(kind)s, %(title)s, %(body)s, %(severity)s, %(domains)s, %(is_global)s,
-         %(penalty)s, %(expires_at)s, %(decay_days)s, 'active', %(operator)s)
+         %(expires_at)s, %(decay_days)s, 'active', %(operator)s)
     RETURNING event_id
 """
 
@@ -62,8 +55,8 @@ _INSERT_EVENT_SQL = """
 # threat event is about domain relevance, not the adjudication verdict on any
 # one hit.
 _MATCH_DOMAINS_SQL = """
-    INSERT INTO threat_event_matches (event_id, user_ref, matched_via, penalty_applied)
-    SELECT DISTINCT ON (i.user_ref) %(event_id)s, i.user_ref, c.source_domain, %(penalty)s
+    INSERT INTO threat_event_matches (event_id, user_ref, matched_via)
+    SELECT DISTINCT ON (i.user_ref) %(event_id)s, i.user_ref, c.source_domain
     FROM infringements i
     JOIN content_urls c ON c.url_hash = i.url_hash
     WHERE c.source_domain = ANY(%(domains)s) AND i.url_alive
@@ -77,8 +70,8 @@ _MATCH_DOMAINS_SQL = """
 # being overwritten with 'global' — this insert only reaches people the
 # domain pass did not.
 _MATCH_GLOBAL_SQL = """
-    INSERT INTO threat_event_matches (event_id, user_ref, matched_via, penalty_applied)
-    SELECT %(event_id)s, user_ref, 'global', %(penalty)s FROM subjects
+    INSERT INTO threat_event_matches (event_id, user_ref, matched_via)
+    SELECT %(event_id)s, user_ref, 'global' FROM subjects
     ON CONFLICT DO NOTHING
     RETURNING user_ref
 """
@@ -99,7 +92,7 @@ _MATCHED_REFS_SQL = """
 """
 
 _LIST_EVENTS_SQL = """
-    SELECT event_id, kind, title, body, severity, domains, is_global, penalty,
+    SELECT event_id, kind, title, body, severity, domains, is_global,
            starts_at, expires_at, decay_days, status, created_by, created_at, updated_at
     FROM threat_events
     ORDER BY created_at DESC
@@ -117,7 +110,6 @@ class ThreatStore(Protocol):
         severity: int,
         domains: tuple[str, ...],
         is_global: bool,
-        penalty: Decimal,
         expires_at: datetime,
         decay_days: int,
         operator: str,
@@ -145,7 +137,6 @@ class PostgresThreatStore:
         severity: int,
         domains: tuple[str, ...],
         is_global: bool,
-        penalty: Decimal,
         expires_at: datetime,
         decay_days: int,
         operator: str,
@@ -161,7 +152,6 @@ class PostgresThreatStore:
                     "severity": severity,
                     "domains": list(domains),
                     "is_global": is_global,
-                    "penalty": penalty,
                     "expires_at": expires_at,
                     "decay_days": decay_days,
                     "operator": operator,
@@ -173,14 +163,12 @@ class PostgresThreatStore:
 
             cur = await conn.execute(
                 _MATCH_DOMAINS_SQL,
-                {"event_id": event_id, "domains": list(domains), "penalty": penalty},
+                {"event_id": event_id, "domains": list(domains)},
             )
             matched.update(parse_user_ref(r[0]) for r in await cur.fetchall())
 
             if is_global:
-                cur = await conn.execute(
-                    _MATCH_GLOBAL_SQL, {"event_id": event_id, "penalty": penalty}
-                )
+                cur = await conn.execute(_MATCH_GLOBAL_SQL, {"event_id": event_id})
                 matched.update(parse_user_ref(r[0]) for r in await cur.fetchall())
 
             await conn.execute(
@@ -248,14 +236,13 @@ class PostgresThreatStore:
                 "severity": row[4],
                 "domains": list(row[5]),
                 "is_global": row[6],
-                "penalty": row[7],
-                "starts_at": row[8],
-                "expires_at": row[9],
-                "decay_days": row[10],
-                "status": row[11],
-                "created_by": row[12],
-                "created_at": row[13],
-                "updated_at": row[14],
+                "starts_at": row[7],
+                "expires_at": row[8],
+                "decay_days": row[9],
+                "status": row[10],
+                "created_by": row[11],
+                "created_at": row[12],
+                "updated_at": row[13],
             }
             for row in rows
         ]

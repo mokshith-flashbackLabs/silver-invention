@@ -543,10 +543,7 @@ class ProviderHealthResponse(BaseModel):
 
 class ThreatEventCreateRequest(ServiceModel):
     """Operator input for a new threat event, submitted via the backend's
-    /v1/admin/* proxy. ``penalty`` crosses as a decimal STRING (pydantic
-    coerces to ``Decimal``), same convention as every other money-shaped
-    value at this boundary — a float round-trip is exactly the drift
-    ``NUMERIC(5,2)`` exists to avoid.
+    /v1/admin/* proxy.
     """
 
     kind: Literal["leak", "deepfake_wave", "platform_incident", "other"]
@@ -555,7 +552,10 @@ class ThreatEventCreateRequest(ServiceModel):
     severity: int = Field(ge=1, le=5)
     domains: tuple[str, ...] = ()
     is_global: bool = False
-    penalty: Decimal = Field(gt=0)
+    # ACCEPTED AND IGNORED for one release (spec 2026-09-24): it fed only the
+    # protection score, which is gone. The backend stops sending it once these
+    # services are live; drop the field after that.
+    penalty: Decimal | None = None
     expires_at: datetime
     decay_days: int = Field(gt=0)
     operator: str = Field(min_length=1)
@@ -594,9 +594,6 @@ class ThreatEventItem(BaseModel):
     severity: int
     domains: list[str]
     is_global: bool
-    # Decimal-as-string, same convention as penalty above and as
-    # ProviderHealthItem's cost fields.
-    penalty: str
     starts_at: datetime
     expires_at: datetime
     decay_days: int
