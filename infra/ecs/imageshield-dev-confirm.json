@@ -84,7 +84,7 @@
         },
         {
           "name": "LIVENESS_MAX_ATTEMPTS_24H",
-          "value": "5"
+          "value": "10"
         },
         {
           "name": "DB_POOL_MAX_SIZE",
