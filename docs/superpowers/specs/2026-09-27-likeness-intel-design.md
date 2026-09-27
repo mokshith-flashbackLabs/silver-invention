@@ -1,7 +1,11 @@
 # Likeness intel — design
 
-*2026-09-27. Approved in conversation, section by section. Revised the same day after an adversarial review
-(88 verified findings), before owner review. Awaiting written-spec review.*
+*2026-09-27. Approved in conversation, section by section, and revised the same day in three passes:*
+1. *after a first adversarial review (88 verified findings), before owner review;*
+2. *at owner review, to adapt to quiz changes (decision 10): exposure tags replace the fixed platform list;*
+3. *after a second adversarial review of that change (26 verified findings, plus 2 found in unverified leftovers).*
+
+*Awaiting the owner's final look.*
 
 *Two repos. This one, `image_flashbacklabs`, carries most of the work. The backend half has its own companion spec,
 `image_backend/docs/superpowers/specs/2026-09-27-likeness-intel-backend-design.md`. Each half ships under its own
@@ -32,9 +36,10 @@ The feature lives in services. ToS changes and LinkedIn were given as examples, 
 | 4 | How does good news raise a score? | **Both ways.** A platform-specific improvement shrinks that option's deduction. A broad protection adds a small capped credit. |
 | 5 | Which repo does what? | **Services gathers and proposes. The backend applies**, and the score keeps one implementation. |
 | 6 | Model access | **Claude Platform on AWS**: Anthropic-operated, SigV4 with the task role, AWS Marketplace billing. Amazon Bedrock was considered and rejected because it offers no web search or web fetch tool. |
-| 7 | Changes forced by the code, confirmed before writing | Protection credits are events, not config entries (§3.7). The platform map lives in the backend's scoring config. Web search only discovers URLs; we fetch everything ourselves (§4.2). Weight changes apply to `mutable` questions only (§4.5). Attribution runs the engine twice on a weights-only version change (backend spec). PII in excerpts is dropped (§6.3). Cost goes through the provider gate (§5). |
+| 7 | Changes forced by the code, confirmed before writing | Protection credits are events, not config entries (§3.7). Web search only discovers URLs; we fetch everything ourselves (§4.2). Weight changes apply to `mutable` questions only (§4.5). Attribution runs the engine twice on a weights-only version change (backend spec). PII in excerpts is dropped (§6.3). Cost goes through the provider gate (§5). |
 | 8 | The "ask first" items in §3 rule 6 | **Approved:** a new `intel-worker` container (§4.1, no fourth queue); reversing "services deployables stay LLM-free" (§1). |
-| 9 | **Owner approval needed at spec review** | A third new dependency, **`publicsuffixlist`** (pinned, bundled list, no network), so corroboration counts publishers by registrable domain (§3.6). Without it, one outlet's two subdomains count as two publishers and #50 is defeated. |
+| 9 | A third dependency | **Approved at spec review:** `publicsuffixlist` (pinned, bundled list, no network), so corroboration counts publishers by registrable domain (§3.6). |
+| 10 | **It must adapt when the quiz changes** (owner, at spec review) | Nothing in intel may assume a fixed quiz. The things an event can target are **exposure tags**: live data the backend owns, which an operator creates and maps to *any* option of *any* question, with no deploy and no retake (§3.1). Every proposal is generated against the vocabulary the backend pushes after each change, and services react to every change on their own (§4.9). A question or option added tomorrow becomes a target for evidence, suggestions and events tomorrow. |
 
 **Why the human gate is the whole design.** A false positive here is a psychological injury (§1). A model misreading
 one news story must not lower thousands of scores unattended. The model writes rows into intel tables and nothing
@@ -91,8 +96,9 @@ services, by owner decision. The amendments are dated and written in place, neve
 | `fetcher` | SSRF-guarded egress to third-party URLs | DB credentials, the model client |
 
 **Services never sees a person in this feature.** Prompts carry public document text, signals and the backend's
-published scoring vocabulary (the questions, options, weights and platform map, which `GET /v1/quiz` already serves
-publicly in part). Services never receives a quiz answer. Platform matching happens in the backend.
+published scoring vocabulary: the questions, options and weights (which `GET /v1/quiz` already serves publicly in
+part), the exposure-tag registry and the option-to-tag map. Services never receives a quiz answer. Matching a tag to
+a person happens in the backend.
 
 **Data is kept indefinitely as the evidence trail** (services §5: never DELETE, provenance). The backend's
 `scoring_provenance` cites proposal ids forever, so nothing an approval rested on may disappear. Intel's
@@ -111,7 +117,7 @@ the type is the `CUSTOM_TYPES` pin in `tests/test_migrations.py:47`.
 | File | Ships in | Contents |
 |---|---|---|
 | `0038_likeness_intel` | step 1 | `providers.kind` becomes TEXT (below); the `claude_intel` row; `provider_calls.intel_run_id`; every `intel_*` table in §3.1–§3.6 and §3.8; the `intel_rw` role and its grants. **No threat or protection change, and no view.** |
-| `0039_intel_scoped_threats` | step 3 | `threat_events.platforms` and `proposal_id`; the relevance-CHECK swap; `intel_rw` grants on `threat_events`; `svc.v_active_scoped_events` with **the threat half only**, and its grant. |
+| `0039_intel_scoped_threats` | step 3 | `threat_events.tags` and `proposal_id`; the relevance-CHECK swap; `intel_rw` grants on `threat_events`; `svc.v_active_scoped_events` with **the threat half only**, and its grant. |
 | `0040_intel_protection_events` | step 4 | `protection_events`; the view dropped and re-created as the UNION, **with its grant re-issued in the same file**, because `DROP VIEW` loses it. |
 
 If steps 3 and 4 ship together, 0039 carries both halves and 0040 does not exist. The four hand-maintained contract
@@ -130,20 +136,38 @@ the column grant on `content_urls` (§6.1), because superuser test runs hide a m
 **Column names pass the schema lint (#9):** `*_text` and `*_url` are fine. No `*_data`, `*_blob`, `*_bytes`, `*_b64`
 or `bytea`.
 
-### 3.1 Platform vocabulary
+### 3.1 Exposure tags — the vocabulary events target, owned by the backend as data
 
-`intel/platforms.py` holds `PLATFORM_SLUGS`, a closed tuple: `x`, `snapchat`, `instagram`, `facebook`, `tiktok`,
-`youtube`, `linkedin`, `reddit`, `whatsapp`, `telegram`, `discord`, `threads`. Every `platforms text[]` column carries
-`CHECK (platforms <@ ARRAY[...]::text[])` with the same list.
+An **exposure tag** is something a person can be exposed through: a platform (`instagram`, `linkedin`, `bumble`), a
+kind of service (`dating_apps`, `cloud_photo_backup`) or a practice (`public_profile_photo`). **Tags are live data, not
+code.**
+- **The registry** (slug, label, description, kind, retired) lives in the backend (`profile.exposure_tags`). So does
+  **the option-to-tag map** (`profile.option_tags`), which says which answer of which question exposes a person to
+  which tags.
+- **Both are edited in the control room**, with no deploy in either repo and no quiz retake (backend spec §2).
+- **Services receive both** in every vocabulary push (§3.8).
 
-**It is a two-repo contract.** The backend's `PLATFORM_SLUGS` must be byte-identical. Each repo pins its own list in a
-test, and a change is two coordinated commits, the way contract-view columns are handled. Services does not
-normalise case, which is why a free-text list would fail silently (the threat-domain lesson).
+**Rules that keep a data vocabulary as safe as the closed list it replaces:**
+- **A slug is immutable and never deleted.** It matches `^[a-z][a-z0-9_]{0,39}$`, the same pattern on both sides, so
+  `x` is valid.
+- **Retiring a tag refuses *new* uses only.** A retired tag cannot be added to a mapping, a new proposal or an
+  operator's edited `values`. An event, mapping or pending proposal that already names it keeps working unchanged, so
+  retiring moves nobody.
+- **Every `tags text[]` column** in this repo carries `CHECK (intel_tags_well_formed(tags))`, an immutable SQL function
+  that checks each element's shape and that the array holds no duplicates.
+  - **Membership is checked in code** against the loaded vocabulary, with one diff rule: a tag a write *adds* must be
+    registered and not retired, while a tag already in the proposal's own `target` may be retired. That happens at
+    generation and again on every operator's `values`, and it is refused as `422 unknown_tag` or `422 tag_retired`,
+    naming the slugs.
+  - The database cannot check membership, because the registry lives in the other repo. The backend re-checks
+    membership before relaying any operator write that names tags. A tag that fails is refused, never silently
+    matched to nobody (the threat-domain lesson).
+- **"Mapped"** means at least one option of the *live* quiz maps to the tag. A registered but unmapped tag moves
+  nobody, and every read says so (`unmapped_tags`, and the backend's `reach`).
 
-**Six of the twelve slugs map to no live quiz option today.** The live `platforms` question offers X, Snapchat,
-Instagram, Facebook, TikTok and YouTube. **LinkedIn, the owner's own example, moves nobody** until a quiz-editor
-publish adds the option and maps it. So evidence about an unmapped-only platform becomes a `coverage_gap`, never an
-event (§4.5).
+**What this buys.** When a quiz-editor publish adds "LinkedIn" to a question and an operator maps it to `linkedin`,
+**every active event already tagged `linkedin` starts reaching those people** on their next recompute, and every
+pending `coverage_gap` about LinkedIn closes itself (§4.9). Nothing in services is edited or deployed.
 
 ### 3.2 Sources
 
@@ -156,7 +180,7 @@ event (§4.5).
 | `source_url` | Canonicalised with `search/urlhash.py`. `CHECK ((kind = 'search_query') = (source_url IS NULL))` |
 | `url_hash`, `normalisation_version` | `CHECK ((source_url IS NULL) = (url_hash IS NULL AND normalisation_version IS NULL))`. Unique where not NULL. The functions are reused; the `content_urls` **table is not** (it feeds recheck's allowlist and threat matching). |
 | `query_text` | `CHECK ((kind = 'search_query') = (query_text IS NOT NULL))`. Refused with `422 query_names_a_person` if it contains a phone- or email-shaped run (§6.1). |
-| `platforms` | A hint for the extractor. May be empty. |
+| `tags` | A hint for the extractor. May be empty. Well-formed by CHECK; membership checked on write. |
 | `check_every_hours` | `CHECK BETWEEN 6 AND 720` |
 | `next_check_at`, `enabled`, `created_by`, `created_at`, `updated_at` | |
 | `terms_note` | TEXT NOT NULL, `CHECK (length(terms_note) >= 10)`. §7.7: whoever adds a source records that automated access to it is permitted. |
@@ -187,9 +211,10 @@ event (§4.5).
 | Column | Notes |
 |---|---|
 | `run_id` | UUID PK |
-| `kind` | `source_check` · `discovery` · `adhoc_url` · `weight_suggestion` · `renewal_check` |
-| `source_id` | NULL for `adhoc_url`, `weight_suggestion` and `renewal_check` |
-| `request` | JSONB. `adhoc_url`: `{url}`. `weight_suggestion`: the question payload (§4.6). `renewal_check`: `{event_id}`. **Never person data.** |
+| `kind` | `source_check` · `discovery` · `adhoc_url` · `weight_suggestion` · `renewal_check` · `gap_regenerate` |
+| `source_id` | NULL for every kind except `source_check` and `discovery` |
+| `request` | JSONB. `adhoc_url`: `{url}`. `weight_suggestion`: the question payload (§4.6). `renewal_check`: `{event_id}`. `gap_regenerate`: `{coverage_gap_id, tag, signal_ids}` (§4.9). **Never person data.** |
+| `vocabulary_release_no`, `vocabulary_map_version` | The vocabulary pair the run loaded, NULL when none existed. Every signal (through its document) and every proposal, event kinds included, inherits it, so what registry an output was produced against is always answerable. |
 | `status` | `queued` · `running` · `completed` · `failed` · `refused` |
 | `attempts` | SMALLINT NOT NULL DEFAULT 0, incremented by each claim |
 | `lease_expires_at` | Claimed with `FOR UPDATE SKIP LOCKED` |
@@ -222,7 +247,10 @@ event (§4.5).
 - `signal_id`, `document_id`
 - `category`: `policy` · `incident` · `tooling` · `protection` · `law` · `research`
 - `direction`: `risk_up` · `risk_down` · `neutral`
-- `platforms`: may be empty for a signal about everyone
+- `tags`: the exposure tags the evidence concerns, from the registry loaded at extraction. May be empty for a signal
+  about everyone.
+- `unregistered_subjects`: text[] of things the evidence concerns that **no registered tag covers**, such as a platform
+  nobody has tagged yet, masked (§6.3). This is what `coverage_gap` is built from.
 - `summary`: model-written, ≤ 500 characters, masked (§6.3), **control room only**
 - `model_id`: **the model that actually answered**, `response.model`, never the configured id
 - `prompt_version`
@@ -276,10 +304,13 @@ So **an approved proposal cannot exist without a name on it and its exact number
 | Kind | `target` | `suggested` | `decided` |
 |---|---|---|---|
 | `weight_change` | `{question_key, option, current}` | `{delta}` | `{delta}`. An edit may change only `delta`. |
-| `threat_event` | `{platforms}` | `{kind, title, severity, expires_in_days}` | the same keys, as inserted, plus `platforms` |
-| `protection_event` | `{platforms, is_global, renews_event_id?}` | `{title, strength, review_in_days}` | the same keys, as inserted, plus `platforms`, `is_global` and `applies_regardless_of_location` |
-| `weight_suggestion` | `{question_key, options: [{option, deduction \| null, rationale, signal_ids}]}` | — | — |
-| `coverage_gap` | `{subject, platforms, suggested_question?}` | — | — |
+| `threat_event` | `{tags}` | `{kind, title, severity, expires_in_days}` | the same keys, as inserted, plus `tags` |
+| `protection_event` | `{tags, is_global, renews_event_id?}` | `{title, strength, review_in_days}` | the same keys, as inserted, plus `tags`, `is_global` and `applies_regardless_of_location` |
+| `weight_suggestion` | `{question_key, options: [{option, deduction \| null, rationale, signal_ids, suggested_tags, new_tag?}]}` | — | — |
+| `coverage_gap` | `{subject, suggested_tag?: {slug, label, kind}, suggested_question?, regenerated_by_run_id?}` | — | — |
+
+**Supersession needs a reason.** `supersede_reason` is non-NULL exactly when `status = 'superseded'`. It is one of
+`newer_proposal`, `cell_changed` or `resolved_by_quiz` (§4.9).
 
 **`intel_proposal_signals (proposal_id, signal_id)` PK.** Every proposal needs at least one when it is written. Rows
 may be **added** later to a still-pending event proposal (the `attach` path, §4.3). Adding evidence never changes
@@ -308,30 +339,35 @@ the backend.
 - Private suffixes (`github.io`, `blogspot.com`) collapse to their owner, so they count as one publisher. An IP literal
   or a bare suffix falls back to the hostname.
 - The value is stored once and never recomputed at decision time.
-- One pure predicate, `intel/corroboration.py:why_not(signals) -> str | None`, uses the code constant
-  `CORROBORATION_MIN_PUBLISHERS = 2` from `intel/bounds.py`. **Every caller uses it**: the `approvable` and `why_not`
-  fields on both proposal reads, the in-transaction re-check on decision, and the per-option `corroborated` flag on
-  weight suggestions. So a proposal the panel shows as approvable is never one the decision refuses.
+- **The corroboration predicate** is `intel/corroboration.py:uncorroborated(signals) -> bool`, using the code constant
+  `CORROBORATION_MIN_PUBLISHERS = 2` from `intel/bounds.py`.
+- **The approvability predicate** is one pure function, `intel/approvable.py:why_not(proposal, active_signals,
+  vocabulary) -> str | None`. It answers every refusal knowable at read time, in a fixed order: `not_decidable`,
+  `evidence_retracted`, `uncorroborated`, `tags_unmapped` (event kinds, §4.5).
+- **Every caller uses them**: the `approvable` and `why_not` fields on both proposal reads, the in-transaction re-check
+  on decision, and the per-option `corroborated` flag on weight suggestions (which calls the corroboration predicate
+  per option). So **a proposal the panel shows as approvable is never one the decision refuses**, except for races the
+  transaction itself catches (`proposal_not_pending`, `proposal_cell_awaiting_publish`).
 
 ### 3.7 Events and the contract view
 
 **`threat_events` gains two columns (0039):**
-- `platforms text[] NOT NULL DEFAULT '{}'`, with the slug CHECK;
+- `tags text[] NOT NULL DEFAULT '{}'`, with the well-formed CHECK (§3.1);
 - `proposal_id uuid NULL UNIQUE REFERENCES intel_proposals`. It is nullable because operators can still create events
   by hand.
 
 **The relevance CHECK.** The unnamed CHECK `(is_global OR cardinality(domains) > 0)` from 0022:65 is **looked up by
 definition in `pg_constraint` inside a DO block**, never assumed to be `threat_events_check1`. It is replaced with
-`is_global OR cardinality(domains) > 0 OR cardinality(platforms) > 0`. `ThreatEventCreateRequest._domains_or_global`
-changes the same way, and `platforms` is added to the create model, the store Protocol, the route kwargs and
-`ThreatEventItem`.
+`is_global OR cardinality(domains) > 0 OR cardinality(tags) > 0`. `ThreatEventCreateRequest._domains_or_global`
+changes the same way, and `tags` is added to the create model (shape-validated), the store Protocol, the route kwargs
+and `ThreatEventItem`.
 
 **0039's down leg, in order:**
-1. **Guard.** RAISE if any row has `cardinality(platforms) > 0 AND NOT is_global AND cardinality(domains) = 0 AND
-   status IN ('active','draft')`. It checks `status` alone, not `expires_at`: the code never writes `expired`, so an
-   event past its expiry still reads `active`, and refusing on it is the conservative choice.
+1. **Guard.** RAISE if any row has `cardinality(tags) > 0 AND NOT is_global AND cardinality(domains) = 0 AND status IN
+   ('active','draft')`. It checks `status` alone, not `expires_at`: the code never writes `expired`, so an event past
+   its expiry still reads `active`, and refusing on it is the conservative choice.
 2. Drop the widened CHECK, looked up by definition.
-3. **Restore the old CHECK as `NOT VALID`.** Retracted platform-only rows keep their shape, and nothing updates them,
+3. **Restore the old CHECK as `NOT VALID`.** Retracted tag-only rows keep their shape, and nothing updates them,
    because retract only touches active rows. Validating the constraint would fail on them.
 
 **`intel_rw` gains `SELECT, INSERT` on `threat_events`**, because approving a proposal creates the event in one
@@ -345,7 +381,7 @@ transaction. **The follow-up migration that drops the dormant score tables must 
 | `event_id` | UUID PK |
 | `title`, `body` | `body` is control room only |
 | `strength` | SMALLINT, 1–5 |
-| `platforms`, `is_global` | Slug CHECK. `CHECK (is_global OR cardinality(platforms) > 0)`. `CHECK (NOT (is_global AND cardinality(platforms) > 0))` |
+| `tags`, `is_global` | Well-formed CHECK. `CHECK (is_global OR cardinality(tags) > 0)`. `CHECK (NOT (is_global AND cardinality(tags) > 0))` |
 | `starts_at`, `review_by` | `CHECK (review_by > starts_at AND review_by <= starts_at + interval '366 days')` |
 | `status` | `active` · `retracted` |
 | `proposal_id` | **NOT NULL UNIQUE** REFERENCES `intel_proposals`. Every credit has citations, by construction. There is no hand-created protection event. |
@@ -355,7 +391,7 @@ transaction. **The follow-up migration that drops the dormant score tables must 
 - **A credit lapses at `review_by` unless it is renewed** (§4.8). The failure mode is *less* reassurance, never stale
   reassurance. Retraction is terminal, as it is for threats.
 - **The protection must apply to everyone it credits, wherever they are.** A law or protection limited to some
-  jurisdictions or regions is **rejected**, never approved as global or platform-wide, because we hold no location.
+  jurisdictions or regions is **rejected**, never approved as global or tag-wide, because we hold no location.
   The approval body must carry `applies_regardless_of_location: true` (§4.7), and that attestation lands in the audit
   row.
 
@@ -364,22 +400,23 @@ transaction. **The follow-up migration that drops the dormant score tables must 
 ```sql
 CREATE VIEW svc.v_active_scoped_events AS
   SELECT event_id, 'threat'::text AS direction, kind, title, body,
-         severity AS magnitude, platforms, is_global, starts_at, expires_at AS ends_at
+         severity AS magnitude, tags, is_global, starts_at, expires_at AS ends_at
     FROM threat_events
    WHERE status = 'active' AND starts_at <= now() AND expires_at > now()
-     AND cardinality(platforms) > 0
+     AND cardinality(tags) > 0
   UNION ALL
   SELECT event_id, 'protection'::text, 'protection'::text, title, body,
-         strength, platforms, is_global, starts_at, review_by
+         strength, tags, is_global, starts_at, review_by
     FROM protection_events
    WHERE status = 'active' AND starts_at <= now() AND review_by > now();
 GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
 ```
 
 - **It carries events, not people.** Matching happens in the backend, against answers only the backend holds.
-- **Scope of each half.** It carries only threats scoped to a platform; domain and global threats keep reaching people
-  through `v_person_threat_context`. **An event that is both domain- and platform-scoped appears on both, so the
-  backend dedupes by `event_id`.** `v_person_threat_context` does not filter `starts_at`. That makes no difference
+- **Scope of each half.** It carries only threats scoped to tags; domain and global threats keep reaching people
+  through `v_person_threat_context`. **An event that is both domain- and tag-scoped appears on both, so the backend
+  dedupes by `event_id`.** Tags are matched against the backend's *current* option-to-tag map, so a mapping added
+  after an event was approved reaches people with no change to the event. `v_person_threat_context` does not filter `starts_at`. That makes no difference
   today, because no writer sets a future `starts_at`, and future-dated threats are out of scope (§9).
 - **One namespace, two directions.** Threat and protection event ids share it. **Every consumer filters on
   `direction`**; the backend's threat-action liveness check reads only `direction = 'threat'`.
@@ -394,17 +431,25 @@ GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
 ### 3.8 Scoring vocabulary cache
 
 `intel_vocabulary`, a single row (`id smallint PK CHECK (id = 1)`):
-- `release_no` (bigint NOT NULL), `scoring_version`, `quiz_version`, `received_at`
-- `document` JSONB: the backend-published vocabulary. That means the questions (key, prompt, type, options), per-option
-  deductions and caps, the per-question platform map, `dynamic.threat` and `dynamic.protection`.
+- `release_no` (bigint NOT NULL), `map_version` (bigint NOT NULL), `scoring_version`, `quiz_version`, `received_at`
+- `reconciled_release_no`, `reconciled_map_version`: what the worker has already reacted to (§4.9)
+- `document` JSONB: the backend-published vocabulary. It holds:
+  - the questions (key, prompt, type, options), per-option deductions and caps, `dynamic.threat` and
+    `dynamic.protection`;
+  - **the exposure-tag registry** (`slug, label, description, kind, retired`);
+  - **the option-to-tag map** for the live quiz;
+  - **`renamed`**: the backend's **ordered rename log**, `[{release_no, question_key, old_option, new_option}]`, the
+    whole history. Services apply the entries above `reconciled_release_no`, in order and chained (§4.9). A later
+    weights release or a failed push therefore never loses a rename.
 
 **The backend pushes it with `PUT /v1/admin/intel/vocabulary`:** after every release (quiz-editor publish, rollback,
-weights release, bootstrap), once at worker boot, and **hourly**.
-- **Pushes are ordered by `release_no`**, the monotonic identity of the live release. `scoring_version` goes backwards
-  on a rollback and cannot order anything.
-- The row is updated only when `incoming.release_no >= stored.release_no`. An equal number overwrites, so a replay is
-  harmless. A strictly lower one is a no-op answered `200`, so a stale pusher never retries. A lost or out-of-order push
-  converges within an hour.
+weights release, bootstrap), **after every tag or mapping change**, once at worker boot, and **hourly**.
+- **Pushes are ordered by the pair `(release_no, map_version)`.** `release_no` is the monotonic identity of the live
+  release, and `map_version` is the backend's counter, bumped in the same transaction as any tag or mapping change.
+  `scoring_version` goes backwards on a rollback and cannot order anything.
+- The row is updated only when the incoming pair is not older than the stored one in either component. An equal pair
+  overwrites, so a replay is harmless. An older one is a no-op answered `200`, so a stale pusher never retries. A lost
+  or out-of-order push converges within an hour.
 - **It is public, non-person data.** It is how the proposal step can name real question keys and options.
 - A run **loads the vocabulary once** and validates against that loaded copy, never against a row a push may overwrite
   mid-run. `against_scoring_version` and `against_release_no` record which copy it was.
@@ -569,7 +614,7 @@ A run stopped mid-way by a gate skip ends `refused` with `refused_by = 'gate'`, 
 
 **`discovery` for a `search_query` source:**
 1. One model call with the web search tool (`max_uses` and `blocked_domains` from config). The prompt holds the
-   operator's saved query, the category taxonomy and `PLATFORM_SLUGS`. **Never person data.**
+   operator's saved query, the category taxonomy and the loaded tag registry. **Never person data.**
 2. The structured output lists candidate URLs, each with a reason.
 3. Each URL is https-only, deduplicated against documents from the last 30 days, checked against known hit locations,
    fetched through `/v1/text`, and extracted with `trust = web`.
@@ -580,15 +625,19 @@ The model's web-search text is never trusted as evidence. Only text we fetched i
 listed`, because a person chose it.
 
 **Extraction**, with `INTEL_EXTRACTION_MODEL`, structured output (`output_config.format`) and adaptive thinking:
-- **Input:** the normalised text (or diff), the source kind, platform hints and the taxonomy.
-- **Output:** `signals: [{category, direction, platforms, summary, quotes: [string]}]`.
+- **Input:** the normalised text (or diff), the source kind, the source's tag hints, the taxonomy, and **the loaded
+  tag registry** (slug, label, description; retired tags omitted). A registry larger than `MAX_PROMPT_TAGS` (300,
+  `intel/bounds.py`) is narrowed to tags whose label or slug appears in the text, plus the source's hints.
+- **Output:** `signals: [{category, direction, tags, unregistered_subjects, summary, quotes: [string]}]`. The model
+  uses a registered tag where one fits and names anything else as an unregistered subject. It never invents a slug.
 - **Local verification. This is the rule; the prompt is not** (#49):
   1. Normalise each quote. It must be a **substring of the normalised document text**, and the offsets are recorded.
   2. Its length must be 20–600 characters.
   3. **It must contain no phone-shaped or email-shaped run** (§6.3). Otherwise the quote is dropped, never redacted,
      because redacting would break the verbatim property.
   4. A signal with no surviving quote is not written.
-  5. The platforms must be a subset of `PLATFORM_SLUGS`, or the signal is dropped.
+  5. Every tag must be in the loaded registry and not retired. An unknown tag is removed from the signal and counted
+     (`unknown_tag`). It is never kept, and never silently turned into an unregistered subject.
   6. The summary is masked (§6.3).
 
   Every drop and mask is counted by reason on the run's `outcome`.
@@ -599,18 +648,22 @@ listed`, because a person chose it.
 `medium`). It runs once per run that wrote new signals.
 - **Input:**
   - the new signals;
-  - related active signals from the last 90 days with overlapping platforms or category, bounded to 60;
-  - **pending event proposals and active threat and protection events with overlapping platforms**, bounded to 40
-    each, with their `signal_ids`;
-  - the loaded vocabulary, including **the set of mapped slugs**.
+  - related active signals from the last 90 days with overlapping tags or category, bounded to 60;
+  - **pending event proposals and active threat and protection events with overlapping tags**, bounded to 40 each,
+    with their `signal_ids`;
+  - the loaded vocabulary, including **the set of mapped tags** and the questions with their `mutable` flag.
 
-  The prompt says: never re-propose a live event; attach new evidence to a matching pending proposal instead; evidence
-  about an unmapped-only platform is a `coverage_gap`, not an event.
+  The prompt says:
+  - never re-propose a live event;
+  - attach new evidence to a matching pending proposal instead;
+  - evidence about **unregistered subjects** is a `coverage_gap`;
+  - an event on **registered but unmapped** tags may be proposed, and it waits, unapprovable, until a mapping gives it
+    reach (§4.5).
 - **Output:** `proposals: [{kind, target, suggested, rationale, signal_ids}]` and `attach: [{proposal_id, signal_ids}]`.
 - **Code validation (§4.5)** drops any proposal that fails, with the reason counted. Nothing is "fixed up".
 - **`attach` is validated in code.** The target proposal must still be `pending` and of an event kind, and every
   attached signal must be new in this run, `active` and verified.
-- **Duplicate detection is deterministic.** A new event proposal whose kind and platform set equal a pending
+- **Duplicate detection is deterministic.** A new event proposal whose kind and tag set equal a pending
   proposal's, and which shares any signal document with it, is converted to an `attach` rather than written.
 - **All of a run's proposals and attachments commit in one transaction** with `proposals_written_at`, so a reclaimed
   run never generates twice.
@@ -646,11 +699,11 @@ change, a review and a `git blame`, the same argument as the backend's `REPORT_F
 | Kind | Validated at generation and again on the operator's `values` |
 |---|---|
 | `weight_change` | The question must be **`mutable` in the loaded vocabulary**. The option must exist. `target.current` must **equal the loaded vocabulary's deduction** for that option (else dropped, `current_mismatch`). `delta` int, non-zero, within [−2, +2]. `current + delta` within [0, 10], and not above the question's cap when it has one. An operator edit may change `delta` only. |
-| `threat_event` | `kind` ∈ `leak` · `deepfake_wave` · `platform_incident` · `other` (the 0022 CHECK; the signal category taxonomy is a different vocabulary). `title` non-empty. `severity` 1–5. `platforms` non-empty (a global threat stays hand-created). `expires_in_days` 1–90. |
-| `protection_event` | `strength` 1–5. `review_in_days` 30–366. **The model may not propose `is_global`** (dropped, `global_not_proposable`), because it cannot know a protection applies regardless of where a person lives. A global event exists only by an operator's edit on approval. A renewal (§4.8) is written by code, not the model, and carries forward the scope an operator already approved, including global. It still needs a fresh approval and a fresh location attestation. Exactly one of platforms or global. |
-| event kinds | **Every slug unmapped:** a non-global event whose platforms are all absent from the loaded vocabulary's platform maps is dropped (`unmapped_platforms`). Its signals stay, and count toward the `coverage_gap` threshold. |
-| `weight_suggestion` | `deduction` int 0–10, or `null` meaning **no evidence, operator's call**, which is never an invented number. Up to the question's cap when it has one. |
-| `coverage_gap` | Written only with at least `COVERAGE_GAP_MIN_SIGNALS` (3) active signals from at least `COVERAGE_GAP_MIN_PUBLISHERS` (2) publishers in 90 days, about something the vocabulary does not capture. These are separate constants from the approval rule. |
+| `threat_event` | `kind` ∈ `leak` · `deepfake_wave` · `platform_incident` · `other` (the 0022 CHECK; the signal category taxonomy is a different vocabulary). `title` non-empty. `severity` 1–5. `tags` non-empty, each registered and not retired (a global threat stays hand-created). `expires_in_days` 1–90. |
+| `protection_event` | `strength` 1–5. `review_in_days` 30–366. **The model may not propose `is_global`** (dropped, `global_not_proposable`), because it cannot know a protection applies regardless of where a person lives. A global event exists only by an operator's edit on approval. A renewal (§4.8) is written by code, not the model, and carries forward the scope an operator already approved, including global. It still needs a fresh approval and a fresh location attestation. Exactly one of `tags` or global, and every tag registered and not retired. |
+| event kinds | **Every tag unmapped:** a non-global event whose tags are all unmapped is **written `pending`, never dropped**. It reads `approvable = false, why_not = 'tags_unmapped'`, computed at read time against the current vocabulary, and approving it is `409 proposal_tags_unmapped`. **Once any of its tags is mapped it becomes approvable with no rewrite**, and the reviewer then sees its real reach. Its signals still count toward the `coverage_gap` threshold. An event whose tags are only *partly* mapped is approvable. This check runs at read and decision time. It is **not** a generation drop. |
+| `weight_suggestion` | `deduction` int 0–10, or `null` meaning **no evidence, operator's call**, which is never an invented number. Up to the question's cap when it has one. `suggested_tags` are registered, non-retired tags only. `new_tag` is offered only when none fits, with a well-formed slug that is not already registered. |
+| `coverage_gap` | Written only with at least `COVERAGE_GAP_MIN_SIGNALS` (3) active signals from at least `COVERAGE_GAP_MIN_PUBLISHERS` (2) publishers in 90 days, whose `unregistered_subjects` or unmapped tags concern the same subject. These are separate constants from the approval rule. `suggested_tag`, when present, is well-formed and unregistered, or registered but unmapped. |
 
 - **`threat_events.decay_days`** is still NOT NULL and has fed nothing since 0037. The approval insert supplies it as
   `expires_in_days`, and the value is inert. It is never shown to or edited by an operator.
@@ -661,28 +714,42 @@ change, a review and a `git blame`, the same argument as the backend's `REPORT_F
   at least `CORROBORATION_MIN_PUBLISHERS` distinct publishers. Otherwise it is written as `pending` and approval is
   refused (`409 proposal_uncorroborated`) until an `attach` from another publisher lands. Reads carry `approvable` and
   `why_not`.
-- **Reads also carry `unmapped_platforms`** for event kinds: slugs in `target.platforms` missing from the *current*
-  vocabulary. It is a non-blocking warning; the backend adds the live reach count.
+- **Reads also carry `unmapped_tags`** for event kinds: tags in `target.tags` that are unmapped in the *current*
+  vocabulary, and `retired_tags`. Both are non-blocking warnings, and the backend adds the live reach count.
 
-### 4.6 Weight suggestions for quiz drafts
+### 4.6 Weight and tag suggestions for quiz drafts
 
 The backend's quiz editor calls `POST /v1/admin/intel/weight-suggestions` with `{question_key, prompt, type, options,
-cap?, platforms?, operator}`. `platforms` is an optional `{option: slug}` map taken from the *draft*. Every key must be
-one of `options` (`422` otherwise), and it is stored in `intel_runs.request`. Services inserts a `weight_suggestion`
-run with `requested_by = operator`, and answers `202 {run_id}`.
+cap?, tags?, operator}`.
+- `tags` is an optional `{option: [slug]}` map: the backend's option-to-tag rows for the draft's options. The map is
+  keyed by question and option text, so it can hold rows for options that exist only in a draft.
+- Every key must be one of `options`, and every slug well-formed (`422` otherwise).
+- It is stored in `intel_runs.request`.
+
+Services inserts a `weight_suggestion` run with `requested_by = operator`, and answers `202 {run_id}`.
 
 **Retrieval** covers signals from the last 365 days, active only:
-- those whose platforms map to the options, using the request's `platforms` map. **When the map is present, even
-  `{}`, it replaces the vocabulary's map for this run**, because the draft is authoritative for the draft. The cached
-  map is used only when the field is absent;
-- those whose category is `research`, `policy` or `incident` and whose summary mentions an option term.
+- **By tag:** signals whose tags intersect the options' tags. **When the request carries `tags`, even `{}`, it replaces
+  the vocabulary's map for this run**, because the draft is authoritative for the draft. The cached map is used only
+  when the field is absent.
+- **By subject:** signals whose `unregistered_subjects` or tag labels mention an option's text. This is what lets a
+  brand-new option ("Bumble") find evidence before anybody has tagged it.
+- **By category:** signals whose category is `research`, `policy` or `incident` and whose summary mentions an option
+  term.
 
-At most 80 are used. `INTEL_PROPOSAL_MODEL` then suggests per option, validated as in §4.5. The result is a
-`weight_suggestion` proposal, born `delivered`.
+At most 80 are used. `INTEL_PROPOSAL_MODEL` then suggests, **per option**:
+- a deduction;
+- **the registered tags that option should map to**;
+- when none fits, a new tag (slug, label, kind) for an operator to create.
+
+Everything is validated as in §4.5. The result is a `weight_suggestion` proposal, born `delivered`. **Accepting a
+suggested tag or new tag is a backend action**: the quiz editor creates the tag and writes the mapping through the
+backend's tag routes, never through services.
 
 **The poll** is `GET /v1/admin/intel/weight-suggestions/{run_id}` and returns `{run_id, status, proposal_id | null,
-error_code | null, options: [{option, deduction | null, rationale, signal_ids, corroborated, why_not}] | null}`.
-`corroborated` comes from the one predicate (§3.6), computed per option from that option's own signals.
+error_code | null, options: [{option, deduction | null, rationale, signal_ids, suggested_tags, new_tag, corroborated,
+why_not}] | null}`. `corroborated` comes from the one predicate (§3.6), computed per option from that option's own
+signals.
 
 ### 4.7 Admin API — `/v1/admin/intel/*`
 
@@ -703,14 +770,14 @@ error_code | null, options: [{option, deduction | null, rationale, signal_ids, c
 
 | Route | Does |
 |---|---|
-| `GET /sources` · `POST /sources` · `PATCH /sources/{id}` | Registry. PATCH changes `enabled`, `check_every_hours`, `platforms`, `terms_note` and `query_text`. `POST` refuses a known hit location (`422 known_hit_location`) and a PII-shaped `query_text` (`422 query_names_a_person`). |
+| `GET /sources` · `POST /sources` · `PATCH /sources/{id}` | Registry. PATCH changes `enabled`, `check_every_hours`, `tags`, `terms_note` and `query_text`. `POST` refuses a known hit location (`422 known_hit_location`) and a PII-shaped `query_text` (`422 query_names_a_person`). |
 | `POST /sources/{id}/check` | Queues a `source_check`, or returns the open one (§3.4) |
 | `POST /documents` | Pastes a URL and queues an `adhoc_url` run. `422 known_hit_location` is checked synchronously. |
 | `GET /runs` | Recent runs with outcomes, plus a top-level `spend` block: `{spend_date, call_count, spent_today_usd, daily_budget_usd, budget_headroom_usd}` for `claude_intel`. It is read from the same UTC-day `provider_spend` row the budget guard enforces, **never summed from runs**. Money crosses as decimal strings. `daily_budget_usd` is null while unset. |
 | `GET /signals` · `GET /signals/{id}` | With excerpts and document provenance |
 | `POST /signals/{id}/retract` | `{reason, operator}`. Guarded by `WHERE status = 'active'`. |
 | `GET /proposals?status=&kind=&cursor=&limit=` | `status` and `kind` are repeatable closed enums; an unknown value is `422`. Omitting `kind` omits `weight_suggestion`. |
-| `GET /proposals/{id}` | With signals, excerpts, `approvable`, `why_not`, `unmapped_platforms`, `evidence_retracted`, and related active events with overlapping platforms, so a reviewer sees what a new threat duplicates |
+| `GET /proposals/{id}` | With signals, excerpts, `approvable`, `why_not`, `unmapped_tags`, `retired_tags` (informational), `evidence_retracted`, `stale` and `why_stale` (§4.9), and related active events with overlapping tags, so a reviewer sees what a new threat duplicates. **For `weight_suggestion`** it also returns `options: [{option, deduction, suggested_tags, new_tag, corroborated, why_not}]`, computed per option exactly as the poll does, while its proposal-level `approvable` is fixed `false` with `why_not = 'not_decidable'`. This is the read the backend's quiz-editor publish uses. |
 | `POST /proposals/{id}/decision` | `{decision, values?, reason, applies_regardless_of_location?, operator}`. See below. |
 | `POST /proposals/applied` | System write, see above. Moves `approved` `weight_change` rows to `applied`, **keeping the approval's `decided_by`, `decided_at` and `decision_reason`**. Already-applied rows are a no-op. |
 | `PUT /vocabulary` | System write (§3.8) |
@@ -726,7 +793,8 @@ re-checked inside it.
   `suggested`, then re-checked (`422 values_out_of_bounds`). The event row is inserted from `decided` only, with
   `proposal_id`. The proposal becomes `applied` with `applied_ref = event_id`, and one audit row is written.
   - A protection event requires `applies_regardless_of_location: true` (`422 values_out_of_bounds` otherwise), whether
-    it is global or platform-scoped. The attestation is recorded in the audit metadata.
+    it is global or tag-scoped. The attestation is recorded in the audit metadata. Every tag in the final `values`
+    must be registered and not retired in the loaded vocabulary (`422 values_out_of_bounds`).
   - An event kind whose consumer has not shipped is `409 proposal_not_decidable` (§4.3).
   - **A renewal** (`target.renews_event_id`) inserts the new event with `starts_at = old.review_by`, so the two never
     overlap: the view filters `starts_at <= now()`. That allows no double credit and no gap.
@@ -740,8 +808,11 @@ re-checked inside it.
 
 **Error codes** (the envelope from §9 of the services manual): `proposal_not_found`, `proposal_not_pending`,
 `proposal_uncorroborated`, `proposal_not_decidable`, `proposal_evidence_retracted`, `proposal_cell_awaiting_publish`,
-`values_out_of_bounds`, `known_hit_location`, `query_names_a_person`, `intel_source_not_found`, `intel_run_not_found`,
-`signal_not_found`, `signal_not_active`, `protection_event_not_found`. The `intel_` prefixes exist because
+`proposal_tags_unmapped`, `values_out_of_bounds`, `unknown_tag`, `tag_retired`, `known_hit_location`,
+`query_names_a_person`, `intel_source_not_found`, `intel_run_not_found`, `signal_not_found`, `signal_not_active`,
+`protection_event_not_found`. `unknown_tag` and `tag_retired` carry the offending slugs. **A hand-created threat's
+`tags` are shape-checked only**; the backend, which owns the registry, is the authority on their membership. The
+`intel_` prefixes exist because
 `run_not_found` already means a missing search run. The backend maps every 404, 409 and semantic 422 code by name,
 because its `mapServicesError` otherwise collapses a 409 into `CONFLICT` and a 422 into `VALIDATION_FAILED`. The plain
 pydantic `validation_error` 422 stays unmapped on purpose.
@@ -759,6 +830,33 @@ pydantic `validation_error` 422 stays unmapped on purpose.
   `review_by`. The operator sees why on `GET /protection-events`.
 
 A renewal is approved like any other proposal (§4.7). No year-old evidence is ever re-cited without being re-checked.
+
+### 4.9 Adapting to quiz changes — no deploy, no hand edits
+
+The quiz will change: questions added and removed, options renamed, new platforms mapped. **Intel holds no copy of the
+quiz that can go stale except the vocabulary**, and it reacts to every new vocabulary on its own.
+
+**When it reacts.** On each loop, the worker compares `intel_vocabulary`'s `(release_no, map_version)` with its
+`reconciled_*` pair. If either moved, it reconciles once, in **one transaction**, and records the new pair. The
+reconcile is idempotent and deterministic; no model runs in it.
+
+| What changed | What intel does |
+|---|---|
+| **A new question or option** (any question, any type) | Nothing needs doing. The next run's prompts carry it. A `mutable` question can receive `weight_change` proposals from then on, and the quiz editor can ask for suggestions for it before it is even published (§4.6). |
+| **An option renamed** (entries in the `renamed` log above `reconciled_release_no`) | Entries are applied **in `release_no` order and chained**, so A → B then B → C lands a proposal on A at C. A pending `weight_change` on the old text is **retargeted** to its final text when the live deduction still equals its `current`. Otherwise it is superseded with `cell_changed`. Its signals stay attached either way. After a rollback to a pre-rename release, a proposal retargeted to the new text lands on a non-live option and is handled by the removed-option row below. |
+| **An option or question removed, a question no longer `mutable`, or a deduction moved** | A pending `weight_change` on that cell is superseded with `cell_changed`. |
+| **Any of the above, for an `approved`, unapplied `weight_change`** | **Nothing is changed automatically.** An approval is a human's decision and stays one.<br>• **First, a published-but-unacknowledged change is recognised.** When the live deduction equals `target.current + decided.delta` exactly, the proposal was just published and its acknowledgement has not landed yet. Reads show `applied_pending_ack: true`, **never `stale`**, and withdrawal is refused (`409 proposal_not_pending`).<br>• Otherwise the reads show `stale: true` with `why_stale` (`option_renamed`, `cell_removed`, `not_mutable`, `deduction_moved`), so an operator withdraws it or re-approves a fresh one. The backend would refuse it as `STALE` at publish anyway. |
+| **A tag newly mapped** | **The evidence behind a closed gap is re-proposed, never lost.**<br>• A pending `coverage_gap` is resolved when its `suggested_tag.slug` equals the tag, or its normalised subject equals the tag's normalised slug or label. The comparison is exact on lowercase text with non-alphanumerics collapsed; nothing is fuzzy.<br>• For each gap it resolves, the reconcile **queues a `gap_regenerate` run** through the normal provider gate. The run's input is the gap's active `signal_ids`, plus active signals whose normalised `unregistered_subjects` equal the tag's normalised slug or label. They are passed explicitly, because signal tags are immutable and old signals would never match "overlapping tags".<br>• The gap is superseded with `resolved_by_quiz` **in the same transaction that queues the run**, and records `regenerated_by_run_id`. The run then writes event proposals against a vocabulary where the tag is mapped.<br>• Pending event proposals whose only unmapped tags are now mapped become approvable, with no rewrite.<br>• Active events already carrying the tag start reaching the newly mapped people **in the backend**, with no event edited. |
+| **A tag registered** | From the next run, extraction uses it instead of reporting the subject as unregistered. |
+| **A tag retired** | New proposals and operator values may no longer *add* it. Existing events, mappings and pending proposals keep it and stay approvable, and reads show it in `retired_tags`, informational only. A renewal carries it forward. |
+| **Question keys** | Keys are identities. A new key is a new question, and an old key's evidence stays attached to the old key. Renaming a *key* is out of scope (§9). |
+
+**Why only `weight_change` is ever retargeted, and only while pending.** Event proposals target tags, not options, so
+a quiz change cannot invalidate them; at most it changes their reach, which the backend shows live. Suggestions are
+delivered advice with no state to repair. Approved rows belong to the person who approved them.
+
+**The one-line promise:** after any quiz-editor publish or tag change, within one poll interval, intel's pending queue
+matches the live quiz, and nothing an operator approved has been silently rewritten.
 
 ## 5. Cost and controls — the existing provider gate, with a new kind
 
@@ -860,7 +958,7 @@ in a column") is honoured three ways:
 
    Masks are counted per field on the run's `outcome`. These fields carry no verbatim guarantee, and dropping would
    discard real evidence over CVE ids, date ranges and support numbers. Closed-vocabulary fields (`question_key`,
-   `option`, `kind`, `platforms`) are validated against closed sets instead.
+   `option`, `kind`, `tags`) are validated against the loaded vocabulary or closed sets instead.
 
 Operator-typed fields (`terms_note`, `decision_reason`, approved `values`) are treated as hand-created threat events
 and articles are. The human gate on exact values covers them, and a masked suggested title reaches the operator
@@ -945,10 +1043,10 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 | Step | Services | Backend | Moves a score? |
 |---|---|---|---|
 | **0** | Region and access check (`devtools/`, throwaway): Claude Platform on AWS in `ap-south-1` and `us-east-1`, with both models; the exact IAM action names; the web search price; the worst-case `cost_per_call_usd`; a 1.x `anthropic[aws]` pin; a `publicsuffixlist` pin | — | no |
-| **1** | 0038. `/v1/text`, `intel-worker`, sources, runs, extraction and verification, discovery, cost gating, the reads, sources/documents/signal-retract writes, vocabulary, §1 amendments. Then the budget migration and enable, per environment. | The read relays and sources routes; the vocabulary push (on api post-release and on worker boot/hourly); `PLATFORM_SLUGS`; `model.ts` optional blocks may ship here | no |
-| **2** | Proposal generation (`weight_change`, `weight_suggestion`, `coverage_gap`), decisions, `applied` | 0062; `model.ts` on api **and** worker; the bootstrap release; weights publish and decision routes; provenance; two-pass attribution; drift sweep; stale-draft rule | **yes**, first |
-| **3** | 0039. `threat_event` generation and decisions; hand-created `platforms` | Platform matching, the merged reader, the threat half of event decisions, `threatEventBody.platforms` | yes |
-| **4** | 0040. `protection_event` generation, decisions and renewal | 0063; the protection engine term, snapshot column, copy, protection routes, the drift sweep's event leg | yes |
+| **1** | 0038. `/v1/text`, `intel-worker`, sources, runs, extraction and verification, discovery, cost gating, the reads, sources/documents/signal-retract writes, vocabulary, §1 amendments. Then the budget migration and enable, per environment. | 0062. The read relays and sources routes; **the exposure-tag registry, the option-to-tag map, their routes and `scripts/intel-seed-tags.ts`**; draft rename maps, the publish tag carry and the rename log; gate-applied answer storage plus its one-time cleanup; the vocabulary push (after each release or tag/mapping change, on worker boot, hourly); the `model.ts` `dynamic.protection` block may ship here | no |
+| **2** | Proposal generation (`weight_change`, `weight_suggestion`, `coverage_gap`), decisions, `applied`, the §4.9 reconcile | 0063; `model.ts` on api **and** worker; the bootstrap release; weights publish and decision routes; provenance; two-pass attribution; the drift sweep's **version leg only**; stale-draft rule | **yes**, first |
+| **3** | 0039. `threat_event` generation and decisions, `gap_regenerate`; hand-created `tags` | Tag matching, the merged reader, `breakdown.scope`, the reach counterfactual and `scope_update`, the drift sweep's **map leg** (one expected catch-up pass), the threat half of event decisions, `threatEventBody.tags` | yes |
+| **4** | 0040. `protection_event` generation, decisions and renewal | 0064; the protection engine term, snapshot column, copy, protection routes, the drift sweep's event leg | yes |
 | **5** | Weight suggestions | The quiz editor's suggest action; provenance from drafts; citation coverage | no |
 | **6** | Coverage-gap proposals surfaced | Their display | no |
 
@@ -957,7 +1055,7 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 - **Step 1:** in production, `INTEL_ENABLED` stays false until the prod IAM grant is applied.
 - **Step 2:** backend `model.ts` reaches api and worker before the bootstrap release runs. The bootstrap may carry
   `dynamic.protection`; it is inert until 0040.
-- **Step 4:** services 0040, then backend 0063 and the engine term together, before any protection approval.
+- **Step 4:** services 0040, then backend 0064 and the engine term together, before any protection approval.
 
 **If `ap-south-1` is not served**, dev sets `INTEL_ANTHROPIC_REGION` to the nearest served region, and this spec's
 data note records that intel's public-document text is processed there. **Nothing proceeds on an unverified region.**
@@ -978,6 +1076,8 @@ data note records that intel's public-document text is processed there. **Nothin
 - **Anything about minors.** Discovery for minors stays refused. The backend's open P14 item, that coverage does not
   consult discovery eligibility, applies to protection credits too. Recorded, not fixed here.
 - **A heartbeat for more than one intel worker.** The single-worker assumption is written down (§3.4).
+- **Renaming a question key.** Keys are identities (§4.9). Carrying evidence across a key rename would need the quiz
+  editor to record key renames, and nothing records them today.
 
 ## 10. Tests that must exist and never be deleted (added to §10's list)
 
@@ -1033,14 +1133,37 @@ data note records that intel's public-document text is processed there. **Nothin
 **Schema**
 - Every intel table's grant, and the `content_urls` column grant, works as `app_services`.
 - 0038's down succeeds after `claude_intel` has call and spend rows.
-- 0039's down refuses while a platform-only threat is active, and succeeds (restoring the old CHECK `NOT VALID`) once
+- 0039's down refuses while a tag-only threat is active, and succeeds (restoring the old CHECK `NOT VALID`) once
   it is retracted.
 
 **Contract**
 - `svc.v_active_scoped_events` carries no person column. A retracted, expired or not-yet-started event of either
   direction is absent from it.
-- A vocabulary push with a lower `release_no` changes nothing. An equal one overwrites.
+- **Vocabulary pushes are ordered by the pair.** A push of `(R, M−1)` after `(R, M)` is a no-op answered 200, and the
+  stored map is unchanged. A lower `release_no` is a no-op even with a higher `map_version`. The equal pair `(R, M)`
+  overwrites. `(R, M+1)` and `(R+1, M)` both apply.
 - `/v1/text` refuses a private address on a redirect hop, a DTD in a feed, and an unsupported type, and reports
   `truncated` honestly.
 - A renewal whose excerpts no longer verify writes no proposal. An approved renewal starts exactly at the old
   `review_by`.
+
+**Adapting to the quiz (§4.9)**
+- A vocabulary with a new `mutable` question yields `weight_change` proposals for it on the next run, with no code
+  change.
+- A rename in `renamed` retargets a pending `weight_change` whose `current` still matches, and supersedes one whose
+  does not. An approved one is never modified, and reads `stale`.
+- A removed option supersedes its pending `weight_change` with `cell_changed`.
+- A newly mapped tag supersedes the pending `coverage_gap` about it with `resolved_by_quiz`.
+- A second reconcile of the same `(release_no, map_version)` changes nothing.
+- An extraction that returns an unregistered slug drops that tag (`unknown_tag`). A retired tag an operator *adds* in
+  `values` is refused (`tag_retired`). A pending proposal whose own tag was retired after it was written is still
+  approvable, with no `values`.
+- `intel_tags_well_formed` accepts `x`, and refuses a malformed slug and a duplicate in the array.
+- A threat proposal whose tags are all unmapped is written `pending`, reads `approvable = false` with `why_not =
+  'tags_unmapped'`, is refused `409 proposal_tags_unmapped`, and becomes approvable as soon as a push maps one of its
+  tags.
+- Mapping a tag that resolves a pending `coverage_gap` queues exactly one `gap_regenerate` run in the same transaction
+  as the supersession. That run writes the event proposal from the gap's signals.
+- A rename log `A → B` at release 5 and `B → C` at release 6, reconciled together, retargets a pending proposal on A to
+  C.
+- Every signal and proposal can name the `(release_no, map_version)` of the vocabulary it was produced against.
