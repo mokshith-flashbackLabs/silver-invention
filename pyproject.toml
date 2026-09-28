@@ -12,7 +12,8 @@ license = { text = "Proprietary" }
 authors = [{ name = "Flashback Labs" }]
 # Mirrors the Flashback agent service scaffold (AgentMeeMaw/pyproject.toml)
 # minus its LLM/ML stack: no openai/voyageai/numpy/hdbscan/scipy/pgvector/
-# redis. None are needed here (CLAUDE.md §2, §10). anthropic arrives in Task 8.
+# redis. None are needed here (CLAUDE.md §2, §10) -- with the one exception
+# below: anthropic[aws], confined to intel/model.py.
 #
 # Pillow IS here, and it is the one exception to that list. Attribution has to
 # search for a SPECIFIC face in a photo, and SearchFacesByImage "first detects
@@ -43,6 +44,9 @@ dependencies = [
     "python-multipart>=0.0.9",
     # intel/publisher.py ONLY -- registrable domains for #50, bundled list, no network.
     "publicsuffixlist==1.0.2.20260925",
+    # intel/model.py ONLY -- CLAUDE.md §2 amended 2026-09-28. Claude Platform on
+    # AWS (AnthropicAWS/AsyncAnthropicAWS), no API key, SigV4 with the task role.
+    "anthropic[aws]==1.8.0",
 ]
 
 [project.optional-dependencies]
