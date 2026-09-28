@@ -43,6 +43,11 @@ class ProviderRuntime(BaseModel):
     breaker_reason: str | None
     breaker_consecutive_failures: int
     breaker_cooldown_seconds: int | None
+    # 'image_search' | 'face_search' | 'classifier' | 'llm' (providers.kind,
+    # TEXT since migration 0038). No default: a model-call provider silently
+    # defaulting to 'image_search' is exactly the mislabelling this guards
+    # against.
+    kind: str
 
 
 class DailySpend(BaseModel):
@@ -114,3 +119,8 @@ class ProviderDailyStats(BaseModel):
     successful_calls_24h: int
     latency_p50_ms: int | None
     latency_p99_ms: int | None
+    kind: str
+    # Only meaningful for kind 'llm': a source or queued run has waited past
+    # INTEL_STALE_GRACE_HOURS. False for every other kind and never computed
+    # for one — see observability.daily_stats.
+    intel_overdue: bool = False

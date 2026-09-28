@@ -719,9 +719,21 @@ async def trust_provider(
     human looking" are different claims. The first is arithmetic and the
     floor checks it. The second is judgement about whether the eval set
     resembles the real world, and no code can check that.
+
+    An ``llm`` provider (``claude_intel``) can never be trusted: it has no
+    ``score_kind``/``score_domain``/band concept for this pipeline to
+    calibrate — ``providers_llm_never_calibrated`` (migration 0038) is the
+    database's backstop, but refusing here gives the operator a clear message
+    instead of a bare ``IntegrityError``.
     """
     if not reason.strip():
         raise ValueError("--reason is required and must not be blank")
+    meta = await store.provider_meta(provider_id)
+    if meta is not None and meta.kind == "llm":
+        raise ValueError(
+            f"{provider_id} is kind 'llm' and can never be calibrated/trusted"
+            " — that concept applies to scored search providers only"
+        )
     await store.set_calibrated(provider_id, trusted, actor, reason)
     # Re-band under the new flag: revoking must actually put everything back
     # to review, or the flag is decorative.

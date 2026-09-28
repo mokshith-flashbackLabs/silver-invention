@@ -211,6 +211,10 @@ def _stats_for_alarms(**overrides: Any) -> Any:
         "successful_calls_24h": 10,
         "latency_p50_ms": 100,
         "latency_p99_ms": 200,
+        # Every existing caller here is Hive. ProviderDailyStats.kind has NO
+        # default (providers/models.py) — an llm provider's stats must never
+        # be silently mislabelled image_search.
+        "kind": "image_search",
     }
     return ProviderDailyStats(**{**defaults, **overrides})
 

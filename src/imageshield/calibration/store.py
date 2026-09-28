@@ -72,6 +72,11 @@ class ProviderMeta(BaseModel):
     score_kind: ScoreKind
     score_domain: ScoreDomain
     calibrated: bool
+    # 'image_search' | 'face_search' | 'classifier' | 'llm' (providers.kind).
+    # trust_provider (devtools/calibrate) reads this to refuse an llm
+    # provider before it ever reaches set_calibrated — the DB CHECK
+    # (providers_llm_never_calibrated) is the backstop, not the first line.
+    kind: str
 
 
 class StoredConfig(BaseModel):
@@ -204,7 +209,7 @@ _UNCOVERED_SEEDS_SQL = """
 """
 
 _PROVIDER_META_SQL = """
-    SELECT score_kind, score_domain, calibrated FROM providers
+    SELECT score_kind, score_domain, calibrated, kind FROM providers
     WHERE provider_id = %(provider_id)s
 """
 
@@ -558,6 +563,7 @@ class PostgresCalibrationStore:
             score_kind=row[0],
             score_domain=parse_score_domain(row[1]),
             calibrated=row[2],
+            kind=row[3],
         )
 
     async def insert_config(

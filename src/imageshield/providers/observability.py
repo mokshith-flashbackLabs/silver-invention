@@ -26,6 +26,7 @@ from typing import Any, Literal, Protocol
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ConfigDict
 
+from imageshield.intel.bounds import INTEL_STALE_GRACE_HOURS
 from imageshield.providers.budget import headroom
 from imageshield.providers.models import ProviderDailyStats, ProviderRuntime
 from imageshield.providers.store import utc_spend_date
@@ -37,6 +38,7 @@ AlarmKind = Literal[
     "monthly_spend_near_budget",
     "low_success_rate",
     "no_successful_calls_24h",
+    "intel_stale",
 ]
 
 _ZERO = Decimal("0")
@@ -87,6 +89,20 @@ _LIVENESS_SQL = f"""
       AND created_at >= now() - interval '{_LIVENESS_WINDOW_HOURS} hours'
 """
 
+# Only ever run for kind 'llm'. An overdue source or a run stuck in 'queued'
+# past the grace period means the intel worker may be down — the same
+# "silence must be visible" reasoning as the search side's
+# no_successful_calls_24h alarm, but that alarm's own precondition (a
+# successful CALL happened) does not apply here: a healthy intel worker with
+# nothing due yet makes zero calls in 24h and must not alarm on that.
+_INTEL_OVERDUE_SQL = """
+    SELECT EXISTS (SELECT 1 FROM intel_sources
+                    WHERE enabled AND next_check_at < now() - make_interval(hours => %(grace)s))
+        OR EXISTS (SELECT 1 FROM intel_runs
+                    WHERE status = 'queued'
+                      AND created_at < now() - make_interval(hours => %(grace)s))
+"""
+
 
 class Alarm(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -125,6 +141,13 @@ class PostgresProviderObservability:
                 _LIVENESS_SQL, {"provider_id": runtime.provider_id}
             )
             liveness = await cur.fetchone()
+            intel_overdue = False
+            if runtime.kind == "llm":
+                cur = await conn.execute(
+                    _INTEL_OVERDUE_SQL, {"grace": INTEL_STALE_GRACE_HOURS}
+                )
+                overdue_row = await cur.fetchone()
+                intel_overdue = bool(overdue_row[0]) if overdue_row is not None else False
 
         today = next((r for r in month_rows if r[0] == spend_date), None)
         call_count = int(today[1]) if today is not None else 0
@@ -150,6 +173,8 @@ class PostgresProviderObservability:
             successful_calls_24h=int(liveness[0]) if liveness is not None else 0,
             latency_p50_ms=_ms(window, 2),
             latency_p99_ms=_ms(window, 3),
+            kind=runtime.kind,
+            intel_overdue=intel_overdue,
         )
 
 
@@ -246,9 +271,10 @@ def alarms(
             )
         )
 
-    if stats.successful_calls_24h == 0:
-        # The one that matters most. Zero successful calls is indistinguishable
-        # from a quiet week for infringements unless something says so out loud.
+    if stats.kind != "llm" and stats.successful_calls_24h == 0:
+        # The one that matters most. Zero successful calls is
+        # indistinguishable from a quiet week for infringements unless
+        # something says so out loud.
         found.append(
             Alarm(
                 provider_id=stats.provider_id,
@@ -256,6 +282,22 @@ def alarms(
                 detail=(
                     f"no successful call in {_LIVENESS_WINDOW_HOURS}h — an outage"
                     " here reads downstream as 'no matches found'"
+                ),
+            )
+        )
+
+    if stats.kind == "llm" and stats.intel_overdue:
+        # The intel worker's silence check: an ordinary quiet day makes zero
+        # calls and must not alarm (that is exactly what the guard above
+        # skips for this kind), but a source or run stuck past the grace
+        # period means nothing is turning the crank at all.
+        found.append(
+            Alarm(
+                provider_id=stats.provider_id,
+                kind="intel_stale",
+                detail=(
+                    "intel work is overdue — a source or queued run has waited past"
+                    " the grace period; the worker may be down"
                 ),
             )
         )

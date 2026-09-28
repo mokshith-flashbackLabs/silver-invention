@@ -41,7 +41,7 @@ log = structlog.get_logger("imageshield.providers")
 _RUNTIME_COLUMNS = (
     "provider_id, enabled, cost_per_call_usd, daily_budget_usd, monthly_budget_usd,"
     " rate_limit_per_min, breaker_state, breaker_opened_at, breaker_reason,"
-    " breaker_consecutive_failures, breaker_cooldown_seconds"
+    " breaker_consecutive_failures, breaker_cooldown_seconds, kind"
 )
 
 _RUNTIMES_SQL = f"SELECT {_RUNTIME_COLUMNS} FROM providers ORDER BY provider_id"
@@ -74,10 +74,10 @@ _UPSERT_SPEND_SQL = """
 _INSERT_CALL_SQL = """
     INSERT INTO provider_calls (run_id, provider_id, status, http_status,
                                 latency_ms, cost_usd, attempt, error_detail,
-                                raw_response)
+                                raw_response, intel_run_id)
     VALUES (%(run_id)s, %(provider_id)s, %(status)s, %(http_status)s,
             %(latency_ms)s, %(cost_usd)s, %(attempt)s, %(error_detail)s,
-            %(raw_response)s)
+            %(raw_response)s, %(intel_run_id)s)
 """
 
 _APPLY_BREAKER_SQL = """
@@ -175,6 +175,7 @@ def _to_runtime(row: tuple[Any, ...]) -> ProviderRuntime:
         breaker_reason=row[8],
         breaker_consecutive_failures=row[9],
         breaker_cooldown_seconds=row[10],
+        kind=row[11],
     )
 
 
@@ -189,16 +190,23 @@ class ProviderControlStore(Protocol):
 
     async def record_outcome(
         self,
-        run_id: UUID,
+        run_id: UUID | None,
         result: ProviderResult,
         *,
         cost_usd: Decimal | None,
         spend_date: date,
         probe: bool = False,
+        intel_run_id: UUID | None = None,
     ) -> None: ...
 
     async def record_skip(
-        self, run_id: UUID, provider_id: ProviderId, reason: SkipReason, detail: str
+        self,
+        run_id: UUID | None,
+        provider_id: ProviderId,
+        reason: SkipReason,
+        detail: str,
+        *,
+        intel_run_id: UUID | None = None,
     ) -> None: ...
 
     async def set_enabled(
@@ -317,12 +325,13 @@ class PostgresProviderControlStore:
 
     async def record_outcome(
         self,
-        run_id: UUID,
+        run_id: UUID | None,
         result: ProviderResult,
         *,
         cost_usd: Decimal | None,
         spend_date: date,
         probe: bool = False,
+        intel_run_id: UUID | None = None,
     ) -> None:
         """Record a call that was actually made: the ``provider_calls`` row, the
         ``provider_spend`` upsert, and the breaker transition — one transaction.
@@ -367,6 +376,7 @@ class PostgresProviderControlStore:
                     "attempt": result.attempts,
                     "error_detail": result.error_detail,
                     "raw_response": Jsonb(result.raw_response),
+                    "intel_run_id": intel_run_id,
                 },
             )
             await conn.execute(
@@ -419,7 +429,13 @@ class PostgresProviderControlStore:
             )
 
     async def record_skip(
-        self, run_id: UUID, provider_id: ProviderId, reason: SkipReason, detail: str
+        self,
+        run_id: UUID | None,
+        provider_id: ProviderId,
+        reason: SkipReason,
+        detail: str,
+        *,
+        intel_run_id: UUID | None = None,
     ) -> None:
         """Record a provider that was NOT called.
 
@@ -442,6 +458,7 @@ class PostgresProviderControlStore:
                     "attempt": 0,  # zero attempts: nothing left this process
                     "error_detail": detail,
                     "raw_response": Jsonb({"skipped": reason, "detail": detail}),
+                    "intel_run_id": intel_run_id,
                 },
             )
         log.warning(

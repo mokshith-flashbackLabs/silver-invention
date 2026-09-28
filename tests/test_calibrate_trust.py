@@ -8,6 +8,7 @@ from devtools.calibrate.__main__ import trust_provider
 from imageshield.types import ProviderId
 
 HIVE = ProviderId("hive")
+CLAUDE_INTEL = ProviderId("claude_intel")
 
 
 async def test_trust_flips_calibrated_and_audits(
@@ -34,6 +35,20 @@ async def test_trust_requires_a_reason(sound_eval_set) -> None:
     store, _ = sound_eval_set
     with pytest.raises(ValueError, match="reason"):
         await trust_provider(store, HIVE, trusted=True, actor="tester", reason="  ")
+
+
+async def test_trust_refuses_an_llm_provider(calibration_store) -> None:
+    """claude_intel (kind 'llm', migration 0038's seed row) has no score_kind/
+    score_domain/band concept for this pipeline to calibrate.
+    providers_llm_never_calibrated is the database's backstop; this asserts
+    the application refuses with a clear message rather than leaning on a
+    bare IntegrityError, and that it never even attempts the write."""
+    with pytest.raises(ValueError, match="llm"):
+        await trust_provider(
+            calibration_store, CLAUDE_INTEL, trusted=True, actor="tester",
+            reason="attempting to trust a model provider",
+        )
+    assert (await calibration_store.provider_meta(CLAUDE_INTEL)).calibrated is False
 
 
 async def test_bands_move_off_review_only_after_both_keys(

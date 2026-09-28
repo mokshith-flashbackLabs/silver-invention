@@ -67,6 +67,8 @@ class ProviderResult(BaseModel):
     provider_id: ProviderId
     status: ProviderStatus
     matches: list[ProviderMatch]
+    # EXCEPT kind llm (intel/metering.py): metadata only — no content, quotes
+    # or search results.
     raw_response: dict[str, Any]    # VERBATIM, always, even on error
     http_status: int | None
     latency_ms: int

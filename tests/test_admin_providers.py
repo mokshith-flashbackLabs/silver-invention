@@ -44,6 +44,10 @@ def _stats(
     success_rate: float | None = 1.0,
     window_calls: int = 10,
     successful_24h: int = 10,
+    # Every existing caller is Hive or Google. ProviderDailyStats.kind has NO
+    # default (providers/models.py) — an llm provider's stats must never be
+    # silently mislabelled image_search.
+    kind: str = "image_search",
 ) -> ProviderDailyStats:
     budget = Decimal(daily_budget) if daily_budget is not None else None
     return ProviderDailyStats(
@@ -62,6 +66,7 @@ def _stats(
         successful_calls_24h=successful_24h,
         latency_p50_ms=120,
         latency_p99_ms=980,
+        kind=kind,
     )
 
 

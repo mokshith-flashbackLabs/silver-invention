@@ -50,6 +50,11 @@ def runtime(
     breaker_opened_at: datetime | None = None,
     failures: int = 0,
     cooldown: int | None = None,
+    # Every existing caller is Hive or Google, both image_search — the
+    # default matches every pre-existing call site so none of them had to
+    # change. ProviderRuntime.kind itself has NO default (providers/models.py):
+    # a test that wants an 'llm' runtime must pass kind="llm" explicitly.
+    kind: str = "image_search",
 ) -> ProviderRuntime:
     return ProviderRuntime(
         provider_id=provider_id,
@@ -65,6 +70,7 @@ def runtime(
         breaker_reason="timeout" if breaker_state != "closed" else None,
         breaker_consecutive_failures=failures,
         breaker_cooldown_seconds=cooldown,
+        kind=kind,
     )
 
 
@@ -81,9 +87,10 @@ class FakeControlStore:
         self._runtimes = dict(runtimes_by_id or {HIVE: runtime(HIVE)})
         self._spend = {k: Decimal(v) for k, v in (spend or {}).items()}
         self._half_open_grants = half_open_grants or set()
-        self.outcomes: list[tuple[UUID, ProviderResult, Decimal | None]] = []
-        self.skips: list[tuple[UUID, ProviderId, SkipReason, str]] = []
+        self.outcomes: list[tuple[UUID | None, ProviderResult, Decimal | None]] = []
+        self.skips: list[tuple[UUID | None, ProviderId, SkipReason, str]] = []
         self.probes: list[tuple[ProviderId, bool]] = []
+        self.intel_run_ids: list[UUID | None] = []
         self.half_open_claims: list[ProviderId] = []
         self.enabled_writes: list[tuple[ProviderId, bool, str]] = []
         self.breaker_resets: list[ProviderId] = []
@@ -110,20 +117,29 @@ class FakeControlStore:
 
     async def record_outcome(
         self,
-        run_id: UUID,
+        run_id: UUID | None,
         result: ProviderResult,
         *,
         cost_usd: Decimal | None,
         spend_date: date,
         probe: bool = False,
+        intel_run_id: UUID | None = None,
     ) -> None:
         self.outcomes.append((run_id, result, cost_usd))
         self.probes.append((result.provider_id, probe))
+        self.intel_run_ids.append(intel_run_id)
 
     async def record_skip(
-        self, run_id: UUID, provider_id: ProviderId, reason: SkipReason, detail: str
+        self,
+        run_id: UUID | None,
+        provider_id: ProviderId,
+        reason: SkipReason,
+        detail: str,
+        *,
+        intel_run_id: UUID | None = None,
     ) -> None:
         self.skips.append((run_id, provider_id, reason, detail))
+        self.intel_run_ids.append(intel_run_id)
 
     async def set_enabled(
         self, provider_id: ProviderId, enabled: bool, *, actor: str, reason: str
