@@ -1036,6 +1036,10 @@ force a coordinated `svc` contract change). **Open follow-up:** drop `protection
 `threat_event_matches.penalty_applied` in one migration, once dev and prod have both run a release
 without them.
 
+- **Re-home threat grants before dropping `score_rw`.** `threat_events` and `threat_event_matches` are granted to
+  `score_rw` (0022). The follow-up migration that drops the dormant score tables must grant them to a threats role
+  (or `intel_rw`) first, or `create_event` starts failing with permission denied. (Likeness intel spec §3.7.)
+
 New role `score_rw`, granted `SELECT, INSERT, UPDATE` on `protection_scores`, `recommendations`,
 `threat_events`, `threat_event_matches` — and **`SELECT, INSERT` only** (no `UPDATE`, no `DELETE`) on
 `score_events`. That grant shape is the enforcement mechanism for INVARIANTS #44: an editable journal

@@ -95,7 +95,8 @@ copyable rather than re-derived.
 | Health / readiness | `GET /health` — always `200`, db reachability only; `GET /readyz` — `503` when the `svc` contract is broken (deploy gate) |
 
 Not used here, unlike Flashback: pgvector (not until we own embeddings), Valkey (no working-memory
-concept), and any LLM SDK — see §10.
+concept), and any LLM SDK **except** `anthropic[aws]`, which is confined to `src/imageshield/intel/model.py` and calls Claude
+Platform on AWS (amended 2026-09-28, likeness intel, spec 2026-09-27 §1) — see §10.
 
 **Pillow has three call sites, and no more.** `attribution/crop.py` (cropping a candidate face before
 `SearchFacesByImage`, so three faces in one photo are never searched as the same "largest face" — and,
@@ -114,7 +115,8 @@ joining it.
 and the S3 grep and asserts nothing about Pillow, so the count is kept honest by review rather than
 by CI. Adding a fourth site means editing this sentence, which is the point.
 
-External dependencies we **call** but do not own: the proxy (REST), Rekognition, Hive, Postgres, SQS.
+External dependencies we **call** but do not own: the proxy (REST), Rekognition, Hive, Postgres, SQS, and Claude Platform on AWS
+(intel only).
 
 We hold **no AWS S3 credentials**. If they aren't in the environment, the mistake can't be made.
 
@@ -356,7 +358,7 @@ the struck row below. The table below is the current state, not the v1-launch st
 | Cost tracking + circuit breakers | The cadence scheduler that reads `next_scan_after` |
 | Subject eligibility (step 8) | `discovered-v1`, clustering, cluster claims |
 | Adaptive cadence mechanism | The shield rule / photo protection / coverage arithmetic |
-| Infringement feedback (`not_me` / `authorised`) | Automated threat-event feeds (v1 threat events are admin-curated only) |
+| Infringement feedback (`not_me` / `authorised`) | |
 | URL recheck loop (`url_alive`) | Takedown, of any kind |
 | Attribution: face → seed (`/v1/attribute`) | |
 | **Face-crop seeds** — on a photo with 2+ faces each subject's seed is a crop of their own face, so a bystander who never consented is not transmitted to Hive/Google every cycle. `attribution/seeds.py` + `crop_upload.py`, `seed_kind='face_crop'` (0029). A failed crop upload registers NO seed, never a photo seed. Built 2026-09-01, dark until the proxy sets its crop bucket; the §6 recall measurement has not run | |
@@ -369,6 +371,7 @@ the struck row below. The table below is the current state, not the v1-launch st
 | **Threat events** — `threats/`, admin-curated via `/v1/admin/threat-events`. **As of 2026-09-24 this repo keeps no score effect of its own**: `threat_events.penalty` and `threat_event_matches.penalty_applied` are nullable and unwritten (migration 0037), accepted-and-ignored on create for one release. The backend charges the user-facing score by severity through its own term instead (its 0049, `dynamic.threat`) — INVARIANTS #46 is retired | |
 | **Control room console — retired 2026-08-29.** Staff now reach this admin API through the backend's `/v1/admin/*` operator proxy (`image_backend` spec `2026-08-29-admin-proxy-design.md`); this repo's admin routes are unchanged, only the direct-to-services client is gone | |
 | **Articles** — `articles/`, `/v1/admin/articles`, the panel's Articles pages (via the backend proxy), `svc.v_articles` (0026). Operator content for the app feed; no targeting, no score effect, no LLM (spec 2026-08-27, supersedes the 2026-08-20 campaigns spec) | |
+| **Likeness intel (step 1)** — `intel/`: a curated source registry plus model web search; Claude extracts signals whose quotes code verifies against text we fetched; everything is metered by the provider gate (`claude_intel`, kind `llm`). **Model-proposed, human-approved; nothing auto-publishes.** Amended 2026-09-28: this replaces "Automated threat-event feeds — do not build yet". Spec `docs/superpowers/specs/2026-09-27-likeness-intel-design.md` | |
 
 Two notes on that right-hand column. **CSAM screening and reporting are what gate minor
 discovery** — `MINOR_DISCOVERY_SUPPORTED` stays `False` until both exist, and flipping it without them
@@ -619,6 +622,10 @@ Full detail in `PROXY_INTEGRATION.md`. The shape:
   banding, dedup — all deterministic code and small vision models. If an LLM ends up in the matching
   path, something has gone wrong. Its legitimate places are the periphery: drafting takedown notices,
   summarising a report into plain language.
+
+  *Amended 2026-09-28:* the one sanctioned place a model runs is `intel/`, and there it only proposes. It reads public
+  documents, never person data. Its output is a proposal a named operator must approve. Detection, matching, banding,
+  dedup and every score stay deterministic.
 - **Docs we maintain:** `CLAUDE.md` (this), `ARCHITECTURE.md`, `SCHEMA.md`, `INVARIANTS.md`,
   `NEAR-TERM-BUILD.md`, `PROXY_INTEGRATION.md`, `MIGRATION-MAP.md`.
 - **Typed identifiers at every boundary.** `UserRef = NewType("UserRef", UUID)`, plus `SessionId`,

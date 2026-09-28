@@ -215,6 +215,15 @@ substring.
 Check: adding `photo bytea` to any table fails the build. Adding `thumbnail_b64 text` fails. Adding
 `reference_image_uri text` passes.
 
+**#9, amended 2026-09-28 (likeness intel, spec 2026-09-27 §7).**
+- "No image bytes persisted" stands unchanged, and `/v1/text` refuses every non-text type.
+- The fetcher's claim that "a document is never persisted" gains one scoped exception: **the latest normalised text of
+  a `policy_page` intel source**, PII-masked, one row per source, from public pages, persisted only so a change can be
+  detected. It is never quoted from.
+- **Known hit locations are refused by exact URL** before any fetch. That is what is enforced. The claim that "no
+  infringing page is ever read" is *not* made: a page that hosts abuse but is not one of our hits can be read, and its
+  text goes to the model provider. Only excerpts and masked summaries persist from it.
+
 **10. Previews are rendered in-memory and never cached.**
 No CDN, no `Cache-Control: public`, no disk write, no temp file. Response headers are
 `Cache-Control: no-store, private`.
@@ -244,6 +253,16 @@ concrete:
 Check: point either at `http://169.254.169.254/`. It must refuse. Then point one at an allowlisted
 domain that *resolves* to `169.254.169.254` — a hostname check passes that and the post-DNS guard is
 the only thing that catches it.
+
+**#11, amended 2026-09-28 (likeness intel, spec 2026-09-27 §7).** It is corrected to what is true, rather than cited
+as met:
+- Third-party fetches run only in the no-DB fetcher, behind a post-DNS SSRF check on every hop, capped redirects, a
+  byte cap and a timeout.
+- The fetcher runs under host networking, so the network layer does not isolate it. The SSRF check is the control.
+- Intel URLs are allowlisted by the registry when listed. When discovered by model search, they are allowlisted by
+  nothing but the SSRF check, the known-hit check and `INTEL_BLOCKED_DOMAINS`.
+
+The deviation from the original "allowlist from `content_items`" letter is recorded in place, with this spec's date.
 
 **11b. Only a 404 or a 410 marks a URL dead.**
 A timeout, a DNS failure, a 5xx, or a 403 leaves `url_alive` and `last_checked_at` untouched. 403 is
@@ -794,3 +813,34 @@ Check: `tests/test_review.py::test_decide_never_trips_the_infringements_confirme
 `tests/test_confirm_worker.py::test_explicit_but_unmatched_still_only_triages` (the four that do
 not confirm); `tests/test_review.py::test_an_operator_can_reject_an_auto_confirmed_hit` (the
 override lane) and `::test_a_subject_cannot_overturn_a_machine_confirm`.
+
+## H. Likeness intel *(2026-09-28, spec `docs/superpowers/specs/2026-09-27-likeness-intel-design.md` §7)*
+
+**48. The model proposes; a named human disposes; no person data reaches it.**
+- `intel/` is the only place a language model runs in this repo.
+- It reads public documents, operator-authored queries and the backend's published scoring vocabulary, and nothing
+  keyed to a person.
+- It writes only `intel_documents`, `intel_signals`, `intel_excerpts`, `intel_proposals` and `intel_proposal_signals`.
+- No proposal takes effect except through `decided`: values an operator approved and the schema stored.
+- There is no timeout, confidence level or source trust that auto-approves.
+- A known hit location is never fetched for it.
+- An operator query must not name an individual. That is policy, and the PII-shape refusal is its only enforcement.
+
+Check: the boundary tests (§6.1), the shape CHECKs (§3.6), and a test that no code path moves a proposal to
+`approved` except the decision route.
+
+**49. Every citation is a verbatim substring of text we fetched.**
+- An excerpt's normalised text is a substring of the normalised document text fetched through our fetcher, at the
+  recorded offsets.
+- Text returned by the model's own web tools is never evidence.
+- A signal with no verified excerpt does not exist.
+- An excerpt holding a phone- or email-shaped run is dropped, never redacted. Model-written text is masked.
+- A renewal re-verifies every excerpt before it can be proposed.
+
+Check: a fabricated quote is rejected; a paraphrase is rejected; a PII-bearing quote is dropped.
+
+**50. A web-only claim needs corroboration.** A proposal whose every active signal came from model web search cannot
+be approved until signals from at least `CORROBORATION_MIN_PUBLISHERS` distinct registrable domains back it. One
+predicate answers that question for every caller.
+
+Check: one web publisher → 409; two subdomains of one publisher → 409; two publishers → approvable.
