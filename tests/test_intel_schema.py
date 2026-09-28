@@ -1,0 +1,342 @@
+"""0038 — the intel schema (spec §3). Privileges are asserted under SET ROLE, the
+only place a role's real grants show (test_articles_store precedent)."""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from uuid import uuid4
+
+import psycopg
+import pytest
+
+from tests.db import run_migrate
+
+
+@pytest.fixture
+def migrated_db(throwaway_db: str) -> str:
+    assert run_migrate(throwaway_db, "down", "--all").returncode == 0
+    up = run_migrate(throwaway_db, "up")
+    assert up.returncode == 0, up.stderr
+    return throwaway_db
+
+
+def test_providers_kind_is_text_with_llm_allowed(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        (typ,) = conn.execute(  # type: ignore[misc]
+            "SELECT data_type FROM information_schema.columns"
+            " WHERE table_name = 'providers' AND column_name = 'kind'"
+        ).fetchone()
+        assert typ == "text"
+        row = conn.execute(
+            "SELECT kind, enabled, calibrated FROM providers WHERE provider_id = 'claude_intel'"
+        ).fetchone()
+        assert row == ("llm", False, False)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "UPDATE providers SET calibrated = true WHERE provider_id = 'claude_intel'"
+            )
+
+
+def test_tags_well_formed(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        ok = conn.execute(
+            "SELECT intel_tags_well_formed(ARRAY['x','dating_apps']::text[])"
+        ).fetchone()
+        assert ok == (True,)
+        for bad in ("ARRAY['X']", "ARRAY['a','a']", "ARRAY['1a']", "ARRAY[NULL]::text[]"):
+            result = conn.execute(f"SELECT intel_tags_well_formed({bad}::text[])").fetchone()
+            assert result == (False,)
+        assert conn.execute("SELECT intel_tags_well_formed('{}'::text[])").fetchone() == (True,)
+
+
+def test_intel_rw_writes_but_never_deletes(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute("SET ROLE intel_rw")
+        (source_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_sources (kind, source_url, url_hash, normalisation_version,"
+            " check_every_hours, terms_note, created_by)"
+            " VALUES ('policy_page', 'https://p.example/terms', repeat('a', 64), 'v1', 24,"
+            " 'automated access permitted per robots and terms', 'alice') RETURNING source_id"
+        ).fetchone()
+        (run_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_runs (kind, source_id, requested_by)"
+            " VALUES ('source_check', %s, 'schedule')"
+            " RETURNING run_id",
+            (source_id,),
+        ).fetchone()
+        conn.execute("INSERT INTO audit_log (actor_type, action) VALUES ('service', 'intel.test')")
+        conn.execute("SELECT url_hash FROM content_urls LIMIT 1")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("SELECT url FROM content_urls LIMIT 1")  # column grant is url_hash only
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM intel_runs WHERE run_id = %s", (run_id,))
+        conn.execute("RESET ROLE")
+
+
+def test_intel_rw_grant_surface_covers_every_intel_table_and_metering(migrated_db: str) -> None:
+    """Controller ruling: the grant test must exercise, under SET ROLE, every new
+    intel table's granted operations (SELECT/INSERT/UPDATE), `providers` UPDATE,
+    and the provider_calls/provider_spend writes the metering path needs -- not
+    only the four operations `test_intel_rw_writes_but_never_deletes` happens to
+    touch. And it must assert no DELETE on any intel table, not only intel_runs.
+
+    Builds one dependency chain (source -> run -> document -> signal -> excerpt,
+    plus a standalone proposal linked to the signal, plus the singleton
+    vocabulary row) so every table has a real row to SELECT/UPDATE/refuse-DELETE
+    against, then checks providers/provider_calls/provider_spend separately.
+    """
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute("SET ROLE intel_rw")
+
+        (source_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_sources (kind, source_url, url_hash, normalisation_version,"
+            " check_every_hours, terms_note, created_by)"
+            " VALUES ('policy_page', 'https://q.example/terms', repeat('b', 64), 'v1', 24,"
+            " 'automated access permitted per robots and terms', 'alice') RETURNING source_id"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO intel_snapshots (source_id, content_sha256, snapshot_text, content_type,"
+            " truncated) VALUES (%s, repeat('c', 64), 'terms text', 'text/html', false)",
+            (source_id,),
+        )
+        (run_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_runs (kind, source_id, requested_by)"
+            " VALUES ('source_check', %s, 'schedule')"
+            " RETURNING run_id",
+            (source_id,),
+        ).fetchone()
+        (document_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_documents (run_id, source_id, document_url, final_url, url_hash,"
+            " document_url_hash, normalisation_version, publisher_domain, trust, content_sha256,"
+            " truncated) VALUES (%s, %s, 'https://q.example/terms', 'https://q.example/terms',"
+            " repeat('d', 64), repeat('d', 64), 'v1', 'q.example', 'listed', repeat('e', 64),"
+            " false) RETURNING document_id",
+            (run_id, source_id),
+        ).fetchone()
+        (signal_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_signals (document_id, category, direction, summary, model_id,"
+            " prompt_version) VALUES (%s, 'policy', 'risk_up', 'A policy change worth noting.',"
+            " 'claude-sonnet-5', 'p1') RETURNING signal_id",
+            (document_id,),
+        ).fetchone()
+        (excerpt_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_excerpts (signal_id, quote_text, char_start, char_end, quote_sha256)"
+            " VALUES (%s, 'this is a quoted excerpt of the source text', 0, 20, repeat('f', 64))"
+            " RETURNING excerpt_id",
+            (signal_id,),
+        ).fetchone()
+        proposal_id = uuid4()
+        conn.execute(
+            "INSERT INTO intel_proposals (proposal_id, kind, status, target, suggested, rationale,"
+            " model_id, prompt_version) VALUES (%s, 'coverage_gap', 'pending', '{}', '{}', 'r',"
+            " 'claude-sonnet-5', 'p1')",
+            (proposal_id,),
+        )
+        conn.execute(
+            "INSERT INTO intel_proposal_signals (proposal_id, signal_id) VALUES (%s, %s)",
+            (proposal_id, signal_id),
+        )
+        conn.execute(
+            "INSERT INTO intel_vocabulary (id, release_no, map_version, scoring_version,"
+            " quiz_version, document) VALUES (1, 1, 1, 'v1', 'v1', '{}')"
+        )
+
+        # SELECT + UPDATE on every one of the nine tables.
+        assert conn.execute(
+            "SELECT source_id FROM intel_sources WHERE source_id = %s", (source_id,)
+        ).fetchone() == (source_id,)
+        conn.execute(
+            "UPDATE intel_sources SET updated_at = now() WHERE source_id = %s", (source_id,)
+        )
+
+        assert conn.execute(
+            "SELECT source_id FROM intel_snapshots WHERE source_id = %s", (source_id,)
+        ).fetchone() == (source_id,)
+        conn.execute(
+            "UPDATE intel_snapshots SET fetched_at = now() WHERE source_id = %s", (source_id,)
+        )
+
+        assert conn.execute(
+            "SELECT run_id FROM intel_runs WHERE run_id = %s", (run_id,)
+        ).fetchone() == (run_id,)
+        conn.execute("UPDATE intel_runs SET attempts = attempts + 1 WHERE run_id = %s", (run_id,))
+
+        assert conn.execute(
+            "SELECT document_id FROM intel_documents WHERE document_id = %s", (document_id,)
+        ).fetchone() == (document_id,)
+        conn.execute(
+            "UPDATE intel_documents SET title = 'Terms of service' WHERE document_id = %s",
+            (document_id,),
+        )
+
+        assert conn.execute(
+            "SELECT signal_id FROM intel_signals WHERE signal_id = %s", (signal_id,)
+        ).fetchone() == (signal_id,)
+        conn.execute(
+            "UPDATE intel_signals SET summary = 'An updated summary.' WHERE signal_id = %s",
+            (signal_id,),
+        )
+
+        assert conn.execute(
+            "SELECT excerpt_id FROM intel_excerpts WHERE excerpt_id = %s", (excerpt_id,)
+        ).fetchone() == (excerpt_id,)
+        conn.execute(
+            "UPDATE intel_excerpts SET quote_sha256 = repeat('9', 64) WHERE excerpt_id = %s",
+            (excerpt_id,),
+        )
+
+        assert conn.execute(
+            "SELECT proposal_id FROM intel_proposals WHERE proposal_id = %s", (proposal_id,)
+        ).fetchone() == (proposal_id,)
+        conn.execute(
+            "UPDATE intel_proposals SET rationale = 'updated rationale' WHERE proposal_id = %s",
+            (proposal_id,),
+        )
+
+        assert conn.execute(
+            "SELECT proposal_id, signal_id FROM intel_proposal_signals"
+            " WHERE proposal_id = %s AND signal_id = %s",
+            (proposal_id, signal_id),
+        ).fetchone() == (proposal_id, signal_id)
+        conn.execute(
+            "UPDATE intel_proposal_signals SET proposal_id = proposal_id"
+            " WHERE proposal_id = %s AND signal_id = %s",
+            (proposal_id, signal_id),
+        )
+
+        assert conn.execute("SELECT id FROM intel_vocabulary WHERE id = 1").fetchone() == (1,)
+        conn.execute("UPDATE intel_vocabulary SET received_at = now() WHERE id = 1")
+
+        # providers UPDATE -- the metering path enables/disables and re-prices
+        # claude_intel without a migration.
+        conn.execute(
+            "UPDATE providers SET daily_budget_usd = 5.00 WHERE provider_id = 'claude_intel'"
+        )
+        assert conn.execute(
+            "SELECT daily_budget_usd FROM providers WHERE provider_id = 'claude_intel'"
+        ).fetchone() == (Decimal("5.00"),)
+
+        # provider_calls / provider_spend writes -- the metering path itself.
+        conn.execute(
+            "INSERT INTO provider_calls (intel_run_id, provider_id, status, raw_response)"
+            " VALUES (%s, 'claude_intel', 'ok', '{}'::jsonb)",
+            (run_id,),
+        )
+        conn.execute(
+            "INSERT INTO provider_spend (provider_id, spend_date, call_count, cost_usd)"
+            " VALUES ('claude_intel', current_date, 1, 0.25)"
+            " ON CONFLICT (provider_id, spend_date)"
+            " DO UPDATE SET call_count = provider_spend.call_count + 1,"
+            " cost_usd = provider_spend.cost_usd + 0.25"
+        )
+
+        # No DELETE anywhere on the nine intel tables -- 0015's rule, checked
+        # per table rather than only on intel_runs.
+        no_delete_cases = [
+            (
+                "intel_proposal_signals",
+                "proposal_id = %s AND signal_id = %s",
+                (proposal_id, signal_id),
+            ),
+            ("intel_proposals", "proposal_id = %s", (proposal_id,)),
+            ("intel_excerpts", "excerpt_id = %s", (excerpt_id,)),
+            ("intel_signals", "signal_id = %s", (signal_id,)),
+            ("intel_documents", "document_id = %s", (document_id,)),
+            ("intel_runs", "run_id = %s", (run_id,)),
+            ("intel_snapshots", "source_id = %s", (source_id,)),
+            ("intel_sources", "source_id = %s", (source_id,)),
+            ("intel_vocabulary", "id = %s", (1,)),
+        ]
+        for table, where, params in no_delete_cases:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(f"DELETE FROM {table} WHERE {where}", params)
+
+        conn.execute("RESET ROLE")
+
+
+def test_source_shape_checks(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):  # policy_page without a url
+            conn.execute(
+                "INSERT INTO intel_sources (kind, check_every_hours, terms_note, created_by)"
+                " VALUES ('policy_page', 24, 'automated access permitted', 'alice')"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):  # search_query with a url
+            conn.execute(
+                "INSERT INTO intel_sources (kind, source_url, url_hash, normalisation_version,"
+                " query_text, check_every_hours, terms_note, created_by)"
+                " VALUES ('search_query', 'https://a.b/',"
+                " repeat('b', 64), 'v1', 'q', 24, 'automated access permitted', 'alice')"
+            )
+
+
+def test_one_open_run_per_source(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        (source_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_sources (kind, query_text, check_every_hours, terms_note,"
+            " created_by) VALUES ('search_query', 'platform privacy change', 24,"
+            " 'automated access permitted', 'a')"
+            " RETURNING source_id"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO intel_runs (kind, source_id, requested_by) VALUES ('discovery', %s, 'a')",
+            (source_id,),
+        )
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(
+                "INSERT INTO intel_runs (kind, source_id, requested_by)"
+                " VALUES ('discovery', %s, 'a')",
+                (source_id,),
+            )
+
+
+def test_down_succeeds_after_claude_intel_was_metered(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        (run_id,) = conn.execute(  # type: ignore[misc]
+            "INSERT INTO intel_runs (kind, requested_by, request)"
+            " VALUES ('adhoc_url', 'a', '{}'::jsonb)"
+            " RETURNING run_id"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO provider_calls (intel_run_id, provider_id, status, raw_response)"
+            " VALUES (%s, 'claude_intel', 'ok', '{}'::jsonb)",
+            (run_id,),
+        )
+        conn.execute(
+            "INSERT INTO provider_spend (provider_id, spend_date, call_count, cost_usd)"
+            " VALUES ('claude_intel', current_date, 1, 0.01)"
+        )
+    down = run_migrate(migrated_db, "down", "--steps", "1")
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute("SELECT 1 FROM pg_type WHERE typname = 'provider_kind'").fetchone() == (
+            1,
+        )
+        assert (
+            conn.execute("SELECT 1 FROM providers WHERE provider_id = 'claude_intel'").fetchone()
+            is None
+        )
+    assert run_migrate(migrated_db, "up").returncode == 0
+
+
+def test_proposal_shape_checks(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):  # approved with no name
+            conn.execute(
+                "INSERT INTO intel_proposals (kind, status, target, suggested, rationale,"
+                " model_id, prompt_version, decided) VALUES ('threat_event', 'approved', '{}',"
+                " '{}', 'r', 'm', 'p', '{}')"
+            )
+        # suggestion must be delivered/superseded
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO intel_proposals (kind, status, target, suggested, rationale,"
+                " model_id, prompt_version)"
+                " VALUES ('weight_suggestion', 'pending', '{}', '{}', 'r', 'm', 'p')"
+            )
+        conn.execute(
+            "INSERT INTO intel_proposals (proposal_id, kind, status, target, suggested,"
+            " rationale, model_id, prompt_version)"
+            " VALUES (%s, 'coverage_gap', 'pending', '{}', '{}', 'r', 'm', 'p')",
+            (uuid4(),),
+        )

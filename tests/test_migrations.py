@@ -44,7 +44,7 @@ CORE_TABLES = {
     "outbox",
     "audit_log",
 }
-CUSTOM_TYPES = {"liveness_status", "provider_kind"}
+CUSTOM_TYPES = {"liveness_status"}
 
 
 def _table_names(conn: psycopg.Connection[tuple[str]]) -> set[str]:
@@ -1472,17 +1472,18 @@ def test_0019_stub_cost_is_zero_not_null(throwaway_db: str) -> None:
     assert row[0] == Decimal("0")
 
 
-def test_0021_seeded_providers_are_exactly_hive_google_stub_and_rekognition_confirm(
+def test_seeded_providers_are_exactly_hive_google_stub_rekognition_confirm_and_claude_intel(
     throwaway_db: str,
 ) -> None:
     # Was "...exactly hive, google, and stub" until 0021 added a fourth row;
     # renamed along with the assertion rather than left to describe a set the
     # migrated schema no longer produces.
+    # 0038 added claude_intel (likeness intel, kind llm, disabled).
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         ids = {row[0] for row in conn.execute("SELECT provider_id FROM providers").fetchall()}
-    assert ids == {"hive", "google", "stub", "rekognition_confirm"}
+    assert ids == {"hive", "google", "stub", "rekognition_confirm", "claude_intel"}
 
 
 def test_0019_down_deletes_only_the_stub_row(throwaway_db: str) -> None:
@@ -1992,7 +1993,11 @@ def test_0037_penalty_is_optional_and_reversible(throwaway_db: str) -> None:
             )
 
     # Down past 0037 with a NULL row present: it must not fail, and the row is backfilled.
-    back = run_migrate(throwaway_db, "down", "--steps", "1")
+    # _steps_back_to (not a hardcoded "1"): 0038 landed on top of 0037 and a
+    # literal step count would silently revert the wrong migration once a
+    # migration follows it -- exactly the failure mode the helper's docstring
+    # names.
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0036_"))
     assert back.returncode == 0, back.stderr
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         assert (
