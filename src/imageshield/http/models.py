@@ -16,6 +16,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
+from imageshield.intel.tags import TAG_SLUG_RE, is_well_formed
 from imageshield.search.feedback import FeedbackSignal
 from imageshield.types import UserRef
 
@@ -882,3 +883,123 @@ class ReviewStatsResponse(BaseModel):
     by_severity: list[ReviewStatsSeverityItem]
     subject_agreement: ReviewStatsSubjectAgreement
     by_operator: list[ReviewStatsOperatorItem]
+
+
+# ── likeness intel (spec §4.7, Task 12) ──────────────────────────────────
+
+IntelSourceKind = Literal[
+    "policy_page", "feed", "news", "breach_index", "regulator", "research", "search_query"
+]
+
+
+class IntelSourceCreateRequest(ServiceModel):
+    kind: IntelSourceKind
+    source_url: str | None = None
+    query_text: str | None = Field(default=None, max_length=300)
+    tags: tuple[str, ...] = ()
+    check_every_hours: int = Field(ge=6, le=720)
+    terms_note: str = Field(min_length=10, max_length=500)
+    operator: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _shape(self) -> IntelSourceCreateRequest:
+        if (self.kind == "search_query") != (self.source_url is None):
+            raise ValueError(
+                "search_query takes query_text and no source_url; every other kind a source_url"
+            )
+        if (self.kind == "search_query") != (self.query_text is not None):
+            raise ValueError("query_text is for search_query only")
+        if self.source_url is not None and not self.source_url.startswith("https://"):
+            raise ValueError("source_url must be https")
+        if any(not is_well_formed(t) for t in self.tags) or len(set(self.tags)) != len(self.tags):
+            raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
+        return self
+
+
+class IntelSourcePatchRequest(ServiceModel):
+    """Shape-only validation lives here. Whether ``query_text`` may be set at all
+    depends on the STORED source's own ``kind`` — a PATCH body never carries
+    ``kind`` — so that check runs in the route, against the row the store returns
+    (controller ruling 1)."""
+
+    enabled: bool | None = None
+    check_every_hours: int | None = Field(default=None, ge=6, le=720)
+    tags: tuple[str, ...] | None = None
+    terms_note: str | None = Field(default=None, min_length=10, max_length=500)
+    query_text: str | None = Field(default=None, max_length=300)
+    operator: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _shape(self) -> IntelSourcePatchRequest:
+        if self.tags is not None and (
+            any(not is_well_formed(t) for t in self.tags)
+            or len(set(self.tags)) != len(self.tags)
+        ):
+            raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
+        return self
+
+
+class IntelOperatorRequest(ServiceModel):
+    operator: str = Field(min_length=1, max_length=64)
+
+
+class IntelDocumentRequest(ServiceModel):
+    url: str = Field(pattern=r"^https://")
+    operator: str = Field(min_length=1, max_length=64)
+
+
+class IntelRetractRequest(ServiceModel):
+    reason: str = Field(min_length=3, max_length=500)
+    operator: str = Field(min_length=1, max_length=64)
+
+
+class IntelVocabTag(ServiceModel):
+    slug: str = Field(pattern=TAG_SLUG_RE.pattern)
+    label: str
+    description: str = ""
+    kind: str
+    retired: bool
+
+
+class IntelVocabOptionTag(ServiceModel):
+    question_key: str
+    option: str
+    tags: tuple[str, ...] = ()
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not is_well_formed(t) for t in value):
+            raise ValueError("tags must be slugs matching ^[a-z][a-z0-9_]{0,39}$")
+        return value
+
+
+class IntelVocabRenamed(ServiceModel):
+    release_no: int
+    question_key: str
+    old_option: str
+    new_option: str
+
+
+class IntelVocabDocument(ServiceModel):
+    """The backend's vocabulary-push document (spec §4.7) — exactly these five
+    top-level keys. An unknown key or a malformed item is a 422 here, never a
+    later ``KeyError`` somewhere downstream in the pipeline."""
+
+    tags: tuple[IntelVocabTag, ...] = ()
+    option_tags: tuple[IntelVocabOptionTag, ...] = ()
+    renamed: tuple[IntelVocabRenamed, ...] = ()
+    questions: tuple[dict[str, Any], ...] = ()
+    dynamic: dict[str, Any] | None = None
+
+
+class IntelVocabularyRequest(ServiceModel):
+    """The ONE system write with no operator (spec §4.7) — ``extra='forbid'``
+    is what makes a stray ``operator`` on this body a 422 rather than a
+    silently-ignored field."""
+
+    release_no: int = Field(ge=0)
+    map_version: int = Field(ge=0)
+    scoring_version: str = Field(min_length=1)
+    quiz_version: str = Field(min_length=1)
+    document: IntelVocabDocument

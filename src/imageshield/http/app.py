@@ -38,6 +38,7 @@ from imageshield.http.errors import install_error_handlers
 from imageshield.http.logging import configure_logging, install_request_logging_middleware
 from imageshield.http.routes.admin_articles import router as admin_articles_router
 from imageshield.http.routes.admin_hits import router as admin_hits_router
+from imageshield.http.routes.admin_intel import router as admin_intel_router
 from imageshield.http.routes.admin_providers import router as admin_providers_router
 from imageshield.http.routes.admin_review import router as admin_review_router
 from imageshield.http.routes.admin_threat_events import router as admin_threat_events_router
@@ -50,6 +51,8 @@ from imageshield.http.routes.liveness import router as liveness_router
 from imageshield.http.routes.ping import admin_router, v1_router
 from imageshield.http.routes.search import router as search_router
 from imageshield.http.routes.subjects import router as subjects_router
+from imageshield.intel.evidence_store import PostgresEvidenceStore
+from imageshield.intel.store import PostgresIntelStore
 from imageshield.liveness.provider import RekognitionLivenessProvider
 from imageshield.liveness.store import PostgresLivenessStore
 from imageshield.liveness.uploader import HttpxObjectUploader
@@ -126,6 +129,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             base_url=cfg.fetcher_base_url,
             token=cfg.fetcher_token,
         )
+    if getattr(app.state, "intel_store", None) is None:
+        app.state.intel_store = PostgresIntelStore(pool)
+    if getattr(app.state, "evidence_store", None) is None:
+        app.state.evidence_store = PostgresEvidenceStore(pool)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     # Which AWS account and region, before anything touches Rekognition.
@@ -181,4 +188,5 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(admin_articles_router)
     app.include_router(admin_review_router)
     app.include_router(admin_hits_router)
+    app.include_router(admin_intel_router)
     return app

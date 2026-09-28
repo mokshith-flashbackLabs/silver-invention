@@ -23,6 +23,8 @@ if TYPE_CHECKING:
     from imageshield.articles.store import ArticleStore
     from imageshield.enrolment.faceindex import FaceIndex
     from imageshield.enrolment.store import EnrolmentStore
+    from imageshield.intel.evidence_store import EvidenceStore
+    from imageshield.intel.store import IntelStore
     from imageshield.liveness.provider import LivenessProvider
     from imageshield.liveness.store import LivenessStore
     from imageshield.liveness.uploader import ObjectUploader
@@ -152,3 +154,13 @@ def get_preview_store(request: Request) -> PreviewStore:
 def get_crop_client(request: Request) -> FetcherCropClient:
     client: FetcherCropClient = _required_state(request, "crop_client")  # type: ignore[assignment]
     return client
+
+
+def get_intel_store(request: Request) -> IntelStore:
+    store: IntelStore = _required_state(request, "intel_store")  # type: ignore[assignment]
+    return store
+
+
+def get_evidence_store(request: Request) -> EvidenceStore:
+    store: EvidenceStore = _required_state(request, "evidence_store")  # type: ignore[assignment]
+    return store
