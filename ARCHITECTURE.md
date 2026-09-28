@@ -478,6 +478,55 @@ into every write server-side. This repo's admin routes (§3.6b and the rest of `
 unchanged — only the direct-to-services client is gone. `CONSOLE_OPERATORS` stays in Secrets
 Manager (an audit artifact of what was granted); no code reads it any more.
 
+### 3.12 Likeness intel worker — built, step 1 (2026-09-28)
+
+`src/imageshield/intel/` — a new **deployable in name only**: not its own task definition, but a
+third container (`intel-worker`, `python -m imageshield.intel.worker`, 128 MiB) in the existing
+`services-worker` ECS task alongside `relay` and `search-worker` (`docs/deploy/DEPLOY-RUNBOOK.md`
+§13.7). It polls a leased run queue (`intel_runs`) the same shape §3.6b's search runs use — claim,
+lease, attempt cap, reclaim on crash — and never fetches a third-party URL in-process: text comes
+from the fetcher's new route, `POST /v1/text` (§3.7's isolation pattern reused, not reinvented —
+the fetcher holds no database credentials either way).
+
+**A registry of sources, one call at a time.** `intel_sources` are policy pages, feeds, news,
+breach indices, regulator pages, research pages, or a saved search query — each on its own check
+cadence (`check_every_hours`), each refusing a `source_url` that is already a known hit location
+(`known_hit_location`) and a `query_text` that names a person (`query_names_a_person`, PII-shaped
+text refused before it is ever saved). A run fetches, extracts with a model, and writes signals
+(`intel_signals` + `intel_excerpts`) — never a claim about a specific person: no `user_ref`, no
+face, no phone number or email crosses into a prompt (`intel/pii.py` masks the text first;
+INVARIANTS #48). Every excerpt is verified as a **verbatim substring** of the unmasked source text
+before it is stored, so a signal can never cite something the model paraphrased into existence.
+
+**The model seam** (`intel/model.py`) is "Claude Platform on AWS" — `AnthropicAWS`/
+`AsyncAnthropicAWS`, one region and workspace, structured output, priced by the *requested* model
+id so an unpriced or drifting *answering* id can never leave a billed call unrecorded. It runs
+through the same provider gate, budget and circuit breaker every search provider uses (§3.6b) under
+a new kind, `llm`, and a new row, `claude_intel` (migration 0038) — see
+`docs/OPERATIONS.md` §4 for the operational shape (`budget_unset`, `intel_stale`, and why
+`no_successful_calls_24h` does not apply to this kind).
+
+**Admin surface — the step-1 set, ten routes under `/v1/admin/intel/*`**: the source registry
+(`GET`/`POST /sources`, `PATCH /sources/{id}`, `POST /sources/{id}/check`), pasting a one-off URL
+(`POST /documents`), run history with today's spend (`GET /runs`), the signal list and single-signal
+read (`GET /signals`, `GET /signals/{id}`), retraction (`POST /signals/{id}/retract`), and the one
+system write, `PUT /vocabulary` (no operator field — it mirrors the backend's published quiz
+release, never a human decision). Full route table, request bodies and error codes in
+`PROXY_INTEGRATION.md` ("Likeness intel admin surface (step 1)"). Fronted like every other admin
+surface by the backend's `/v1/admin/*` operator proxy (§3.11) — no direct client of its own.
+
+**Specified, not built in this pass (step 2):** proposal generation and review
+(`intel_proposals`/`intel_proposal_signals` exist in the 0038 schema but nothing writes or decides
+them yet), quiz weight/tag suggestions, and protection events + renewal (§4.8 of the design spec).
+Nothing here moves a score — that is entirely step 2's, and step 1 ships with it inert.
+
+**Disabled in both environments until an owner action.** `INTEL_ENABLED=false` on both dev and prod
+`intel-worker` containers, `claude_intel` seeded disabled with a NULL `daily_budget_usd`
+(`budget_unset` refuses every run), and a placeholder workspace id (`pending-step0`) sits in three
+places — both task definitions' `ANTHROPIC_AWS_WORKSPACE_ID` and the task role's IAM `Resource` ARN
+— until the step-0 live probe runs and the owner substitutes the real ids
+(`docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
+
 ---
 
 ## 4. Data ownership
@@ -499,6 +548,7 @@ Manager (an audit artifact of what was granted); no code reads it any more.
 | Confirm-pipeline triage (severity, pHash, moderation labels) | **Services** | Postgres, on `infringements` (migration 0021 — §3.8). No image bytes; text and a 64-bit hash only |
 | Hostile-image fetch + live crop render | **Services** | Nothing persisted — the fetcher deployable (§3.7) holds no DB credentials at all |
 | Report reads for the UI | **Proxy** | Postgres (read-only, `svc` views — migrations 0016 + 0023) |
+| Likeness intel — sources, runs, documents, signals + excerpts, the vocabulary cache | **Services** | Postgres (migration 0038 — §3.12). No `user_ref` anywhere in this data; `intel_proposals`/`intel_proposal_signals` exist in the same migration but nothing writes them yet (step 2) |
 | Pushing onto any queue | **Services** | SQS (via outbox) |
 
 Admin/operator reads and writes (threat events, review, provider health) own no

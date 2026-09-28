@@ -677,6 +677,55 @@ from the table; the synchronous result response already carries the same outcome
 Mobile passes a deep link; web passes an https redirect. The services repo never hardcodes either.
 This is what collapses the old `/api/consent/*` and `/api/web-consent/*` split into one path.
 
+### Likeness intel admin surface (step 1)
+
+**New 2026-09-28**, ten routes under `/v1/admin/intel/*`. This is a new admin-only surface, not a
+user-facing one — it exists so an operator can register public, non-person sources (a platform's
+policy page, a breach index, a news feed, a saved search query) and let a worker check them on a
+cadence, extracting cited signals with a model. **Nothing here is person-shaped.** No `user_ref`
+appears anywhere in this API; a source's `query_text` is refused if it looks like it names one
+(`422 query_names_a_person`), the same rule §6.1 of the design spec applies to every prompt this
+repo builds.
+
+Like every other admin route: both tokens (`X-Service-Token`, `X-Admin-Service-Token`),
+`extra='forbid'` bodies, keyset pagination on `(created_at, id)` with a malformed cursor answering
+`422 invalid_cursor`. **Every write in this table carries an `operator` field except one** —
+`PUT /vocabulary` is the single system write, with no operator, because it is not a human decision:
+it mirrors whatever quiz release is already live on your side, the same way a config value tracks a
+release rather than asking anyone. (The design spec's §4.7 also names a second system write,
+`POST /proposals/applied` — that route, and the whole proposal-review surface it belongs to, is
+**step 2 and not built yet**; do not wire a relay for it from what follows.)
+
+| Route | Request body | Success | Error codes |
+|---|---|---|---|
+| `POST /v1/admin/intel/sources` | `kind` (`policy_page`\|`feed`\|`news`\|`breach_index`\|`regulator`\|`research`\|`search_query`), `source_url?`, `query_text?`, `tags[]`, `check_every_hours` (6–720), `terms_note` (≥10 chars — why automated access is permitted), `operator` | `201` the created source | `422 known_hit_location`, `422 query_names_a_person`, `422 unknown_tag`, `422 tag_retired`, `422 validation_error` |
+| `PATCH /v1/admin/intel/sources/{id}` | Any of `enabled`, `check_every_hours`, `tags`, `terms_note`, `query_text` (all optional), `operator` | `200` the updated source | `404 intel_source_not_found`, `422 query_text_wrong_kind` (only a `search_query` source may carry one), `422 query_names_a_person`, `422 unknown_tag`, `422 tag_retired`, `422 validation_error` |
+| `GET /v1/admin/intel/sources?cursor=&limit=` | — | `200 {sources, next_cursor}` | `422 invalid_cursor` |
+| `POST /v1/admin/intel/sources/{id}/check` | `operator` | `200 {run_id}` | `404 intel_source_not_found` |
+| `POST /v1/admin/intel/documents` | `url` (https only), `operator` | `202 {run_id}` — queues an `adhoc_url` run | `422 known_hit_location` |
+| `GET /v1/admin/intel/runs?cursor=&limit=` | — | `200 {runs, next_cursor, spend}` — `spend` is `{spend_date, call_count, spent_today_usd, daily_budget_usd, budget_headroom_usd}` for `claude_intel`, read off the same pre-aggregated `provider_spend` row the budget guard enforces, money as decimal **strings**, `daily_budget_usd`/`budget_headroom_usd` null while unset | `422 invalid_cursor` |
+| `GET /v1/admin/intel/signals?cursor=&limit=` | — | `200 {signals, next_cursor}`, each with its excerpts and document provenance | `422 invalid_cursor` |
+| `GET /v1/admin/intel/signals/{id}` | — | `200` the signal | `404 signal_not_found` |
+| `POST /v1/admin/intel/signals/{id}/retract` | `reason` (≥3 chars), `operator` | `200 {status: retracted}` | `404 signal_not_found`, `409 signal_not_active` |
+| `PUT /v1/admin/intel/vocabulary` | `release_no`, `map_version`, `scoring_version`, `quiz_version`, `document` — **no `operator` field; sending one is `422`** | `200 {applied: bool}` — `false` when the incoming `(release_no, map_version)` pair is older than what's stored, a no-op rather than a failure | `422 validation_error` (malformed document) |
+
+All ten additionally answer the framework-level `401` (missing/wrong token) and `422
+validation_error` for a body that fails its own shape check — not listed per row above, same
+convention as the reviewer-feed table.
+
+**Map these error codes by name, the same way you already map the reviewer-feed and provider
+codes** — `known_hit_location`, `query_names_a_person`, `unknown_tag`, `tag_retired`,
+`query_text_wrong_kind`, `intel_source_not_found`, `signal_not_found`, `signal_not_active` are all
+semantic 422s or scoped 404/409s that `mapServicesError` must not collapse into `CONFLICT` or
+`VALIDATION_FAILED`. `unknown_tag` and `tag_retired` carry the offending slugs in the error
+envelope's `extra`.
+
+**Not built yet (step 2), so there is nothing to relay for it today:** `GET`/`POST /proposals*`,
+`POST /proposals/{id}/decision`, `POST /proposals/applied`, `POST /weight-suggestions`,
+`GET /protection-events*`. The `intel_proposals` table exists in the schema (migration 0038) but
+nothing writes or decides a row in it yet — step 1 only registers sources and produces signals.
+Nothing on this surface moves anyone's score.
+
 ---
 
 ## 5. Object storage — the proxy mints, we PUT and discard

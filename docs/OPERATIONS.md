@@ -282,6 +282,47 @@ at least a budget outage will not also relax everyone's cadence.
   guard is one indexed row by design; a month is a range scan. Month-to-date is
   an admin read only.
 
+### `claude_intel` (likeness intel, kind `llm`)
+
+- **A NULL `daily_budget_usd` refuses every run** (`budget_unset`) — the
+  inverse of Hive, on purpose. Migration 0038 seeds `claude_intel` disabled
+  with a NULL budget, so the worker runs and does nothing billable until an
+  operator sets a cap.
+- Turning it on, per environment, **in this order — none of the later steps do
+  anything useful ahead of an earlier one:**
+  1. **The owner runs the step-0 live probe** (`devtools/intel_access_probe.py`)
+     against the real Claude Platform on AWS workspace for that environment —
+     this has not run yet (`docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
+  2. **Substitute the placeholder workspace id, `pending-step0`, in all three
+     places it appears**, with the id the probe confirmed: the dev and prod
+     `intel-worker` containers' `ANTHROPIC_AWS_WORKSPACE_ID`
+     (`infra/ecs/imageshield-dev-services-worker.json`,
+     `infra/ecs/prod/services-worker.json`) and the task role's IAM `Resource`
+     ARN (`infra/ecs/policies/services-task-role.json`). Leaving any one of the
+     three on the placeholder means the grant is scoped to a workspace that
+     does not exist, so every call fails closed rather than reaching the
+     wrong workspace.
+  3. **Set the owner's daily cap by migration** (prod DB access is read-only):
+     `UPDATE providers SET daily_budget_usd = <n> WHERE provider_id =
+     'claude_intel';`. The number is a finance decision, not an engineering
+     one — nothing here picks it for you.
+  4. **`POST /v1/admin/providers/claude_intel/enable`** (the backend relays it
+     at developer tier) — the row itself; a NULL budget above still refuses
+     every run even once this flips.
+  5. **Set `INTEL_ENABLED=true` on the `intel-worker` container and redeploy.**
+     **In production this step waits on the backend's own prod IAM grant being
+     applied there** — the services-side grant (step 2 above) is only half of
+     what a real call needs, and flipping this flag before the backend side is
+     in place would have the worker attempt calls that fail on the OTHER
+     repo's missing permission instead of doing nothing, which is a noisier
+     and less honest failure mode than staying off.
+- `intel_stale` fires when an enabled source or a queued run has waited past
+  `INTEL_STALE_GRACE_HOURS` (6). It is the `kind='llm'` analogue of
+  `no_successful_calls_24h`, and its precondition is the opposite one: a
+  healthy intel worker with nothing due yet makes zero calls in 24h and must
+  not alarm on that, so **`no_successful_calls_24h` is suppressed for kind
+  `llm`** — `intel_stale` is what actually watches this provider for silence.
+
 ---
 
 ## 5. A provider has returned zero successful calls for 24h

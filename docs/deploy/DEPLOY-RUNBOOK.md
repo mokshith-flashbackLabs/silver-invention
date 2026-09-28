@@ -931,6 +931,52 @@ carry `user_ref`, bounding boxes and provider payloads. Do not size any pool fro
 a dev measurement (`DEPLOY-DEV-HANDOFF.md` §11); the rule that matters is
 `tasks × pool ≤ the role's connection limit`.
 
+### 13.7 The intel worker, and the enable order
+
+**Not its own task definition.** `intel-worker` is a third container in the existing
+`imageshield-dev-services-worker.json` / `infra/ecs/prod/services-worker.json` task, alongside
+`relay` and `search-worker` (§9a) — one more process in the worker task, not a new service to
+register or create. `memoryReservation: 128`, command `["python", "-m", "imageshield.intel.worker"]`,
+same image as the other two containers in that task. §9a's memory table gains 128 MiB per
+environment on top of whatever it already totalled (dev: `relay 160 + search-worker 288 +
+intel-worker 128 = 576`, matching the figure `infra/ecs/prod/README.md` now carries for prod).
+
+**`IntelConfig` (`src/imageshield/intel/config.py`) is read only by this container** — every other
+container in the task ignores every `INTEL_*`/`ANTHROPIC_*` key, and
+`tests/test_ecs_task_defs.py::test_intel_worker_sets_nothing_intel_config_does_not_read` holds that
+structurally rather than by review. Required keys with no default: `intel_enabled`,
+`intel_model_provider` (`stub` in development, must not be `stub` in production — same "dev spends
+real money, prod must not silently read nothing" pair `SEARCH_PROVIDER` enforces),
+`intel_anthropic_region`, `anthropic_aws_workspace_id`, `intel_extraction_model`,
+`intel_web_search_tool_type`, `fetcher_base_url`, `fetcher_token`. Everything else (call/document/run
+caps, poll interval, lease seconds, breaker tuning) has a sane default — see the task-5 build report
+for the full field table if you need one not listed here.
+
+**Both dev and prod ship `INTEL_ENABLED=false` today**, and a placeholder workspace id,
+`pending-step0`, sits in **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
+(`infra/ecs/imageshield-dev-services-worker.json`), the prod container's (`infra/ecs/prod/services-worker.json`),
+and the task role's IAM `Resource` ARN
+(`infra/ecs/policies/services-task-role.json`, `Sid: ClaudePlatformInvoke`,
+`aws-external-anthropic:CreateInference`, scoped — never `Resource: "*"`). All three must change
+together; a mismatch between the container's env var and the IAM ARN scopes the grant to a
+workspace the container never asks for, which fails closed rather than reaching the wrong one.
+
+**The enable order, this repo's half of it** (the full sequence, including the two provider-table
+steps, is `docs/OPERATIONS.md` §4's `claude_intel` entry — this is the deploy-time framing of the
+same five steps):
+
+1. Owner runs the step-0 live probe against the real workspace for that environment (not run yet —
+   `docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
+2. Substitute `pending-step0` with the confirmed workspace id in all three files above, redeploy the
+   task definition and reapply the IAM policy.
+3. Set `claude_intel.daily_budget_usd` by migration (the owner's number — a finance decision, not an
+   engineering one).
+4. `POST /v1/admin/providers/claude_intel/enable`.
+5. Only then set `INTEL_ENABLED=true` on the container and redeploy — **and in production, only
+   after the backend repo's own prod IAM grant for this surface is applied there.** The services-side
+   grant in step 2 is half of what a real call needs; flipping this flag first would have the worker
+   fail on the *other* repo's missing permission instead of simply staying off.
+
 ---
 
 ## 14. Order of operations, condensed
