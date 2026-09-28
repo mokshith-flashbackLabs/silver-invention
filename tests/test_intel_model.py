@@ -98,6 +98,42 @@ def test_cost_is_computed_from_usage_and_unknown_models_refuse() -> None:
         cost_of("claude-mystery-9", Usage(1, 1, 0, 0, 0))
 
 
+def test_construction_refuses_an_unpriced_extraction_model(clean_env: pytest.MonkeyPatch) -> None:
+    """Pricing is checked at CONSTRUCTION, not at the first billed call: an
+    operator misconfiguring INTEL_EXTRACTION_MODEL fails the worker at startup,
+    never mid-run after a call has already been made and billed (the gap Task 10
+    flagged and this task's controller ruling closes)."""
+    for k, v in BASE.items():
+        clean_env.setenv(k, v)
+    clean_env.setenv("INTEL_EXTRACTION_MODEL", "claude-mystery-9")
+    from imageshield.intel.config import load_intel_config
+
+    with pytest.raises(UnknownModelPrice):
+        ClaudeIntelModel(load_intel_config(), client=SimpleNamespace(messages=FakeMessages([])))
+
+
+async def test_an_unpriced_answering_model_is_still_priced_by_the_requested_model(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """The API may answer with a DIFFERENT model id than the one requested (a
+    routing fallback). Pricing THAT id directly would raise UnknownModelPrice
+    AFTER the call is already billed -- the exception would leave it unrecorded
+    in provider_calls/provider_spend, and the run would retry (and re-bill) it up
+    to MAX_RUN_ATTEMPTS times. The call is priced by the REQUESTED model instead
+    -- the one this process always sends, and the one construction already
+    proved is priced -- so a billed call is always recorded."""
+    response = SimpleNamespace(
+        model="claude-mystery-9",
+        stop_reason="end_turn",
+        usage=_usage(),
+        content=[_text_block(ExtractionOutput(signals=[]).model_dump_json())],
+    )
+    model, _ = _model([response], clean_env)
+    call = await model.extract("sys", "user")
+    assert call.answered_by == "claude-mystery-9"
+    assert call.cost_usd == cost_of("claude-sonnet-5", Usage(1000, 100, 0, 0, 0))
+
+
 async def test_a_parsed_response_is_ok(clean_env: pytest.MonkeyPatch) -> None:
     parsed = ExtractionOutput(signals=[])
     response = SimpleNamespace(
@@ -249,10 +285,24 @@ async def test_discover_resumes_a_pause_turn_with_the_first_user_turn_and_the_pa
 
 
 async def test_discover_stops_resuming_at_the_call_cap(clean_env: pytest.MonkeyPatch) -> None:
-    """A search that never stops pausing ends -- it does not loop forever. It
-    comes back unparseable (a pause carries no text block), a neutral verdict."""
+    """A search that never stops pausing ends -- it does not loop forever, and it
+    never makes MORE than the configured cap of actual API calls (the off-by-one
+    Task 10 flagged: the initial call must count against its own cap, not only
+    the resumes after it). It comes back unparseable (a pause carries no text
+    block), a neutral verdict."""
     clean_env.setenv("INTEL_MAX_CALLS_PER_RUN", "2")
     model, fake = _model([_paused() for _ in range(5)], clean_env)
     call = await model.discover("sys", "find things")
-    assert call.pause_turns == 2 and len(fake.calls) == 3
+    assert call.pause_turns == 1 and len(fake.calls) == 2
     assert call.outcome == "unparseable" and call.output is None
+
+
+async def test_discover_never_exceeds_the_cap_for_any_cap_value(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """Same property, pinned at the boundary: a cap of 1 must still allow the
+    FIRST call (nothing has been called yet) but never a resume."""
+    clean_env.setenv("INTEL_MAX_CALLS_PER_RUN", "1")
+    model, fake = _model([_paused() for _ in range(5)], clean_env)
+    call = await model.discover("sys", "find things")
+    assert call.pause_turns == 0 and len(fake.calls) == 1

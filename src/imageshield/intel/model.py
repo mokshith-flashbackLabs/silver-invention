@@ -104,6 +104,14 @@ def _output_config(output_format: type[BaseModel]) -> dict[str, Any]:
 
 class ClaudeIntelModel:
     def __init__(self, config: IntelConfig, *, client: Any | None = None) -> None:
+        # Priced BEFORE any call, not after: a call is billed the moment the API
+        # answers (see `_send` below), so an `UnknownModelPrice` escaping AFTER a
+        # billed call would leave that call unrecorded while the run retries it
+        # -- up to MAX_RUN_ATTEMPTS times, each one billed and unmetered. Pricing
+        # the configured (requested) model id here, once, means `_send` and
+        # `discover` can never raise pricing a call that already happened: the
+        # id this process sends never changes mid-run.
+        cost_of(config.intel_extraction_model, Usage(0, 0, 0, 0, 0))
         self._config = config
         # Explicitly `Any`: an injected test double (SimpleNamespace) is not an
         # AsyncAnthropicAWS, and `self._client.messages.create(**kwargs)` below
@@ -173,10 +181,13 @@ class ClaudeIntelModel:
         return ModelCall(
             output=output,
             outcome=outcome,
+            # The model that ANSWERED, recorded for logging/debugging -- may
+            # differ from what was requested (a routing fallback) and is never
+            # what prices the call (see `__init__`'s pre-check).
             answered_by=str(response.model),
             stop_reason=stop,
             usage=usage,
-            cost_usd=cost_of(str(response.model), usage),
+            cost_usd=cost_of(self._config.intel_extraction_model, usage),
             latency_ms=int((time.monotonic() - started) * 1000),
             content=content,
         )
@@ -201,9 +212,11 @@ class ClaudeIntelModel:
         ]
         messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
         pause_turns = 0
+        total_calls = 0  # every actual API call this discover() makes, initial included
         total = Usage(0, 0, 0, 0, 0)
         while True:
             call = await self._send(DiscoveryOutput, system=system, tools=tools, messages=messages)
+            total_calls += 1
             u = call.usage
             total = Usage(
                 total.input_tokens + u.input_tokens,
@@ -212,9 +225,14 @@ class ClaudeIntelModel:
                 total.cache_read_input_tokens + u.cache_read_input_tokens,
                 total.web_search_requests + u.web_search_requests,
             )
+            # `total_calls`, not `pause_turns`: the cap bounds every call this
+            # method makes, not merely the resumes after the first. Checked
+            # before resuming again -- the off-by-one this replaces let one
+            # discover() make `max_calls_per_run + 1` calls (the initial call
+            # was never counted against its own cap).
             if (
                 call.stop_reason != "pause_turn"
-                or pause_turns >= self._config.intel_max_calls_per_run
+                or total_calls >= self._config.intel_max_calls_per_run
             ):
                 return ModelCall(
                     output=call.output,
@@ -222,7 +240,7 @@ class ClaudeIntelModel:
                     answered_by=call.answered_by,
                     stop_reason=call.stop_reason,
                     usage=total,
-                    cost_usd=cost_of(call.answered_by, total),
+                    cost_usd=cost_of(self._config.intel_extraction_model, total),
                     latency_ms=call.latency_ms,
                     pause_turns=pause_turns,
                 )
