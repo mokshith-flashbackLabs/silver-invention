@@ -475,3 +475,87 @@ def test_the_collision_exemption_is_actually_used() -> None:
         "faceindex.py no longer calls face search — delete the exemption"
     )
     assert "search_face" in module.read_text(encoding="utf-8")
+
+
+# ── Task 11: the intel worktree's own boundary gates ────────────────────────
+
+INTEL = SRC / "imageshield" / "intel"
+INTEL_FORBIDDEN_IMPORTS = (
+    "imageshield.subjects",
+    "imageshield.attribution",
+    "imageshield.liveness",
+    "imageshield.enrolment",
+    "imageshield.review",
+    "imageshield.confirm",
+    "imageshield.preview",
+    "imageshield.recheck",
+    "imageshield.threats.store",
+    "imageshield.http.routes",
+    "imageshield.search.store",
+    "imageshield.search.models",
+    "imageshield.search.runner",
+    "imageshield.search.hive",
+    "imageshield.search.google",
+    "imageshield.search.worker",
+)
+
+
+def _imports_of(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            found.append(node.module)
+    return found
+
+
+def test_intel_imports_no_person_bearing_module() -> None:
+    """PERMANENT. INVARIANTS #48: no person data reaches the model. Verified to
+    fire by adding ``import imageshield.subjects`` to ``intel/prompts.py``."""
+    files = sorted(INTEL.rglob("*.py"))
+    assert files, "intel/ scan found nothing — path wrong?"
+    offenders = [
+        f"{p.name}: {m}"
+        for p in files
+        for m in _imports_of(p)
+        if any(m == f or m.startswith(f + ".") for f in INTEL_FORBIDDEN_IMPORTS)
+    ]
+    assert offenders == []
+
+
+def test_every_intel_ban_entry_is_a_real_module() -> None:
+    """An entry that matches no installed module is a typo the grep above would
+    silently never catch — this fails loudly instead."""
+    import importlib.util
+
+    dead = [m for m in INTEL_FORBIDDEN_IMPORTS if importlib.util.find_spec(m) is None]
+    assert dead == [], f"ban entries that match nothing: {dead}"
+
+
+def test_only_intel_model_imports_anthropic() -> None:
+    """PERMANENT. CLAUDE.md §2 amended 2026-09-28: the SDK is confined to one
+    file, because a call that bills money and a call that does not must not be
+    indistinguishable by grep."""
+    offenders = [
+        str(p.relative_to(SRC))
+        for p in _source_files()
+        if any(m == "anthropic" or m.startswith("anthropic.") for m in _imports_of(p))
+        and p != INTEL / "model.py"
+    ]
+    assert offenders == []
+
+
+def test_only_the_fetcher_imports_fetcher_fetch() -> None:
+    """PERMANENT. INVARIANTS #11: a DB-holding process never fetches a
+    third-party URL in-process. The intel worker (and pipeline) instead calls
+    the fetcher CONTAINER over HTTP (``intel/fetch_client.py``) — it must never
+    import the fetcher's own in-process fetch function."""
+    fetcher_dir = SRC / "imageshield" / "fetcher"
+    offenders = [
+        str(p.relative_to(SRC))
+        for p in _source_files()
+        if "imageshield.fetcher.fetch" in _imports_of(p) and fetcher_dir not in p.parents
+    ]
+    assert offenders == []
