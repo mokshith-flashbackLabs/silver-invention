@@ -1,8 +1,12 @@
 """THROWAWAY (spec §8 step 0): prove Claude Platform on AWS serves our models in a region.
 
 Run with operator AWS credentials in the environment:
-    AWS_PROFILE=... python devtools/intel_access_probe.py --region ap-south-1 --workspace <id>
-Prints what answered and what it cost.
+    AWS_PROFILE=... python devtools/intel_access_probe.py --region ap-south-1 \
+        --workspace <id> --web-search-type web_search_20260209
+Prints what answered and what it cost. `--web-search-type` is required (e.g. the current
+web_search_20260209 tool version) — see the findings file's "Owner actions" section
+(docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md) for the exact dev/prod
+commands.
 
 NOT YET RUN (2026-09-28): controller ruling for Task 0 forbade calling AWS from this session —
 the workspace ids do not exist in anything readable here, the prod account is off-limits, and the
@@ -43,27 +47,30 @@ def probe(region: str, workspace: str, web_search_type: str) -> None:
             )
         except anthropic.APIStatusError as exc:
             print(json.dumps({"model": model, "status": exc.status_code, "type": exc.type}))
-    response = client.messages.create(
-        model=MODELS[0],
-        max_tokens=512,
-        tools=[{"type": web_search_type, "name": "web_search", "max_uses": 1}],
-        messages=[
-            {
-                "role": "user",
-                "content": "Find one news article about a social platform "
-                "changing its privacy policy. Reply with its URL only.",
-            }
-        ],
-    )
-    print(
-        json.dumps(
-            {
-                "web_search": True,
-                "stop_reason": response.stop_reason,
-                "usage": response.usage.model_dump(),
-            }
+    try:
+        response = client.messages.create(
+            model=MODELS[0],
+            max_tokens=512,
+            tools=[{"type": web_search_type, "name": "web_search", "max_uses": 1}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Find one news article about a social platform "
+                    "changing its privacy policy. Reply with its URL only.",
+                }
+            ],
         )
-    )
+        print(
+            json.dumps(
+                {
+                    "web_search": True,
+                    "stop_reason": response.stop_reason,
+                    "usage": response.usage.model_dump(),
+                }
+            )
+        )
+    except anthropic.APIStatusError as exc:
+        print(json.dumps({"web_search": True, "status": exc.status_code, "type": exc.type}))
 
 
 if __name__ == "__main__":
