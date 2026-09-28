@@ -2,14 +2,20 @@
 one content type the caller asked for. The only module in this repo that
 touches hostile bytes.
 
-**Two public fetchers, one guard.** ``fetch_image`` takes ``image/*`` and
-``fetch_page`` takes ``text/html``; both are thin wrappers over
-``_get_guarded``, which owns the redirect walk, the SSRF check on every hop and
-the streaming byte cap. ``fetch_page`` was added 2026-09-07 because Google's
-``pagesWithMatchingImages`` entries carry no image URL, so a page-keyed hit had
-nothing fetchable and the subject saw no picture (11 of 12 real hits). It
-widens the hostile-input surface deliberately and under the same guard — the
-alternative was leaving those hits unreviewable.
+**Three public fetchers, one guard.** ``fetch_image`` takes ``image/*``,
+``fetch_page`` takes ``text/html`` and ``fetch_text`` takes ``TEXT_TYPES``; all
+three are thin wrappers over ``_get_guarded``, which owns the redirect walk,
+the SSRF check on every hop and the streaming byte cap. ``fetch_page`` was
+added 2026-09-07 because Google's ``pagesWithMatchingImages`` entries carry no
+image URL, so a page-keyed hit had nothing fetchable and the subject saw no
+picture (11 of 12 real hits). It widens the hostile-input surface deliberately
+and under the same guard — the alternative was leaving those hits
+unreviewable. ``fetch_text`` was added for likeness intel (spec §4.2): the
+worker never fetches a third-party URL itself, so this is the only egress path
+for a page's terms, a news feed or a JSON API response, and it is the one
+caller that also refuses a plain-``http`` hop (``https_only=True``) — the
+other two render or relay bytes for one request, while this one's output can
+end up quoted as evidence.
 
 Mirrors ``recheck/client.py``'s hand-rolled redirect walk (same
 ``_REDIRECT_STATUSES``, same "guard, then request, on every hop" shape) for
@@ -47,6 +53,9 @@ is discarded when that response is sent.
 """
 
 from __future__ import annotations
+
+import asyncio
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -94,26 +103,42 @@ async def _get_guarded(
     client: httpx.AsyncClient,
     url: str,
     *,
-    accept_prefix: str,
+    accept_prefixes: tuple[str, ...],
     reject_code: str,
     max_bytes: int,
     truncate_over_cap: bool = False,
     timeout_seconds: float,
     max_redirects: int,
     resolver: Resolver | None,
-) -> tuple[str, bytes]:
+    https_only: bool = False,
+) -> tuple[str, bytes, str]:
     """The guarded GET both public fetchers are built on.
 
-    ONE implementation on purpose. ``fetch_image`` and ``fetch_page`` differ
-    only in which content type they accept and how big a body they tolerate;
-    everything that makes this safe — the hand-rolled redirect walk with
-    ``address_refusal`` re-run on every hop, the content-type check before the
-    body is read, the cap applied WHILE streaming — is identical, and a second
-    copy of it is how one of the two ends up missing a hop check later.
+    ONE implementation on purpose. ``fetch_image``, ``fetch_page`` and
+    ``fetch_text`` differ only in which content type they accept, how big a
+    body they tolerate and (``fetch_text`` only) whether every hop must stay
+    on ``https``; everything that makes this safe — the hand-rolled redirect
+    walk with ``address_refusal`` re-run on every hop, the content-type check
+    before the body is read, the cap applied WHILE streaming — is identical,
+    and a second copy of it is how one of the three ends up missing a hop
+    check later.
+
+    Returns ``(content_type, body, final_url)`` — ``final_url`` is ``current``
+    at the hop that actually answered, so a caller can tell a subject or an
+    operator which URL the bytes really came from after any redirects.
     """
     current = url
     for _hop in range(max_redirects + 1):
-        refusal = address_refusal(current, resolver)
+        if https_only and urlsplit(current).scheme != "https":
+            # Checked on EVERY hop, not just the URL the caller supplied: a
+            # https origin can still redirect to a plain-http location, and an
+            # intel fetch must never follow that — same reasoning as the SSRF
+            # check re-running per hop, just for a different failure mode.
+            raise FetchRefused("not_https", f"{current} is not https")
+
+        # Run off the event loop: a real getaddrinfo() is a blocking syscall,
+        # and this loop can run once per redirect hop.
+        refusal = await asyncio.to_thread(address_refusal, current, resolver)
         if refusal is not None:
             # Every ssrf refusal reason (not just 'private_address') collapses
             # onto one FetchRefused code — the caller's contract is "this
@@ -142,7 +167,7 @@ async def _get_guarded(
             # are about to refuse, and a hostile response can make the body
             # arbitrarily expensive to pull off the wire.
             content_type = response.headers.get("content-type", "")
-            if not content_type.startswith(accept_prefix):
+            if not content_type.startswith(accept_prefixes):
                 raise FetchRefused(reject_code, content_type or "(missing)")
 
             body = bytearray()
@@ -167,7 +192,7 @@ async def _get_guarded(
             except httpx.HTTPError as exc:
                 raise FetchRefused("unfetchable", str(exc)) from exc
 
-            return content_type, bytes(body)
+            return content_type, bytes(body), current
         finally:
             await response.aclose()
 
@@ -187,10 +212,10 @@ async def fetch_image(
     :class:`FetchRefused` for every way this can legitimately not work; nothing
     else should escape.
     """
-    content_type, body = await _get_guarded(
+    content_type, body, _final_url = await _get_guarded(
         client,
         url,
-        accept_prefix="image/",
+        accept_prefixes=("image/",),
         reject_code="not_an_image",
         max_bytes=max_bytes,
         timeout_seconds=timeout_seconds,
@@ -221,10 +246,10 @@ async def fetch_page(
     string rather than an exception. The charset in ``content-type`` is
     deliberately not honoured — trusting it would let a page choose our decoder.
     """
-    content_type, body = await _get_guarded(
+    content_type, body, _final_url = await _get_guarded(
         client,
         url,
-        accept_prefix="text/html",
+        accept_prefixes=("text/html",),
         reject_code="not_a_page",
         truncate_over_cap=True,
         max_bytes=max_bytes,
@@ -233,3 +258,67 @@ async def fetch_page(
         resolver=resolver,
     )
     return FetchedPage(content_type=content_type, html=body.decode("utf-8", errors="replace"))
+
+
+TEXT_TYPES: tuple[str, ...] = (
+    "text/html",
+    "application/xhtml+xml",
+    "text/plain",
+    "application/rss+xml",
+    "application/atom+xml",
+    "application/xml",
+    "text/xml",
+    "application/json",
+)
+
+
+class FetchedText(BaseModel):
+    """Bytes of a public text document, in memory for one request. Never
+    persisted and never logged by the fetcher (INVARIANTS #9)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    content_type: str
+    final_url: str
+    raw: bytes
+    truncated: bool
+
+
+async def fetch_text(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_bytes: int,
+    timeout_seconds: float,
+    max_redirects: int,
+    resolver: Resolver | None = None,
+) -> FetchedText:
+    """GET ``url`` as one of ``TEXT_TYPES`` for likeness intel (spec §4.2).
+
+    ``https_only=True``: every hop must stay on ``https``, not merely the URL
+    the caller supplied — a redirect to plain ``http`` is refused exactly like
+    a redirect to a private address, because this fetcher's callers use the
+    result as evidence, not as a rendering convenience.
+
+    Reading ``max_bytes + 1`` is what makes ``truncated`` honest: one byte past
+    the cap proves more existed than what is returned.
+    """
+    content_type, body, final_url = await _get_guarded(
+        client,
+        url,
+        accept_prefixes=TEXT_TYPES,
+        reject_code="unsupported_type",
+        truncate_over_cap=True,
+        max_bytes=max_bytes + 1,
+        timeout_seconds=timeout_seconds,
+        max_redirects=max_redirects,
+        resolver=resolver,
+        https_only=True,
+    )
+    truncated = len(body) > max_bytes
+    return FetchedText(
+        content_type=content_type,
+        final_url=final_url,
+        raw=body[:max_bytes],
+        truncated=truncated,
+    )

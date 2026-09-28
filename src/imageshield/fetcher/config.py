@@ -65,6 +65,14 @@ class FetcherConfig(BaseSettings):
     page_max_bytes: int = 2 * 1024 * 1024
     page_timeout_seconds: float = 10.0
 
+    # POST /v1/text (likeness intel, spec §4.2). Truncates and SAYS so
+    # (truncated), unlike /v1/page. The semaphore caps intel's share of the
+    # 8-connection pool so a crawl never delays a victim's hit preview on
+    # /v1/crop.
+    intel_text_max_bytes: int = 2 * 1024 * 1024
+    intel_text_timeout_seconds: float = 10.0
+    intel_text_max_concurrency: int = 2
+
     @field_validator("fetcher_token")
     @classmethod
     def _token(cls, value: str) -> str:
@@ -74,14 +82,20 @@ class FetcherConfig(BaseSettings):
             raise ValueError("is still set to a placeholder")
         return value
 
-    @field_validator("fetch_max_bytes", "fetch_max_redirects", "page_max_bytes")
+    @field_validator(
+        "fetch_max_bytes",
+        "fetch_max_redirects",
+        "page_max_bytes",
+        "intel_text_max_bytes",
+        "intel_text_max_concurrency",
+    )
     @classmethod
     def _positive(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("must be a positive integer")
         return value
 
-    @field_validator("fetch_timeout_seconds", "page_timeout_seconds")
+    @field_validator("fetch_timeout_seconds", "page_timeout_seconds", "intel_text_timeout_seconds")
     @classmethod
     def _positive_float(cls, value: float) -> float:
         if value <= 0:

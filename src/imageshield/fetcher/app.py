@@ -19,9 +19,11 @@ caller, no reason to publish an OpenAPI surface.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -32,7 +34,8 @@ from pydantic import BaseModel, ConfigDict
 from imageshield.attribution.crop import UndecodableImage
 from imageshield.attribution.models import BoundingBox
 from imageshield.fetcher.config import FetcherConfig, load_fetcher_config
-from imageshield.fetcher.fetch import FetchRefused, fetch_image, fetch_page
+from imageshield.fetcher.extract import UnsupportedDocument, to_text
+from imageshield.fetcher.fetch import FetchRefused, fetch_image, fetch_page, fetch_text
 from imageshield.fetcher.render import render_preview
 from imageshield.recheck.ssrf import Resolver
 
@@ -84,6 +87,10 @@ _FETCH_REFUSED_STATUS: dict[str, int] = {
     "too_large": 413,
     "redirect_limit": 400,
     "unfetchable": 502,
+    # /v1/text: the content type is none of TEXT_TYPES, or a hop (including
+    # the URL the caller supplied) left https.
+    "unsupported_type": 400,
+    "not_https": 400,
 }
 
 
@@ -224,6 +231,53 @@ async def page(
     return {"html": fetched.html}
 
 
+@router.post("/text")
+async def text(
+    body: FetchRequest,
+    request: Request,
+    client: httpx.AsyncClient = Depends(get_http_client),
+    resolver: Resolver | None = Depends(get_resolver),
+    cfg: FetcherConfig = Depends(get_fetcher_config),
+) -> dict[str, object]:
+    """A public text document as text, for likeness intel (spec §4.2).
+
+    The one egress path for intel: the worker never fetches a third-party URL
+    itself. Same SSRF guard and hand-rolled redirect walk as ``/v1/fetch`` and
+    ``/v1/page`` -- but ``https`` only, on every hop, because this fetch's
+    output can end up quoted as evidence rather than rendered for one request.
+    The bytes and the decoded text both live only for this request
+    (INVARIANTS #9); nothing here writes to disk, a column, or a log.
+    """
+    if urlsplit(body.url).scheme != "https":
+        raise FetcherError(400, "not_https", "intel fetches https only")
+    gate = getattr(request.app.state, "intel_text_gate", None) or asyncio.Semaphore(
+        cfg.intel_text_max_concurrency
+    )
+    async with gate:
+        try:
+            fetched = await fetch_text(
+                client,
+                body.url,
+                max_bytes=cfg.intel_text_max_bytes,
+                timeout_seconds=cfg.intel_text_timeout_seconds,
+                max_redirects=cfg.fetch_max_redirects,
+                resolver=resolver,
+            )
+        except FetchRefused as exc:
+            raise _fetch_refused_to_error(exc) from exc
+    try:
+        extracted = to_text(fetched.content_type, fetched.raw)
+    except UnsupportedDocument as exc:
+        raise FetcherError(400, "unsupported_type", str(exc)) from exc
+    return {
+        "text": extracted.text,
+        "content_type": fetched.content_type,
+        "final_url": fetched.final_url,
+        "truncated": fetched.truncated,
+        "items": [i.model_dump() for i in extracted.items] if extracted.items is not None else None,
+    }
+
+
 @router.post("/crop")
 async def crop(
     body: CropRequest,
@@ -277,6 +331,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     if getattr(app.state, "resolver", None) is None:
         app.state.resolver = None
+    if getattr(app.state, "intel_text_gate", None) is None:
+        app.state.intel_text_gate = asyncio.Semaphore(app.state.config.intel_text_max_concurrency)
     log.info("fetcher.started")
     try:
         yield
