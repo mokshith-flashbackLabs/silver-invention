@@ -1,0 +1,97 @@
+"""Row and value types shared by the intel store, the pipeline and the admin routes.
+
+Frozen pydantic models over ``intel_sources`` / ``intel_runs`` / ``intel_vocabulary`` rows
+(migration 0038, task-3-report.md's column list is binding for the store's SQL) plus one
+non-persisted read (``SpendToday``, a projection over ``providers``/``provider_spend``).
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict
+
+from imageshield.intel.tags import TagRegistry
+
+
+class Source(BaseModel):
+    """One ``intel_sources`` row (spec §3.2). ``source_url``/``url_hash``/``query_text``
+    are jointly nullable: a ``policy_page``/``feed``/... source carries a URL, a
+    ``search_query`` source carries ``query_text`` instead — the DB's own CHECKs enforce
+    which, this model only carries whatever the row has."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source_id: UUID
+    kind: str
+    source_url: str | None
+    url_hash: str | None
+    query_text: str | None
+    tags: tuple[str, ...]
+    check_every_hours: int
+    next_check_at: datetime
+    enabled: bool
+    terms_note: str
+    last_content_sha256: str | None
+    last_checked_at: datetime | None
+    last_run_status: str | None
+    consecutive_failures: int
+    disabled_reason: str | None
+    created_by: str
+    created_at: datetime
+
+
+class Run(BaseModel):
+    """One ``intel_runs`` row. ``source_id`` is null for an ``adhoc_url`` run; ``request``
+    and ``outcome`` are the run's own JSONB payload and result, never re-typed here."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: UUID
+    kind: str
+    source_id: UUID | None
+    request: dict[str, Any]
+    status: str
+    attempts: int
+    requested_by: str
+    outcome: dict[str, Any]
+    error_code: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class Vocabulary(BaseModel):
+    """The singleton ``intel_vocabulary`` row (spec §3.1) — the backend's own tag/quiz/
+    scoring identity as of the last push this repo accepted, per ``put_vocabulary``'s
+    pair ordering."""
+
+    model_config = ConfigDict(frozen=True)
+
+    release_no: int
+    map_version: int
+    scoring_version: str
+    quiz_version: str
+    document: dict[str, Any]
+
+    def registry(self) -> TagRegistry:
+        tags = self.document.get("tags", [])
+        return TagRegistry(
+            active=frozenset(t["slug"] for t in tags if not t.get("retired")),
+            retired=frozenset(t["slug"] for t in tags if t.get("retired")),
+        )
+
+
+class SpendToday(BaseModel):
+    """A projection over ``providers``/``provider_spend`` for ``claude_intel``, never a
+    persisted row of its own — ``daily_budget_usd`` is ``None`` until an operator sets one
+    (invariant #38's fail-closed budget, applied to this provider)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    spend_date: date
+    call_count: int
+    spent_today_usd: Decimal
+    daily_budget_usd: Decimal | None
