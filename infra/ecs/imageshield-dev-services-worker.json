@@ -112,6 +112,42 @@
           "awslogs-stream-prefix": "search-worker"
         }
       }
+    },
+    {
+      "name": "intel-worker",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:96bed45",
+      "essential": true,
+      "memoryReservation": 128,
+      "command": ["python", "-m", "imageshield.intel.worker"],
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "DB_SSLMODE", "value": "require" },
+        { "name": "DB_POOL_MAX_SIZE", "value": "2" },
+        { "name": "INTEL_ENABLED", "value": "false" },
+        { "name": "INTEL_MODEL_PROVIDER", "value": "claude" },
+        { "name": "INTEL_ANTHROPIC_REGION", "value": "ap-south-1" },
+        { "name": "ANTHROPIC_AWS_WORKSPACE_ID", "value": "pending-step0" },
+        { "name": "INTEL_EXTRACTION_MODEL", "value": "claude-sonnet-5" },
+        { "name": "INTEL_WEB_SEARCH_TOOL_TYPE", "value": "web_search_20260209" },
+        { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" }
+      ],
+      "secrets": [
+        { "name": "DB_HOST", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:host::" },
+        { "name": "DB_PORT", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:port::" },
+        { "name": "DB_NAME", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:dbname::" },
+        { "name": "DB_USER", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:password::" },
+        { "name": "FETCHER_TOKEN", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/service-token/backend-to-services-uqZXJj:FETCHER_TOKEN::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/imageshield/dev",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "intel-worker"
+        }
+      }
     }
   ]
 }

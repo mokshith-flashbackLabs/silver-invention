@@ -87,14 +87,24 @@ ECS places against `memoryReservation` where set, otherwise `memory`:
 | Task | Placement |
 |---|---|
 | `services` | 576 |
-| `services-worker` (relay 160 + search-worker 288) | 448 |
+| `services-worker` (relay 160 + search-worker 288 + intel-worker 128) | 576 |
 | `confirm` (confirm-worker 160) | 160 |
 | `fetcher` | 128 |
-| **services side total** | **1312** |
+| **services side total** | **1440** |
 
-With the backend's `api` (512), `worker` (512) and `image-worker` (1024) that is 3360 MiB of the
-3835 MiB a `t4g.medium` offers — 475 MiB free, enough for the 256 MiB migration task to run
-alongside everything else, but not much more. If any of these grow, redo this arithmetic.
+`intel-worker` (+128 MiB, likeness-intel task 5) ships with `INTEL_ENABLED=false`, so it adds
+placement weight before it adds any traffic — the arithmetic below already assumes it is running.
+
+With the backend's `api` (512), `worker` (512) and `image-worker` (1024) that is 3488 MiB of the
+3835 MiB a `t4g.medium` offers — 347 MiB free, still enough for the 256 MiB migration task to run
+alongside everything else, but only 91 MiB to spare. If any of these grow, redo this arithmetic.
+
+**`ANTHROPIC_AWS_WORKSPACE_ID` on `intel-worker` and the `ClaudePlatformInvoke` statement's
+`Resource` in `infra/ecs/policies/services-task-role.json` both carry the placeholder
+`pending-step0`** until the owner runs `devtools/intel_access_probe.py` against the real
+workspaces (see `docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`) — replace
+the placeholder with the confirmed workspace id in both files before flipping `INTEL_ENABLED` to
+`true` anywhere.
 
 ## Order
 

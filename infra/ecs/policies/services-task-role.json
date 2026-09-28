@@ -59,6 +59,12 @@
       "Effect": "Allow",
       "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
       "Resource": "arn:aws:kms:ap-south-1:225989356895:key/5b32f333-b48d-4ea0-b4a7-7b1c8e591c74"
+    },
+    {
+      "Sid": "ClaudePlatformInvoke",
+      "Effect": "Allow",
+      "Action": ["aws-external-anthropic:CreateInference"],
+      "Resource": "arn:aws:aws-external-anthropic:ap-south-1:225989356895:workspace/pending-step0"
     }
   ]
 }

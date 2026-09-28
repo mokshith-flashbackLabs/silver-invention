@@ -1,6 +1,6 @@
 {
   "family": "imageshield-prod-services-worker",
-  "x-notes": "PRODUCTION. Two containers, one task, because the relay and the search worker are both small, both stateless and both die with the instance; splitting them would double the placement bookkeeping for no isolation. Generated from infra/ecs/imageshield-dev-services-worker.json by applying only the environment-specific values. Dev already carried ENVIRONMENT=production and SEARCH_PROVIDER=hive here, which reads like an inconsistency and is not one: config.py refuses development+hive, and these two containers must hold a live adapter to do anything at all, so dev's search worker really does run in the production configuration and really does spend Hive money. Production changes the region, the queues, the collections, the log group and the roles; it changes nothing about that pair. LOG_LEVEL was already info. See services.json notes on the two ATTRIBUTION_ values, which are unset here as in dev.",
+  "x-notes": "PRODUCTION. Three containers, one task: the relay, the search worker and (as of the likeness-intel work) the intel worker are all small, stateless and die with the instance; splitting them would double the placement bookkeeping for no isolation. Generated from infra/ecs/imageshield-dev-services-worker.json by applying only the environment-specific values. Dev already carried ENVIRONMENT=production and SEARCH_PROVIDER=hive here, which reads like an inconsistency and is not one: config.py refuses development+hive, and these two containers must hold a live adapter to do anything at all, so dev's search worker really does run in the production configuration and really does spend Hive money. Production changes the region, the queues, the collections, the log group and the roles; it changes nothing about that pair. LOG_LEVEL was already info. See services.json notes on the two ATTRIBUTION_ values, which are unset here as in dev. intel-worker ships with INTEL_ENABLED=false and ANTHROPIC_AWS_WORKSPACE_ID=pending-step0 until the step-0 probe confirms the prod workspace id and region -- see infra/ecs/prod/README.md.",
   "networkMode": "host",
   "requiresCompatibilities": ["EC2"],
   "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-prod-exec",
@@ -111,6 +111,42 @@
           "awslogs-group": "/imageshield/prod",
           "awslogs-region": "us-east-1",
           "awslogs-stream-prefix": "search-worker"
+        }
+      }
+    },
+    {
+      "name": "intel-worker",
+      "image": "225989356895.dkr.ecr.us-east-1.amazonaws.com/imageshield/services:${IMAGE_TAG}",
+      "essential": true,
+      "memoryReservation": 128,
+      "command": ["python", "-m", "imageshield.intel.worker"],
+      "environment": [
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "DB_SSLMODE", "value": "require" },
+        { "name": "DB_POOL_MAX_SIZE", "value": "2" },
+        { "name": "INTEL_ENABLED", "value": "false" },
+        { "name": "INTEL_MODEL_PROVIDER", "value": "claude" },
+        { "name": "INTEL_ANTHROPIC_REGION", "value": "us-east-1" },
+        { "name": "ANTHROPIC_AWS_WORKSPACE_ID", "value": "pending-step0" },
+        { "name": "INTEL_EXTRACTION_MODEL", "value": "claude-sonnet-5" },
+        { "name": "INTEL_WEB_SEARCH_TOOL_TYPE", "value": "web_search_20260209" },
+        { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" }
+      ],
+      "secrets": [
+        { "name": "DB_HOST", "valueFrom": "${SECRET_DB_APP_SERVICES}:host::" },
+        { "name": "DB_PORT", "valueFrom": "${SECRET_DB_APP_SERVICES}:port::" },
+        { "name": "DB_NAME", "valueFrom": "${SECRET_DB_APP_SERVICES}:dbname::" },
+        { "name": "DB_USER", "valueFrom": "${SECRET_DB_APP_SERVICES}:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "${SECRET_DB_APP_SERVICES}:password::" },
+        { "name": "FETCHER_TOKEN", "valueFrom": "${SECRET_SERVICE_TOKEN_BACKEND}:FETCHER_TOKEN::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/imageshield/prod",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "intel-worker"
         }
       }
     }

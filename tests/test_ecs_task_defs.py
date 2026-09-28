@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from imageshield.config import Config
+from imageshield.intel.config import IntelConfig
 
 ECS_DIR = Path(__file__).resolve().parents[1] / "infra" / "ecs"
 SERVICES_TASK = ECS_DIR / "imageshield-dev-services.json"
@@ -290,18 +291,24 @@ def _worker_containers() -> dict[str, dict[str, Any]]:
     return {c["name"]: c for c in _load(WORKER_TASK)["containerDefinitions"]}
 
 
-def test_worker_task_runs_exactly_the_relay_and_the_search_consumer() -> None:
-    """One task, two processes: the outbox relay (the only outbox→SQS path)
-    and the ``search:runs`` consumer. Both essential — if either dies, ECS
-    restarts the task rather than running a relay whose messages nothing
-    consumes, or a consumer whose queue nothing feeds."""
+def test_worker_task_runs_exactly_the_relay_the_search_consumer_and_intel() -> None:
+    """One task, three processes: the outbox relay (the only outbox→SQS path),
+    the ``search:runs`` consumer, and the intel worker. All essential — if any
+    dies, ECS restarts the task rather than running a relay whose messages
+    nothing consumes, a consumer whose queue nothing feeds, or an intel worker
+    with nothing polling for it."""
     containers = _worker_containers()
-    assert set(containers) == {"relay", "search-worker"}
+    assert set(containers) == {"relay", "search-worker", "intel-worker"}
     assert containers["relay"]["command"] == ["python", "-m", "imageshield.relay"]
     assert containers["search-worker"]["command"] == [
         "python",
         "-m",
         "imageshield.search.worker",
+    ]
+    assert containers["intel-worker"]["command"] == [
+        "python",
+        "-m",
+        "imageshield.intel.worker",
     ]
     for container in containers.values():
         assert container["essential"] is True
@@ -323,12 +330,19 @@ def test_worker_containers_serve_no_http() -> None:
 def test_worker_supplies_every_required_config_field_in_both_containers() -> None:
     """Both processes call ``load_config()`` — the same required set as the
     HTTP app, validated at boot, exiting non-zero on a missing name. Same
-    reasoning as the services check above, per container."""
+    reasoning as the services check above, per container.
+
+    Only ``relay`` and ``search-worker`` read ``Config`` — ``intel-worker``
+    reads its own ``IntelConfig`` instead (see
+    ``test_intel_worker_supplies_every_required_intel_field``), so it is
+    excluded here rather than failing on every name ``Config`` never declared.
+    """
     required = {
         name.upper() for name, field in Config.model_fields.items() if field.is_required()
     }
-    for name, container in _worker_containers().items():
-        missing = required - _container_supplied_names(container)
+    containers = _worker_containers()
+    for name in ("relay", "search-worker"):
+        missing = required - _container_supplied_names(containers[name])
         assert missing == set(), (
             f"{WORKER_TASK.name} container {name!r} omits required config:"
             f" {sorted(missing)}. The container will exit non-zero at boot."
@@ -351,9 +365,14 @@ def test_worker_runs_live_providers_under_the_production_gates() -> None:
     constructs Hive AND Google; which of them runs is ``providers.enabled``'s
     job, the hot-reloadable kill switch. The API task stays development+stub:
     it builds no adapters and spends nothing.
+
+    ``intel-worker`` is excluded: it reads no ``SEARCH_PROVIDER`` or
+    ``AWS_REGION`` at all (its own gates are
+    ``test_intel_worker_runs_under_the_production_gate``).
     """
-    for name, container in _worker_containers().items():
-        env = {entry["name"]: entry["value"] for entry in container["environment"]}
+    containers = _worker_containers()
+    for name in ("relay", "search-worker"):
+        env = {entry["name"]: entry["value"] for entry in containers[name]["environment"]}
         assert env["ENVIRONMENT"] == "production", f"{name} loses the boot gates"
         assert env["SEARCH_PROVIDER"] == "hive", f"{name} would search nothing, silently"
         assert env["LOG_LEVEL"] != "debug", f"{name} would refuse to boot"
@@ -362,11 +381,16 @@ def test_worker_runs_live_providers_under_the_production_gates() -> None:
 
 def test_worker_sets_no_variable_config_does_not_read() -> None:
     """Same reverse-direction check as the services task: a name Config does
-    not read is accepted in silence by ``extra='ignore'``."""
+    not read is accepted in silence by ``extra='ignore'``.
+
+    Excludes ``intel-worker``, which is checked against ``IntelConfig``
+    instead by ``test_intel_worker_sets_nothing_intel_config_does_not_read``.
+    """
     known = {name.upper() for name in Config.model_fields}
     inert_by_design = {"ENROLMENT_QUALITY_FILTER"}
-    for name, container in _worker_containers().items():
-        unread = _container_supplied_names(container) - known - inert_by_design
+    containers = _worker_containers()
+    for name in ("relay", "search-worker"):
+        unread = _container_supplied_names(containers[name]) - known - inert_by_design
         assert unread == set(), (
             f"{WORKER_TASK.name} container {name!r} sets variables this service"
             f" does not read: {sorted(unread)}."
@@ -470,3 +494,45 @@ def test_fetcher_serves_8083() -> None:
     instance — 8081 is `services`, so it must not collide with it."""
     fetcher = _load(FETCHER_TASK)["containerDefinitions"][0]
     assert "8083" in " ".join(fetcher["command"])
+
+
+def test_intel_worker_supplies_every_required_intel_field() -> None:
+    required = {n.upper() for n, f in IntelConfig.model_fields.items() if f.is_required()}
+    required -= {"DATABASE_URL"}  # composed from the five DB_* secrets, never environment
+    container = _worker_containers()["intel-worker"]
+    assert required - _container_supplied_names(container) == set()
+
+
+def test_intel_worker_sets_nothing_intel_config_does_not_read() -> None:
+    known = {n.upper() for n in IntelConfig.model_fields}
+    container = _worker_containers()["intel-worker"]
+    assert _container_supplied_names(container) - known == set()
+
+
+def test_intel_worker_runs_under_the_production_gate() -> None:
+    env = {e["name"]: e["value"] for e in _worker_containers()["intel-worker"]["environment"]}
+    assert env["ENVIRONMENT"] == "production" and env["INTEL_MODEL_PROVIDER"] == "claude"
+    assert env["LOG_LEVEL"] != "debug"
+
+
+def test_no_container_carries_a_database_url_in_environment() -> None:
+    # If this fails on a task that ALREADY carried DATABASE_URL before this change,
+    # that is a pre-existing DSN leak: stop and report it to the owner — never
+    # weaken the test to make it pass.
+    for path in (SERVICES_TASK, WORKER_TASK, CONFIRM_TASK, MIGRATE_TASK):
+        for c in _load(path)["containerDefinitions"]:
+            names = {e["name"].upper() for e in c.get("environment", [])}
+            assert "DATABASE_URL" not in names, (
+                f"{path.name}:{c['name']} leaks a DSN into environment"
+            )
+
+
+def test_the_task_role_grants_the_claude_platform_invoke_actions_scoped_to_the_workspace() -> None:
+    statements = [s for s in _statements(TASK_ROLE) if s.get("Sid") == "ClaudePlatformInvoke"]
+    assert len(statements) == 1
+    actions = statements[0]["Action"]
+    actions = [actions] if isinstance(actions, str) else actions
+    assert actions and all(a.lower().startswith("aws-external-anthropic:") for a in actions)
+    resources = statements[0]["Resource"]
+    resource_list = resources if isinstance(resources, list) else [resources]
+    assert resources != "*" and "*" not in resource_list
