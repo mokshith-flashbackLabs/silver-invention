@@ -110,6 +110,7 @@ class EvidenceStore(Protocol):
     ) -> UUID | None: ...
     async def snapshot_for(self, source_id: UUID) -> SnapshotRecord | None: ...
     async def seen_url_hashes(self, source_id: UUID, hashes: Sequence[str]) -> set[str]: ...
+    async def recorded_in_run(self, run_id: UUID, hashes: Sequence[str]) -> bool: ...
     async def recently_fetched(self, hashes: Sequence[str], *, days: int) -> set[str]: ...
     async def record_check(self, source_id: UUID, *, ok: bool, status: str) -> None: ...
     async def disable_source(
@@ -225,16 +226,44 @@ class PostgresEvidenceStore:
         return SnapshotRecord(**row) if row is not None else None
 
     async def seen_url_hashes(self, source_id: UUID, hashes: Sequence[str]) -> set[str]:
+        """Which of ``hashes`` already has a document among THIS source's documents
+        (a feed's "no unseen items" gate, spec §4.3), with no time window. Matches
+        EITHER ``url_hash`` or ``document_url_hash``: a feed item's link that
+        redirects is recorded under its final URL, and matching only that column
+        would re-fetch and re-bill the item on every check (the 0038 ruling D1)."""
         hash_list = list(hashes)
         if not hash_list:
             return set()
         async with self._pool.connection() as conn:
             cur = await conn.execute(
-                "SELECT url_hash FROM intel_documents WHERE source_id = %s AND url_hash = ANY(%s)",
-                (source_id, hash_list),
+                """SELECT url_hash FROM intel_documents
+                    WHERE source_id = %(source_id)s AND url_hash = ANY(%(hashes)s)
+                   UNION
+                   SELECT document_url_hash FROM intel_documents
+                    WHERE source_id = %(source_id)s AND document_url_hash = ANY(%(hashes)s)""",
+                {"source_id": source_id, "hashes": hash_list},
             )
             rows = await cur.fetchall()
         return {r[0] for r in rows}
+
+    async def recorded_in_run(self, run_id: UUID, hashes: Sequence[str]) -> bool:
+        """Whether this run already recorded a document under any of ``hashes``
+        (EITHER column). The pipeline asks before every metered call, so a reclaimed
+        run never pays twice for a unit its first attempt already consumed --
+        ``record_unit``'s ``ON CONFLICT`` only stops the second WRITE, after the
+        second call has been billed."""
+        hash_list = list(hashes)
+        if not hash_list:
+            return False
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                """SELECT 1 FROM intel_documents
+                    WHERE run_id = %(run_id)s
+                      AND (url_hash = ANY(%(hashes)s) OR document_url_hash = ANY(%(hashes)s))
+                    LIMIT 1""",
+                {"run_id": run_id, "hashes": hash_list},
+            )
+            return await cur.fetchone() is not None
 
     async def recently_fetched(self, hashes: Sequence[str], *, days: int) -> set[str]:
         """Which of ``hashes`` was fetched within the last ``days`` days, matching

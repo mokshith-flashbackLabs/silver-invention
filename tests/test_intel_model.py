@@ -23,7 +23,7 @@ from imageshield.intel.config import IntelConfig
 from imageshield.intel.model import ClaudeIntelModel, ModelUnavailable
 from imageshield.intel.pricing import UnknownModelPrice, Usage, cost_of
 from imageshield.intel.prompts import extraction_request
-from imageshield.intel.schemas import ExtractionOutput
+from imageshield.intel.schemas import DiscoveryCandidate, DiscoveryOutput, ExtractionOutput
 from imageshield.intel.stub import StubIntelModel
 from tests.test_intel_config import BASE
 
@@ -208,3 +208,51 @@ async def test_the_stub_proposes_nothing_and_says_so() -> None:
     call = await StubIntelModel().extract("s", "u")
     assert call.outcome == "ok" and call.output is not None and call.output.signals == []
     assert call.answered_by == "stub" and call.cost_usd == Decimal("0")
+
+
+def _paused(**usage: int) -> SimpleNamespace:
+    block = SimpleNamespace(
+        type="server_tool_use", id="srvtoolu_1", name="web_search", input={"query": "q"}
+    )
+    return SimpleNamespace(
+        model="claude-sonnet-5", stop_reason="pause_turn", usage=_usage(**usage), content=[block]
+    )
+
+
+async def test_discover_resumes_a_pause_turn_with_the_first_user_turn_and_the_paused_content(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """spec §4.4: a web-search ``pause_turn`` is driven to completion inside
+    discover(). The resume resends the ORIGINAL user turn plus the paused assistant
+    turn verbatim (``call.content``), and usage accumulates across both calls, so
+    what metering records is the whole search, not its last leg."""
+    paused = _paused(i=100, o=10, ws=1)
+    output = DiscoveryOutput(candidates=[DiscoveryCandidate(url="https://n.example/a", reason="r")])
+    final = SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(i=200, o=20, ws=2),
+        content=[_text_block(output.model_dump_json())],
+    )
+    model, fake = _model([paused, final], clean_env)
+    call = await model.discover("sys", "find things")
+    assert call.outcome == "ok" and call.output == output and call.pause_turns == 1
+    first, second = fake.calls
+    assert first["messages"] == [{"role": "user", "content": "find things"}]
+    assert second["messages"] == [
+        {"role": "user", "content": "find things"},
+        {"role": "assistant", "content": paused.content},
+    ]
+    assert second["tools"] == first["tools"] and second["system"] == "sys"
+    assert call.usage == Usage(300, 30, 0, 0, 3)
+    assert call.cost_usd == cost_of("claude-sonnet-5", Usage(300, 30, 0, 0, 3))
+
+
+async def test_discover_stops_resuming_at_the_call_cap(clean_env: pytest.MonkeyPatch) -> None:
+    """A search that never stops pausing ends -- it does not loop forever. It
+    comes back unparseable (a pause carries no text block), a neutral verdict."""
+    clean_env.setenv("INTEL_MAX_CALLS_PER_RUN", "2")
+    model, fake = _model([_paused() for _ in range(5)], clean_env)
+    call = await model.discover("sys", "find things")
+    assert call.pause_turns == 2 and len(fake.calls) == 3
+    assert call.outcome == "unparseable" and call.output is None

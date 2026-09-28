@@ -522,3 +522,44 @@ async def banded_infringements(calibration_store: Any) -> BandedFixture:
                 {},
             )
     return BandedFixture(calibration_store, calibration_store._pool)
+
+
+# ── Likeness intel: the pipeline and worker DB fixtures (tasks 10-11) ───────
+#
+# Here rather than in test_intel_pipeline.py so the worker's tests can take them
+# as parameters without importing a test module (ruff F811). The fakes they are
+# used with live in tests/intel_fakes.py.
+
+
+@pytest.fixture
+def intel_db(throwaway_db: str) -> str:
+    """A freshly migrated database with ``claude_intel`` ENABLED under a budget:
+    0038 ships it disabled with a NULL budget, which refuses every run
+    (``budget_unset``), so a pipeline test needs both set to reach the model."""
+    down_result = run_migrate(throwaway_db, "down", "--all")
+    assert down_result.returncode == 0, down_result.stderr
+    up_result = run_migrate(throwaway_db, "up")
+    assert up_result.returncode == 0, up_result.stderr
+    import psycopg
+
+    with psycopg.connect(throwaway_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE providers SET enabled = true, daily_budget_usd = 50,"
+            " cost_per_call_usd = 0.5 WHERE provider_id = 'claude_intel'"
+        )
+    return throwaway_db
+
+
+@pytest.fixture
+async def intel_pool(intel_db: str) -> AsyncIterator[Any]:
+    """A pool over ``intel_db`` with ``tests.intel_fakes.VOCABULARY`` loaded (one
+    active tag, ``instagram``, and one retired, ``myspace``)."""
+    from tests.intel_fakes import seed_vocabulary
+
+    pool = make_async_pool(intel_db, min_size=1, max_size=3)
+    await pool.open()
+    try:
+        await seed_vocabulary(pool)
+        yield pool
+    finally:
+        await pool.close()
