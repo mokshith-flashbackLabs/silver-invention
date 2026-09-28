@@ -11,8 +11,8 @@ requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Flashback Labs" }]
 # Mirrors the Flashback agent service scaffold (AgentMeeMaw/pyproject.toml)
-# minus its LLM/ML stack: no openai/anthropic/voyageai/numpy/hdbscan/scipy/
-# pgvector/redis. None are needed here (CLAUDE.md §2, §10).
+# minus its LLM/ML stack: no openai/voyageai/numpy/hdbscan/scipy/pgvector/
+# redis. None are needed here (CLAUDE.md §2, §10). anthropic arrives in Task 8.
 #
 # Pillow IS here, and it is the one exception to that list. Attribution has to
 # search for a SPECIFIC face in a photo, and SearchFacesByImage "first detects
@@ -41,6 +41,8 @@ dependencies = [
     # /v1/admin/* proxy); kept as a main dependency rather than moved to
     # dev-only because devtools is not a separate install target.
     "python-multipart>=0.0.9",
+    # intel/publisher.py ONLY -- registrable domains for #50, bundled list, no network.
+    "publicsuffixlist==1.0.2.20260925",
 ]
 
 [project.optional-dependencies]
@@ -84,6 +86,12 @@ packages = ["imageshield"]
 # liveness/provider.py — wrap the calls they need behind hand-written
 # Protocols instead).
 module = ["boto3", "botocore", "botocore.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# publicsuffixlist ships no py.typed / inline types and no third-party stub
+# package exists for it (intel/publisher.py is its one importer).
+module = ["publicsuffixlist", "publicsuffixlist.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
