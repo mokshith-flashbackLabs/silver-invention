@@ -99,12 +99,12 @@ With the backend's `api` (512), `worker` (512) and `image-worker` (1024) that is
 3835 MiB a `t4g.medium` offers — 347 MiB free, still enough for the 256 MiB migration task to run
 alongside everything else, but only 91 MiB to spare. If any of these grow, redo this arithmetic.
 
-**`ANTHROPIC_AWS_WORKSPACE_ID` on `intel-worker` and the `ClaudePlatformInvoke` statement's
-`Resource` in `infra/ecs/policies/services-task-role.json` both carry the placeholder
-`pending-step0`** until the owner runs `devtools/intel_access_probe.py` against the real
-workspaces (see `docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`) — replace
-the placeholder with the confirmed workspace id in both files before flipping `INTEL_ENABLED` to
-`true` anywhere.
+**`ANTHROPIC_AWS_WORKSPACE_ID` on `intel-worker` carries the real prod workspace id**
+(`wrkspc_01Pyst4AzZBMDsgNsTHDSWuV`, us-east-1), confirmed by `devtools/intel_access_probe.py` on
+2026-09-29 (see `docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`). The prod
+role's `ClaudePlatformInvoke` grant lives in the backend repo
+(`deploy/iam/prod/services-task-role.json` on `release/prod-sep15`) and must be APPLIED before
+`INTEL_ENABLED` is flipped to `true` here, together with a `claude_intel` daily budget.
 
 ## Order
 
