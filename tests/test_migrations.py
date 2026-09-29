@@ -1992,7 +1992,7 @@ def test_0037_penalty_is_optional_and_reversible(throwaway_db: str) -> None:
             )
 
     # Down past 0037 with a NULL row present: it must not fail, and the row is backfilled.
-    back = run_migrate(throwaway_db, "down", "--steps", "1")
+    back = run_migrate(throwaway_db, "down", "--steps", _steps_back_to("0036"))
     assert back.returncode == 0, back.stderr
     with psycopg.connect(throwaway_db, autocommit=True) as conn:
         assert (
