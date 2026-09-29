@@ -64,7 +64,7 @@
       "Sid": "ClaudePlatformInvoke",
       "Effect": "Allow",
       "Action": ["aws-external-anthropic:CreateInference"],
-      "Resource": "arn:aws:aws-external-anthropic:ap-south-1:225989356895:workspace/pending-step0"
+      "Resource": "arn:aws:aws-external-anthropic:ap-south-1:225989356895:workspace/wrkspc_01A2ZZVekB1bXvKKimttBQGF"
     }
   ]
 }

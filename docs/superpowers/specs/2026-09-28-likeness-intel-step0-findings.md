@@ -15,11 +15,11 @@ owner runs `devtools/intel_access_probe.py` later, against both workspaces, and 
 
 | Fact | Dev | Prod |
 |---|---|---|
-| `INTEL_ANTHROPIC_REGION` | `ap-south-1` — **not yet confirmed by the probe**; per AWS docs, Claude Platform on AWS workspaces bind to "All AWS commercial regions" (see Region availability below), so `ap-south-1` is an eligible binding, but only the probe confirms it actually serves `claude-sonnet-5` and `claude-opus-5-5` | `us-east-1` — same caveat; `us-east-1` is an eligible binding per docs, unconfirmed by probe |
-| `ANTHROPIC_AWS_WORKSPACE_ID` | `PENDING — owner runs devtools/intel_access_probe.py` | `PENDING — owner runs devtools/intel_access_probe.py` |
-| `claude-sonnet-5` served | `PENDING — owner runs devtools/intel_access_probe.py` | `PENDING — owner runs devtools/intel_access_probe.py` |
-| `claude-opus-5-5` served | `PENDING — owner runs devtools/intel_access_probe.py` | `PENDING — owner runs devtools/intel_access_probe.py` |
-| web search works | `PENDING — owner runs devtools/intel_access_probe.py` | `PENDING — owner runs devtools/intel_access_probe.py` |
+| `INTEL_ANTHROPIC_REGION` | `ap-south-1` — **confirmed by the probe 2026-09-29** (both models and web search answered). Responses report `inference_geo: "global"`: the workspace binds to ap-south-1 but inference is not pinned there — acceptable because intel sends only public web documents, never person data (INVARIANTS #48) | `us-east-1` — same caveat; `us-east-1` is an eligible binding per docs, unconfirmed by probe |
+| `ANTHROPIC_AWS_WORKSPACE_ID` | `wrkspc_01A2ZZVekB1bXvKKimttBQGF` (account 225989356895, created 2026-09-29)  | `PENDING — owner runs devtools/intel_access_probe.py` |
+| `claude-sonnet-5` served | **yes** — probed 2026-09-29, `answered_by: claude-sonnet-5`, `end_turn`  | `PENDING — owner runs devtools/intel_access_probe.py` |
+| `claude-opus-5-5` served | **yes** — probed 2026-09-29, `answered_by: claude-opus-5-5`, `end_turn`  | `PENDING — owner runs devtools/intel_access_probe.py` |
+| web search works | **yes** — probed 2026-09-29, `server_tool_use.web_search_requests: 1`  | `PENDING — owner runs devtools/intel_access_probe.py` |
 
 **Stop condition from the brief still applies and is unresolved by this task**: "Stop here if no
 region serves both models, and tell the owner" — that determination requires Step 3, which this
@@ -75,6 +75,23 @@ now says explicitly that it stays committed until the owner has run it and this 
 
 No probe execution occurred in this session. This is the one row in the interfaces list that
 only the owner, with real credentials and real workspace ids, can produce.
+
+## Step 3 (dev) — RUN 2026-09-29
+
+The owner created the dev workspace (`wrkspc_01A2ZZVekB1bXvKKimttBQGF`, ap-south-1, account
+225989356895) and the probe ran with the operator's local credentials
+(`arn:aws:iam::225989356895:user/mokshith_dev`):
+
+- `claude-sonnet-5` → `answered_by: claude-sonnet-5`, `stop_reason: end_turn`, 16 in / 4 out tokens
+- `claude-opus-5-5` → `answered_by: claude-opus-5-5`, `stop_reason: end_turn`, 18 in / 4 out tokens
+- web search (sonnet-5, `web_search_20260209`, `max_uses: 1`) → `end_turn`,
+  `web_search_requests: 1`, 26 195 in / 290 out tokens — about $0.07 all told
+- every response carries `inference_geo: "global"` and `service_tier: "standard"`
+
+The dev `pending-step0` placeholders were replaced with the workspace id in
+`infra/ecs/imageshield-dev-services-worker.json` and `infra/ecs/policies/services-task-role.json`;
+dev `INTEL_ENABLED` stays `false` until the owner's daily budget lands. The prod probe
+(us-east-1) has not run; the prod task definition keeps `pending-step0`.
 
 ## Step 4 — IAM actions, ARN shape, and prices (official sources, fetched and quoted)
 
