@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import selectors
 import sys
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -31,6 +31,37 @@ from imageshield.search.store import PostgresSearchStore
 from imageshield.types import ProviderId, UserRef
 from tests.db import ensure_subject, run_migrate
 from tests.db import throwaway_db as throwaway_db  # re-exported for fixture discovery
+
+
+@pytest.fixture(autouse=True)
+def _retract_tag_only_threats(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Migration 0042's down REFUSES while an active or draft threat event is scoped by tags
+    alone (spec §3.7), and every DB fixture in this suite starts with ``migrate down --all`` on
+    the one session-scoped database. A test that left such an event behind would fail the NEXT
+    test's fixture, far from the cause. Retracting after each database test is what an operator
+    does before a real down. It never runs for a test that did not touch the database."""
+    db = (
+        request.getfixturevalue("throwaway_db")
+        if "throwaway_db" in request.fixturenames
+        else None
+    )
+    yield
+    if db is None:
+        return
+    import psycopg
+
+    with psycopg.connect(db, autocommit=True) as conn:
+        has_tags = conn.execute(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name = 'threat_events' AND column_name = 'tags'"
+        ).fetchone()
+        if has_tags:
+            conn.execute(
+                "UPDATE threat_events SET status = 'retracted'"
+                " WHERE cardinality(tags) > 0 AND NOT is_global"
+                " AND cardinality(domains) = 0 AND status IN ('active', 'draft')"
+            )
+
 
 if sys.platform == "win32":
     # psycopg's async I/O cannot run on Windows' default Proactor event loop

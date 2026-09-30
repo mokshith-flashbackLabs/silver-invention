@@ -1,4 +1,4 @@
-"""The expected shape of the nine `svc` contract views.
+"""The expected shape of the ten `svc` contract views.
 
 This is the ONE place outside migration 0016 that names `svc.v_person_*`, which
 is what the deploy checklist's `grep svc.v_person_` check relies on.
@@ -16,7 +16,7 @@ caught.
 
 **Three things are checked, not one.** The relations exist *as views*, their
 columns are present and correctly typed, and `imageshield_proxy_ro` still holds
-SELECT on all nine. The grant is half the contract and it is the half whose
+SELECT on all ten. The grant is half the contract and it is the half whose
 failure lands entirely on the other repo: revoke it and the views are still
 present, still correctly shaped, and unreadable by the only role that reads
 them. `relkind` matters for the same reason a name check is not enough —
@@ -41,10 +41,13 @@ database, and sent the operator to re-run a migration that had already succeeded
 there rather than what its own connection role happens to own.
 
 Types are ``format_type(atttypid, atttypmod)`` spellings — PostgreSQL's own
-canonical form, which is not always ``information_schema.data_type``'s. Of the 65
-columns here exactly one differs: ``v_person_hits.score`` reads as ``numeric``
-there and ``numeric(6,4)`` here. The narrower spelling is the better contract,
-because the precision is part of what the proxy deserialises.
+canonical form, which is not always ``information_schema.data_type``'s. Three
+columns differ today, all in the direction of ``format_type`` being the more
+precise: ``v_person_hits.score`` and ``face_match_score`` read as ``numeric``
+there and ``numeric(6,4)`` / ``numeric(5,2)`` here, and
+``v_active_scoped_events.tags`` (the contract's first array) reads as ``ARRAY``
+there and ``text[]`` here. The narrower spelling is the better contract, because
+the precision (or the element type) is part of what the proxy deserialises.
 """
 
 from __future__ import annotations
@@ -200,6 +203,21 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         "published_at": "timestamp with time zone",
         "updated_at": "timestamp with time zone",
     },
+    # ── 0042: likeness intel — events, never people (spec 2026-09-27 §3.7) ─────────
+    # REQUIRED here, where there is no optional tier; the backend reads it as optional,
+    # like v_articles. Step 4 re-creates it as a UNION and keeps these ten columns.
+    "v_active_scoped_events": {
+        "event_id": "uuid",
+        "direction": "text",
+        "kind": "text",
+        "title": "text",
+        "body": "text",
+        "magnitude": "smallint",
+        "tags": "text[]",
+        "is_global": "boolean",
+        "starts_at": "timestamp with time zone",
+        "ends_at": "timestamp with time zone",
+    },
 }
 
 # LEFT JOIN to pg_attribute so a relation whose columns have all been dropped
@@ -293,7 +311,7 @@ async def check_svc_contract(
         problems.append(
             f"missing_grant_role: {proxy_role} does not exist — migration 0016"
             " creates it and 0017 grants the proxy's login roles membership;"
-            " without it the nine views below are readable by nobody"
+            " without it the ten views below are readable by nobody"
         )
 
     for view, expected in EXPECTED_VIEWS.items():

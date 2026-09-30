@@ -39,6 +39,7 @@ VIEWS = (
     "v_person_recommendations",
     "v_person_threat_context",
     "v_articles",
+    "v_active_scoped_events",
 )
 
 # Derived, not transcribed: src/imageshield/http/svc_contract.py is the single
@@ -171,6 +172,19 @@ FROZEN_CONTRACT_COLUMNS: dict[str, set[str]] = {
         "sources",
         "published_at",
         "updated_at",
+    },
+    # 0042: likeness intel -- events, never people (spec 2026-09-27 §3.7).
+    "v_active_scoped_events": {
+        "event_id",
+        "direction",
+        "kind",
+        "title",
+        "body",
+        "magnitude",
+        "tags",
+        "is_global",
+        "starts_at",
+        "ends_at",
     },
 }
 
@@ -381,6 +395,7 @@ def test_the_proxy_role_reads_the_views_and_nothing_else(migrated_db: str) -> No
             "public.attributed_faces",
             "public.subjects",
             "public.articles",
+            "public.threat_events",
         ):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute(f"SELECT * FROM {table}")
@@ -1216,3 +1231,52 @@ def test_the_grant_target_never_becomes_an_identity(migrated_db: str) -> None:
         "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'imageshield_proxy_ro'",
     )
     assert row["rolcanlogin"] is False
+
+
+# ── v_active_scoped_events (0042) ────────────────────────────────────────────
+
+_SCOPED_THREAT = (
+    "INSERT INTO threat_events (kind, title, severity, tags, domains, is_global, starts_at,"
+    " expires_at, decay_days, status, created_by)"
+    " VALUES ('leak', %s, 4, %s::text[], %s::text[], false, now() + %s::interval,"
+    " now() + %s::interval, 7, %s, 'ops') RETURNING event_id"
+)
+
+
+def test_active_scoped_events_carries_live_tag_scoped_threats_and_no_person(
+    migrated_db: str,
+) -> None:
+    """spec §3.7: the view carries EVENTS, never people, and only threats scoped by tags;
+    domain and global threats keep reaching people through v_person_threat_context. A
+    retracted, expired or not-yet-started event is absent."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+
+        def add(
+            title: str,
+            tags: list[str],
+            *,
+            domains: list[str] | None = None,
+            status: str = "active",
+            starts: str = "0 days",
+            ends: str = "7 days",
+        ) -> UUID:
+            row = conn.execute(
+                _SCOPED_THREAT, (title, tags, domains or [], starts, ends, status)
+            ).fetchone()
+            assert row is not None
+            event_id: UUID = row[0]
+            return event_id
+
+        live = add("live", ["linkedin"])
+        add("both", ["linkedin"], domains=["evil.example"])
+        add("untagged", [], domains=["evil.example"])
+        add("retracted", ["linkedin"], status="retracted")
+        add("expired", ["linkedin"], starts="-8 days", ends="-1 days")
+        add("future", ["linkedin"], starts="1 days", ends="8 days")
+    rows = _rows(migrated_db, "SELECT * FROM svc.v_active_scoped_events ORDER BY title")
+    assert [r["title"] for r in rows] == ["both", "live"]
+    (row,) = [r for r in rows if r["event_id"] == live]
+    assert row["direction"] == "threat" and row["magnitude"] == 4
+    assert row["tags"] == ["linkedin"] and row["is_global"] is False and row["body"] == ""
+    assert row["ends_at"] > row["starts_at"]
+    assert not {"person_ref", "user_ref"} & set(row)

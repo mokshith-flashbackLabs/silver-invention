@@ -3,8 +3,10 @@ only place a role's real grants show (test_articles_store precedent)."""
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import psycopg
@@ -367,4 +369,145 @@ def test_0041_prices_the_proposal_models_worst_case(migrated_db: str) -> None:
     assert down.returncode == 0, down.stderr
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         assert conn.execute(query).fetchone() == (Decimal("0.25"),)
+    assert run_migrate(migrated_db, "up").returncode == 0
+
+
+_OLD_RELEVANCE = "CHECKis_globalORcardinalitydomains>0"
+_NEW_RELEVANCE = "CHECKis_globalORcardinalitydomains>0ORcardinalitytags>0"
+
+_THREAT = (
+    "INSERT INTO threat_events (kind, title, severity, tags, domains, is_global,"
+    " expires_at, decay_days, status, created_by, proposal_id)"
+    " VALUES ('leak', 't', 3, %s::text[], %s::text[], %s, now() + interval '7 days', 7,"
+    " %s, 'op', %s) RETURNING event_id"
+)
+
+_THREAT_PROPOSAL = (
+    "INSERT INTO intel_proposals (kind, status, target, suggested, rationale, model_id,"
+    " prompt_version) VALUES ('threat_event', 'pending', '{\"tags\": [\"x\"]}', '{}', 'r',"
+    " 'm', 'p') RETURNING proposal_id"
+)
+
+
+def _relevance_checks(conn: psycopg.Connection[Any]) -> dict[str, bool]:
+    """Every CHECK on threat_events: normalised definition -> convalidated. Whitespace,
+    parentheses and a NOT VALID suffix are removed, exactly as 0042's DO blocks compare."""
+    rows = conn.execute(
+        "SELECT pg_get_constraintdef(oid), convalidated FROM pg_constraint"
+        " WHERE conrelid = 'threat_events'::regclass AND contype = 'c'"
+    ).fetchall()
+    return {re.sub(r"[\s()]", "", d.removesuffix(" NOT VALID")): v for d, v in rows}
+
+
+def test_0042_threat_events_carry_tags_and_an_optional_proposal(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        (event_id,) = conn.execute(  # type: ignore[misc]
+            _THREAT, (["linkedin"], [], False, "active", None)
+        ).fetchone()
+        assert conn.execute(
+            "SELECT tags, proposal_id FROM threat_events WHERE event_id = %s", (event_id,)
+        ).fetchone() == (["linkedin"], None)
+        for tags in (["LinkedIn"], ["x", "x"]):  # the shape every intel tags column checks
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(_THREAT, (tags, [], False, "active", None))
+        with pytest.raises(psycopg.errors.CheckViolation):  # matches nothing at all
+            conn.execute(_THREAT, ([], [], False, "active", None))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute(_THREAT, (["x"], [], False, "active", uuid4()))
+        checks = _relevance_checks(conn)
+        assert _OLD_RELEVANCE not in checks and checks[_NEW_RELEVANCE] is True
+
+
+def test_0042_one_event_per_proposal(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        (pid,) = conn.execute(_THREAT_PROPOSAL).fetchone()  # type: ignore[misc]
+        conn.execute(_THREAT, (["x"], [], False, "active", pid))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(_THREAT, (["x"], [], False, "active", pid))
+
+
+def test_0042_intel_rw_reads_and_inserts_threat_events_and_nothing_more(migrated_db: str) -> None:
+    """Approving a threat proposal inserts the event in the decision's own transaction (spec
+    §3.7). Asserted under SET ROLE: a superuser run hides a missing grant (the 0035 trap)."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        (pid,) = conn.execute(_THREAT_PROPOSAL).fetchone()  # type: ignore[misc]
+        conn.execute("SET ROLE intel_rw")
+        conn.execute(_THREAT, (["x"], [], False, "active", pid))
+        assert conn.execute(
+            "SELECT count(*) FROM threat_events WHERE proposal_id = %s", (pid,)
+        ).fetchone() == (1,)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("UPDATE threat_events SET title = 'x'")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM threat_events")
+        conn.execute("RESET ROLE")
+
+
+def test_0042_down_refuses_a_live_tag_only_threat_then_restores_the_old_check_not_valid(
+    migrated_db: str,
+) -> None:
+    """spec §3.7's down leg, then Review Focus 2: an up over the row that down grandfathered."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        (tag_only,) = conn.execute(  # type: ignore[misc]
+            _THREAT, (["linkedin"], [], False, "active", None)
+        ).fetchone()
+        # Scoped by a domain as well: the old CHECK holds it, so it never blocks the down.
+        conn.execute(_THREAT, (["linkedin"], ["evil.example"], False, "active", None))
+    steps = _steps_through("0042_")
+    refused = run_migrate(migrated_db, "down", "--steps", steps)
+    assert refused.returncode != 0 and "retract" in refused.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(  # nothing was reverted
+            "SELECT 1 FROM pg_views WHERE viewname = 'v_active_scoped_events'"
+        ).fetchone() == (1,)
+        conn.execute(
+            "UPDATE threat_events SET status = 'retracted' WHERE event_id = %s", (tag_only,)
+        )
+    down = run_migrate(migrated_db, "down", "--steps", steps)
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert _relevance_checks(conn)[_OLD_RELEVANCE] is False  # restored NOT VALID
+        assert conn.execute(
+            "SELECT status FROM threat_events WHERE event_id = %s", (tag_only,)
+        ).fetchone() == ("retracted",)
+        assert (
+            conn.execute(
+                "SELECT 1 FROM pg_views WHERE viewname = 'v_active_scoped_events'"
+            ).fetchone()
+            is None
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):  # new rows are held to it
+            conn.execute(
+                "INSERT INTO threat_events (kind, title, severity, expires_at, decay_days,"
+                " created_by) VALUES ('leak', 't', 3, now() + interval '1 day', 1, 'op')"
+            )
+    up = run_migrate(migrated_db, "up")
+    assert up.returncode == 0, up.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        checks = _relevance_checks(conn)
+        assert _OLD_RELEVANCE not in checks
+        assert checks[_NEW_RELEVANCE] is False  # the grandfathered row keeps it unvalidated
+
+
+def test_0042_down_all_survives_a_retracted_tag_only_threat(migrated_db: str) -> None:
+    """A retracted tag-only event must not break a FULL down. NOT VALID skips existing rows,
+    not a later UPDATE of one: 0037's down runs ``UPDATE threat_events SET penalty = 0.01
+    WHERE penalty IS NULL``, Postgres re-checks the CHECK 0042's down restores, and every event
+    written since 0037 has no penalty. Without the UPDATE in 0042's down this failed the NEXT
+    database test's fixture, far from its cause."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(_THREAT, (["linkedin"], [], False, "retracted", None))
+    down = run_migrate(migrated_db, "down", "--all")
+    assert down.returncode == 0, down.stderr
+    assert run_migrate(migrated_db, "up").returncode == 0
+
+    # The same row one generation later: 0042's own down grandfathered it, a re-up kept it
+    # (unvalidated), and the full down must still get past 0037.
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(_THREAT, (["linkedin"], [], False, "retracted", None))
+    steps = _steps_through("0042_")
+    assert run_migrate(migrated_db, "down", "--steps", steps).returncode == 0
+    assert run_migrate(migrated_db, "up").returncode == 0
+    down = run_migrate(migrated_db, "down", "--all")
+    assert down.returncode == 0, down.stderr
     assert run_migrate(migrated_db, "up").returncode == 0
