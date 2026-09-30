@@ -37,6 +37,7 @@ from imageshield.fetcher.config import FetcherConfig, load_fetcher_config
 from imageshield.fetcher.extract import UnsupportedDocument, to_text
 from imageshield.fetcher.fetch import FetchRefused, fetch_image, fetch_page, fetch_text
 from imageshield.fetcher.render import render_preview
+from imageshield.fetcher.robots import USER_AGENT, RobotsCache, robots_allows
 from imageshield.recheck.ssrf import Resolver
 
 log = structlog.get_logger("imageshield.fetcher")
@@ -91,6 +92,10 @@ _FETCH_REFUSED_STATUS: dict[str, int] = {
     # the URL the caller supplied) left https.
     "unsupported_type": 400,
     "not_https": 400,
+    # /v1/text with respect_robots (spec §4.10): the site's robots.txt refuses the path, or could
+    # not be read at all (RFC 9309 reads that as a complete disallow).
+    "robots_disallowed": 403,
+    "robots_unreachable": 502,
 }
 
 
@@ -111,6 +116,13 @@ class _RequestModel(BaseModel):
 
 class FetchRequest(_RequestModel):
     url: str
+
+
+class TextRequest(_RequestModel):
+    url: str
+    # Source validation asks for robots.txt to be honoured (spec §4.10). Scheduled checks, discovery
+    # and pasted URLs do not ask, and /v1/fetch and /v1/page never read robots.txt.
+    respect_robots: bool = False
 
 
 class _BBoxRequest(_RequestModel):
@@ -231,9 +243,32 @@ async def page(
     return {"html": fetched.html}
 
 
+async def _require_robots(
+    request: Request,
+    client: httpx.AsyncClient,
+    url: str,
+    cfg: FetcherConfig,
+    resolver: Resolver | None,
+) -> None:
+    cache: RobotsCache | None = getattr(request.app.state, "robots_cache", None)
+    if cache is None:
+        cache = RobotsCache()
+        request.app.state.robots_cache = cache
+    allowed = await robots_allows(
+        client,
+        url,
+        cache=cache,
+        timeout_seconds=cfg.intel_text_timeout_seconds,
+        max_redirects=cfg.fetch_max_redirects,
+        resolver=resolver,
+    )
+    if not allowed:
+        raise FetchRefused("robots_disallowed", "robots.txt disallows this path")
+
+
 @router.post("/text")
 async def text(
-    body: FetchRequest,
+    body: TextRequest,
     request: Request,
     client: httpx.AsyncClient = Depends(get_http_client),
     resolver: Resolver | None = Depends(get_resolver),
@@ -247,6 +282,9 @@ async def text(
     output can end up quoted as evidence rather than rendered for one request.
     The bytes and the decoded text both live only for this request
     (INVARIANTS #9); nothing here writes to disk, a column, or a log.
+
+    ``respect_robots`` (source validation, spec §4.10) checks the origin's robots.txt
+    first, and the final URL's after a redirect (``fetcher/robots.py``).
     """
     if urlsplit(body.url).scheme != "https":
         raise FetcherError(400, "not_https", "intel fetches https only")
@@ -255,6 +293,9 @@ async def text(
     )
     async with gate:
         try:
+            if body.respect_robots:
+                # Before the page is fetched: a disallowed path is never requested.
+                await _require_robots(request, client, body.url, cfg, resolver)
             fetched = await fetch_text(
                 client,
                 body.url,
@@ -263,6 +304,11 @@ async def text(
                 max_redirects=cfg.fetch_max_redirects,
                 resolver=resolver,
             )
+            if body.respect_robots and fetched.final_url != body.url:
+                # A redirect lands on a URL nobody asked about: another path on this origin (the
+                # cached rules answer, no second read), or another origin with its own robots.txt.
+                # Its text is never returned when they disallow us.
+                await _require_robots(request, client, fetched.final_url, cfg, resolver)
         except FetchRefused as exc:
             raise _fetch_refused_to_error(exc) from exc
     try:
@@ -327,12 +373,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.http_client = httpx.AsyncClient(
             follow_redirects=False,
             limits=httpx.Limits(max_connections=8),
-            headers={"User-Agent": "ImageShield-Fetcher/1.0"},
+            headers={"User-Agent": USER_AGENT},
         )
     if getattr(app.state, "resolver", None) is None:
         app.state.resolver = None
     if getattr(app.state, "intel_text_gate", None) is None:
         app.state.intel_text_gate = asyncio.Semaphore(app.state.config.intel_text_max_concurrency)
+    if getattr(app.state, "robots_cache", None) is None:
+        app.state.robots_cache = RobotsCache()
     log.info("fetcher.started")
     try:
         yield

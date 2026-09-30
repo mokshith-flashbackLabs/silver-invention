@@ -15,7 +15,10 @@ worker never fetches a third-party URL itself, so this is the only egress path
 for a page's terms, a news feed or a JSON API response, and it is the one
 caller that also refuses a plain-``http`` hop (``https_only=True``) — the
 other two render or relay bytes for one request, while this one's output can
-end up quoted as evidence.
+end up quoted as evidence. ``fetch_robots`` (2026-09-30) is a fourth thin wrapper over
+the same guard, for source validation's robots.txt check (spec §4.10,
+``fetcher/robots.py``): https on every hop, any content type, and the upstream's
+status kept on ``FetchRefused.status`` so a 4xx can be told from a 5xx.
 
 Mirrors ``recheck/client.py``'s hand-rolled redirect walk (same
 ``_REDIRECT_STATUSES``, same "guard, then request, on every hop" shape) for
@@ -70,12 +73,15 @@ class FetchRefused(Exception):
 
     ``code`` is the stable machine string ``fetcher/app.py`` maps to an HTTP
     status; ``detail`` is free text for logs, never echoed to a caller as-is.
+    ``status`` is the upstream's HTTP status when it answered with a non-2xx, so a
+    robots.txt read can tell a 4xx from a 5xx; it is None for every other refusal.
     """
 
-    def __init__(self, code: str, detail: str) -> None:
+    def __init__(self, code: str, detail: str, *, status: int | None = None) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+        self.status = status
 
 
 class FetchedImage(BaseModel):
@@ -161,7 +167,11 @@ async def _get_guarded(
                 continue
 
             if not 200 <= response.status_code < 300:
-                raise FetchRefused("unfetchable", f"upstream returned {response.status_code}")
+                raise FetchRefused(
+                    "unfetchable",
+                    f"upstream returned {response.status_code}",
+                    status=response.status_code,
+                )
 
             # Checked BEFORE the body is read: no point paying for bytes we
             # are about to refuse, and a hostile response can make the body
@@ -322,3 +332,57 @@ async def fetch_text(
         raw=body[:max_bytes],
         truncated=truncated,
     )
+
+
+# RFC 9309 asks a crawler to parse at least 500 KiB of a robots.txt; past this the head is used.
+ROBOTS_MAX_BYTES = 512 * 1024
+
+
+class RobotsFile(BaseModel):
+    """A robots.txt, in memory for one request. ``text`` is None when there is no usable file (a
+    4xx other than 429, or a redirect chain past the cap): RFC 9309 then allows everything."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str | None
+
+
+async def fetch_robots(
+    client: httpx.AsyncClient,
+    origin: str,
+    *,
+    timeout_seconds: float,
+    max_redirects: int,
+    resolver: Resolver | None = None,
+) -> RobotsFile:
+    """GET ``{origin}/robots.txt`` for source validation (spec §4.10), under the same guard as
+    every fetch here: the SSRF check and https on every hop, a byte cap applied while reading.
+
+    Any content type is accepted: a robots.txt served as ``text/html`` still parses, to nothing if
+    it is a page. A 5xx, a 429, a timeout or a transport error is "unreachable", which RFC 9309
+    reads as a complete disallow: it raises ``robots_unreachable``. A private address raises
+    ``refused_private_address`` unchanged, because the page shares the host."""
+    try:
+        _content_type, body, _final_url = await _get_guarded(
+            client,
+            f"{origin}/robots.txt",
+            accept_prefixes=("",),
+            reject_code="unsupported_type",
+            truncate_over_cap=True,
+            max_bytes=ROBOTS_MAX_BYTES,
+            timeout_seconds=timeout_seconds,
+            max_redirects=max_redirects,
+            resolver=resolver,
+            https_only=True,
+        )
+    except FetchRefused as exc:
+        if exc.code == "refused_private_address":
+            raise
+        unavailable = exc.status is not None and 400 <= exc.status < 500 and exc.status != 429
+        if exc.code == "redirect_limit" or unavailable:
+            return RobotsFile(text=None)
+        raise FetchRefused("robots_unreachable", exc.detail) from exc
+    # utf-8-sig: a byte-order mark (Windows editors write one) is not part of the first line.
+    # Left in, ``User-agent`` would read as an unknown field and a blanket ``Disallow: /`` would
+    # bind nobody.
+    return RobotsFile(text=body.decode("utf-8-sig", errors="replace"))

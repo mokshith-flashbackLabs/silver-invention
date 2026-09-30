@@ -59,14 +59,29 @@ VOCABULARY: dict[str, Any] = {
 
 class FakeFetcher:
     """``pages`` maps a requested URL to what ``/v1/text`` would answer; anything
-    unlisted is ``unfetchable``. ``fetched`` is every URL requested, in order."""
+    unlisted is ``unfetchable``. ``fetched`` is every URL requested, in order. A URL in
+    ``robots_disallowed`` answers ``robots_disallowed`` when the call asks for
+    ``respect_robots`` (source validation); ``robots_checked`` records every such ask."""
 
-    def __init__(self, pages: dict[str, TextFetch | FetchFailure]) -> None:
+    def __init__(
+        self,
+        pages: dict[str, TextFetch | FetchFailure],
+        *,
+        robots_disallowed: frozenset[str] | set[str] = frozenset(),
+    ) -> None:
         self.pages = pages
         self.fetched: list[str] = []
+        self.robots_disallowed = frozenset(robots_disallowed)
+        self.robots_checked: list[str] = []
 
-    async def fetch_text(self, url: str) -> TextFetch | FetchFailure:
+    async def fetch_text(
+        self, url: str, *, respect_robots: bool = False
+    ) -> TextFetch | FetchFailure:
         self.fetched.append(url)
+        if respect_robots:
+            self.robots_checked.append(url)
+            if url in self.robots_disallowed:
+                return FetchFailure(code="robots_disallowed")
         return self.pages.get(url, FetchFailure(code="unfetchable"))
 
 
