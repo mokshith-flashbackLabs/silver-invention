@@ -29,7 +29,7 @@ HIVE = ProviderId("hive")
 GOOGLE = ProviderId("google")
 STUB = ProviderId("stub")  # migration 0019: seeded DISABLED, but still a row
 REKOGNITION_CONFIRM = ProviderId("rekognition_confirm")  # migration 0021: classifier row
-CLAUDE_INTEL = ProviderId("claude_intel")  # migration 0038: likeness-intel, seeded DISABLED
+CLAUDE_INTEL = ProviderId("claude_intel")  # migration 0039: likeness-intel, seeded DISABLED
 
 
 @pytest.fixture

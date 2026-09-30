@@ -1,7 +1,7 @@
 """The model's structured output shapes (spec §4.4).
 
 Every model here is ``extra='forbid'``, and ``category``/``direction`` are the exact
-Literals migration 0038's CHECKs enforce on ``intel_signals`` -- a model that let a
+Literals migration 0039's CHECKs enforce on ``intel_signals`` -- a model that let a
 fourth value through would round-trip fine here and fail only on INSERT, several
 modules away from the mistake.
 """

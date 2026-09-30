@@ -969,7 +969,7 @@ same five steps):
    2026-09-29, both** — `docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
 2. Substitute `pending-step0` with the confirmed workspace id in all three files above (**done**), redeploy
    the task definition and reapply the IAM policy.
-3. Set `claude_intel.daily_budget_usd` by migration (**done: 0039, USD 50 a day in every environment**).
+3. Set `claude_intel.daily_budget_usd` by migration (**done: 0040, USD 50 a day in every environment**).
 4. `POST /v1/admin/providers/claude_intel/enable`.
 5. Only then set `INTEL_ENABLED=true` on the container and redeploy — **and in production, only
    after the backend repo's own prod IAM grant for this surface is applied there.** The services-side

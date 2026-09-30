@@ -1478,7 +1478,7 @@ def test_seeded_providers_are_exactly_hive_google_stub_rekognition_confirm_and_c
     # Was "...exactly hive, google, and stub" until 0021 added a fourth row;
     # renamed along with the assertion rather than left to describe a set the
     # migrated schema no longer produces.
-    # 0038 added claude_intel (likeness intel, kind llm, disabled).
+    # 0039 added claude_intel (likeness intel, kind llm, disabled).
     run_migrate(throwaway_db, "down", "--all")
     run_migrate(throwaway_db, "up")
     with psycopg.connect(throwaway_db, autocommit=True) as conn:

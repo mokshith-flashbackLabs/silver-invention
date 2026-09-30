@@ -44,7 +44,7 @@ class ProviderRuntime(BaseModel):
     breaker_consecutive_failures: int
     breaker_cooldown_seconds: int | None
     # 'image_search' | 'face_search' | 'classifier' | 'llm' (providers.kind,
-    # TEXT since migration 0038). No default: a model-call provider silently
+    # TEXT since migration 0039). No default: a model-call provider silently
     # defaulting to 'image_search' is exactly the mislabelling this guards
     # against.
     kind: str

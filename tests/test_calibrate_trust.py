@@ -38,7 +38,7 @@ async def test_trust_requires_a_reason(sound_eval_set) -> None:
 
 
 async def test_trust_refuses_an_llm_provider(calibration_store) -> None:
-    """claude_intel (kind 'llm', migration 0038's seed row) has no score_kind/
+    """claude_intel (kind 'llm', migration 0039's seed row) has no score_kind/
     score_domain/band concept for this pipeline to calibrate.
     providers_llm_never_calibrated is the database's backstop; this asserts
     the application refuses with a clear message rather than leaning on a

@@ -1,4 +1,4 @@
--- Reverses 0038. Rolling the feature back throws away its metering ON PURPOSE —
+-- Reverses 0039. Rolling the feature back throws away its metering ON PURPOSE —
 -- downs run in dev and CI (0004's down carries the same note).
 
 DO $$

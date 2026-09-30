@@ -285,7 +285,7 @@ at least a budget outage will not also relax everyone's cadence.
 ### `claude_intel` (likeness intel, kind `llm`)
 
 - **A NULL `daily_budget_usd` refuses every run** (`budget_unset`) — the
-  inverse of Hive, on purpose. Migration 0038 seeds `claude_intel` disabled
+  inverse of Hive, on purpose. Migration 0039 seeds `claude_intel` disabled
   with a NULL budget, so the worker runs and does nothing billable until an
   operator sets a cap.
 - Turning it on, per environment, **in this order — none of the later steps do
@@ -307,7 +307,7 @@ at least a budget outage will not also relax everyone's cadence.
   3. **Set the owner's daily cap by migration** (prod DB access is read-only):
      `UPDATE providers SET daily_budget_usd = <n> WHERE provider_id =
      'claude_intel';`. The number is a finance decision, not an engineering
-     one — nothing here picks it for you. **Done: migration 0039 sets USD 50 a
+     one — nothing here picks it for you. **Done: migration 0040 sets USD 50 a
      day in every environment** (owner, 2026-09-30). It is a safety ceiling
      against a runaway, not a spending plan; a different number is a new
      migration.

@@ -722,7 +722,7 @@ envelope's `extra`.
 
 **Not built yet (step 2), so there is nothing to relay for it today:** `GET`/`POST /proposals*`,
 `POST /proposals/{id}/decision`, `POST /proposals/applied`, `POST /weight-suggestions`,
-`GET /protection-events*`. The `intel_proposals` table exists in the schema (migration 0038) but
+`GET /protection-events*`. The `intel_proposals` table exists in the schema (migration 0039) but
 nothing writes or decides a row in it yet — step 1 only registers sources and produces signals.
 Nothing on this surface moves anyone's score.
 

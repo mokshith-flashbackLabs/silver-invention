@@ -4,7 +4,7 @@ intel_sources, intel_runs and intel_vocabulary.
 Every write that is an operator act writes its ``audit_log`` row in the same transaction
 (``actor_type 'operator'``, ``metadata.operator``); a machine write (the vocabulary push)
 uses ``actor_type 'service'``. Nothing here ever ``DELETE``s — ``intel_rw`` holds no
-DELETE grant on any of these tables (migration 0038), so a bug that tried would fail at
+DELETE grant on any of these tables (migration 0039), so a bug that tried would fail at
 the database rather than merely at review.
 """
 

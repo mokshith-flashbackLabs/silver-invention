@@ -115,16 +115,18 @@ a transaction, so each per-file `conn.transaction()` is a savepoint. A value add
 used by a later pending file in the same run. So **`providers.kind` stops being an enum**. The only code that names
 the type is the `CUSTOM_TYPES` pin in `tests/test_migrations.py:47`.
 
+> **Renumbered 2026-09-30.** origin/main took services 0038 (global threats reach late subjects) before this branch merged, so the intel schema is **0039** and the claude_intel budget **0040**. The step-3 and step-4 migrations take "the next free number at the time"; references to 0038 elsewhere in this spec mean 0039.
+
 | File | Ships in | Contents |
 |---|---|---|
-| `0038_likeness_intel` | step 1 | `providers.kind` becomes TEXT (below); the `claude_intel` row; `provider_calls.intel_run_id`; every `intel_*` table in §3.1–§3.6 and §3.8; the `intel_rw` role and its grants. **No threat or protection change, and no view.** |
-| `0039_intel_scoped_threats` | step 3 | `threat_events.tags` and `proposal_id`; the relevance-CHECK swap; `intel_rw` grants on `threat_events`; `svc.v_active_scoped_events` with **the threat half only**, and its grant. |
-| `0040_intel_protection_events` | step 4 | `protection_events`; the view dropped and re-created as the UNION, **with its grant re-issued in the same file**, because `DROP VIEW` loses it. |
+| `0039_likeness_intel` | step 1 | `providers.kind` becomes TEXT (below); the `claude_intel` row; `provider_calls.intel_run_id`; every `intel_*` table in §3.1–§3.6 and §3.8; the `intel_rw` role and its grants. **No threat or protection change, and no view.** |
+| `<next free>_intel_scoped_threats` | step 3 | `threat_events.tags` and `proposal_id`; the relevance-CHECK swap; `intel_rw` grants on `threat_events`; `svc.v_active_scoped_events` with **the threat half only**, and its grant. |
+| `<next free>_intel_protection_events` | step 4 | `protection_events`; the view dropped and re-created as the UNION, **with its grant re-issued in the same file**, because `DROP VIEW` loses it. |
 
-If steps 3 and 4 ship together, 0039 carries both halves and 0040 does not exist. The four hand-maintained contract
+If steps 3 and 4 ship together, the first of the two numbers carries both halves and the second is not used. The four hand-maintained contract
 pins change in the file that creates the view (§3.7).
 
-**0038 converts `providers.kind`:** `ALTER COLUMN kind TYPE text USING kind::text`, then `CHECK (kind IN
+**0039 converts `providers.kind`:** `ALTER COLUMN kind TYPE text USING kind::text`, then `CHECK (kind IN
 ('image_search','face_search','classifier','llm'))`, then `DROP TYPE provider_kind`. The `CUSTOM_TYPES` pin loses
 `provider_kind`. The down leg recreates the type and casts back. It runs after the down has removed the only `llm`
 row (§3.9), and after it has dropped the calibration CHECK that names `'llm'`.
@@ -356,7 +358,7 @@ the backend.
 
 ### 3.7 Events and the contract view
 
-**`threat_events` gains two columns (0039):**
+**`threat_events` gains two columns (step 3's migration):**
 - `tags text[] NOT NULL DEFAULT '{}'`, with the well-formed CHECK (§3.1);
 - `proposal_id uuid NULL UNIQUE REFERENCES intel_proposals`. It is nullable because operators can still create events
   by hand.
@@ -367,7 +369,7 @@ definition in `pg_constraint` inside a DO block**, never assumed to be `threat_e
 changes the same way, and `tags` is added to the create model (shape-validated), the store Protocol, the route kwargs
 and `ThreatEventItem`.
 
-**0039's down leg, in order:**
+**Step 3's down leg, in order:**
 1. **Guard.** RAISE if any row has `cardinality(tags) > 0 AND NOT is_global AND cardinality(domains) = 0 AND status IN
    ('active','draft')`. It checks `status` alone, not `expires_at`: the code never writes `expired`, so an event past
    its expiry still reads `active`, and refusing on it is the conservative choice.
@@ -379,7 +381,7 @@ and `ThreatEventItem`.
 transaction. **The follow-up migration that drops the dormant score tables must re-home the `threat_events` and
 `threat_event_matches` grants off `score_rw` before revoking it.** That note goes into `SCHEMA.md`'s open-items list.
 
-**`protection_events`, new (0040):**
+**`protection_events`, new (step 4's migration):**
 
 | Column | Notes |
 |---|---|
@@ -400,7 +402,7 @@ transaction. **The follow-up migration that drops the dormant score tables must 
   The approval body must carry `applies_regardless_of_location: true` (§4.7), and that attestation lands in the audit
   row.
 
-**The contract view, `svc.v_active_scoped_events`** (0039 creates the threat half; 0040 re-creates it as below):
+**The contract view, `svc.v_active_scoped_events`** (step 3's migration creates the threat half; step 4's re-creates it as below):
 
 ```sql
 CREATE VIEW svc.v_active_scoped_events AS
@@ -463,7 +465,7 @@ weights release, bootstrap), **after every tag or mapping change**, once at work
 - The backend **re-validates every proposal against the live model when applying it.** Stale is refused there, not
   trusted here.
 
-### 3.9 Cost-control rows (0038)
+### 3.9 Cost-control rows (0039)
 
 - **The provider row.** `providers` gains `claude_intel`:
   - kind `llm`, `enabled = false`, `score_version = 'n/a'`;
@@ -480,7 +482,7 @@ weights release, bootstrap), **after every tag or mapping change**, once at work
   pin (`test_migrations.py:1475`) gains `claude_intel`.
 - **Grants.** `intel_rw` gets `SELECT, UPDATE` on `providers` and `SELECT, INSERT, UPDATE` on `provider_calls` and
   `provider_spend`.
-- **0038's down deletes the provider's metering on purpose**, following 0004's down and carrying its comment: downs run
+- **0039's down deletes the provider's metering on purpose**, following 0004's down and carrying its comment: downs run
   in dev and CI, and rolling the feature back throws its metering away deliberately. In order:
   1. drop the calibration CHECK;
   2. drop the `num_nonnulls` CHECK and `provider_calls.intel_run_id`;
@@ -962,7 +964,7 @@ search providers do (#37). The chain's step 1 (subject eligibility) does not app
   - The worker refuses to run (`outcome: budget_unset`, transient) while `claude_intel.daily_budget_usd` is NULL. For
     search providers a missing budget means no cap, and that rule is **inverted for `llm`** deliberately: a model that
     can loop on web search must not run uncapped.
-  - **Turning intel on is two ordered steps**, per environment, after 0038: (a) a migration sets the owner's
+  - **Turning intel on is two ordered steps**, per environment, after 0039: (a) a migration sets the owner's
     `daily_budget_usd`; (b) an operator enables it through `/v1/admin/providers/claude_intel/enable`, which the backend
     relays at developer tier. The health read already shows the budget, so the operator can confirm it before
     enabling.
@@ -1138,10 +1140,10 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 | Step | Services | Backend | Moves a score? |
 |---|---|---|---|
 | **0** | Region and access check (`devtools/`, throwaway): Claude Platform on AWS in `ap-south-1` and `us-east-1`, with both models; the exact IAM action names; the web search price; the worst-case `cost_per_call_usd`; a 1.x `anthropic[aws]` pin; a `publicsuffixlist` pin | — | no |
-| **1** | 0038. `/v1/text`, `intel-worker`, sources, runs, extraction and verification, discovery, cost gating, the reads, sources/documents/signal-retract writes, vocabulary, §1 amendments. Then the budget migration and enable, per environment. | 0062. The read relays and sources routes; **the exposure-tag registry, the option-to-tag map, their routes and `scripts/intel-seed-tags.ts`**; draft rename maps, the publish tag carry and the rename log; gate-applied answer storage plus its one-time cleanup; the vocabulary push (after each release or tag/mapping change, on worker boot, hourly); the `model.ts` `dynamic.protection` block may ship here | no |
+| **1** | 0039. `/v1/text`, `intel-worker`, sources, runs, extraction and verification, discovery, cost gating, the reads, sources/documents/signal-retract writes, vocabulary, §1 amendments. Then the budget migration and enable, per environment. | 0062. The read relays and sources routes; **the exposure-tag registry, the option-to-tag map, their routes and `scripts/intel-seed-tags.ts`**; draft rename maps, the publish tag carry and the rename log; gate-applied answer storage plus its one-time cleanup; the vocabulary push (after each release or tag/mapping change, on worker boot, hourly); the `model.ts` `dynamic.protection` block may ship here | no |
 | **2** | Proposal generation (`weight_change`, `weight_suggestion`, `coverage_gap`), decisions, `applied`, the §4.9 reconcile | 0063; `model.ts` on api **and** worker; the bootstrap release; weights publish and decision routes; provenance; two-pass attribution; the drift sweep's **version leg only**; stale-draft rule | **yes**, first |
-| **3** | 0039. `threat_event` generation and decisions, `gap_regenerate`; hand-created `tags` | Tag matching, the merged reader, `breakdown.scope`, the reach counterfactual and `scope_update`, the drift sweep's **map leg** (one expected catch-up pass), the threat half of event decisions, `threatEventBody.tags` | yes |
-| **4** | 0040. `protection_event` generation, decisions and renewal | 0064; the protection engine term, snapshot column, copy, protection routes, the drift sweep's event leg | yes |
+| **3** | step-3 migration. `threat_event` generation and decisions, `gap_regenerate`; hand-created `tags` | Tag matching, the merged reader, `breakdown.scope`, the reach counterfactual and `scope_update`, the drift sweep's **map leg** (one expected catch-up pass), the threat half of event decisions, `threatEventBody.tags` | yes |
+| **4** | step-4 migration. `protection_event` generation, decisions and renewal | 0064; the protection engine term, snapshot column, copy, protection routes, the drift sweep's event leg | yes |
 | **5** | Weight suggestions, **starting with per-question source proposal, validation (including `robots.txt`) and the first read**; sources pausing with their tags (§4.10) | The quiz editor's suggest action **with its source picker**; provenance from drafts; citation coverage | no |
 | **6** | Coverage-gap proposals surfaced | Their display | no |
 
@@ -1149,8 +1151,8 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 - **Services always deploy first** on the way up: every new body field is refused (`422`) by an older services build.
 - **Step 1:** in production, `INTEL_ENABLED` stays false until the prod IAM grant is applied.
 - **Step 2:** backend `model.ts` reaches api and worker before the bootstrap release runs. The bootstrap may carry
-  `dynamic.protection`; it is inert until 0040.
-- **Step 4:** services 0040, then backend 0064 and the engine term together, before any protection approval.
+  `dynamic.protection`; it is inert until step 4's migration.
+- **Step 4:** services step-4 migration, then backend 0064 and the engine term together, before any protection approval.
 
 **If `ap-south-1` is not served**, dev sets `INTEL_ANTHROPIC_REGION` to the nearest served region, and this spec's
 data note records that intel's public-document text is processed there. **Nothing proceeds on an unverified region.**
@@ -1227,8 +1229,8 @@ data note records that intel's public-document text is processed there. **Nothin
 
 **Schema**
 - Every intel table's grant, and the `content_urls` column grant, works as `app_services`.
-- 0038's down succeeds after `claude_intel` has call and spend rows.
-- 0039's down refuses while a tag-only threat is active, and succeeds (restoring the old CHECK `NOT VALID`) once
+- 0039's down succeeds after `claude_intel` has call and spend rows.
+- Step 3's down refuses while a tag-only threat is active, and succeeds (restoring the old CHECK `NOT VALID`) once
   it is retracted.
 
 **Contract**

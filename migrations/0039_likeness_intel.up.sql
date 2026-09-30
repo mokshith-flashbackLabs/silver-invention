@@ -5,7 +5,7 @@
 -- used by the INSERT below in the same file — a just-added enum label is not visible
 -- to the transaction that added it. Only tests/test_migrations.py named the type.
 --
--- No threat or protection change and no svc view here: those are 0039/0040 (steps 3/4).
+-- No threat or protection change and no svc view here: those are the next free numbers (steps 3/4).
 
 ALTER TABLE providers ALTER COLUMN kind TYPE text USING kind::text;
 ALTER TABLE providers ADD CONSTRAINT providers_kind_valid

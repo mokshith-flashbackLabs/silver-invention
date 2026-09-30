@@ -1,7 +1,7 @@
 """Row and value types shared by the intel store, the pipeline and the admin routes.
 
 Frozen pydantic models over ``intel_sources`` / ``intel_runs`` / ``intel_vocabulary`` rows
-(migration 0038, task-3-report.md's column list is binding for the store's SQL) plus one
+(migration 0039, task-3-report.md's column list is binding for the store's SQL) plus one
 non-persisted read (``SpendToday``, a projection over ``providers``/``provider_spend``).
 """
 

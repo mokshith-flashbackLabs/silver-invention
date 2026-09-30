@@ -722,7 +722,7 @@ async def trust_provider(
 
     An ``llm`` provider (``claude_intel``) can never be trusted: it has no
     ``score_kind``/``score_domain``/band concept for this pipeline to
-    calibrate — ``providers_llm_never_calibrated`` (migration 0038) is the
+    calibrate — ``providers_llm_never_calibrated`` (migration 0039) is the
     database's backstop, but refusing here gives the operator a clear message
     instead of a bare ``IntegrityError``.
     """

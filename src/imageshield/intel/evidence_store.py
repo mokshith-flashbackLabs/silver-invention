@@ -9,7 +9,7 @@ raising or double-writing signals: the caller sees ``None`` and moves on.
 Every write here that is an operator act audits in the same transaction
 (``actor_type 'operator'``); ``record_check``/``disable_source`` are the worker's own
 bookkeeping and audit as ``actor_type 'service'``. Nothing here ``DELETE``s —
-``intel_rw`` holds no DELETE grant on any of these tables (migration 0038).
+``intel_rw`` holds no DELETE grant on any of these tables (migration 0039).
 """
 
 from __future__ import annotations
@@ -230,7 +230,7 @@ class PostgresEvidenceStore:
         (a feed's "no unseen items" gate, spec §4.3), with no time window. Matches
         EITHER ``url_hash`` or ``document_url_hash``: a feed item's link that
         redirects is recorded under its final URL, and matching only that column
-        would re-fetch and re-bill the item on every check (the 0038 ruling D1)."""
+        would re-fetch and re-bill the item on every check (the 0039 ruling D1)."""
         hash_list = list(hashes)
         if not hash_list:
             return set()

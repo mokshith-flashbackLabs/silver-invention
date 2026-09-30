@@ -502,7 +502,7 @@ before it is stored, so a signal can never cite something the model paraphrased 
 `AsyncAnthropicAWS`, one region and workspace, structured output, priced by the *requested* model
 id so an unpriced or drifting *answering* id can never leave a billed call unrecorded. It runs
 through the same provider gate, budget and circuit breaker every search provider uses (§3.6b) under
-a new kind, `llm`, and a new row, `claude_intel` (migration 0038) — see
+a new kind, `llm`, and a new row, `claude_intel` (migration 0039) — see
 `docs/OPERATIONS.md` §4 for the operational shape (`budget_unset`, `intel_stale`, and why
 `no_successful_calls_24h` does not apply to this kind).
 
@@ -516,7 +516,7 @@ release, never a human decision). Full route table, request bodies and error cod
 surface by the backend's `/v1/admin/*` operator proxy (§3.11) — no direct client of its own.
 
 **Specified, not built in this pass (step 2):** proposal generation and review
-(`intel_proposals`/`intel_proposal_signals` exist in the 0038 schema but nothing writes or decides
+(`intel_proposals`/`intel_proposal_signals` exist in the 0039 schema but nothing writes or decides
 them yet), quiz weight/tag suggestions, and protection events + renewal (§4.8 of the design spec).
 Nothing here moves a score — that is entirely step 2's, and step 1 ships with it inert.
 
@@ -548,7 +548,7 @@ places — both task definitions' `ANTHROPIC_AWS_WORKSPACE_ID` and the task role
 | Confirm-pipeline triage (severity, pHash, moderation labels) | **Services** | Postgres, on `infringements` (migration 0021 — §3.8). No image bytes; text and a 64-bit hash only |
 | Hostile-image fetch + live crop render | **Services** | Nothing persisted — the fetcher deployable (§3.7) holds no DB credentials at all |
 | Report reads for the UI | **Proxy** | Postgres (read-only, `svc` views — migrations 0016 + 0023) |
-| Likeness intel — sources, runs, documents, signals + excerpts, the vocabulary cache | **Services** | Postgres (migration 0038 — §3.12). No `user_ref` anywhere in this data; `intel_proposals`/`intel_proposal_signals` exist in the same migration but nothing writes them yet (step 2) |
+| Likeness intel — sources, runs, documents, signals + excerpts, the vocabulary cache | **Services** | Postgres (migration 0039 — §3.12). No `user_ref` anywhere in this data; `intel_proposals`/`intel_proposal_signals` exist in the same migration but nothing writes them yet (step 2) |
 | Pushing onto any queue | **Services** | SQS (via outbox) |
 
 Admin/operator reads and writes (threat events, review, provider health) own no
