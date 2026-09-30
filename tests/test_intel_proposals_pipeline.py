@@ -271,10 +271,7 @@ async def test_a_threat_on_unmapped_tags_is_written_and_waits_for_a_mapping(
     (row,) = await PostgresProposalStore(intel_pool).list_proposals(
         statuses=None, kinds=["threat_event"], cursor=None, limit=5
     )
-    # why_not reads "tags_unmapped" only once threat_event is decidable, which Task 7 ships
-    # (approvable.APPROVABLE_KINDS); until then it reads "not_decidable". What this run owes is a
-    # pending row that names the unmapped tag, and "not approvable" holds either way.
-    assert row["approvable"] is False
+    assert (row["approvable"], row["why_not"]) == (False, "tags_unmapped")
     assert row["unmapped_tags"] == ["linkedin"]
 
 
@@ -356,9 +353,7 @@ async def test_a_gap_regenerate_run_proposes_events_from_the_signals_it_names(
     (row,) = await PostgresProposalStore(intel_pool).list_proposals(
         statuses=None, kinds=["threat_event"], cursor=None, limit=5
     )
-    # Not asserted yet: row["approvable"] is True. That needs threat_event in APPROVABLE_KINDS,
-    # which Task 7 adds. The tag is mapped now, which is the whole point of a regeneration.
-    assert set(row["signal_ids"]) == set(signals) and row["unmapped_tags"] == []
+    assert set(row["signal_ids"]) == set(signals) and row["approvable"] is True
 
 
 async def test_a_regeneration_whose_evidence_was_retracted_makes_no_call(

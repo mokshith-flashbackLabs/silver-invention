@@ -82,7 +82,7 @@ def test_a_retracted_signal_does_not_count() -> None:
 
 def test_why_not_answers_in_the_spec_order() -> None:
     v = scoring()
-    # not_decidable first: step 2 approves weight changes only
+    # not_decidable first: step 3 approves weight changes and threat events only
     assert (
         why_not(_proposal(kind="coverage_gap", target={"subject": "Bumble"}), [], v)
         == "not_decidable"
@@ -91,9 +91,14 @@ def test_why_not_answers_in_the_spec_order() -> None:
         why_not(_proposal(kind="weight_suggestion", status="delivered"), [], v) == "not_decidable"
     )
     assert (
-        why_not(_proposal(kind="threat_event", target={"tags": ["linkedin"]}), [], v)
+        why_not(_proposal(kind="protection_event", target={"tags": ["instagram"]}), [], v)
         == "not_decidable"
-    )
+    )  # step 4's
+    threat = _proposal(kind="threat_event", target={"tags": ["linkedin"]})
+    assert why_not(threat, [], v) == "evidence_retracted"
+    assert why_not(threat, [_signal(trust="listed")], v) == "tags_unmapped"
+    mapped = _proposal(kind="threat_event", target={"tags": ["instagram", "linkedin"]})
+    assert why_not(mapped, [_signal(trust="listed")], v) is None  # partly mapped: approvable
     assert why_not(_proposal(), [], v) == "evidence_retracted"
     assert why_not(_proposal(), [_signal("a.example")], v) == "uncorroborated"
     assert why_not(_proposal(), [_signal("a.example"), _signal("b.example")], v) is None

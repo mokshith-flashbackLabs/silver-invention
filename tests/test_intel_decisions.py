@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -11,12 +13,22 @@ import psycopg
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.db.connection import make_async_pool
 from imageshield.intel.decisions import PostgresDecisionStore
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.proposal_models import Decided, DecisionRefused
 from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.publisher import publisher_domain
-from tests.intel_fakes import QUIZ_VOCABULARY, seed_proposal, seed_quiz_vocabulary, seed_signal
+from tests.intel_fakes import (
+    QUIZ_VOCABULARY,
+    THREAT_SUGGESTED,
+    mapped_document,
+    quiz_document,
+    seed_proposal,
+    seed_quiz_vocabulary,
+    seed_signal,
+    seed_threat_proposal,
+)
 
 
 async def _scalar(pool: AsyncConnectionPool, query: str, *params: Any) -> Any:
@@ -240,7 +252,6 @@ async def test_a_gap_is_dismissed_never_approved(intel_pool: AsyncConnectionPool
 @pytest.mark.parametrize(
     ("kind", "status", "target"),
     [
-        ("threat_event", "pending", {"tags": ["instagram"]}),
         ("protection_event", "pending", {"tags": ["instagram"], "is_global": False}),
         ("weight_suggestion", "delivered", {"question_key": "platforms", "options": []}),
     ],
@@ -354,3 +365,223 @@ async def test_the_shape_check_refuses_an_approved_change_without_decided(
                 " VALUES ('weight_change', 'approved', '{}', '{}', 'r', 'm', 'p', 'ann', now(),"
                 " 'ok')"
             )
+
+
+# -- threat events (step 3) ---------------------------------------------------
+
+
+async def _threat_approvable(pool: AsyncConnectionPool, **kw: Any) -> UUID:
+    sid = await seed_signal(pool, tags=("instagram",))  # listed: corroborated alone
+    return await seed_threat_proposal(pool, signal_ids=[sid], **kw)
+
+
+async def test_approving_a_threat_creates_the_event_from_decided_in_one_transaction(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _threat_approvable(intel_pool)
+    decided = await _decide(intel_pool, pid)
+    assert (decided.kind, decided.status) == ("threat_event", "applied")
+    assert decided.decided == {**THREAT_SUGGESTED, "tags": ["instagram"]}
+    assert decided.applied_ref is not None
+    event_id = UUID(decided.applied_ref)
+    async with intel_pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT kind, title, severity, tags, domains, is_global, status, created_by,"
+            " proposal_id, decay_days, expires_at - starts_at, body"
+            " FROM threat_events WHERE event_id = %s",
+            (event_id,),
+        )
+        row = await cur.fetchone()
+    assert row == (
+        "leak",
+        THREAT_SUGGESTED["title"],
+        3,
+        ["instagram"],
+        [],
+        False,
+        "active",
+        "ann",
+        pid,
+        30,
+        timedelta(days=30),
+        "",
+    )
+    assert await _scalar(
+        intel_pool,
+        "SELECT ARRAY[direction, magnitude::text] FROM svc.v_active_scoped_events"
+        " WHERE event_id = %s",
+        event_id,
+    ) == ["threat", "3"]
+    metadata = await _scalar(
+        intel_pool, "SELECT metadata FROM audit_log WHERE action = 'intel.proposal_decided'"
+    )
+    assert metadata["event_id"] == str(event_id) and metadata["operator"] == "ann"
+
+
+async def test_a_partial_edit_changes_only_what_it_names_and_keeps_the_proposals_tags(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The backend may send values without tags (its §6.3): the proposal's own tags stand."""
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _threat_approvable(intel_pool)
+    decided = await _decide(intel_pool, pid, values={"severity": 5, "title": "Edited title"})
+    assert decided.decided == {
+        **THREAT_SUGGESTED,
+        "severity": 5,
+        "title": "Edited title",
+        "tags": ["instagram"],
+    }
+    assert await _scalar(
+        intel_pool,
+        "SELECT ARRAY[title, severity::text] FROM threat_events WHERE proposal_id = %s",
+        pid,
+    ) == ["Edited title", "5"]
+
+
+async def test_an_out_of_bounds_threat_edit_is_refused_and_writes_no_event(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    for bad in (
+        {"severity": 6},
+        {"severity": 2.5},
+        {"severity": True},
+        {"expires_in_days": 91},
+        {"expires_in_days": 0},
+        {"kind": "tsunami"},
+        {"title": "   "},
+        {"tags": []},
+        {"tags": ["Instagram"]},
+        {"tags": ["instagram", "instagram"]},
+        {"body": "a threat carries no body"},
+        {"delta": 1},
+    ):
+        pid = await _threat_approvable(intel_pool)
+        assert await _refused(intel_pool, pid, values=bad) == "values_out_of_bounds", bad
+        assert (
+            await _scalar(
+                intel_pool, "SELECT status FROM intel_proposals WHERE proposal_id = %s", pid
+            )
+            == "pending"
+        )
+    assert await _scalar(intel_pool, "SELECT count(*) FROM threat_events") == 0
+
+
+async def test_adding_an_unregistered_or_retired_tag_is_refused_naming_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _threat_approvable(intel_pool)
+    with pytest.raises(DecisionRefused) as unknown:
+        await _decide(intel_pool, pid, values={"tags": ["instagram", "tiktok"]})
+    assert (unknown.value.code, unknown.value.slugs) == ("unknown_tag", ("tiktok",))
+    with pytest.raises(DecisionRefused) as retired:
+        await _decide(intel_pool, pid, values={"tags": ["instagram", "myspace"]})
+    assert (retired.value.code, retired.value.slugs) == ("tag_retired", ("myspace",))
+    assert await _scalar(intel_pool, "SELECT count(*) FROM threat_events") == 0
+
+
+async def test_a_proposal_whose_own_tag_was_retired_since_is_still_approvable(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec §10: retiring refuses NEW uses only. Retiring never unmaps an option, so the tag
+    stays mapped, and it is not 'added' when it is the proposal's own."""
+    doc = quiz_document()
+    doc["tags"][0]["retired"] = True  # instagram, still mapped to the Instagram option
+    await seed_quiz_vocabulary(intel_pool, document=doc)
+    first = await _threat_approvable(intel_pool)
+    decided = (await _decide(intel_pool, first)).decided
+    assert decided is not None and decided["tags"] == ["instagram"]
+    second = await _threat_approvable(intel_pool)
+    assert (await _decide(intel_pool, second, values={"tags": ["instagram"]})).status == "applied"
+
+
+async def test_an_all_unmapped_threat_waits_then_becomes_approvable_when_a_push_maps_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    sid = await seed_signal(intel_pool, tags=("linkedin",))
+    pid = await seed_threat_proposal(intel_pool, signal_ids=[sid], tags=("linkedin",))
+    store = PostgresProposalStore(intel_pool)
+    read = await store.get_proposal(pid)
+    assert read is not None and (read["approvable"], read["why_not"]) == (False, "tags_unmapped")
+    assert await _refused(intel_pool, pid) == "proposal_tags_unmapped"
+    await seed_quiz_vocabulary(
+        intel_pool, map_version=2, document=mapped_document("LinkedIn", "linkedin")
+    )
+    read = await store.get_proposal(pid)
+    assert read is not None and read["approvable"] is True
+    assert (await _decide(intel_pool, pid)).status == "applied"
+
+
+async def test_an_edit_that_leaves_only_unmapped_tags_is_refused(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Review Focus 3: an edit must not create an event that reaches nobody."""
+    await seed_quiz_vocabulary(intel_pool)
+    sid = await seed_signal(intel_pool, tags=("instagram", "linkedin"))
+    pid = await seed_threat_proposal(intel_pool, signal_ids=[sid], tags=("instagram", "linkedin"))
+    assert (
+        await _refused(intel_pool, pid, values={"tags": ["linkedin"]}) == "proposal_tags_unmapped"
+    )
+    assert await _scalar(intel_pool, "SELECT count(*) FROM threat_events") == 0
+
+
+async def test_two_simultaneous_threat_approvals_make_one_event(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _threat_approvable(intel_pool)
+    results = await asyncio.gather(
+        _decide(intel_pool, pid, operator="ann"),
+        _decide(intel_pool, pid, operator="bob"),
+        return_exceptions=True,
+    )
+    (refused,) = [r for r in results if isinstance(r, DecisionRefused)]
+    assert refused.code == "proposal_not_pending"
+    assert (
+        await _scalar(intel_pool, "SELECT count(*) FROM threat_events WHERE proposal_id = %s", pid)
+        == 1
+    )
+
+
+async def test_rejecting_a_threat_writes_no_event(intel_pool: AsyncConnectionPool) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _threat_approvable(intel_pool)
+    rejected = await _decide(intel_pool, pid, "rejected")
+    assert (rejected.status, rejected.applied_ref, rejected.decided) == ("rejected", None, None)
+    assert await _scalar(intel_pool, "SELECT count(*) FROM threat_events") == 0
+
+
+@pytest.fixture
+async def intel_rw_pool(intel_db: str) -> AsyncIterator[AsyncConnectionPool]:
+    """A pool whose sessions run AS ``intel_rw``. Every other test here connects as the
+    superuser, which hides a missing grant (the 0035 trap)."""
+    sep = "&" if "?" in intel_db else "?"
+    pool = make_async_pool(f"{intel_db}{sep}options=-c%20role%3Dintel_rw", min_size=1, max_size=2)
+    await pool.open()
+    try:
+        yield pool
+    finally:
+        await pool.close()
+
+
+async def test_a_threat_approval_needs_no_grant_intel_rw_lacks(
+    intel_pool: AsyncConnectionPool, intel_rw_pool: AsyncConnectionPool
+) -> None:
+    """The whole decision transaction -- the row lock, the reads, the event insert, the
+    proposal update and the audit row -- runs AS intel_rw, the role 0042 grants the insert to.
+    An edited expiry reaches the row, and the inert decay_days follows it (spec §4.5)."""
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _threat_approvable(intel_pool)
+    assert await _scalar(intel_rw_pool, "SELECT current_user") == "intel_rw"
+    decided = await _decide(intel_rw_pool, pid, values={"expires_in_days": 7})
+    assert decided.status == "applied" and decided.applied_ref is not None
+    async with intel_pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT proposal_id, decay_days, expires_at - starts_at FROM threat_events"
+            " WHERE event_id = %s",
+            (UUID(decided.applied_ref),),
+        )
+        assert await cur.fetchone() == (pid, 7, timedelta(days=7))

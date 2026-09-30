@@ -584,3 +584,18 @@ def test_only_the_decision_path_moves_a_proposal_to_approved() -> None:
         text = path.read_text(encoding="utf-8")
         for match in re.finditer(r"INSERT\s+INTO\s+intel_proposals\b", text, re.IGNORECASE):
             assert "'approved'" not in text[match.end() : match.end() + 600], path.name
+
+
+def test_only_the_threat_store_and_the_decision_path_insert_threat_events() -> None:
+    """PERMANENT. INVARIANTS #48 (step 3): an intel threat event exists only as a named
+    operator's approval, inserted from ``decided`` in the decision's own transaction. Verified
+    to fire by adding ``INSERT INTO threat_events`` to intel/pipeline.py."""
+    insert = re.compile(r"INSERT\s+INTO\s+threat_events\b", re.IGNORECASE)
+    hits = sorted(
+        {
+            p.relative_to(SRC).as_posix()
+            for p in _source_files()
+            if insert.search(p.read_text(encoding="utf-8"))
+        }
+    )
+    assert hits == ["imageshield/intel/decisions.py", "imageshield/threats/store.py"]

@@ -315,6 +315,8 @@ _REFUSAL_STATUS: dict[str, int] = {
     "proposal_tags_unmapped": 409,
     "proposal_cell_awaiting_publish": 409,
     "values_out_of_bounds": 422,
+    "unknown_tag": 422,
+    "tag_retired": 422,
 }
 
 
@@ -386,7 +388,11 @@ async def decide_proposal(
         )
     except DecisionRefused as refused:
         raise ServiceError(
-            _REFUSAL_STATUS[refused.code], refused.code, refused.message, retryable=False
+            _REFUSAL_STATUS[refused.code],
+            refused.code,
+            refused.message,
+            retryable=False,
+            extra={"slugs": list(refused.slugs)} if refused.slugs else None,
         ) from refused
     log.info(
         "intel.proposal_decided_via_admin",

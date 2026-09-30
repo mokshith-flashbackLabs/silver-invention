@@ -47,12 +47,16 @@ class FakeProposalStore:
 class FakeDecisionStore:
     def __init__(self) -> None:
         self.refuse: str | None = None
+        self.slugs: tuple[str, ...] = ()
+        self.result: Decided | None = None
         self.decisions: list[dict[str, Any]] = []
 
     async def decide(self, proposal_id: UUID, **kw: Any) -> Decided:
         self.decisions.append({"proposal_id": proposal_id, **kw})
         if self.refuse is not None:
-            raise DecisionRefused(self.refuse, "refused")  # type: ignore[arg-type]
+            raise DecisionRefused(self.refuse, "refused", slugs=self.slugs)  # type: ignore[arg-type]
+        if self.result is not None:
+            return self.result
         return Decided(
             proposal_id, "weight_change", kw["decision"], None, kw["values"] or {"delta": 1}
         )
@@ -150,6 +154,8 @@ def test_a_decision_answers_the_spec_body() -> None:
         ("proposal_tags_unmapped", 409),
         ("proposal_cell_awaiting_publish", 409),
         ("values_out_of_bounds", 422),
+        ("unknown_tag", 422),
+        ("tag_retired", 422),
     ],
 )
 def test_every_refusal_maps_to_its_status_by_name(code: str, status: int) -> None:
@@ -159,6 +165,35 @@ def test_every_refusal_maps_to_its_status_by_name(code: str, status: int) -> Non
         f"/v1/admin/intel/proposals/{uuid4()}/decision", headers=ADMIN, json=_decision()
     )
     assert r.status_code == status and r.json()["error"]["code"] == code
+
+
+def test_a_tag_refusal_names_its_slugs() -> None:
+    client, _, decisions = _client()
+    decisions.refuse, decisions.slugs = "unknown_tag", ("tiktok",)
+    r = client.post(
+        f"/v1/admin/intel/proposals/{uuid4()}/decision",
+        headers=ADMIN,
+        json=_decision(values={"tags": ["tiktok"]}),
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "unknown_tag"
+    assert r.json()["error"]["slugs"] == ["tiktok"]
+
+
+def test_a_threat_approval_answers_applied_with_the_event_id() -> None:
+    client, _, decisions = _client()
+    pid, event_id = uuid4(), uuid4()
+    decided = {"kind": "leak", "title": "t", "severity": 3, "expires_in_days": 30, "tags": ["x"]}
+    decisions.result = Decided(pid, "threat_event", "applied", str(event_id), decided)
+    r = client.post(f"/v1/admin/intel/proposals/{pid}/decision", headers=ADMIN, json=_decision())
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "proposal_id": str(pid),
+        "kind": "threat_event",
+        "status": "applied",
+        "applied_ref": str(event_id),
+        "decided": decided,
+    }
 
 
 @pytest.mark.parametrize(
