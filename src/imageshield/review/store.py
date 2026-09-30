@@ -256,7 +256,7 @@ _OPEN_HITS_SQL = """
 # as a range scan, and one that cannot be got subtly wrong.
 _LIST_HITS_SQL = """
     SELECT i.infringement_id, i.user_ref, cu.source_domain, i.page_url, i.image_url,
-           i.first_seen_at, i.status, i.confirm_state, i.severity,
+           i.first_seen_at, i.last_seen_at, i.status, i.confirm_state, i.severity,
            i.confirm_decided_by, i.confirm_decided_at, i.face_match_score,
            i.moderation_labels, i.duplicate_of,
            (
@@ -445,6 +445,7 @@ def _hit_row(row: tuple[Any, ...]) -> dict[str, Any]:
         page_url,
         image_url,
         first_seen_at,
+        last_seen_at,
         status,
         confirm_state,
         severity,
@@ -482,6 +483,7 @@ def _hit_row(row: tuple[Any, ...]) -> dict[str, Any]:
         "page_url": page_url,
         "image_url": image_url,
         "first_seen_at": first_seen_at,
+        "last_seen_at": last_seen_at,
         "status": status,
         "confirm_state": confirm_state,
         "severity": severity,

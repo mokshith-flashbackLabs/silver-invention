@@ -167,7 +167,8 @@ Query: `limit` (default 50, 1–200), `cursor`, `severity`, `confirm_state` (one
     "infringement_id": "uuid", "user_ref": "uuid",
     "source_domain": "example.com", "page_url": "https://...",
     "image_url": "https://... | null",        // TEXT EVIDENCE. Never rendered — rule 5.
-    "first_seen_at": "…", "status": "new",
+    "first_seen_at": "…", "last_seen_at": "…",   // last_seen_at: the last scan that found it again
+    "status": "new",
     "confirm_state": "machine_triaged", "severity": "explicit_unmatched | … | null",
     "confirm_decided_by": "subject | <operator> | auto:nsfw | null",
     "confirm_decided_at": "… | null",

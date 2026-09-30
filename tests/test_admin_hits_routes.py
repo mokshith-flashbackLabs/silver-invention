@@ -46,6 +46,7 @@ def _hit(**overrides: Any) -> dict[str, Any]:
         "page_url": "https://example.test/p",
         "image_url": "https://example.test/p.jpg",
         "first_seen_at": datetime(2026, 9, 14, 12, 0, tzinfo=UTC),
+        "last_seen_at": datetime(2026, 9, 14, 12, 0, tzinfo=UTC),
         "status": "new",
         "confirm_state": "machine_triaged",
         "severity": "explicit_unmatched",

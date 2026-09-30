@@ -376,3 +376,75 @@ async def test_event_retraction_removes_it_from_the_threat_context_view(
         (user_ref, event_id),
     )
     assert after["n"] == 0
+
+
+# ── a global event reaches people who enrol after it (0038) ────────────────
+
+
+async def test_a_global_event_reaches_a_subject_who_enrols_after_it(
+    migrated_db: str, store: PostgresThreatStore, pool: AsyncConnectionPool
+) -> None:
+    """The prod bug of 2026-09-29: "All users" was everyone enrolled at the
+    moment of creation, so a person enrolling later was matched to nothing and
+    carried no threat charge. The trigger on ``subjects`` closes it."""
+    early = _user()
+    await ensure_subject(pool, early)
+    event_id, matched = await _create(store, is_global=True)
+    assert set(matched) == {early}
+
+    late = _user()
+    await ensure_subject(pool, late)
+
+    match_row = _row(
+        migrated_db,
+        "SELECT matched_via FROM threat_event_matches WHERE event_id = %s AND user_ref = %s",
+        (event_id, late),
+    )
+    assert match_row["matched_via"] == "global"
+    context = _rows(
+        migrated_db,
+        "SELECT event_id FROM svc.v_person_threat_context WHERE person_ref = %s",
+        (late,),
+    )
+    assert [row["event_id"] for row in context] == [event_id]
+    # And the late subject is on the list a retraction hands back for recompute.
+    refs = await store.retract_event(event_id, operator="ops-team", reason="test")
+    assert refs is not None and late in refs
+
+
+async def test_a_late_subject_gets_no_domain_retracted_or_expired_event(
+    migrated_db: str, store: PostgresThreatStore, pool: AsyncConnectionPool
+) -> None:
+    await _create(store, domains=("evil.example",))
+    retracted, _ = await _create(store, is_global=True, title="retracted")
+    await store.retract_event(retracted, operator="ops-team", reason="test")
+    expired, _ = await _create(store, is_global=True, title="expired")
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE threat_events SET starts_at = now() - interval '2 days',"
+            " expires_at = now() - interval '1 minute' WHERE event_id = %s",
+            (expired,),
+        )
+
+    late = _user()
+    await ensure_subject(pool, late)
+
+    rows = _rows(
+        migrated_db, "SELECT event_id FROM threat_event_matches WHERE user_ref = %s", (late,)
+    )
+    assert rows == []
+
+
+async def test_a_re_upserted_subject_is_matched_once(
+    migrated_db: str, store: PostgresThreatStore, pool: AsyncConnectionPool
+) -> None:
+    event_id, _ = await _create(store, is_global=True)
+    late = _user()
+    await ensure_subject(pool, late)
+    await ensure_subject(pool, late)
+    rows = _rows(
+        migrated_db,
+        "SELECT user_ref FROM threat_event_matches WHERE event_id = %s AND user_ref = %s",
+        (event_id, late),
+    )
+    assert len(rows) == 1

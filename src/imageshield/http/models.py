@@ -824,6 +824,10 @@ class AdminHitItem(BaseModel):
     page_url: str
     image_url: str | None
     first_seen_at: datetime
+    # When a later scan last found this same hit (2026-09-29). A re-found URL
+    # is an UPDATE of this row, never a new one, so this is the only trace of
+    # it — the backend's "found again" line for a reviewer reads it.
+    last_seen_at: datetime
     status: str
     confirm_state: str
     severity: str | None

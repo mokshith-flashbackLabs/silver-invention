@@ -1066,6 +1066,34 @@ async def test_list_hits_carries_the_whole_reviewer_row(
     assert hit["seed_kind"] == "user_supplied"
 
 
+async def test_list_hits_carries_when_the_hit_was_last_found(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """A re-found hit is the SAME row (UNIQUE (user_ref, url_hash)), so the
+    only trace of a later scan finding it again is last_seen_at. The backend's
+    "found again" line reads nothing else (spec 2026-09-29), so it must reach
+    the feed exactly as stored."""
+    confirm_store, review_store = stores
+    _user_ref, infringement_id = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    first = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    again = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE infringements SET first_seen_at = %s, last_seen_at = %s"
+            " WHERE infringement_id = %s",
+            (first, again, infringement_id),
+        )
+
+    page = await review_store.list_hits(limit=10)
+
+    (hit,) = [h for h in page.hits if h["infringement_id"] == infringement_id]
+    assert hit["first_seen_at"] == first
+    assert hit["last_seen_at"] == again
+
+
 async def test_list_hits_never_shows_a_quarantined_hit_whatever_the_filters(
     migrated_db: str,
     stores: tuple[PostgresConfirmStore, PostgresReviewStore],
