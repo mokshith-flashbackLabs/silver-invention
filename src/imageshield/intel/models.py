@@ -21,7 +21,9 @@ class Source(BaseModel):
     """One ``intel_sources`` row (spec §3.2). ``source_url``/``url_hash``/``query_text``
     are jointly nullable: a ``policy_page``/``feed``/... source carries a URL, a
     ``search_query`` source carries ``query_text`` instead — the DB's own CHECKs enforce
-    which, this model only carries whatever the row has."""
+    which, this model only carries whatever the row has. ``origin`` is ``suggested`` when a
+    stage-1 source-proposal run proposed the source, else ``operator``; ``proposed_for`` is
+    ``{question_key, option}`` provenance, never used for matching (0043)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -42,6 +44,9 @@ class Source(BaseModel):
     disabled_reason: str | None
     created_by: str
     created_at: datetime
+    # Migration 0043 (spec §4.10). Defaults, so a row or a fake without them still reads.
+    origin: str = "operator"
+    proposed_for: dict[str, Any] | None = None
 
 
 class Run(BaseModel):

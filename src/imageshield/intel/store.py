@@ -29,10 +29,11 @@ log = structlog.get_logger("imageshield.intel")
 
 CLAUDE_INTEL = "claude_intel"
 
-_SOURCE_COLUMNS = """source_id, kind, source_url, url_hash, query_text, tags, check_every_hours,
+# Public: intel/question_store.py reads the same rows.
+SOURCE_COLUMNS = """source_id, kind, source_url, url_hash, query_text, tags, check_every_hours,
     next_check_at, enabled, terms_note, last_content_sha256, last_checked_at, last_run_status,
-    consecutive_failures, disabled_reason, created_by, created_at"""
-_RUN_COLUMNS = """run_id, kind, source_id, request, status, attempts, requested_by, outcome,
+    consecutive_failures, disabled_reason, created_by, created_at, origin, proposed_for"""
+RUN_COLUMNS = """run_id, kind, source_id, request, status, attempts, requested_by, outcome,
     error_code, created_at, completed_at"""
 
 _AUDIT_SQL = """
@@ -71,7 +72,7 @@ _CLAIM_SQL = f"""
          ORDER BY created_at
          FOR UPDATE SKIP LOCKED
          LIMIT 1)
-    RETURNING {_RUN_COLUMNS}
+    RETURNING {RUN_COLUMNS}
 """
 
 _EXPIRE_SQL = """
@@ -110,7 +111,7 @@ _PATCH_SOURCE_SQL = f"""
         query_text = coalesce(%(query_text)s::text, query_text),
         updated_at = now()
      WHERE source_id = %(source_id)s
-    RETURNING {_SOURCE_COLUMNS}
+    RETURNING {SOURCE_COLUMNS}
 """
 
 
@@ -190,7 +191,7 @@ class PostgresIntelStore:
                         query_text, tags, check_every_hours, terms_note, created_by)
                     VALUES (%(kind)s, %(url)s, %(hash)s, %(nv)s, %(query)s, %(tags)s, %(every)s,
                             %(terms)s, %(operator)s)
-                    RETURNING {_SOURCE_COLUMNS}""",
+                    RETURNING {SOURCE_COLUMNS}""",
                 {
                     "kind": kind,
                     "url": canonical,
@@ -223,13 +224,13 @@ class PostgresIntelStore:
             cur = conn.cursor(row_factory=dict_row)
             if cursor is None:
                 await cur.execute(
-                    f"SELECT {_SOURCE_COLUMNS} FROM intel_sources"
+                    f"SELECT {SOURCE_COLUMNS} FROM intel_sources"
                     " ORDER BY created_at DESC, source_id DESC LIMIT %s",
                     (limit,),
                 )
             else:
                 await cur.execute(
-                    f"SELECT {_SOURCE_COLUMNS} FROM intel_sources"
+                    f"SELECT {SOURCE_COLUMNS} FROM intel_sources"
                     " WHERE (created_at, source_id) < (%s, %s)"
                     " ORDER BY created_at DESC, source_id DESC LIMIT %s",
                     (cursor[0], cursor[1], limit),
@@ -241,7 +242,7 @@ class PostgresIntelStore:
         async with self._pool.connection() as conn:
             cur = conn.cursor(row_factory=dict_row)
             await cur.execute(
-                f"SELECT {_SOURCE_COLUMNS} FROM intel_sources WHERE source_id = %s", (source_id,)
+                f"SELECT {SOURCE_COLUMNS} FROM intel_sources WHERE source_id = %s", (source_id,)
             )
             row = await cur.fetchone()
         return Source.model_validate(row) if row is not None else None
@@ -384,13 +385,13 @@ class PostgresIntelStore:
             cur = conn.cursor(row_factory=dict_row)
             if cursor is None:
                 await cur.execute(
-                    f"SELECT {_RUN_COLUMNS} FROM intel_runs"
+                    f"SELECT {RUN_COLUMNS} FROM intel_runs"
                     " ORDER BY created_at DESC, run_id DESC LIMIT %s",
                     (limit,),
                 )
             else:
                 await cur.execute(
-                    f"SELECT {_RUN_COLUMNS} FROM intel_runs"
+                    f"SELECT {RUN_COLUMNS} FROM intel_runs"
                     " WHERE (created_at, run_id) < (%s, %s)"
                     " ORDER BY created_at DESC, run_id DESC LIMIT %s",
                     (cursor[0], cursor[1], limit),
