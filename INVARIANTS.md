@@ -827,7 +827,8 @@ override lane) and `::test_a_subject_cannot_overturn_a_machine_confirm`.
 - An operator query must not name an individual. That is policy, and the PII-shape refusal is its only enforcement.
 
 Check: the boundary tests (§6.1), the shape CHECKs (§3.6), and a test that no code path moves a proposal to
-`approved` except the decision route.
+`approved` except the decision route: `tests/test_boundaries.py::test_only_the_decision_path_moves_a_proposal_to_approved`
+and `tests/test_intel_decisions.py::test_approvable_on_the_read_equals_the_decision_not_409ing`.
 
 **49. Every citation is a verbatim substring of text we fetched.**
 - An excerpt's normalised text is a substring of the normalised document text fetched through our fetcher, at the

@@ -520,6 +520,15 @@ surface by the backend's `/v1/admin/*` operator proxy (§3.11) — no direct cli
 them yet), quiz weight/tag suggestions, and protection events + renewal (§4.8 of the design spec).
 Nothing here moves a score — that is entirely step 2's, and step 1 ships with it inert.
 
+*Built 2026-09-30 (step 2):* runs that write signals now generate `weight_change` and `coverage_gap` proposals,
+through one more metered call (`INTEL_PROPOSAL_MODEL`). A proposal is validated in code before it is written.
+- A named operator decides it: `intel/decisions.py` is the only writer of `approved`.
+- The backend acknowledges a published change on `POST /proposals/applied`.
+- The worker's reconcile keeps pending weight changes in step with every new vocabulary.
+
+The admin surface is fourteen routes (step 1's ten plus four). Quiz weight suggestions (step 5) and events (steps 3
+and 4) are still to come.
+
 **Disabled in both environments until an owner action.** `INTEL_ENABLED=false` on both dev and prod
 `intel-worker` containers, `claude_intel` seeded disabled with a NULL `daily_budget_usd`
 (`budget_unset` refuses every run), and a placeholder workspace id (`pending-step0`) sits in three

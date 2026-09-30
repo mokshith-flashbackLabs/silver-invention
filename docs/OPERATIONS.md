@@ -328,6 +328,22 @@ at least a budget outage will not also relax everyone's cadence.
   not alarm on that, so **`no_successful_calls_24h` is suppressed for kind
   `llm`** — `intel_stale` is what actually watches this provider for silence.
 
+**Proposals (step 2, 2026-09-30).**
+- **Cost.** `cost_per_call_usd` is 0.45 from migration 0041, the worst case once the proposal model (Opus 5.5)
+  runs. The guard checks that estimate, and the actual cost is recorded. A run makes at most
+  `INTEL_MAX_CALLS_PER_RUN` reading calls plus ONE generation call.
+- **Outcome counters on `GET /runs`:**
+  - `proposals_written`, `proposals_superseded` and `proposal_dropped_<reason>`;
+  - `proposal_model_<outcome>`, a verdict that consumed the call;
+  - `proposals_deferred_<reason>`: a gate skip or unavailable model; that run's signals feed later runs as context;
+  - `proposals_skipped_vocabulary_missing`: no push has landed yet.
+- **The reconcile** runs at the top of every worker tick and records
+  `intel_vocabulary.reconciled_release_no` and `reconciled_map_version`. If those lag `release_no` and
+  `map_version` for more than a poll, the stored document is unreadable; look for `intel.vocabulary_unreadable` in
+  the worker log.
+- **An approved change that reads `stale`** will be refused as `STALE` by the backend's publish. Withdraw it, which
+  is `rejected` on an approved proposal, and approve a fresh one.
+
 ---
 
 ## 5. A provider has returned zero successful calls for 24h

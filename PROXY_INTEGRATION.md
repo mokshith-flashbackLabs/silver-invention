@@ -726,6 +726,63 @@ envelope's `extra`.
 nothing writes or decides a row in it yet — step 1 only registers sources and produces signals.
 Nothing on this surface moves anyone's score.
 
+*Updated 2026-09-30:* step 2 has shipped `GET /proposals`, `GET /proposals/{id}`,
+`POST /proposals/{id}/decision` and `POST /proposals/applied` (next subsection).
+`POST /weight-suggestions` and `GET /protection-events*` are still later steps.
+
+### Likeness intel admin surface (step 2 — proposals)
+
+**New 2026-09-30**, four routes. A proposal is model-written and reaches nothing until a named operator decides it.
+A weight change reaches a score only when your weights release publishes its `decided` delta, which you then
+acknowledge on `POST /proposals/applied`. That route is the second system write: it takes no `operator`, and
+sending one is `422`. Map every code in the table by name, exactly as the step-1 codes are mapped. The plain
+pydantic `422 validation_error` stays unmapped.
+
+Every route the backend calls in step 2. Both tokens (`X-Service-Token`, `X-Admin-Service-Token`) on every call, and
+every body is `extra='forbid'`. Errors use the envelope `{error: {code, message, retryable, request_id}}`. Every route
+also answers the framework `401` and `422 validation_error` for a body or query that fails its own shape.
+
+| # | Route | Body / query | Success | Semantic errors |
+|---|---|---|---|---|
+| 1 | `GET /v1/admin/intel/proposals` | `status` (repeatable: `pending` `approved` `rejected` `superseded` `applied` `delivered`), `kind` (repeatable: `weight_change` `threat_event` `protection_event` `weight_suggestion` `coverage_gap`), `cursor`, `limit` 1–200 (default 50). **Omitting `kind` omits `weight_suggestion`.** | `200 {proposals: [Proposal], next_cursor: string \| null}`, newest first, keyset on `(created_at, proposal_id)`. `next_cursor` is non-null only when the page is full. | `422 invalid_cursor`; an unknown enum value is `422 validation_error` |
+| 2 | `GET /v1/admin/intel/proposals/{proposal_id}` | — | `200 Proposal + {signals: [Signal]}` | `404 proposal_not_found` |
+| 3 | `POST /v1/admin/intel/proposals/{proposal_id}/decision` | `{decision: "approved"\|"rejected", values?: {delta: int}, reason: string 3–500, applies_regardless_of_location?: bool, operator: string 1–64}`. `values` on a rejection is `422 validation_error`. `applies_regardless_of_location` is accepted and unused until step 4. | `200 {proposal_id, kind, status, applied_ref, decided}` | `404 proposal_not_found`; `409 proposal_not_pending`, `proposal_not_decidable`, `proposal_evidence_retracted`, `proposal_uncorroborated`, `proposal_cell_awaiting_publish` (`proposal_tags_unmapped` becomes reachable in step 3); `422 values_out_of_bounds` |
+| 4 | `POST /v1/admin/intel/proposals/applied` | `{scoring_version: string 1–64, proposal_ids: uuid[] 1–500}`, **no `operator`** (sending one is `422`) | `200 {applied: uuid[], already_applied: uuid[], not_applied: uuid[]}` | none besides `422 validation_error` |
+| 5 | `PUT /v1/admin/intel/vocabulary` (step 1, unchanged path and response) | Step 2 validates `document.questions[]` as exactly `{key, prompt, type: string\|null, options: string[], deductions: {string: int}\|null, cap: int\|null}`, the shape `src/intel/vocabulary.ts` already sends | `200 {applied: bool}`; the worker's reconcile then reacts within one poll interval | `422 validation_error` |
+
+**`Proposal`** (the list item, and the base of the detail) has these fields:
+- the stored row: `proposal_id`, `kind`, `status`, `supersede_reason`, `target`, `suggested`, `decided`, `rationale`,
+  `against_scoring_version`, `against_release_no`, `run_id`, `model_id`, `prompt_version`, `decided_by`, `decided_at`,
+  `decision_reason`, `applied_ref`, `created_at`;
+- `signal_ids`;
+- the read-time flags from `approvable.read_flags`: `approvable` (`status == 'pending'` and `why_not` null), `why_not`,
+  `evidence_retracted`, `stale`, `why_stale` (`option_renamed` · `cell_removed` · `not_mutable` · `deduction_moved`),
+  `applied_pending_ack`, `unmapped_tags`, `retired_tags`.
+
+**`Signal`** (detail only) is `{signal_id, category, direction, tags, unregistered_subjects, summary, status,
+retracted_at, retract_reason, created_at, excerpts: [{excerpt_id, quote_text, char_start, char_end, quote_sha256}],
+document: {document_id, document_url, final_url, publisher_domain, trust, title, published_at, fetched_at}}`. Step 3
+adds `related_events` for event kinds, and step 5 adds `options` for `weight_suggestion`.
+
+**Decidability in step 2:**
+
+| Kind | approve | reject |
+|---|---|---|
+| `weight_change` | yes, from `pending` | from `pending`, or a **withdrawal** from `approved`. A withdrawal is refused `409 proposal_not_pending` when the live deduction already equals `current + decided.delta` (published, acknowledgement pending). |
+| `coverage_gap` | `409 proposal_not_decidable` | yes (dismiss), from `pending` |
+| `threat_event`, `protection_event`, `weight_suggestion` | `409 proposal_not_decidable` | `409 proposal_not_decidable` |
+
+**`svc` views touched: none.** `svc.v_active_scoped_events` is step 3's. Services' `/readyz` is unchanged.
+
+**The vocabulary push now drives a reconcile.** Within one worker poll of a push, services react:
+- a pending weight change on a renamed option is retargeted to the new text, or superseded `cell_changed` when the
+  deduction moved;
+- one on a removed or no-longer-mutable cell is superseded `cell_changed`;
+- an approved change is never touched, and reads `stale` with `why_stale`, or `applied_pending_ack` when the live
+  deduction already equals `current + decided.delta`.
+
+`document.questions[]` is now validated as exactly `{key, prompt, type, options, deductions, cap}`.
+
 ---
 
 ## 5. Object storage — the proxy mints, we PUT and discard

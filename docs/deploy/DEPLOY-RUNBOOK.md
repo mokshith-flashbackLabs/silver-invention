@@ -948,9 +948,17 @@ structurally rather than by review. Required keys with no default: `intel_enable
 `intel_model_provider` (`stub` in development, must not be `stub` in production — same "dev spends
 real money, prod must not silently read nothing" pair `SEARCH_PROVIDER` enforces),
 `intel_anthropic_region`, `anthropic_aws_workspace_id`, `intel_extraction_model`,
-`intel_web_search_tool_type`, `fetcher_base_url`, `fetcher_token`. Everything else (call/document/run
+`intel_proposal_model`, `intel_web_search_tool_type`, `fetcher_base_url`, `fetcher_token`. Everything else (call/document/run
 caps, poll interval, lease seconds, breaker tuning) has a sane default — see the task-5 build report
 for the full field table if you need one not listed here.
+
+*Step 2 (2026-09-30):* `INTEL_PROPOSAL_MODEL=claude-opus-5-5` is required on the `intel-worker` container in both
+task definitions. Without it the container crash-loops at boot, whatever `INTEL_ENABLED` says. Deploy order:
+1. services migration 0041;
+2. the services image and task definitions;
+3. only then the backend's step-2 build.
+
+The backend's decision and applied relays call routes an older services build answers with 404.
 
 **As of 2026-09-30 dev ships `INTEL_ENABLED=true` and prod `INTEL_ENABLED=false`.** The workspace ids
 confirmed by the step-0 probe (2026-09-29) replaced the `pending-step0` placeholder in all **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
