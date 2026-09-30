@@ -448,3 +448,84 @@ async def test_a_re_upserted_subject_is_matched_once(
         (event_id, late),
     )
     assert len(rows) == 1
+
+
+# ── an event scoped by tags (0042) ────────────────────────────────────────
+
+
+async def test_a_tag_scoped_event_is_stored_listed_and_published_on_the_scoped_view(
+    migrated_db: str, store: PostgresThreatStore
+) -> None:
+    """A tag-scoped event materialises no match here: tags are matched to people by the
+    backend, against its own quiz answers, through svc.v_active_scoped_events (spec §3.7)."""
+    event_id, matched = await store.create_event(
+        kind="leak",
+        title="LinkedIn scrape",
+        body="",
+        severity=4,
+        domains=(),
+        is_global=False,
+        expires_at=_EXPIRES_SOON,
+        decay_days=30,
+        operator="ops",
+        tags=("linkedin",),
+    )
+    assert matched == ()
+    (listed,) = [e for e in await store.list_events() if e["event_id"] == event_id]
+    assert listed["tags"] == ["linkedin"]
+    view = _row(
+        migrated_db,
+        "SELECT direction, magnitude, tags FROM svc.v_active_scoped_events WHERE event_id = %s",
+        (event_id,),
+    )
+    assert view == {"direction": "threat", "magnitude": 4, "tags": ["linkedin"]}
+    assert (
+        _rows(
+            migrated_db,
+            "SELECT 1 FROM svc.v_person_threat_context WHERE event_id = %s",
+            (event_id,),
+        )
+        == []
+    )
+    assert await store.retract_event(event_id, operator="ops", reason="false alarm") == ()
+    assert (
+        _rows(
+            migrated_db,
+            "SELECT 1 FROM svc.v_active_scoped_events WHERE event_id = %s",
+            (event_id,),
+        )
+        == []
+    )
+
+
+async def test_create_records_the_tags_in_its_audit_row(
+    migrated_db: str, store: PostgresThreatStore
+) -> None:
+    """The tags an operator scoped a threat at are part of its audit row, beside who did it
+    and how many people the store matched."""
+    event_id, _matched = await store.create_event(
+        kind="leak",
+        title="LinkedIn scrape",
+        body="",
+        severity=4,
+        domains=(),
+        is_global=False,
+        expires_at=_EXPIRES_SOON,
+        decay_days=30,
+        operator="alice",
+        tags=("linkedin", "x"),
+    )
+
+    row = _row(
+        migrated_db,
+        "SELECT metadata FROM audit_log WHERE resource_id = %s AND action = %s",
+        (event_id, THREAT_CREATED_ACTION),
+    )
+    assert row["metadata"] == {
+        "operator": "alice",
+        "title": "LinkedIn scrape",
+        "tags": ["linkedin", "x"],
+        "matched": 0,
+    }
+    # Migration 0042's down refuses while a tag-only event is live; leave none behind.
+    assert await store.retract_event(event_id, operator="alice", reason="test cleanup") == ()

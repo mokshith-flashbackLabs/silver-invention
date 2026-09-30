@@ -560,6 +560,9 @@ class ThreatEventCreateRequest(ServiceModel):
     severity: int = Field(ge=1, le=5)
     domains: tuple[str, ...] = ()
     is_global: bool = False
+    # 0042 (spec §3.7): a threat may be scoped by exposure tags. SHAPE ONLY -- the backend
+    # owns the registry and checks membership before it relays (spec §4.7).
+    tags: tuple[str, ...] = ()
     # ACCEPTED AND IGNORED for one release (spec 2026-09-24): it fed only the
     # protection score, which is gone. The backend stops sending it once these
     # services are live; drop the field after that.
@@ -570,11 +573,12 @@ class ThreatEventCreateRequest(ServiceModel):
 
     @model_validator(mode="after")
     def _domains_or_global(self) -> ThreatEventCreateRequest:
-        # Mirrors 0022's own CHECK (is_global OR cardinality(domains) > 0) so
-        # the obviously-wrong request fails as a 422 here rather than as an
-        # opaque database constraint violation.
-        if not self.is_global and not self.domains:
-            raise ValueError("domains must name at least one domain unless is_global is true")
+        # Mirrors 0042's relevance CHECK (is_global OR domains OR tags) so the obviously-wrong
+        # request fails as a 422 here rather than as an opaque database constraint violation.
+        if any(not is_well_formed(t) for t in self.tags) or len(set(self.tags)) != len(self.tags):
+            raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
+        if not self.is_global and not self.domains and not self.tags:
+            raise ValueError("name at least one domain or tag unless is_global is true")
         return self
 
 
@@ -602,6 +606,7 @@ class ThreatEventItem(BaseModel):
     severity: int
     domains: list[str]
     is_global: bool
+    tags: list[str]
     starts_at: datetime
     expires_at: datetime
     decay_days: int

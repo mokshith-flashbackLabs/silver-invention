@@ -19,6 +19,11 @@ kind of half-applied state ``providers/store.py``'s ``_write_with_audit``
 exists to prevent, and this module follows the same shape by hand because
 here the "write" is itself two statements (domain match + global match) that
 must share one audit row summarising both.
+
+A tag-scoped event (migration 0042) materialises no match here. Tags are matched to people by
+the backend, against its own quiz answers, through ``svc.v_active_scoped_events``; this store
+only records them. An intel-approved event is inserted by ``intel/decisions.py`` instead, with
+intel's own SQL, in the approval's transaction.
 """
 
 from __future__ import annotations
@@ -40,10 +45,10 @@ THREAT_RETRACTED_ACTION = "threat_event.retracted"
 
 _INSERT_EVENT_SQL = """
     INSERT INTO threat_events
-        (kind, title, body, severity, domains, is_global,
+        (kind, title, body, severity, domains, tags, is_global,
          expires_at, decay_days, status, created_by)
     VALUES
-        (%(kind)s, %(title)s, %(body)s, %(severity)s, %(domains)s, %(is_global)s,
+        (%(kind)s, %(title)s, %(body)s, %(severity)s, %(domains)s, %(tags)s, %(is_global)s,
          %(expires_at)s, %(decay_days)s, 'active', %(operator)s)
     RETURNING event_id
 """
@@ -93,7 +98,7 @@ _MATCHED_REFS_SQL = """
 
 _LIST_EVENTS_SQL = """
     SELECT event_id, kind, title, body, severity, domains, is_global,
-           starts_at, expires_at, decay_days, status, created_by, created_at, updated_at
+           starts_at, expires_at, decay_days, status, created_by, created_at, updated_at, tags
     FROM threat_events
     ORDER BY created_at DESC
     LIMIT %(limit)s
@@ -113,6 +118,7 @@ class ThreatStore(Protocol):
         expires_at: datetime,
         decay_days: int,
         operator: str,
+        tags: tuple[str, ...] = (),
     ) -> tuple[UUID, tuple[UserRef, ...]]: ...
 
     async def retract_event(
@@ -140,6 +146,7 @@ class PostgresThreatStore:
         expires_at: datetime,
         decay_days: int,
         operator: str,
+        tags: tuple[str, ...] = (),
     ) -> tuple[UUID, tuple[UserRef, ...]]:
         matched: set[UserRef] = set()
         async with self._pool.connection() as conn, conn.transaction():
@@ -151,6 +158,7 @@ class PostgresThreatStore:
                     "body": body,
                     "severity": severity,
                     "domains": list(domains),
+                    "tags": list(tags),
                     "is_global": is_global,
                     "expires_at": expires_at,
                     "decay_days": decay_days,
@@ -177,7 +185,12 @@ class PostgresThreatStore:
                     "action": THREAT_CREATED_ACTION,
                     "event_id": event_id,
                     "metadata": Jsonb(
-                        {"operator": operator, "title": title, "matched": len(matched)}
+                        {
+                            "operator": operator,
+                            "title": title,
+                            "tags": list(tags),
+                            "matched": len(matched),
+                        }
                     ),
                 },
             )
@@ -243,6 +256,7 @@ class PostgresThreatStore:
                 "created_by": row[11],
                 "created_at": row[12],
                 "updated_at": row[13],
+                "tags": list(row[14]),
             }
             for row in rows
         ]

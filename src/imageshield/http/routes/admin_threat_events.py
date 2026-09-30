@@ -51,6 +51,7 @@ async def create_threat_event(
         expires_at=body.expires_at,
         decay_days=body.decay_days,
         operator=body.operator,
+        tags=body.tags,
     )
     log.info(
         "threat_event.created_via_admin",
@@ -99,6 +100,7 @@ async def list_threat_events(
                 severity=row["severity"],
                 domains=list(row["domains"]),
                 is_global=row["is_global"],
+                tags=list(row["tags"]),
                 starts_at=row["starts_at"],
                 expires_at=row["expires_at"],
                 decay_days=row["decay_days"],

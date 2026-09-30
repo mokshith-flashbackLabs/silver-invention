@@ -8,9 +8,11 @@ the auth assertion is load-bearing — a threat event can name hundreds of
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
@@ -32,6 +34,7 @@ class FakeThreatStore:
         self._matched = matched
         self.create_calls: list[dict[str, Any]] = []
         self.retract_calls: list[tuple[UUID, str, str]] = []
+        self.events: list[dict[str, Any]] = []
         self._active: dict[UUID, tuple[UserRef, ...]] = {}
 
     async def create_event(self, **kwargs: Any) -> tuple[UUID, tuple[UserRef, ...]]:
@@ -47,7 +50,7 @@ class FakeThreatStore:
         return self._active.pop(event_id, None)
 
     async def list_events(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        return []
+        return self.events
 
 
 def make_client(*, matched: tuple[UserRef, ...] = ()) -> tuple[TestClient, FakeThreatStore]:
@@ -190,6 +193,32 @@ def test_domains_required_unless_global() -> None:
     assert threats.create_calls == []
 
 
+def test_create_accepts_tags_alone_and_forwards_them() -> None:
+    """spec §3.7: a threat may be scoped by tags alone. Shape only: the backend owns the
+    registry and checks membership before it relays (spec §4.7)."""
+    client, threats = make_client()
+    response = client.post(
+        "/v1/admin/threat-events", json=_body(domains=[], tags=["linkedin", "x"]), headers=ADMIN
+    )
+    assert response.status_code == 201, response.text
+    assert threats.create_calls[0]["tags"] == ("linkedin", "x")
+
+
+def test_create_without_tags_forwards_an_empty_tuple() -> None:
+    client, threats = make_client()
+    assert client.post("/v1/admin/threat-events", json=_body(), headers=ADMIN).status_code == 201
+    assert threats.create_calls[0]["tags"] == ()
+
+
+@pytest.mark.parametrize("tags", [["LinkedIn"], ["x", "x"], ["1abc"], [""]])
+def test_a_malformed_tag_is_422(tags: list[str]) -> None:
+    client, threats = make_client()
+    response = client.post("/v1/admin/threat-events", json=_body(tags=tags), headers=ADMIN)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert threats.create_calls == []
+
+
 def test_list_returns_200() -> None:
     client, _threats = make_client()
 
@@ -197,3 +226,34 @@ def test_list_returns_200() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"events": []}
+
+
+def test_list_carries_each_events_tags() -> None:
+    """The wire shape the panel reads: a tag-scoped event lists its tags, and an event
+    with none lists an empty array, never a missing key."""
+    client, threats = make_client()
+    stamp = datetime(2026, 9, 30, tzinfo=UTC)
+    common: dict[str, Any] = {
+        "kind": "leak",
+        "title": "Example leak",
+        "body": "",
+        "severity": 3,
+        "domains": [],
+        "is_global": False,
+        "starts_at": stamp,
+        "expires_at": stamp,
+        "decay_days": 30,
+        "status": "active",
+        "created_by": "alice",
+        "created_at": stamp,
+        "updated_at": stamp,
+    }
+    threats.events = [
+        {**common, "event_id": uuid4(), "tags": ["linkedin", "x"]},
+        {**common, "event_id": uuid4(), "domains": ["evil.example"], "tags": []},
+    ]
+
+    response = client.get("/v1/admin/threat-events", headers=ADMIN)
+
+    assert response.status_code == 200, response.text
+    assert [e["tags"] for e in response.json()["events"]] == [["linkedin", "x"], []]
