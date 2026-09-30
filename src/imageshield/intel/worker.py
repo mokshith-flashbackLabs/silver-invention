@@ -45,9 +45,9 @@ def _build_model(config: IntelConfig) -> IntelModel:
 
 async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
     """One pass: reconcile a new vocabulary, expire exhausted runs, schedule due
-    sources, claim at most one run, execute it, finish it. Returns whether a run was executed, so the
-    caller can poll again immediately while there is work and back off once the
-    queue is empty."""
+    sources, claim at most one run, execute it, finish it. Returns whether a run was executed,
+    so the caller can poll again immediately while there is work and back off once
+    the queue is empty."""
     now = deps.clock()
     # spec §4.9: react to a new vocabulary within one poll, before any run loads it.
     await deps.reconciler.reconcile()
