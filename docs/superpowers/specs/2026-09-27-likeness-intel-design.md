@@ -449,6 +449,11 @@ GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
     whole history. Services apply the entries above `reconciled_release_no`, in order and chained (§4.9). A later
     weights release or a failed push therefore never loses a rename.
 
+*Clarified 2026-09-30 (step-2 plan):* the push carries each question's scoring `type` (`mutable`, `escrowed`,
+`decaying`, `recoverable`, or null for an unscored question), not a separate `mutable` flag. Wherever this spec says
+"mutable", services read `type = 'mutable'`. From step 2, `PUT /vocabulary` validates each `questions[]` item as
+exactly `{key, prompt, type, options, deductions, cap}`, the shape the backend already sends.
+
 **The backend pushes it with `PUT /v1/admin/intel/vocabulary`:** after every release (quiz-editor publish, rollback,
 weights release, bootstrap), **after every tag or mapping change**, once at worker boot, and **hourly**.
 - **Pushes are ordered by the pair `(release_no, map_version)`.** `release_no` is the monotonic identity of the live
@@ -474,6 +479,10 @@ weights release, bootstrap), **after every tag or mapping change**, once at work
   - `daily_budget_usd` **NULL**. The owner picks the cap, as a finance decision, the same way SCHEMA.md frames Hive's.
     It lands through its own migration before the provider is enabled (§5). On prod that is the only write path,
     because prod DB access is read-only.
+  - *Amended 2026-09-30 (step 2):* `0041_intel_proposal_cost` raises `cost_per_call_usd` to 0.45, the step-0 worst
+    case across both models, because step 2 calls `INTEL_PROPOSAL_MODEL` (Opus 5.5). 0039 shipped 0.25, the
+    Sonnet-only figure, because step 1 never called Opus. The proposal call keeps `max_tokens` at 8 000, which that
+    estimate assumes, and sets `effort` to `high`. A call that stops at `max_tokens` is consumed and counted.
 - **Call records.** `provider_calls` gains `intel_run_id uuid NULL REFERENCES intel_runs`, with
   `CHECK (num_nonnulls(run_id, intel_run_id) <= 1)`.
 - **Never calibrated.** `CONSTRAINT providers_llm_never_calibrated CHECK (kind <> 'llm' OR NOT calibrated)`. It is
@@ -684,6 +693,23 @@ step 2, `threat_event` from step 3, `protection_event` from step 4. The decision
 consumer has not shipped (`409 proposal_not_decidable`). So no approval can create an event nothing reads, and no
 `review_by` or `expires_at` clock runs on an inert event.
 
+*Clarified 2026-09-30 (step-2 plan):*
+- **Step 2 generates `weight_change` and `coverage_gap` only.** §8 names weight suggestions in both row 2 and row 5.
+  After decision 11 their generation starts with the source stages of §4.10, so it belongs to step 5. Step 2 ships
+  what step-2 code needs of that kind: it is never decidable, reads `why_not = 'not_decidable'`, and is omitted from
+  `GET /proposals` unless asked. Its `options` read block and its supersession ship with its generation.
+- **The step-2 structured output is two typed lists**, `weight_changes` and `coverage_gaps`, rather than one
+  `proposals` list keyed by `kind`, so each kind's shape is closed. Steps 3 and 4 add `threat_events`,
+  `protection_events` and `attach`.
+  - Its JSON schema carries **no numeric bounds**. Structured output does not enforce them, and the SDK would
+    validate them client-side, failing the whole response over one bad delta.
+  - §4.5's bounds run per proposal, in code.
+- **A coverage gap's evidence is recomputed in code.** The signals linked to it are every active signal of the
+  90-day window that concerns its subject. The model's citation list is not used for that, though it must still name
+  real, active signals.
+- Without a vocabulary, step 2 makes no generation call at all (`proposals_skipped_vocabulary_missing`), because it
+  has no event kind to let through yet.
+
 ### 4.4 The model seam
 
 - **`intel/model.py`** is the only module that imports `anthropic`, and a boundary test enforces that. It builds
@@ -823,6 +849,17 @@ re-checked inside it.
 
 **Response:** `{proposal_id, kind, status, applied_ref, decided}`.
 
+*Clarified 2026-09-30 (step-2 plan), where neither this spec nor the backend's pins a shape:*
+- `POST /proposals/applied` answers `200 {applied, already_applied, not_applied}`, each a list of ids. An unknown id,
+  or one that is pending, rejected or of another kind, lands in `not_applied` and moves nothing.
+- Approving a `coverage_gap` answers `409 proposal_not_decidable`; dismissing it is the only decision it takes. Any
+  decision on an event kind is `409 proposal_not_decidable` until its step ships.
+- `approvable` is `status = 'pending'` with `why_not` null.
+  - A pending `weight_change` read between a vocabulary push and its reconcile shows `stale` with `why_stale`.
+  - Approving it answers `422 values_out_of_bounds`, from the §4.5 re-check against the current vocabulary.
+- `applies_regardless_of_location` is accepted on every decision body and read only from step 4.
+- `values` on a rejection is a body-shape `422 validation_error`.
+
 **Error codes** (the envelope from §9 of the services manual): `proposal_not_found`, `proposal_not_pending`,
 `proposal_uncorroborated`, `proposal_not_decidable`, `proposal_evidence_retracted`, `proposal_cell_awaiting_publish`,
 `proposal_tags_unmapped`, `values_out_of_bounds`, `unknown_tag`, `tag_retired`, `known_hit_location`,
@@ -876,6 +913,16 @@ delivered advice with no state to repair. Approved rows belong to the person who
 
 **The one-line promise:** after any quiz-editor publish or tag change, within one poll interval, intel's pending queue
 matches the live quiz, and nothing an operator approved has been silently rewritten.
+
+*Clarified 2026-09-30 (step-2 plan):* step 2 builds this table's `weight_change` rows: rename, removal, no longer
+mutable, deduction moved, and the reads of approved rows.
+- **The "tag newly mapped" row ships in step 3**, with `gap_regenerate` (§8 row 3). Its gap resolution must be
+  **state-based** (any pending gap whose subject or suggested tag is mapped *now*), because pairs reconciled between
+  the two deploys are already recorded.
+- The source-pausing row ships with step 5's migration.
+- **Which renames apply to a proposal:** those above both `reconciled_release_no` and the release the proposal was
+  generated against. They are folded one release at a time, and each release's entries apply simultaneously, so a
+  swap inside one release moves A to B.
 
 ### 4.10 Sources chosen per question — amended 2026-09-30 (decision 11)
 
@@ -994,6 +1041,9 @@ search providers do (#37). The chain's step 1 (subject eligibility) does not app
   ordinary result, which #40 forbids.
 - **Per-run bounds:** `INTEL_MAX_CALLS_PER_RUN` and `INTEL_MAX_WEB_SEARCHES_PER_RUN`. One runaway run cannot spend the
   day.
+  *Clarified 2026-09-30 (step 2):* the run's one generation call (§4.3) sits outside `INTEL_MAX_CALLS_PER_RUN`, which
+  bounds reading, so a run makes at most that cap plus one call. Reserving a slot inside the cap would starve reading
+  at small caps.
 - **Alarms.**
   - `no_successful_calls_24h` excludes kind `llm`. Its copy is about "no matches found", and an intel source may not
     change for days.
@@ -1146,6 +1196,9 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 | **4** | step-4 migration. `protection_event` generation, decisions and renewal | 0064; the protection engine term, snapshot column, copy, protection routes, the drift sweep's event leg | yes |
 | **5** | Weight suggestions, **starting with per-question source proposal, validation (including `robots.txt`) and the first read**; sources pausing with their tags (§4.10) | The quiz editor's suggest action **with its source picker**; provenance from drafts; citation coverage | no |
 | **6** | Coverage-gap proposals surfaced | Their display | no |
+
+*Clarified 2026-09-30 (step-2 plan):* row 2's `weight_suggestion` belongs to step 5 (see the §4.3 note). Step 2's
+services migration is `0041_intel_proposal_cost` (see the §3.9 note), and it changes no table.
 
 **Per-step deploy gates:**
 - **Services always deploy first** on the way up: every new body field is refused (`422`) by an older services build.
