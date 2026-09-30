@@ -35,7 +35,7 @@ from imageshield.attribution.crop import UndecodableImage
 from imageshield.attribution.models import BoundingBox
 from imageshield.fetcher.config import FetcherConfig, load_fetcher_config
 from imageshield.fetcher.extract import UnsupportedDocument, to_text
-from imageshield.fetcher.fetch import FetchRefused, fetch_image, fetch_page, fetch_text
+from imageshield.fetcher.fetch import FetchRefused, HopCheck, fetch_image, fetch_page, fetch_text
 from imageshield.fetcher.render import render_preview
 from imageshield.fetcher.robots import USER_AGENT, RobotsCache, robots_allows
 from imageshield.recheck.ssrf import Resolver
@@ -250,6 +250,9 @@ async def _require_robots(
     cfg: FetcherConfig,
     resolver: Resolver | None,
 ) -> None:
+    """Raise ``robots_disallowed`` unless ``url``'s origin lets our product token fetch its path.
+    ``robots_unreachable`` and ``refused_private_address`` come through from reading the origin's
+    robots.txt (``robots_allows``). One function serves the requested URL and every redirect hop."""
     cache: RobotsCache | None = getattr(request.app.state, "robots_cache", None)
     if cache is None:
         cache = RobotsCache()
@@ -264,6 +267,22 @@ async def _require_robots(
     )
     if not allowed:
         raise FetchRefused("robots_disallowed", "robots.txt disallows this path")
+
+
+def _robots_hop_check(
+    request: Request,
+    client: httpx.AsyncClient,
+    cfg: FetcherConfig,
+    resolver: Resolver | None,
+) -> HopCheck:
+    """``_require_robots`` as the hook ``fetch_text`` awaits with each redirect hop, before that
+    hop is requested: the same per-origin cache, SSRF guard and refusals as the requested URL gets,
+    applied to the hop's own origin and path."""
+
+    async def check(hop_url: str) -> None:
+        await _require_robots(request, client, hop_url, cfg, resolver)
+
+    return check
 
 
 @router.post("/text")
@@ -283,8 +302,12 @@ async def text(
     The bytes and the decoded text both live only for this request
     (INVARIANTS #9); nothing here writes to disk, a column, or a log.
 
-    ``respect_robots`` (source validation, spec §4.10) checks the origin's robots.txt
-    first, and the final URL's after a redirect (``fetcher/robots.py``).
+    ``respect_robots`` (source validation, spec §4.10) reads robots.txt
+    (``fetcher/robots.py``) before anything is requested: the requested URL's
+    first, and then each redirect hop's own, before that hop is requested. A
+    disallowed landing page or middle hop is never contacted, and a hop's origin
+    is read through the same per-origin cache and SSRF guard, not assumed to
+    share the first URL's rules.
     """
     if urlsplit(body.url).scheme != "https":
         raise FetcherError(400, "not_https", "intel fetches https only")
@@ -293,9 +316,15 @@ async def text(
     )
     async with gate:
         try:
+            before_redirect: HopCheck | None = None
             if body.respect_robots:
                 # Before the page is fetched: a disallowed path is never requested.
                 await _require_robots(request, client, body.url, cfg, resolver)
+                # And the same for every redirect hop, inside the walk and before that hop is
+                # requested. That covers a hop's own origin and a middle hop of a chain, which a
+                # check on the landing URL alone (after the walk) never saw. So no check is needed
+                # after the fetch: every URL it requested has been through one before.
+                before_redirect = _robots_hop_check(request, client, cfg, resolver)
             fetched = await fetch_text(
                 client,
                 body.url,
@@ -303,12 +332,8 @@ async def text(
                 timeout_seconds=cfg.intel_text_timeout_seconds,
                 max_redirects=cfg.fetch_max_redirects,
                 resolver=resolver,
+                before_redirect=before_redirect,
             )
-            if body.respect_robots and fetched.final_url != body.url:
-                # A redirect lands on a URL nobody asked about: another path on this origin (the
-                # cached rules answer, no second read), or another origin with its own robots.txt.
-                # Its text is never returned when they disallow us.
-                await _require_robots(request, client, fetched.final_url, cfg, resolver)
         except FetchRefused as exc:
             raise _fetch_refused_to_error(exc) from exc
     try:

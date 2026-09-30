@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from imageshield.fetcher.app import create_app
 from imageshield.fetcher.config import FetcherConfig
-from imageshield.fetcher.fetch import ROBOTS_MAX_BYTES
+from imageshield.fetcher.fetch import ROBOTS_MAX_BYTES, FetchRefused, fetch_text
 from imageshield.fetcher.robots import (
     PRODUCT_TOKEN,
     USER_AGENT,
@@ -399,7 +399,7 @@ def test_a_redirect_to_another_origin_that_allows_us_is_returned() -> None:
 def test_a_same_origin_redirect_into_a_disallowed_path_is_refused() -> None:
     """``/terms`` -> ``/terms?lang=en`` is an ordinary locale redirect and ``Disallow: /*?`` an
     ordinary rule. Comparing origins alone let the page through; the landing URL is checked too,
-    against the rules already read, so it costs no second request."""
+    against the rules already read, so it costs no second request, and before it is requested."""
     seen: list[str] = []
     client = _client(
         {
@@ -412,3 +412,292 @@ def test_a_same_origin_redirect_into_a_disallowed_path_is_refused() -> None:
     r = _text(client, "https://p.example/terms", respect_robots=True)
     assert r.status_code == 403 and r.json()["error"]["code"] == "robots_disallowed"
     assert seen.count("https://p.example/robots.txt") == 1
+    assert "https://p.example/terms?lang=en" not in seen
+
+
+# ── every redirect hop is checked BEFORE it is requested (fix task 2b) ─────────────────────────
+#
+# The task-2 route checked the requested URL first and the landing URL after the walk, so a
+# disallowed landing page had already been requested (its text was only thrown away) and a
+# middle hop of a chain was never checked at all. The fetcher's guarded GET now takes an opt-in
+# hook that is awaited with each redirect hop before that hop is requested. Each test below asserts
+# on the fake transport's request log: what was NOT requested is the point.
+
+ALLOW_ALL = "User-agent: *\nAllow: /\n"
+DISALLOW_ALL = "User-agent: *\nDisallow: /\n"
+
+A_ROBOTS = "https://a.example/robots.txt"
+B_ROBOTS = "https://b.example/robots.txt"
+C_ROBOTS = "https://c.example/robots.txt"
+
+
+def _chain(*, b_robots: str = ALLOW_ALL, c_robots: str = ALLOW_ALL) -> dict[str, Route]:
+    """a.example/x -> b.example/mid -> c.example/final: two redirects, which is what the default
+    cap allows, across three origins that each have a robots.txt of their own."""
+    return {
+        A_ROBOTS: _robots(ALLOW_ALL),
+        "https://a.example/x": _redirect("https://b.example/mid"),
+        B_ROBOTS: _robots(b_robots),
+        "https://b.example/mid": _redirect("https://c.example/final"),
+        C_ROBOTS: _robots(c_robots),
+        "https://c.example/final": _page(),
+    }
+
+
+def test_a_redirect_into_a_disallowed_path_never_requests_the_landing_url() -> None:
+    """The landing origin's robots.txt is read, because that is how the refusal is known. The
+    landing page itself is not."""
+    seen: list[str] = []
+    client = _client(
+        {
+            A_ROBOTS: _robots(ALLOW_ALL),
+            "https://a.example/x": _redirect("https://b.example/y"),
+            B_ROBOTS: _robots("User-agent: *\nDisallow: /y\n"),
+            "https://b.example/y": _page(),
+        },
+        seen=seen,
+    )
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "robots_disallowed"
+    assert seen == [A_ROBOTS, "https://a.example/x", B_ROBOTS]
+
+
+def test_a_middle_hop_that_disallows_us_stops_the_chain_before_it_is_requested() -> None:
+    """a -> b -> c. Looking only where the walk landed (c) never consulted b's origin or b's
+    path. Now b's rules stop the walk at b: neither b's page nor anything at c is requested."""
+    seen: list[str] = []
+    client = _client(_chain(b_robots="User-agent: *\nDisallow: /mid\n"), seen=seen)
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "robots_disallowed"
+    assert seen == [A_ROBOTS, "https://a.example/x", B_ROBOTS]
+
+
+def test_a_final_hop_that_disallows_us_is_never_requested_either() -> None:
+    """The allowed middle hop is fetched; the disallowed final one is not."""
+    seen: list[str] = []
+    client = _client(_chain(c_robots="User-agent: *\nDisallow: /final\n"), seen=seen)
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "robots_disallowed"
+    assert seen == [A_ROBOTS, "https://a.example/x", B_ROBOTS, "https://b.example/mid", C_ROBOTS]
+
+
+def test_an_allowed_redirect_chain_still_returns_the_text_with_each_hop_checked_first() -> None:
+    seen: list[str] = []
+    client = _client(_chain(), seen=seen)
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["final_url"] == "https://c.example/final" and "Our terms" in body["text"]
+    assert seen == [
+        A_ROBOTS,
+        "https://a.example/x",
+        B_ROBOTS,
+        "https://b.example/mid",
+        C_ROBOTS,
+        "https://c.example/final",
+    ]
+
+
+def test_without_respect_robots_a_redirect_chain_is_walked_exactly_as_before() -> None:
+    """Every robots.txt here refuses us, so reading any of them would change the answer."""
+    routes = _chain(b_robots=DISALLOW_ALL, c_robots=DISALLOW_ALL)
+    routes[A_ROBOTS] = _robots(DISALLOW_ALL)
+    for extra in ({}, {"respect_robots": False}):
+        seen: list[str] = []
+        client = _client(routes, seen=seen)
+        r = _text(client, "https://a.example/x", **extra)
+        assert r.status_code == 200 and r.json()["final_url"] == "https://c.example/final"
+        assert seen == ["https://a.example/x", "https://b.example/mid", "https://c.example/final"]
+
+
+def test_fetch_and_page_walk_redirects_exactly_as_before_and_never_read_robots() -> None:
+    """``/v1/fetch`` and ``/v1/page`` are the confirm pipeline's hit-image and page paths. They pass
+    no hop hook, so a chain is walked as it always was and no robots.txt is read for them, though
+    every robots.txt here would refuse us."""
+    image = b"not-really-a-png"
+    routes: dict[str, Route] = {
+        A_ROBOTS: _robots(DISALLOW_ALL),
+        B_ROBOTS: _robots(DISALLOW_ALL),
+        C_ROBOTS: _robots(DISALLOW_ALL),
+        "https://a.example/img": _redirect("https://b.example/img"),
+        "https://b.example/img": _redirect("https://c.example/img.png"),
+        "https://c.example/img.png": lambda: httpx.Response(
+            200, content=image, headers={"content-type": "image/png"}
+        ),
+        "https://a.example/p": _redirect("https://b.example/p"),
+        "https://b.example/p": _redirect("https://c.example/p.html"),
+        "https://c.example/p.html": _page(),
+    }
+    seen: list[str] = []
+    client = _client(routes, seen=seen)
+    fetched = client.post("/v1/fetch", json={"url": "https://a.example/img"}, headers=AUTH)
+    assert fetched.status_code == 200 and fetched.content == image
+    page = client.post("/v1/page", json={"url": "https://a.example/p"}, headers=AUTH)
+    assert page.status_code == 200 and page.json()["html"] == PAGE.decode()
+    assert seen == [
+        "https://a.example/img",
+        "https://b.example/img",
+        "https://c.example/img.png",
+        "https://a.example/p",
+        "https://b.example/p",
+        "https://c.example/p.html",
+    ]
+
+
+def test_a_hop_whose_robots_file_is_unreachable_is_not_requested_and_not_cached() -> None:
+    """The rule the requested origin gets, applied to a hop: an unreachable robots.txt is a
+    complete disallow, and a transient 503 must not block that origin for a day."""
+    seen: list[str] = []
+    routes = _chain()
+    routes[B_ROBOTS] = _status(503)
+    client = _client(routes, seen=seen)
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 502 and r.json()["error"]["code"] == "robots_unreachable"
+    assert seen == [A_ROBOTS, "https://a.example/x", B_ROBOTS]
+    routes[B_ROBOTS] = _robots(ALLOW_ALL)
+    assert _text(client, "https://a.example/x", respect_robots=True).status_code == 200
+    assert seen.count(B_ROBOTS) == 2 and seen.count(A_ROBOTS) == 1
+
+
+def test_a_redirect_to_plain_http_is_refused_before_any_robots_read_for_it() -> None:
+    """The hop's own https rule comes first, so the robots hook only ever sees a hop that already
+    passed it. Reading https://b.example/robots.txt on behalf of an http:// hop would answer a
+    question nobody asked, about a URL the walk is about to refuse anyway."""
+    seen: list[str] = []
+    client = _client(
+        {
+            A_ROBOTS: _robots(ALLOW_ALL),
+            "https://a.example/x": _redirect("http://b.example/y"),
+            B_ROBOTS: _robots(DISALLOW_ALL),
+            "http://b.example/y": _page(),
+        },
+        seen=seen,
+    )
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "not_https"
+    assert seen == [A_ROBOTS, "https://a.example/x"]
+
+
+def test_a_redirect_to_a_private_address_is_refused_and_nothing_is_requested_from_it() -> None:
+    """Neither the hop nor its robots.txt is requested. Either order of the address check and the
+    hook gives this answer (the robots read is address-checked too), so it pins the outcome."""
+
+    def resolver(host: str) -> tuple[str, ...]:
+        return ("10.0.0.5",) if host == "internal.example" else ("93.184.216.34",)
+
+    seen: list[str] = []
+    client = _client(
+        {
+            A_ROBOTS: _robots(ALLOW_ALL),
+            "https://a.example/x": _redirect("https://internal.example/y"),
+            "https://internal.example/robots.txt": _robots(ALLOW_ALL),
+            "https://internal.example/y": _page(),
+        },
+        seen=seen,
+        resolver=resolver,
+    )
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "refused_private_address"
+    assert seen == [A_ROBOTS, "https://a.example/x"]
+
+
+def test_a_relative_redirect_is_checked_as_the_absolute_url_it_resolves_to() -> None:
+    seen: list[str] = []
+    client = _client(
+        {
+            A_ROBOTS: _robots("User-agent: *\nDisallow: /moved\n"),
+            "https://a.example/x": _redirect("/moved"),
+            "https://a.example/moved": _page(),
+        },
+        seen=seen,
+    )
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 403 and r.json()["error"]["code"] == "robots_disallowed"
+    assert seen == [A_ROBOTS, "https://a.example/x"]
+
+
+def test_a_chain_past_the_redirect_cap_checks_only_the_hops_it_requests() -> None:
+    """Three redirects is one past the default cap of two: the fourth URL is never requested, so
+    its robots.txt is never read either."""
+    seen: list[str] = []
+    client = _client(
+        {
+            A_ROBOTS: _robots(ALLOW_ALL),
+            "https://a.example/x": _redirect("https://b.example/mid"),
+            B_ROBOTS: _robots(ALLOW_ALL),
+            "https://b.example/mid": _redirect("https://c.example/z"),
+            C_ROBOTS: _robots(ALLOW_ALL),
+            "https://c.example/z": _redirect("https://d.example/final"),
+            "https://d.example/robots.txt": _robots(ALLOW_ALL),
+            "https://d.example/final": _page(),
+        },
+        seen=seen,
+    )
+    r = _text(client, "https://a.example/x", respect_robots=True)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "redirect_limit"
+    assert seen == [
+        A_ROBOTS,
+        "https://a.example/x",
+        B_ROBOTS,
+        "https://b.example/mid",
+        C_ROBOTS,
+        "https://c.example/z",
+    ]
+
+
+# The hook itself, with no robots in it: the contract ``fetch_text`` and ``_get_guarded`` document.
+
+
+async def _walk(handler: Callable[[httpx.Request], httpx.Response], hook: Any) -> Any:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        return await fetch_text(
+            client,
+            "https://a.example/x",
+            max_bytes=10_000,
+            timeout_seconds=5.0,
+            max_redirects=2,
+            resolver=lambda host: ("93.184.216.34",),
+            before_redirect=hook,
+        )
+
+
+async def test_the_hop_hook_is_awaited_for_redirect_hops_only_and_before_each_request() -> None:
+    log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(f"GET {request.url}")
+        if str(request.url) == "https://a.example/x":
+            return httpx.Response(302, headers={"location": "/y"})  # relative
+        if str(request.url) == "https://a.example/y":
+            return httpx.Response(302, headers={"location": "https://b.example/z"})
+        return _page()()
+
+    async def hook(hop_url: str) -> None:
+        log.append(f"HOOK {hop_url}")
+
+    fetched = await _walk(handler, hook)
+    assert fetched.final_url == "https://b.example/z"
+    assert log == [
+        "GET https://a.example/x",  # the URL the caller supplied: no hook
+        "HOOK https://a.example/y",  # the relative Location, already absolute
+        "GET https://a.example/y",
+        "HOOK https://b.example/z",
+        "GET https://b.example/z",
+    ]
+
+
+async def test_a_refusing_hop_hook_stops_the_walk_and_its_refusal_leaves_unchanged() -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://b.example/y"})
+
+    async def hook(hop_url: str) -> None:
+        raise FetchRefused("robots_disallowed", f"refused {hop_url}")
+
+    with pytest.raises(FetchRefused) as refused:
+        await _walk(handler, hook)
+    assert refused.value.code == "robots_disallowed"
+    assert refused.value.detail == "refused https://b.example/y"
+    assert requested == ["https://a.example/x"]  # the refused hop was never contacted
