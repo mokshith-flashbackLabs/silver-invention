@@ -67,9 +67,32 @@ class ProposedCoverageGap(_Out):
     signal_ids: list[str] = Field(default_factory=list)
 
 
+class ProposedThreatEvent(_Out):
+    """No numeric bounds here either (see ProposedWeightChange): §4.5's severity and expiry
+    bounds run per proposal in intel/generation.py. ``kind`` is an enum, which structured
+    output enforces; it is not a bound the SDK checks client-side. There is no ``is_global``:
+    a global threat stays hand-created (§4.5)."""
+
+    kind: Literal["leak", "deepfake_wave", "platform_incident", "other"]
+    title: str
+    severity: int
+    expires_in_days: int
+    tags: list[str] = Field(default_factory=list)
+    rationale: str
+    signal_ids: list[str] = Field(default_factory=list)
+
+
+class ProposedAttach(_Out):
+    proposal_id: str
+    signal_ids: list[str] = Field(default_factory=list)
+
+
 class ProposalOutput(_Out):
     """Step 2's kinds as two typed lists rather than one list keyed by ``kind``, so each
-    kind's shape is closed. Steps 3 and 4 add threat_events, protection_events and attach."""
+    kind's shape is closed. Step 3 adds threat_events and attach; step 4 adds
+    protection_events."""
 
     weight_changes: list[ProposedWeightChange] = Field(default_factory=list)
     coverage_gaps: list[ProposedCoverageGap] = Field(default_factory=list)
+    threat_events: list[ProposedThreatEvent] = Field(default_factory=list)
+    attach: list[ProposedAttach] = Field(default_factory=list)

@@ -14,10 +14,20 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+
+from imageshield.intel.bounds import (
+    MAX_EVENT_TITLE_CHARS,
+    THREAT_EXPIRES_MAX_DAYS,
+    THREAT_EXPIRES_MIN_DAYS,
+    THREAT_SEVERITY_MAX,
+    THREAT_SEVERITY_MIN,
+)
+from imageshield.intel.tags import is_well_formed
 
 SupersedeReason = Literal["newer_proposal", "cell_changed", "resolved_by_quiz"]
 TagKind = Literal["platform", "service", "practice"]
+ThreatKind = Literal["leak", "deepfake_wave", "platform_incident", "other"]
 
 
 class _Stored(BaseModel):
@@ -50,10 +60,74 @@ class CoverageGapTarget(_Stored):
     regenerated_by_run_id: UUID | None = None
 
 
+def _distinct_slugs(value: tuple[str, ...]) -> tuple[str, ...]:
+    if any(not is_well_formed(t) for t in value) or len(set(value)) != len(value):
+        raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
+    return value
+
+
+class ThreatEventTarget(_Stored):
+    """What a threat_event is about: exposure tags, never a person (spec §3.6)."""
+
+    tags: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _distinct_slugs(value)
+
+
+class ThreatEventSuggested(_Stored):
+    """A threat_event's ``suggested``: the model's numbers and text, kept forever (§3.6). The
+    bounds are §4.5's, and they hold for an operator's final values too (ThreatEventDecided).
+    There is no ``body``: a threat proposal carries only a title (spec note 2026-09-30)."""
+
+    kind: ThreatKind
+    title: str = Field(min_length=1, max_length=MAX_EVENT_TITLE_CHARS)
+    severity: StrictInt = Field(ge=THREAT_SEVERITY_MIN, le=THREAT_SEVERITY_MAX)
+    expires_in_days: StrictInt = Field(ge=THREAT_EXPIRES_MIN_DAYS, le=THREAT_EXPIRES_MAX_DAYS)
+
+    @field_validator("title")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("title must not be blank")
+        return value
+
+
+class ThreatEventDecided(ThreatEventSuggested):
+    """A threat_event's ``decided``: the exact values an approval stores, and the only values
+    the event row is inserted from -- the suggested keys plus the tags (§3.6)."""
+
+    tags: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _distinct_slugs(value)
+
+
+class ThreatEventValues(_Stored):
+    """An operator's edit of a threat approval: any subset of the decided keys, and nothing else.
+    It is merged over the proposal's ``suggested`` and its own ``target.tags``, and the result
+    must parse as ThreatEventDecided. So a partial edit changes only what it names, and a
+    complete one is the whole decided set (spec note 2026-09-30). Types only here; the bounds
+    are ThreatEventDecided's."""
+
+    kind: ThreatKind | None = None
+    title: str | None = None
+    severity: StrictInt | None = None
+    expires_in_days: StrictInt | None = None
+    tags: tuple[str, ...] | None = None
+
+
 @dataclass(frozen=True)
 class ContextSignal:
     """An active-or-retracted signal with the provenance the predicates need. ``trust`` and
-    ``publisher_domain`` come from its document."""
+    ``publisher_domain`` come from its document. ``document_key`` is its document's canonical
+    URL hash (``intel_documents.url_hash``): what duplicate detection compares, so a page read
+    again by a later run is the same document (spec §4.3, note 2026-09-30). None only where a
+    test builds one by hand."""
 
     signal_id: UUID
     category: str
@@ -65,17 +139,21 @@ class ContextSignal:
     publisher_domain: str
     status: str
     created_at: datetime
+    document_key: str | None = None
 
 
 @dataclass(frozen=True)
 class NewProposal:
-    """One validated proposal, pre-insert. Step 3 widens ``kind``."""
+    """One validated proposal, pre-insert. ``document_keys`` are the canonical URL hashes of
+    its cited signals' documents: duplicate detection compares them (spec §4.3). Step 4
+    widens ``kind``."""
 
-    kind: Literal["weight_change", "coverage_gap"]
+    kind: Literal["weight_change", "coverage_gap", "threat_event"]
     target: dict[str, Any]
     suggested: dict[str, Any]
     rationale: str
     signal_ids: tuple[UUID, ...]
+    document_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -91,9 +169,75 @@ class ProposalRecord:
 
 
 @dataclass(frozen=True)
+class PendingEvent:
+    """A pending event proposal as generation reads it: for the prompt, for attach
+    validation, and for duplicate detection (same kind and tag set, a shared document --
+    ``document_keys`` are its signals' documents' canonical URL hashes)."""
+
+    proposal_id: UUID
+    kind: str
+    tags: tuple[str, ...]
+    title: str
+    severity: int | None
+    signal_ids: tuple[UUID, ...]
+    document_keys: frozenset[str]
+
+
+@dataclass(frozen=True)
+class LiveEvent:
+    """An active threat event that carries tags: the prompt's live_events and the detail
+    read's related_events (spec §4.3, §4.7)."""
+
+    event_id: UUID
+    kind: str
+    title: str
+    severity: int
+    tags: tuple[str, ...]
+    is_global: bool
+    starts_at: datetime
+    expires_at: datetime
+    proposal_id: UUID | None
+    signal_ids: tuple[UUID, ...]
+
+    def related(self) -> dict[str, Any]:
+        """One ``related_events`` item of the detail read (Cross-repo contract, step 3)."""
+        return {
+            "event_id": self.event_id,
+            "direction": "threat",
+            "kind": self.kind,
+            "title": self.title,
+            "severity": self.severity,
+            "tags": list(self.tags),
+            "is_global": self.is_global,
+            "starts_at": self.starts_at,
+            "expires_at": self.expires_at,
+            "proposal_id": self.proposal_id,
+        }
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """New evidence for a still-pending event proposal (spec §4.3 ``attach``). It never
+    changes the proposal's target, suggested or rationale."""
+
+    proposal_id: UUID
+    signal_ids: tuple[UUID, ...]
+
+
+class GapRegenerateRequest(_Stored):
+    """``intel_runs.request`` of a gap_regenerate run (spec §3.4, §4.9). Never person data."""
+
+    coverage_gap_id: UUID
+    tag: str
+    signal_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True)
 class WriteResult:
     written: tuple[UUID, ...]
     superseded: tuple[UUID, ...]
+    attached: tuple[UUID, ...] = ()
+    attach_dropped: int = 0
 
 
 @dataclass(frozen=True)
@@ -114,16 +258,20 @@ DecisionRefusal = Literal[
     "proposal_tags_unmapped",
     "proposal_cell_awaiting_publish",
     "values_out_of_bounds",
+    "unknown_tag",
+    "tag_retired",
 ]
 
 
 class DecisionRefused(Exception):
-    """A decision the transaction refused. ``code`` is the §4.7 error code, verbatim."""
+    """A decision the transaction refused. ``code`` is the §4.7 error code, verbatim, and
+    ``slugs`` names the offending tags of ``unknown_tag`` / ``tag_retired`` (§3.1)."""
 
-    def __init__(self, code: DecisionRefusal, message: str) -> None:
+    def __init__(self, code: DecisionRefusal, message: str, *, slugs: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.slugs = slugs
 
 
 @dataclass(frozen=True)

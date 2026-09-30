@@ -16,7 +16,12 @@ from imageshield.intel.generation import (
     prompt_signal,
     validate_proposals,
 )
-from imageshield.intel.prompts import proposal_request
+from imageshield.intel.prompts import (
+    PROPOSE_PROMPT_VERSION,
+    PromptLiveEvent,
+    PromptPendingEvent,
+    proposal_request,
+)
 from imageshield.intel.proposal_models import ContextSignal
 from imageshield.intel.schemas import (
     ProposalOutput,
@@ -264,3 +269,45 @@ def test_the_prompt_carries_the_quiz_with_mutability_and_no_person_data() -> Non
     blob = (system + user).lower()
     assert "user_ref" not in blob and "phone" not in blob
     assert "myspace" not in {t["slug"] for t in payload["tag_registry"]}  # retired omitted
+
+
+def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -> None:
+    pending = PromptPendingEvent(
+        proposal_id=str(uuid4()),
+        kind="threat_event",
+        title="Breach",
+        severity=3,
+        tags=["instagram"],
+        signal_ids=[],
+    )
+    live = PromptLiveEvent(
+        event_id=str(uuid4()),
+        kind="leak",
+        title="Leak",
+        severity=4,
+        tags=["instagram"],
+        expires_at="2026-10-30T00:00:00+00:00",
+        signal_ids=[],
+    )
+
+    def build(events_only: bool) -> tuple[str, str]:
+        return proposal_request(
+            [],
+            [],
+            quiz=prompt_quiz(V),
+            registry_tags=prompt_registry(V, set()),
+            mapped_tags=sorted(V.mapped_tags),
+            pending_events=[pending],
+            live_events=[live],
+            events_only=events_only,
+        )
+
+    system, user = build(False)
+    payload = json.loads(user)
+    assert payload["pending_events"] == [pending] and payload["live_events"] == [live]
+    assert "threat_events" in system and "attach" in system
+    assert "Propose only threat_events and attach" not in system
+    regenerate, _ = build(True)
+    assert regenerate.startswith(system)
+    assert "Propose only threat_events and attach" in regenerate
+    assert PROPOSE_PROMPT_VERSION == "propose-v2"

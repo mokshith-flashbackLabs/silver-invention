@@ -374,6 +374,22 @@ def test_the_proposal_schema_carries_no_numeric_or_length_bounds() -> None:
     assert parsed.weight_changes[0].delta == 7
 
 
+def test_the_threat_output_parses_out_of_range_numbers_for_code_to_drop() -> None:
+    """Review Focus 1 of step 2, extended: no numeric bounds in the schema, so one bad severity
+    reaches intel/generation.py, which drops that one proposal, instead of failing the whole
+    response in the SDK."""
+    schema = json.dumps(ProposalOutput.model_json_schema())
+    for keyword in ("minimum", "maximum", "maxLength", "minLength"):
+        assert keyword not in schema
+    parsed = ProposalOutput.model_validate_json(
+        '{"threat_events": [{"kind": "leak", "title": "t", "severity": 9,'
+        ' "expires_in_days": 400, "tags": [], "rationale": "r", "signal_ids": []}],'
+        ' "attach": [{"proposal_id": "not-a-uuid", "signal_ids": []}]}'
+    )
+    assert parsed.threat_events[0].severity == 9
+    assert parsed.attach[0].proposal_id == "not-a-uuid"
+
+
 async def test_the_stub_proposes_nothing() -> None:
     call = await StubIntelModel().propose("s", "u")
     assert call.outcome == "ok" and call.output == ProposalOutput()
