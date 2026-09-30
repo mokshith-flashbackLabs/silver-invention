@@ -40,6 +40,7 @@ The feature lives in services. ToS changes and LinkedIn were given as examples, 
 | 8 | The "ask first" items in §3 rule 6 | **Approved:** a new `intel-worker` container (§4.1, no fourth queue); reversing "services deployables stay LLM-free" (§1). |
 | 9 | A third dependency | **Approved at spec review:** `publicsuffixlist` (pinned, bundled list, no network), so corroboration counts publishers by registrable domain (§3.6). |
 | 10 | **It must adapt when the quiz changes** (owner, at spec review) | Nothing in intel may assume a fixed quiz. The things an event can target are **exposure tags**: live data the backend owns, which an operator creates and maps to *any* option of *any* question, with no deploy and no retake (§3.1). Every proposal is generated against the vocabulary the backend pushes after each change, and services react to every change on their own (§4.9). A question or option added tomorrow becomes a target for evidence, suggestions and events tomorrow. |
+| 11 | **Sources come from the questions** (owner, 2026-09-30, after steps 0–1 were built) | Today's platform question may not exist tomorrow, so sources are not a registry curated apart from the quiz. Pressing Suggest points also **proposes sources for each option**, lets the operator **add more**, **validates** that each can be read, and only then reads them and suggests points. Chosen sources then join the weekly checks, and they **pause on their own** when the options they belong to leave the quiz (§4.10). The registry stays as the store; `POST /sources` remains for general, untagged sources. |
 
 **Why the human gate is the whole design.** A false positive here is a psychological injury (§1). A model misreading
 one news story must not lower thousands of scores unattended. The model writes rows into intel tables and nothing
@@ -191,6 +192,10 @@ pending `coverage_gap` about LinkedIn closes itself (§4.9). Nothing in services
 **Sources are added through the admin API, never seeded in a migration.** The phone-shaped build gate
 (`test_boundaries.py:395`) fails any migration literal holding a digit run, such as a dated URL or an article id.
 
+*Amended 2026-09-30 (decision 11):* sources tied to a quiz option now arrive through the Suggest points flow (§4.10),
+which adds `origin` and `proposed_for` and a third `disabled_reason`, `unmapped`, for a source paused because none of
+its tags maps to a live option. `POST /sources` stays for general sources.
+
 ### 3.3 Snapshots — only for `policy_page`
 
 `intel_snapshots`, one row per source (latest only): `source_id` PK/FK, `content_sha256`, `snapshot_text`,
@@ -211,7 +216,7 @@ pending `coverage_gap` about LinkedIn closes itself (§4.9). Nothing in services
 | Column | Notes |
 |---|---|
 | `run_id` | UUID PK |
-| `kind` | `source_check` · `discovery` · `adhoc_url` · `weight_suggestion` · `renewal_check` · `gap_regenerate` |
+| `kind` | `source_check` · `discovery` · `adhoc_url` · `weight_suggestion` · `renewal_check` · `gap_regenerate`; step 5 adds `source_proposal` and `source_validation` (§4.10) |
 | `source_id` | NULL for every kind except `source_check` and `discovery` |
 | `request` | JSONB. `adhoc_url`: `{url}`. `weight_suggestion`: the question payload (§4.6). `renewal_check`: `{event_id}`. `gap_regenerate`: `{coverage_gap_id, tag, signal_ids}` (§4.9). **Never person data.** |
 | `vocabulary_release_no`, `vocabulary_map_version` | The vocabulary pair the run loaded, NULL when none existed. Every signal (through its document) and every proposal, event kinds included, inherits it, so what registry an output was produced against is always answerable. |
@@ -543,6 +548,10 @@ one isolation boundary.
 
 `/v1/text` sits beside `/v1/page`. `/v1/page` keeps its exact contract, because confirm depends on it.
 
+*Amended 2026-09-30:* step 5 adds a `robots.txt` check for source validation (§4.10): fetched under the same SSRF
+guard, cached per host for 24 hours, and reported as `robots_disallowed`. It applies to validation, not to
+`/v1/page`.
+
 - **Content types:** `text/html`, `application/xhtml+xml`, `text/plain`, `application/rss+xml`,
   `application/atom+xml`, `application/xml`, `text/xml` and `application/json`. Anything else is `400
   unsupported_type`. PDF is out of v1 (§9).
@@ -719,6 +728,10 @@ change, a review and a `git blame`, the same argument as the backend's `REPORT_F
 
 ### 4.6 Weight and tag suggestions for quiz drafts
 
+*Amended 2026-09-30 (decision 11):* this retrieval and suggestion now run **after** the source stages of §4.10.
+`POST /weight-suggestions` gains a `sources` list, the run first reads newly chosen sources, and its call cap is
+`INTEL_MAX_CALLS_PER_SUGGESTION_RUN`. Everything below still holds for what happens after that read.
+
 The backend's quiz editor calls `POST /v1/admin/intel/weight-suggestions` with `{question_key, prompt, type, options,
 cap?, tags?, operator}`.
 - `tags` is an optional `{option: [slug]}` map: the backend's option-to-tag rows for the draft's options. The map is
@@ -781,7 +794,9 @@ signals.
 | `POST /proposals/{id}/decision` | `{decision, values?, reason, applies_regardless_of_location?, operator}`. See below. |
 | `POST /proposals/applied` | System write, see above. Moves `approved` `weight_change` rows to `applied`, **keeping the approval's `decided_by`, `decided_at` and `decision_reason`**. Already-applied rows are a no-op. |
 | `PUT /vocabulary` | System write (§3.8) |
-| `POST /weight-suggestions` · `GET /weight-suggestions/{run_id}` | §4.6 |
+| `POST /weight-suggestions` · `GET /weight-suggestions/{run_id}` | §4.6, with the `sources` list and `sources_deferred` of §4.10 |
+| `POST /source-proposals` · `GET /source-proposals/{run_id}` | Stage 1 of §4.10: candidate sources per option, existing ones first. Nothing is registered. |
+| `POST /source-validations` · `GET /source-validations/{run_id}` | Stage 3 of §4.10: `ready` or `blocked` with a reason, per candidate. No model call. |
 | `GET /protection-events` | Each row carries `renewal_due` (`review_by` within 30 days) and its renewal run's outcome (§4.8) |
 | `POST /protection-events/{id}/retract` | Terminal, audited, guarded by `WHERE status = 'active'` |
 
@@ -810,7 +825,8 @@ re-checked inside it.
 `proposal_uncorroborated`, `proposal_not_decidable`, `proposal_evidence_retracted`, `proposal_cell_awaiting_publish`,
 `proposal_tags_unmapped`, `values_out_of_bounds`, `unknown_tag`, `tag_retired`, `known_hit_location`,
 `query_names_a_person`, `intel_source_not_found`, `intel_run_not_found`, `signal_not_found`, `signal_not_active`,
-`protection_event_not_found`. `unknown_tag` and `tag_retired` carry the offending slugs. **A hand-created threat's
+`protection_event_not_found`, and from step 5 `source_not_validated` (§4.10), naming the entries.
+`unknown_tag` and `tag_retired` carry the offending slugs. **A hand-created threat's
 `tags` are shape-checked only**; the backend, which owns the registry, is the authority on their membership. The
 `intel_` prefixes exist because
 `run_not_found` already means a missing search run. The backend maps every 404, 409 and semantic 422 code by name,
@@ -848,6 +864,7 @@ reconcile is idempotent and deterministic; no model runs in it.
 | **Any of the above, for an `approved`, unapplied `weight_change`** | **Nothing is changed automatically.** An approval is a human's decision and stays one.<br>• **First, a published-but-unacknowledged change is recognised.** When the live deduction equals `target.current + decided.delta` exactly, the proposal was just published and its acknowledgement has not landed yet. Reads show `applied_pending_ack: true`, **never `stale`**, and withdrawal is refused (`409 proposal_not_pending`).<br>• Otherwise the reads show `stale: true` with `why_stale` (`option_renamed`, `cell_removed`, `not_mutable`, `deduction_moved`), so an operator withdraws it or re-approves a fresh one. The backend would refuse it as `STALE` at publish anyway. |
 | **A tag newly mapped** | **The evidence behind a closed gap is re-proposed, never lost.**<br>• A pending `coverage_gap` is resolved when its `suggested_tag.slug` equals the tag, or its normalised subject equals the tag's normalised slug or label. The comparison is exact on lowercase text with non-alphanumerics collapsed; nothing is fuzzy.<br>• For each gap it resolves, the reconcile **queues a `gap_regenerate` run** through the normal provider gate. The run's input is the gap's active `signal_ids`, plus active signals whose normalised `unregistered_subjects` equal the tag's normalised slug or label. They are passed explicitly, because signal tags are immutable and old signals would never match "overlapping tags".<br>• The gap is superseded with `resolved_by_quiz` **in the same transaction that queues the run**, and records `regenerated_by_run_id`. The run then writes event proposals against a vocabulary where the tag is mapped.<br>• Pending event proposals whose only unmapped tags are now mapped become approvable, with no rewrite.<br>• Active events already carrying the tag start reaching the newly mapped people **in the backend**, with no event edited. |
 | **A tag registered** | From the next run, extraction uses it instead of reporting the subject as unregistered. |
+| **A source's tags all unmapped, or one mapped again** *(2026-09-30, §4.10)* | A source whose non-empty `tags` are all unmapped is paused (`enabled = false, disabled_reason = 'unmapped'`) in the reconcile's transaction, and re-enabled when any of its tags is mapped again, only if `disabled_reason` is still `unmapped`. Untagged sources never pause this way. |
 | **A tag retired** | New proposals and operator values may no longer *add* it. Existing events, mappings and pending proposals keep it and stay approvable, and reads show it in `retired_tags`, informational only. A renewal carries it forward. |
 | **Question keys** | Keys are identities. A new key is a new question, and an old key's evidence stays attached to the old key. Renaming a *key* is out of scope (§9). |
 
@@ -857,6 +874,84 @@ delivered advice with no state to repair. Approved rows belong to the person who
 
 **The one-line promise:** after any quiz-editor publish or tag change, within one poll interval, intel's pending queue
 matches the live quiz, and nothing an operator approved has been silently rewritten.
+
+### 4.10 Sources chosen per question — amended 2026-09-30 (decision 11)
+
+**Owner, 2026-09-30:** *"we take sources directly from the questions … when suggest button is clicked we also select
+the sources and we also give option to add more sources and validate that we can gather information from there and
+then we proceed."* A registry curated apart from the quiz drifts from it: sources for removed options keep costing
+money, and a new option has no sources until somebody remembers to add them. So the Suggest points flow now **starts
+by choosing sources**, and §4.6's retrieval runs only after them. The registry (§3.2) is where chosen sources live
+afterwards; nothing about how a registered source is checked changes.
+
+**The four stages, all behind the quiz editor's one button:**
+
+1. **Propose.** `POST /source-proposals` with `{question_key, prompt, options, tags?, operator}` queues a
+   `source_proposal` run and answers `202 {run_id}`.
+   - One `INTEL_EXTRACTION_MODEL` call with web search (`max_uses` = `INTEL_MAX_SOURCE_PROPOSAL_SEARCHES`, config). The
+     prompt holds the question text, its options, the tag registry and the source kinds. **Never person data.**
+   - Output, per option: up to `MAX_PROPOSED_SOURCES_PER_OPTION` (5, `intel/bounds.py`) candidates
+     `{kind, source_url | query_text, reason}`. Typical candidates are the platform's privacy policy, its terms, its
+     safety or transparency pages, and one or two news searches.
+   - Code, not the model, then: https only; canonicalised with `search/urlhash.py`; deduplicated; known hit locations
+     dropped (§6.1); PII-shaped `query_text` dropped (§6.1). **Existing registry sources whose tags intersect the
+     option's tags are listed first, pre-selected**, so a second press reuses what is already watched.
+   - `GET /source-proposals/{run_id}` returns `{status, options: [{option, existing: [source], proposed:
+     [candidate]}]}`. Nothing is registered at this stage.
+2. **Edit.** The quiz editor shows the list per option. The operator removes candidates and adds their own: a URL of
+   any kind, or a search query.
+3. **Validate.** `POST /source-validations` with `{candidates: [{option, kind, source_url | query_text}], operator}`
+   queues a `source_validation` run. **No model call.** For each candidate:
+   - a known hit location is `blocked` (`known_hit_location`);
+   - it is fetched through `/v1/text`, and the final URL must be https;
+   - its readable text must reach `MIN_POLICY_TEXT_CHARS` (500) for `policy_page`, and `MIN_SOURCE_TEXT_CHARS` (200,
+     `intel/bounds.py`) otherwise. This catches app shells before they cost a scheduled check;
+   - **robots:** the host's `robots.txt` must not disallow the path for our user agent (`robots_disallowed`). The
+     fetcher gains this check (§4.2, amended): it fetches `robots.txt` under the same SSRF guard and caches it per host
+     for 24 hours. Robots is a floor, not a permission: the operator's `terms_note` (§3.2) is still required;
+   - a `feed` must parse as RSS or Atom with at least one item;
+   - a `search_query` passes the PII check, then **one** web search, metered through the gate like any call, must
+     return at least one https URL that passes the checks above.
+
+   `GET /source-validations/{run_id}` returns `[{candidate, status: ready | blocked, reason}]`. A result is honoured
+   for 24 hours.
+4. **Proceed.** `POST /weight-suggestions` gains `sources: [{option, kind, source_url | query_text,
+   validation_run_id, terms_note, check_every_hours?}]`. Each entry must be `ready` in that validation run and inside
+   its 24 hours, or the call is `422 source_not_validated`, naming the entries. In **one transaction**, services:
+   - registers each source, or reuses the existing row with the same `url_hash` or `query_text`, with `origin`
+     (`suggested` when it came from stage 1, `operator` otherwise), `proposed_for = {question_key, option}`, the
+     option's tags from the request's `tags` map or the vocabulary, and `check_every_hours` defaulting to 168;
+   - queues the `weight_suggestion` run.
+
+   That run first performs an **immediate check of every newly registered source**, inside the run rather than as
+   separate queued runs, then retrieval (§4.6) and the suggestion. **Its call cap is
+   `INTEL_MAX_CALLS_PER_SUGGESTION_RUN`** (config, default 60) instead of `INTEL_MAX_CALLS_PER_RUN`, because a
+   question's first read is legitimately larger than a weekly check. Units past the cap stay unconsumed and are read by
+   the sources' first scheduled check. The suggestion proceeds with what was read, and the poll adds
+   `sources_deferred: int`.
+
+From then on the chosen sources are ordinary registry rows on the weekly schedule.
+
+**Sources follow the quiz** (a new row in §4.9's table). A source whose `tags` are non-empty and **all unmapped** in
+the current vocabulary is **paused**: the reconcile sets `enabled = false, disabled_reason = 'unmapped'` in its
+transaction. When any of its tags is mapped again, the reconcile re-enables it, but only when `disabled_reason =
+'unmapped'`; an operator's own disable is never overridden. A source with no tags (a breach tracker, a regulator's
+feed) is general and never pauses this way. So a question removed tomorrow stops its sources costing money, and a
+rollback or a re-added option brings them back, with no hand edits.
+
+**Schema, in the migration that ships step 5:**
+- `intel_sources.origin TEXT NOT NULL DEFAULT 'operator' CHECK (origin IN ('suggested','operator'))`, and
+  `intel_sources.proposed_for JSONB`, provenance only (matching still goes through tags);
+- `disabled_reason` gains `'unmapped'`;
+- `intel_runs.kind` gains `source_proposal` and `source_validation`. Their results live in the run's `outcome`; no
+  new table.
+
+**Cost.** A proposal run is one model call plus its searches. A validation run makes no model call and one search per
+search-query candidate. The suggestion run is bounded by its own cap. All of it goes through the provider gate and the
+daily budget (§5), so a press that hits the budget waits and says so, like any run.
+
+**Why the registry route stays.** `POST /sources` is still how an operator adds a general source that belongs to no
+option. Everything tied to an option arrives through this flow, so it carries the option's tags and pauses with them.
 
 ## 5. Cost and controls — the existing provider gate, with a new kind
 
@@ -1047,7 +1142,7 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 | **2** | Proposal generation (`weight_change`, `weight_suggestion`, `coverage_gap`), decisions, `applied`, the §4.9 reconcile | 0063; `model.ts` on api **and** worker; the bootstrap release; weights publish and decision routes; provenance; two-pass attribution; the drift sweep's **version leg only**; stale-draft rule | **yes**, first |
 | **3** | 0039. `threat_event` generation and decisions, `gap_regenerate`; hand-created `tags` | Tag matching, the merged reader, `breakdown.scope`, the reach counterfactual and `scope_update`, the drift sweep's **map leg** (one expected catch-up pass), the threat half of event decisions, `threatEventBody.tags` | yes |
 | **4** | 0040. `protection_event` generation, decisions and renewal | 0064; the protection engine term, snapshot column, copy, protection routes, the drift sweep's event leg | yes |
-| **5** | Weight suggestions | The quiz editor's suggest action; provenance from drafts; citation coverage | no |
+| **5** | Weight suggestions, **starting with per-question source proposal, validation (including `robots.txt`) and the first read**; sources pausing with their tags (§4.10) | The quiz editor's suggest action **with its source picker**; provenance from drafts; citation coverage | no |
 | **6** | Coverage-gap proposals surfaced | Their display | no |
 
 **Per-step deploy gates:**
@@ -1167,3 +1262,17 @@ data note records that intel's public-document text is processed there. **Nothin
 - A rename log `A → B` at release 5 and `B → C` at release 6, reconciled together, retargets a pending proposal on A to
   C.
 - Every signal and proposal can name the `(release_no, map_version)` of the vocabulary it was produced against.
+
+**Sources chosen per question (§4.10, added 2026-09-30)**
+- A source proposal lists existing sources whose tags intersect an option's first, drops a known hit location and a
+  PII-shaped query, and registers nothing.
+- Validation blocks a known hit location, a non-https final URL, an app shell under the text floor, a
+  `robots.txt`-disallowed path, a feed with no items, and a search query whose search returns no fetchable page, each
+  with its reason, and makes no model call.
+- `POST /weight-suggestions` refuses a source that is not `ready` in the named validation run, or whose result is
+  older than 24 hours (`422 source_not_validated`), and registers nothing when it refuses.
+- A source already in the registry is reused, not duplicated, when chosen again.
+- A suggestion run reads its new sources first, stops at `INTEL_MAX_CALLS_PER_SUGGESTION_RUN`, reports
+  `sources_deferred`, and still returns a suggestion.
+- Unmapping every tag of a source pauses it with `disabled_reason = 'unmapped'`; mapping one again re-enables it; an
+  operator-disabled source is never re-enabled by the reconcile; an untagged source never pauses.
