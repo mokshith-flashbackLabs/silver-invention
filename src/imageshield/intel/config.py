@@ -40,6 +40,9 @@ class IntelConfig(BaseSettings):
     intel_anthropic_region: str
     anthropic_aws_workspace_id: str
     intel_extraction_model: str
+    # Proposal generation (step 2, spec §4.3). Config, not a literal -- the same
+    # build-gate reason as the extraction model -- and priced at construction.
+    intel_proposal_model: str
     # Config, not a literal: the phone-shaped build gate flags this string in src/.
     intel_web_search_tool_type: str
     intel_max_web_searches_per_run: int = 5

@@ -24,6 +24,7 @@ MIGRATE_TASK = ECS_DIR / "imageshield-dev-migrate-services.json"
 WORKER_TASK = ECS_DIR / "imageshield-dev-services-worker.json"
 CONFIRM_TASK = ECS_DIR / "imageshield-dev-confirm.json"
 FETCHER_TASK = ECS_DIR / "imageshield-dev-fetcher.json"
+PROD_WORKER_TASK = ECS_DIR / "prod" / "services-worker.json"
 TASK_ROLE = ECS_DIR / "policies" / "services-task-role.json"
 
 LIVENESS_BUCKET = "imageshield-dev-liveness-225989356895"
@@ -501,6 +502,16 @@ def test_intel_worker_supplies_every_required_intel_field() -> None:
     required -= {"DATABASE_URL"}  # composed from the five DB_* secrets, never environment
     container = _worker_containers()["intel-worker"]
     assert required - _container_supplied_names(container) == set()
+
+
+def test_prod_intel_worker_supplies_every_required_intel_field() -> None:
+    """The dev twin of this is test_intel_worker_supplies_every_required_intel_field. A
+    required IntelConfig key missing from prod crash-loops the container on its first
+    deploy, whatever INTEL_ENABLED says."""
+    required = {n.upper() for n, f in IntelConfig.model_fields.items() if f.is_required()}
+    required -= {"DATABASE_URL"}
+    containers = {c["name"]: c for c in _load(PROD_WORKER_TASK)["containerDefinitions"]}
+    assert required - _container_supplied_names(containers["intel-worker"]) == set()
 
 
 def test_intel_worker_sets_nothing_intel_config_does_not_read() -> None:

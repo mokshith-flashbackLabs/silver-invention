@@ -12,6 +12,7 @@ page.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -29,6 +30,7 @@ from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractedSignal,
     ExtractionOutput,
+    ProposalOutput,
 )
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
@@ -70,6 +72,10 @@ class FakeModel:
         outcome: str = "ok",
         discovery: DiscoveryOutput | None = None,
         unavailable: ModelUnavailable | None = None,
+        *,
+        propose_with: Callable[[dict[str, Any]], ProposalOutput] | None = None,
+        proposal_outcome: str = "ok",
+        propose_unavailable: ModelUnavailable | None = None,
     ) -> None:
         self.extraction = extraction
         self.outcome = outcome
@@ -78,6 +84,11 @@ class FakeModel:
         self.extract_calls = 0
         self.discover_calls = 0
         self.users: list[str] = []
+        self.propose_with = propose_with
+        self.proposal_outcome = proposal_outcome
+        self.propose_unavailable = propose_unavailable
+        self.propose_calls = 0
+        self.proposal_users: list[str] = []
 
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]:
         self.extract_calls += 1
@@ -107,6 +118,31 @@ class FakeModel:
             "end_turn",
             Usage(1, 1, 0, 0, 1),
             Decimal("0.02"),
+            1,
+        )
+
+    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
+        """``propose_with`` receives the parsed user payload, so a test can cite the ids of
+        signals the run under test just wrote."""
+        self.propose_calls += 1
+        self.proposal_users.append(user)
+        if self.propose_unavailable is not None:
+            raise self.propose_unavailable
+        output: ProposalOutput | None = None
+        if self.proposal_outcome == "ok":
+            output = self.propose_with(json.loads(user)) if self.propose_with else ProposalOutput()
+        stop = (
+            self.proposal_outcome
+            if self.proposal_outcome in ("refusal", "max_tokens")
+            else "end_turn"
+        )
+        return ModelCall(
+            output,
+            self.proposal_outcome,  # type: ignore[arg-type]
+            "claude-opus-5-5",
+            stop,
+            Usage(1, 1, 0, 0, 0),
+            Decimal("0.05"),
             1,
         )
 

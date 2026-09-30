@@ -40,12 +40,16 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from imageshield.intel.config import IntelConfig
 from imageshield.intel.pricing import Usage, cost_of
-from imageshield.intel.schemas import DiscoveryOutput, ExtractionOutput
+from imageshield.intel.schemas import DiscoveryOutput, ExtractionOutput, ProposalOutput
 
 T = TypeVar("T", bound=BaseModel)
 Outcome = Literal["ok", "refusal", "max_tokens", "unparseable"]
 _RETRIES = 3
 _MAX_TOKENS = 8000
+# Opus 5.5 defaults to effort "medium" (spec §4.3 says set it explicitly). max_tokens stays
+# _MAX_TOKENS: the 0.45 worst case in migration 0041 assumes 8 000 output tokens, and a
+# proposal call that stops there is consumed and counted (proposal_model_max_tokens).
+_PROPOSAL_EFFORT = "high"
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,7 @@ class ModelUnavailable(Exception):
 class IntelModel(Protocol):
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]: ...
     async def discover(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
+    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]: ...
 
 
 def _usage(raw: Any) -> Usage:
@@ -110,8 +115,9 @@ class ClaudeIntelModel:
         # -- up to MAX_RUN_ATTEMPTS times, each one billed and unmetered. Pricing
         # the configured (requested) model id here, once, means `_send` and
         # `discover` can never raise pricing a call that already happened: the
-        # id this process sends never changes mid-run.
-        cost_of(config.intel_extraction_model, Usage(0, 0, 0, 0, 0))
+        # neither id this process sends changes mid-run.
+        for model_id in (config.intel_extraction_model, config.intel_proposal_model):
+            cost_of(model_id, Usage(0, 0, 0, 0, 0))
         self._config = config
         # Explicitly `Any`: an injected test double (SimpleNamespace) is not an
         # AsyncAnthropicAWS, and `self._client.messages.create(**kwargs)` below
@@ -122,16 +128,21 @@ class ClaudeIntelModel:
             max_retries=0,
         )
 
-    async def _send(self, output_format: type[T], **kwargs: Any) -> ModelCall[T]:
+    async def _send(
+        self, output_format: type[T], *, model: str, effort: str | None = None, **kwargs: Any
+    ) -> ModelCall[T]:
         started = time.monotonic()
+        output_config = _output_config(output_format)
+        if effort is not None:
+            output_config["effort"] = effort
         response: Any = None
         for attempt in range(1, _RETRIES + 1):
             try:
                 response = await self._client.messages.create(
-                    model=self._config.intel_extraction_model,
+                    model=model,
                     max_tokens=_MAX_TOKENS,
                     thinking={"type": "adaptive"},
-                    output_config=_output_config(output_format),
+                    output_config=output_config,
                     **kwargs,
                 )
                 break
@@ -187,14 +198,17 @@ class ClaudeIntelModel:
             answered_by=str(response.model),
             stop_reason=stop,
             usage=usage,
-            cost_usd=cost_of(self._config.intel_extraction_model, usage),
+            cost_usd=cost_of(model, usage),
             latency_ms=int((time.monotonic() - started) * 1000),
             content=content,
         )
 
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]:
         return await self._send(
-            ExtractionOutput, system=system, messages=[{"role": "user", "content": user}]
+            ExtractionOutput,
+            model=self._config.intel_extraction_model,
+            system=system,
+            messages=[{"role": "user", "content": user}],
         )
 
     async def discover(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
@@ -215,7 +229,13 @@ class ClaudeIntelModel:
         total_calls = 0  # every actual API call this discover() makes, initial included
         total = Usage(0, 0, 0, 0, 0)
         while True:
-            call = await self._send(DiscoveryOutput, system=system, tools=tools, messages=messages)
+            call = await self._send(
+                DiscoveryOutput,
+                model=self._config.intel_extraction_model,
+                system=system,
+                tools=tools,
+                messages=messages,
+            )
             total_calls += 1
             u = call.usage
             total = Usage(
@@ -249,3 +269,12 @@ class ClaudeIntelModel:
             # original user turn plus the paused assistant turn verbatim; the
             # server resumes from the trailing server_tool_use block.
             messages = [messages[0], {"role": "assistant", "content": call.content}]
+
+    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
+        return await self._send(
+            ProposalOutput,
+            model=self._config.intel_proposal_model,
+            effort=_PROPOSAL_EFFORT,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )

@@ -22,6 +22,7 @@ BASE = {
     "INTEL_ANTHROPIC_REGION": "ap-south-1",
     "ANTHROPIC_AWS_WORKSPACE_ID": "wrkspc_test",
     "INTEL_EXTRACTION_MODEL": "claude-sonnet-5",
+    "INTEL_PROPOSAL_MODEL": "claude-opus-5-5",
     "INTEL_WEB_SEARCH_TOOL_TYPE": "web_search_20260209",
     "FETCHER_BASE_URL": "http://localhost:8083",
     "FETCHER_TOKEN": "fetcher-token-for-tests-0003",
@@ -97,4 +98,11 @@ def test_it_has_no_field_the_shared_config_would_need() -> None:
 def test_log_level_debug_is_refused_in_production(clean_env: pytest.MonkeyPatch) -> None:
     _env(clean_env, LOG_LEVEL="debug")
     with pytest.raises(ConfigError, match="LOG_LEVEL"):
+        load_intel_config()
+
+
+def test_intel_proposal_model_is_required(clean_env: pytest.MonkeyPatch) -> None:
+    _env(clean_env)
+    clean_env.delenv("INTEL_PROPOSAL_MODEL")
+    with pytest.raises(ConfigError, match="INTEL_PROPOSAL_MODEL"):
         load_intel_config()

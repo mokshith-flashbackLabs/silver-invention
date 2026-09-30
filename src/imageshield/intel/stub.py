@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from imageshield.intel.model import ModelCall
 from imageshield.intel.pricing import Usage
-from imageshield.intel.schemas import DiscoveryOutput, ExtractionOutput
+from imageshield.intel.schemas import DiscoveryOutput, ExtractionOutput, ProposalOutput
 
 _ZERO = Usage(0, 0, 0, 0, 0)
 
@@ -24,3 +24,6 @@ class StubIntelModel:
         return ModelCall(
             DiscoveryOutput(candidates=[]), "ok", "stub", "end_turn", _ZERO, Decimal("0"), 0
         )
+
+    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
+        return ModelCall(ProposalOutput(), "ok", "stub", "end_turn", _ZERO, Decimal("0"), 0)

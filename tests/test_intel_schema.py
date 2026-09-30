@@ -356,3 +356,15 @@ def test_proposal_shape_checks(migrated_db: str) -> None:
             " VALUES (%s, 'coverage_gap', 'pending', '{}', '{}', 'r', 'm', 'p')",
             (uuid4(),),
         )
+
+
+def test_0041_prices_the_proposal_models_worst_case(migrated_db: str) -> None:
+    """Step 2 calls Opus 5.5; the step-0 worst case across both models is 0.45."""
+    query = "SELECT cost_per_call_usd FROM providers WHERE provider_id = 'claude_intel'"
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(query).fetchone() == (Decimal("0.45"),)
+    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0041_"))
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(query).fetchone() == (Decimal("0.25"),)
+    assert run_migrate(migrated_db, "up").returncode == 0

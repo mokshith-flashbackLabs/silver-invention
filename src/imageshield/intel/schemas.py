@@ -1,4 +1,5 @@
-"""The model's structured output shapes (spec §4.4).
+"""The model's structured output shapes (spec §4.4) -- extraction, discovery and,
+from step 2, proposal generation.
 
 Every model here is ``extra='forbid'``, and ``category``/``direction`` are the exact
 Literals migration 0039's CHECKs enforce on ``intel_signals`` -- a model that let a
@@ -37,3 +38,38 @@ class DiscoveryCandidate(_Out):
 
 class DiscoveryOutput(_Out):
     candidates: list[DiscoveryCandidate]
+
+
+class ProposedWeightChange(_Out):
+    """No numeric bounds here, deliberately (spec §4.5): structured output does not enforce
+    them and the SDK would validate them client-side, so one bad delta would make the whole
+    response unparseable. intel/generation.py drops the one bad proposal instead."""
+
+    question_key: str
+    option: str
+    current: int
+    delta: int
+    rationale: str
+    signal_ids: list[str] = Field(default_factory=list)
+
+
+class ProposedTag(_Out):
+    slug: str
+    label: str
+    kind: Literal["platform", "service", "practice"]
+
+
+class ProposedCoverageGap(_Out):
+    subject: str
+    suggested_tag: ProposedTag | None = None
+    suggested_question: str | None = None
+    rationale: str
+    signal_ids: list[str] = Field(default_factory=list)
+
+
+class ProposalOutput(_Out):
+    """Step 2's kinds as two typed lists rather than one list keyed by ``kind``, so each
+    kind's shape is closed. Steps 3 and 4 add threat_events, protection_events and attach."""
+
+    weight_changes: list[ProposedWeightChange] = Field(default_factory=list)
+    coverage_gaps: list[ProposedCoverageGap] = Field(default_factory=list)

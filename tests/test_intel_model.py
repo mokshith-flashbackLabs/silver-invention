@@ -10,6 +10,7 @@ is: ``clean_env`` chdirs to a fresh ``tmp_path`` and deletes every key first.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -23,7 +24,12 @@ from imageshield.intel.config import IntelConfig
 from imageshield.intel.model import ClaudeIntelModel, ModelUnavailable
 from imageshield.intel.pricing import UnknownModelPrice, Usage, cost_of
 from imageshield.intel.prompts import extraction_request
-from imageshield.intel.schemas import DiscoveryCandidate, DiscoveryOutput, ExtractionOutput
+from imageshield.intel.schemas import (
+    DiscoveryCandidate,
+    DiscoveryOutput,
+    ExtractionOutput,
+    ProposalOutput,
+)
 from imageshield.intel.stub import StubIntelModel
 from tests.test_intel_config import BASE
 
@@ -306,3 +312,68 @@ async def test_discover_never_exceeds_the_cap_for_any_cap_value(
     model, fake = _model([_paused() for _ in range(5)], clean_env)
     call = await model.discover("sys", "find things")
     assert call.pause_turns == 0 and len(fake.calls) == 1
+
+
+async def test_propose_uses_the_proposal_model_with_explicit_effort(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """spec §4.3: Opus 5.5 defaults to effort medium, so the proposal call sets it.
+    Priced by the REQUESTED proposal model, never the answering id."""
+    response = SimpleNamespace(
+        model="claude-opus-5-5",
+        stop_reason="end_turn",
+        usage=_usage(),
+        content=[_text_block(ProposalOutput().model_dump_json())],
+    )
+    model, fake = _model([response], clean_env)
+    call = await model.propose("sys", "user")
+    assert call.outcome == "ok" and call.output == ProposalOutput()
+    sent = fake.calls[0]
+    assert sent["model"] == "claude-opus-5-5"
+    assert sent["output_config"]["effort"] == "high"
+    assert sent["thinking"] == {"type": "adaptive"}
+    assert call.cost_usd == cost_of("claude-opus-5-5", Usage(1000, 100, 0, 0, 0))
+
+
+async def test_extraction_keeps_its_model_and_sets_no_effort(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    response = SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(),
+        content=[_text_block(ExtractionOutput(signals=[]).model_dump_json())],
+    )
+    model, fake = _model([response], clean_env)
+    await model.extract("sys", "user")
+    assert fake.calls[0]["model"] == "claude-sonnet-5"
+    assert "effort" not in fake.calls[0]["output_config"]
+
+
+def test_construction_refuses_an_unpriced_proposal_model(clean_env: pytest.MonkeyPatch) -> None:
+    for k, v in BASE.items():
+        clean_env.setenv(k, v)
+    clean_env.setenv("INTEL_PROPOSAL_MODEL", "claude-mystery-9")
+    from imageshield.intel.config import load_intel_config
+
+    with pytest.raises(UnknownModelPrice):
+        ClaudeIntelModel(load_intel_config(), client=SimpleNamespace(messages=FakeMessages([])))
+
+
+def test_the_proposal_schema_carries_no_numeric_or_length_bounds() -> None:
+    """Review Focus 1: structured output does not enforce minimum/maximum/maxLength and the
+    SDK would validate them client-side, failing the WHOLE response over one bad delta.
+    §4.5's bounds run per proposal, in code (intel/generation.py)."""
+    schema = json.dumps(ProposalOutput.model_json_schema())
+    for keyword in ("minimum", "maximum", "maxLength", "minLength"):
+        assert keyword not in schema
+    parsed = ProposalOutput.model_validate_json(
+        '{"weight_changes": [{"question_key": "q", "option": "o", "current": 3, "delta": 7,'
+        ' "rationale": "r", "signal_ids": []}], "coverage_gaps": []}'
+    )
+    assert parsed.weight_changes[0].delta == 7
+
+
+async def test_the_stub_proposes_nothing() -> None:
+    call = await StubIntelModel().propose("s", "u")
+    assert call.outcome == "ok" and call.output == ProposalOutput()

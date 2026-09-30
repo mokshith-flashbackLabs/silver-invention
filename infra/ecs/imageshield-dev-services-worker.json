@@ -129,6 +129,7 @@
         { "name": "INTEL_ANTHROPIC_REGION", "value": "ap-south-1" },
         { "name": "ANTHROPIC_AWS_WORKSPACE_ID", "value": "wrkspc_01A2ZZVekB1bXvKKimttBQGF" },
         { "name": "INTEL_EXTRACTION_MODEL", "value": "claude-sonnet-5" },
+        { "name": "INTEL_PROPOSAL_MODEL", "value": "claude-opus-5-5" },
         { "name": "INTEL_WEB_SEARCH_TOOL_TYPE", "value": "web_search_20260209" },
         { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" }
       ],
