@@ -559,3 +559,28 @@ def test_only_the_fetcher_imports_fetcher_fetch() -> None:
         if "imageshield.fetcher.fetch" in _imports_of(p) and fetcher_dir not in p.parents
     ]
     assert offenders == []
+
+
+def test_only_the_decision_path_moves_a_proposal_to_approved() -> None:
+    """PERMANENT. INVARIANTS #48: no proposal takes effect except through ``decided``, values
+    a named operator approved. Proposal statuses are SQL LITERALS by rule
+    (intel/proposal_store.py), so this grep sees every transition. Verified to fire by adding
+    ``SET status = 'approved'`` to intel/reconcile.py."""
+    approve = re.compile(r"SET\s+status\s*=\s*'approved'", re.IGNORECASE)
+    hits = sorted(
+        {p.relative_to(SRC).as_posix() for p in _source_files() if approve.search(
+            p.read_text(encoding="utf-8"))}
+    )
+    assert hits == ["imageshield/intel/decisions.py"]
+    # Scoped to intel_proposals' SET clause, anywhere in it: intel/store.py's
+    # ``UPDATE intel_runs SET status = %s`` is a run's status, legitimately a parameter.
+    parameterised = re.compile(
+        r"UPDATE\s+intel_proposals\s+SET\b(?:(?!\bWHERE\b).)*?\bstatus\s*=\s*%",
+        re.IGNORECASE | re.DOTALL,
+    )
+    assert [p.name for p in sorted(INTEL.rglob("*.py"))
+            if parameterised.search(p.read_text(encoding="utf-8"))] == []
+    for path in sorted(INTEL.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"INSERT\s+INTO\s+intel_proposals\b", text, re.IGNORECASE):
+            assert "'approved'" not in text[match.end() : match.end() + 600], path.name
