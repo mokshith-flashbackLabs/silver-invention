@@ -14,6 +14,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
@@ -514,3 +515,47 @@ def test_vocabulary_document_rejects_an_unknown_top_level_key() -> None:
     }
     r = client.put("/v1/admin/intel/vocabulary", json=body, headers=ADMIN)
     assert r.status_code == 422
+
+
+BACKEND_QUESTION: dict[str, Any] = {
+    "key": "platforms",
+    "prompt": "Where do you post photos?",
+    "type": "mutable",
+    "options": ["Instagram", "LinkedIn"],
+    "deductions": {"Instagram": 3, "LinkedIn": 2},
+    "cap": 8,
+}
+
+
+def _push(questions: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "release_no": 3,
+        "map_version": 1,
+        "scoring_version": "s3",
+        "quiz_version": "q3",
+        "document": {"tags": [], "questions": questions, "option_tags": [], "renamed": []},
+    }
+
+
+def test_vocabulary_push_accepts_the_backends_question_shape() -> None:
+    client, _ = _client()
+    unscored = {"key": "about", "prompt": "Anything else?", "type": None, "options": [],
+                "deductions": None, "cap": None}
+    r = client.put("/v1/admin/intel/vocabulary", headers=ADMIN,
+                   json=_push([BACKEND_QUESTION, unscored]))
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {**BACKEND_QUESTION, "deductions": {"Instagram": "3"}},
+        {**BACKEND_QUESTION, "deductions": {"Instagram": 2.5}},
+        {k: v for k, v in BACKEND_QUESTION.items() if k != "options"},
+        {**BACKEND_QUESTION, "mutable": True},
+    ],
+)
+def test_vocabulary_push_refuses_a_malformed_question(bad: dict[str, Any]) -> None:
+    client, _ = _client()
+    r = client.put("/v1/admin/intel/vocabulary", headers=ADMIN, json=_push([bad]))
+    assert r.status_code == 422 and r.json()["error"]["code"] == "validation_error"

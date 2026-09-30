@@ -13,7 +13,14 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
 from imageshield.intel.tags import TAG_SLUG_RE, is_well_formed
@@ -985,6 +992,21 @@ class IntelVocabRenamed(ServiceModel):
     new_option: str
 
 
+class IntelVocabQuestion(ServiceModel):
+    """One question of the push, exactly as the backend's ``src/intel/vocabulary.ts`` builds
+    it. ``type`` is the scoring type (``mutable`` · ``escrowed`` · ``decaying`` ·
+    ``recoverable``), or null for an unscored question, and then ``deductions`` and ``cap`` are
+    null too. ``type`` is a string, not a Literal: a scoring type the backend adds later is
+    carried (and never ``mutable``) rather than refusing every push."""
+
+    key: str = Field(min_length=1)
+    prompt: str
+    type: str | None
+    options: tuple[str, ...]
+    deductions: dict[str, StrictInt] | None
+    cap: StrictInt | None
+
+
 class IntelVocabDocument(ServiceModel):
     """The backend's vocabulary-push document (spec §4.7) — exactly these five
     top-level keys. An unknown key or a malformed item is a 422 here, never a
@@ -993,7 +1015,7 @@ class IntelVocabDocument(ServiceModel):
     tags: tuple[IntelVocabTag, ...] = ()
     option_tags: tuple[IntelVocabOptionTag, ...] = ()
     renamed: tuple[IntelVocabRenamed, ...] = ()
-    questions: tuple[dict[str, Any], ...] = ()
+    questions: tuple[IntelVocabQuestion, ...] = ()
     dynamic: dict[str, Any] | None = None
 
 

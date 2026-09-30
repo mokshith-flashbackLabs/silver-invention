@@ -12,6 +12,7 @@ page.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -23,7 +24,7 @@ from psycopg_pool import AsyncConnectionPool
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import FetchFailure, TextFetch
 from imageshield.intel.model import ModelCall, ModelUnavailable
-from imageshield.intel.models import Run
+from imageshield.intel.models import Run, Vocabulary
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
 from imageshield.intel.pricing import Usage
 from imageshield.intel.schemas import (
@@ -33,6 +34,7 @@ from imageshield.intel.schemas import (
     ProposalOutput,
 )
 from imageshield.intel.store import PostgresIntelStore
+from imageshield.intel.vocabulary import ScoringVocabulary, parse_vocabulary
 from imageshield.providers.store import PostgresProviderControlStore
 
 NOW = datetime.now(UTC)
@@ -231,3 +233,70 @@ async def run_once(pool: AsyncConnectionPool, deps: PipelineDeps) -> RunResult:
         error_code=result.error_code,
     )
     return result
+
+
+# A quiz with a capped mutable question, an uncapped one and an escrowed one; one mapped tag
+# (instagram), one registered-but-unmapped (linkedin), one retired (myspace). The shape is
+# exactly what the backend's src/intel/vocabulary.ts pushes.
+QUIZ_VOCABULARY: dict[str, Any] = {
+    "questions": [
+        {
+            "key": "platforms",
+            "prompt": "Where do you post photos of yourself?",
+            "type": "mutable",
+            "options": ["Instagram", "LinkedIn", "X (Twitter)", "Snapchat", "Threads"],
+            "deductions": {
+                "Instagram": 3, "LinkedIn": 2, "X (Twitter)": 4, "Snapchat": 7, "Threads": 1
+            },
+            "cap": 8,
+        },
+        {
+            "key": "dating",
+            "prompt": "Do you use dating apps?",
+            "type": "mutable",
+            "options": ["Yes", "No"],
+            "deductions": {"Yes": 9, "No": 0},
+            "cap": None,
+        },
+        {
+            "key": "age",
+            "prompt": "How old are you?",
+            "type": "escrowed",
+            "options": ["Under 25", "25 or over"],
+            "deductions": {"Under 25": 5, "25 or over": 2},
+            "cap": None,
+        },
+    ],
+    "dynamic": {"threat": None, "protection": None},
+    "tags": [
+        {"slug": "instagram", "label": "Instagram", "description": "photo app", "kind": "platform",
+         "retired": False},
+        {"slug": "linkedin", "label": "LinkedIn", "description": "professional network",
+         "kind": "platform", "retired": False},
+        {"slug": "myspace", "label": "Myspace", "description": "old", "kind": "platform",
+         "retired": True},
+    ],
+    "option_tags": [{"question_key": "platforms", "option": "Instagram", "tags": ["instagram"]}],
+    "renamed": [],
+}
+
+
+def quiz_document(**overrides: Any) -> dict[str, Any]:
+    """A deep copy of QUIZ_VOCABULARY with top-level keys replaced."""
+    return {**copy.deepcopy(QUIZ_VOCABULARY), **overrides}
+
+
+def scoring(
+    document: dict[str, Any] | None = None, *, release_no: int = 2, map_version: int = 1
+) -> ScoringVocabulary:
+    parsed = parse_vocabulary(
+        Vocabulary(
+            release_no=release_no,
+            map_version=map_version,
+            scoring_version=f"s{release_no}",
+            quiz_version="q",
+            document=QUIZ_VOCABULARY if document is None else document,
+        )
+    )
+    assert parsed is not None
+    return parsed
