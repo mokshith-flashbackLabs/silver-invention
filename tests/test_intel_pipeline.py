@@ -204,7 +204,8 @@ async def test_policy_page_first_check_extracts_verifies_and_masks(
     assert result.status == "completed" and result.error_code is None
     assert result.outcome["signals_kept"] == 1 and result.outcome["documents_recorded"] == 1
     assert result.outcome["tag_dropped_unknown_tag"] == 1
-    assert result.outcome["pii_masked_summary"] == 1 and result.outcome["model_calls"] == 1
+    # model_calls: extraction + the run's one generation call (step 2)
+    assert result.outcome["pii_masked_summary"] == 1 and result.outcome["model_calls"] == 2
     evidence = PostgresEvidenceStore(intel_pool)
     (signal,) = await evidence.list_signals(cursor=None, limit=5)
     assert signal["tags"] == ["instagram"] and "press@example.com" not in signal["summary"]
@@ -652,7 +653,7 @@ async def test_discovery_fetches_candidates_with_web_trust(intel_pool: AsyncConn
     model = FakeModel(make_signal(), discovery=discovery)
     result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
     assert result.outcome["not_https"] == 1 and fetcher.fetched == [ARTICLE]
-    assert result.outcome["model_calls"] == 2 and result.outcome["signals_kept"] == 1
+    assert result.outcome["model_calls"] == 3 and result.outcome["signals_kept"] == 1
     assert await _scalar(intel_pool, "SELECT trust FROM intel_documents") == "web"
 
 
@@ -685,6 +686,7 @@ async def test_the_call_cap_stops_taking_units_and_leaves_the_rest(
     model = FakeModel(make_signal(), discovery=discovery)
     deps = make_deps(intel_pool, fetcher, model, max_calls_per_run=2)
     result = await run(await claim(intel_pool), deps)
-    assert result.status == "completed" and result.outcome["model_calls"] == 2
+    # generation is one call beyond the reading cap (spec note, 2026-09-30)
+    assert result.status == "completed" and result.outcome["model_calls"] == 3
     assert result.outcome["call_cap_deferred"] == 2 and result.outcome["stopped_call_cap"] == 1
     assert model.extract_calls == 1 and fetcher.fetched == urls[:1]

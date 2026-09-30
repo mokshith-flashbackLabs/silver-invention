@@ -16,6 +16,13 @@ would be dropped by verification anyway. Every quote is then verified against th
 UNMASKED normalised text we fetched (#49), so a model that "corrects" a garbled
 character or paraphrases produces nothing. A known hit location is never fetched,
 and a page that redirects onto one is never read (§6.1).
+
+GENERATION (step 2). A run that wrote new signals makes ONE more call, INTEL_PROPOSAL_MODEL,
+through the same gate. That call is outside INTEL_MAX_CALLS_PER_RUN, which bounds reading. Its
+output is validated in code (intel/generation.py) and written with proposals_written_at in one
+transaction (intel/proposal_store.py), so a reclaimed run never generates twice. A verdict
+(refusal, max_tokens, unparseable) is consumed like any other; a gate skip or an unavailable
+model leaves generation undone and stops the run.
 """
 
 from __future__ import annotations
@@ -36,11 +43,15 @@ import structlog
 from pydantic import BaseModel
 
 from imageshield.intel.bounds import (
+    COVERAGE_GAP_POOL_MAX,
+    COVERAGE_GAP_WINDOW_DAYS,
     DISCOVERY_DEDUP_DAYS,
     FEED_MAX_ITEM_AGE_DAYS,
     FEED_MAX_ITEMS_PER_RUN,
     MAX_PROMPT_TAGS,
     MIN_POLICY_TEXT_CHARS,
+    PROPOSAL_CONTEXT_DAYS,
+    PROPOSAL_CONTEXT_MAX_SIGNALS,
 )
 from imageshield.intel.evidence_store import (
     DocumentRecord,
@@ -49,22 +60,33 @@ from imageshield.intel.evidence_store import (
     SnapshotRecord,
 )
 from imageshield.intel.fetch_client import FETCHER_SIDE_CODES, FetchFailure, TextFetch, TextFetcher
+from imageshield.intel.generation import (
+    GeneratedBatch,
+    prompt_quiz,
+    prompt_registry,
+    prompt_signal,
+    validate_proposals,
+)
 from imageshield.intel.metering import metered
 from imageshield.intel.model import IntelModel, ModelCall
 from imageshield.intel.models import Run, Source, Vocabulary
 from imageshield.intel.pii import mask
 from imageshield.intel.prompts import (
     EXTRACT_PROMPT_VERSION,
+    PROPOSE_PROMPT_VERSION,
     RegistryTag,
     discovery_request,
     extraction_request,
+    proposal_request,
 )
+from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.publisher import publisher_domain
 from imageshield.intel.schemas import ExtractedSignal
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, is_well_formed
 from imageshield.intel.text import content_sha256, normalise
 from imageshield.intel.verify import VerifiedQuote, verify_quote
+from imageshield.intel.vocabulary import parse_vocabulary
 from imageshield.providers.store import ProviderControlStore
 from imageshield.search.urlhash import canonicalise, url_hash
 
@@ -98,6 +120,7 @@ class PipelineDeps:
     fetcher: TextFetcher
     model: IntelModel
     control: ProviderControlStore
+    proposals: ProposalStore
     clock: Callable[[], datetime]
     max_calls_per_run: int
     max_document_chars: int
@@ -180,6 +203,7 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
         vocabulary=vocabulary,
         registry=vocabulary.registry() if vocabulary is not None else None,
     )
+    stop: _Stop | None = None
     try:
         if claimed.kind == "source_check":
             await _source_check(ctx)
@@ -191,8 +215,18 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
             return RunResult("failed", ctx.outcome(), "kind_not_supported_yet")
     except _CallCap:
         ctx.counts["stopped_call_cap"] += 1
-    except _Stop as stop:
-        ctx.counts[f"stopped_{stop.reason}"] += 1
+    except _Stop as reading:
+        ctx.counts[f"stopped_{reading.reason}"] += 1
+        stop = reading
+    # Generation runs unless the GATE stopped reading: the same gate just refused, and a
+    # second call would only record a second skip.
+    if stop is None or not stop.gate:
+        try:
+            await _generate(ctx)
+        except _Stop as generation:
+            ctx.counts[f"proposals_deferred_{generation.reason}"] += 1
+            stop = stop or generation
+    if stop is not None:
         if stop.gate:
             return RunResult("refused", {**ctx.outcome(), "refused_by": "gate"}, stop.reason)
         return RunResult("failed", ctx.outcome(), stop.reason)
@@ -637,14 +671,87 @@ def _verified_signal(
     )
 
 
+# ── proposal generation (step 2) ───────────────────────────────────────────────
+
+
+async def _generate(ctx: _Ctx) -> None:
+    """spec §4.3, the step-2 kinds (weight_change, coverage_gap). Raises _Stop only for a
+    gate skip or an unavailable model; everything the model can SAY is consumed."""
+    store = ctx.deps.proposals
+    new = await store.run_signals(ctx.run.run_id)
+    if not new:
+        return
+    if await store.proposals_written(ctx.run.run_id):
+        ctx.counts["proposals_already_written"] += 1
+        return
+    vocabulary = parse_vocabulary(ctx.vocabulary) if ctx.vocabulary is not None else None
+    if vocabulary is None:
+        ctx.counts["proposals_skipped_vocabulary_missing"] += 1
+        return
+    now = ctx.deps.clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    tags = sorted({t for s in new for t in s.tags})
+    related = await store.related_signals(
+        exclude=[s.signal_id for s in new],
+        tags=tags,
+        categories=sorted({s.category for s in new}),
+        since=now - timedelta(days=PROPOSAL_CONTEXT_DAYS),
+        limit=PROPOSAL_CONTEXT_MAX_SIGNALS,
+    )
+    registry = vocabulary.registry()
+    gap_pool = await store.gap_candidates(
+        since=now - timedelta(days=COVERAGE_GAP_WINDOW_DAYS),
+        unmapped_tags=sorted((registry.active | registry.retired) - vocabulary.mapped_tags),
+        limit=COVERAGE_GAP_POOL_MAX,
+    )
+    relevant = set(tags) | {t for s in related for t in s.tags} | set(vocabulary.mapped_tags)
+    system, user = proposal_request(
+        [prompt_signal(s) for s in new],
+        [prompt_signal(s) for s in related],
+        quiz=prompt_quiz(vocabulary),
+        registry_tags=prompt_registry(vocabulary, relevant),
+        mapped_tags=sorted(vocabulary.mapped_tags),
+    )
+    call = await _call_model(ctx, lambda: ctx.deps.model.propose(system, user), capped=False)
+    batch = GeneratedBatch()
+    if call.output is None:
+        ctx.counts[f"proposal_model_{call.outcome}"] += 1  # a verdict, not an outage: consumed
+    else:
+        batch = validate_proposals(
+            call.output,
+            context={s.signal_id: s for s in [*new, *related]},
+            gap_pool=gap_pool,
+            vocabulary=vocabulary,
+            now=now,
+            counts=ctx.counts,
+        )
+    result = await store.write_generated(
+        ctx.run.run_id,
+        batch.proposals,
+        against_scoring_version=vocabulary.scoring_version,
+        against_release_no=vocabulary.release_no,
+        model_id=call.answered_by,
+        prompt_version=PROPOSE_PROMPT_VERSION,
+    )
+    if result is None:
+        ctx.counts["proposals_already_written"] += 1
+        return
+    ctx.counts["proposals_written"] += len(result.written)
+    ctx.counts["proposals_superseded"] += len(result.superseded)
+
+
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 
-async def _call_model(ctx: _Ctx, call: Callable[[], Awaitable[ModelCall[T]]]) -> ModelCall[T]:
-    """One call through the provider gate. A gate refusal or an unavailable model
-    stops the run with the current unit unconsumed; every returned answer --
-    including a refusal or unparseable output -- is handed back to be consumed."""
-    if not ctx.calls_left():
+async def _call_model(
+    ctx: _Ctx, call: Callable[[], Awaitable[ModelCall[T]]], *, capped: bool = True
+) -> ModelCall[T]:
+    """One call through the provider gate. A gate refusal or an unavailable model stops the
+    run with the current unit unconsumed; every returned answer -- including a refusal or
+    unparseable output -- is handed back to be consumed. ``capped=False`` is the generation
+    call: one per run, on top of INTEL_MAX_CALLS_PER_RUN."""
+    if capped and not ctx.calls_left():
         raise _CallCap
     outcome, result, reason = await metered(
         ctx.deps.control, run_id=ctx.run.run_id, now=ctx.deps.clock(), call=call

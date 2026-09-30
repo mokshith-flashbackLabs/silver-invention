@@ -27,6 +27,7 @@ from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import HttpTextFetcher
 from imageshield.intel.model import ClaudeIntelModel, IntelModel
 from imageshield.intel.pipeline import PipelineDeps, run
+from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
 
@@ -104,6 +105,7 @@ async def run_forever(config: IntelConfig) -> None:
             default_cooldown_seconds=config.breaker_cooldown_seconds,
             max_cooldown_seconds=config.breaker_cooldown_max_seconds,
         ),
+        proposals=PostgresProposalStore(pool),
         clock=lambda: datetime.now(UTC),
         # No default on PipelineDeps for either of these (task 10) -- a second
         # default beside IntelConfig's would be a second source of truth.

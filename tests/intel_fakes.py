@@ -29,6 +29,7 @@ from imageshield.intel.model import ModelCall, ModelUnavailable
 from imageshield.intel.models import Run, Vocabulary
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
 from imageshield.intel.pricing import Usage
+from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractedSignal,
@@ -208,6 +209,7 @@ def make_deps(
         fetcher=fetcher,
         model=model,
         control=control,
+        proposals=PostgresProposalStore(pool),
         clock=clock or (lambda: NOW),
         max_calls_per_run=max_calls_per_run,
         max_document_chars=max_document_chars,
