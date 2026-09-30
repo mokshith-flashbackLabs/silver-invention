@@ -301,6 +301,11 @@ _LIST_HITS_SQL = """
       AND (%(confirm_state)s::text IS NULL OR i.confirm_state = %(confirm_state)s)
       AND (%(user_ref)s::uuid IS NULL OR i.user_ref = %(user_ref)s)
       AND (%(since)s::timestamptz IS NULL OR i.first_seen_at >= %(since)s)
+      -- The reviewer's to-do list (2026-09-30): whether ANY verdict exists,
+      -- read off the same LATERAL that supplies latest_verdict, so the filter
+      -- and the column can never disagree about a row.
+      AND (%(has_verdict)s::boolean IS NULL
+           OR (lv.verdict_id IS NOT NULL) = %(has_verdict)s)
       AND (%(after_ts)s::timestamptz IS NULL
            OR (i.first_seen_at, i.infringement_id)
                < (%(after_ts)s::timestamptz, %(after_id)s::uuid))
@@ -586,6 +591,7 @@ class ReviewStore(Protocol):
         confirm_state: str | None = None,
         user_ref: UserRef | None = None,
         since: datetime | None = None,
+        has_verdict: bool | None = None,
     ) -> HitsPage: ...
 
     async def record_verdict(
@@ -874,6 +880,7 @@ class PostgresReviewStore:
         confirm_state: str | None = None,
         user_ref: UserRef | None = None,
         since: datetime | None = None,
+        has_verdict: bool | None = None,
     ) -> HitsPage:
         """Every hit a reviewer may look at, newest first, keyset-paged.
 
@@ -889,6 +896,7 @@ class PostgresReviewStore:
             "confirm_state": confirm_state,
             "user_ref": user_ref,
             "since": since,
+            "has_verdict": has_verdict,
         }
         async with self._pool.connection() as conn:
             cur = await conn.execute(_LIST_HITS_SQL, params)

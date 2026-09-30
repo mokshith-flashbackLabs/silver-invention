@@ -159,7 +159,8 @@ are not the same claim, and conflating them in the UI is how the measurement get
 ### `GET /v1/admin/hits`
 Query: `limit` (default 50, 1–200), `cursor`, `severity`, `confirm_state` (one of
 `unconfirmed | machine_triaged | confirmed | rejected | duplicate`), `user_ref`, `since`
-(ISO-8601). Every filter is optional and they compose.
+(ISO-8601), `has_verdict` (`true` = graded by a reviewer, `false` = not yet; 2026-09-30).
+Every filter is optional and they compose.
 
 ```json
 200 {
