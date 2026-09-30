@@ -18,10 +18,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from uuid import UUID, uuid4
 
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from imageshield.intel.evidence_store import PostgresEvidenceStore
+from imageshield.intel.evidence_store import DocumentRecord, PostgresEvidenceStore, SignalRecord
 from imageshield.intel.fetch_client import FetchFailure, TextFetch
 from imageshield.intel.model import ModelCall, ModelUnavailable
 from imageshield.intel.models import Run, Vocabulary
@@ -34,8 +36,10 @@ from imageshield.intel.schemas import (
     ProposalOutput,
 )
 from imageshield.intel.store import PostgresIntelStore
+from imageshield.intel.verify import VerifiedQuote
 from imageshield.intel.vocabulary import ScoringVocabulary, parse_vocabulary
 from imageshield.providers.store import PostgresProviderControlStore
+from imageshield.search.urlhash import url_hash
 
 NOW = datetime.now(UTC)
 QUOTE = "Public profile photos may be used to train our AI models by default."
@@ -300,3 +304,141 @@ def scoring(
     )
     assert parsed is not None
     return parsed
+
+
+async def seed_quiz_vocabulary(
+    pool: AsyncConnectionPool,
+    *,
+    release_no: int = 2,
+    map_version: int = 1,
+    document: dict[str, Any] | None = None,
+) -> None:
+    await PostgresIntelStore(pool).put_vocabulary(
+        release_no=release_no,
+        map_version=map_version,
+        scoring_version=f"s{release_no}",
+        quiz_version="q",
+        document=QUIZ_VOCABULARY if document is None else document,
+    )
+
+
+async def seed_signal(
+    pool: AsyncConnectionPool,
+    *,
+    tags: tuple[str, ...] = (),
+    subjects: tuple[str, ...] = (),
+    trust: str = "listed",
+    publisher: str = "p.example",
+    category: str = "policy",
+    created_at: datetime | None = None,
+    run_id: UUID | None = None,
+) -> UUID:
+    """One active signal on its own document, through the real record_unit. Each call makes
+    its own adhoc run unless ``run_id`` is given."""
+    if run_id is None:
+        run_id = await PostgresIntelStore(pool).queue_adhoc(
+            f"https://{publisher}/seed", operator="seed"
+        )
+    url = f"https://{publisher}/{uuid4()}"
+    document_id = await PostgresEvidenceStore(pool).record_unit(
+        DocumentRecord(
+            run_id=run_id,
+            document_url=url,
+            final_url=url,
+            url_hash=url_hash(url),
+            publisher_domain=publisher,
+            trust=trust,  # type: ignore[arg-type]
+            content_sha256="0" * 64,
+            truncated=False,
+            title="",
+            published_at=None,
+        ),
+        [
+            SignalRecord(
+                category=category,  # type: ignore[arg-type]
+                direction="risk_up",
+                tags=tags,
+                unregistered_subjects=subjects,
+                summary="seeded",
+                model_id="claude-sonnet-5",
+                prompt_version="extract-v1",
+                quotes=(VerifiedQuote(QUOTE, 0, len(QUOTE), "0" * 64),),
+            )
+        ],
+        snapshot=None,
+        source_hash=None,
+    )
+    assert document_id is not None
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT signal_id FROM intel_signals WHERE document_id = %s", (document_id,)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        if created_at is not None:
+            await conn.execute(
+                "UPDATE intel_signals SET created_at = %s WHERE signal_id = %s",
+                (created_at, row[0]),
+            )
+    signal_id: UUID = row[0]
+    return signal_id
+
+
+async def seed_proposal(
+    pool: AsyncConnectionPool,
+    *,
+    signal_ids: list[UUID],
+    kind: str = "weight_change",
+    status: str = "pending",
+    target: dict[str, Any] | None = None,
+    suggested: dict[str, Any] | None = None,
+    decided: dict[str, Any] | None = None,
+    against_release_no: int = 2,
+    created_at: datetime | None = None,
+) -> UUID:
+    """A proposal row written directly (superuser), for tests of reads, decisions and the
+    reconcile. Fills the shape CHECKs' required columns for the chosen status."""
+    target = (
+        target
+        if target is not None
+        else {"question_key": "platforms", "option": "Instagram", "current": 3}
+    )
+    suggested = (
+        suggested if suggested is not None else ({"delta": 1} if kind == "weight_change" else {})
+    )
+    named = status in ("approved", "rejected", "applied")
+    weighty = kind in ("weight_change", "weight_suggestion")
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """INSERT INTO intel_proposals (kind, status, target, suggested, decided, rationale,
+                   against_scoring_version, against_release_no, model_id, prompt_version,
+                   decided_by, decided_at, decision_reason, created_at, applied_ref,
+                   supersede_reason)
+               VALUES (%s, %s, %s, %s, %s, 'seeded', %s, %s, 'claude-opus-5-5', 'propose-v1',
+                       %s, %s, %s, coalesce(%s, now()), %s, %s)
+               RETURNING proposal_id""",
+            (
+                kind,
+                status,
+                Jsonb(target),
+                Jsonb(suggested),
+                Jsonb(decided) if decided is not None else None,
+                f"s{against_release_no}" if weighty else None,
+                against_release_no if weighty else None,
+                "seed-op" if named else None,
+                datetime.now(UTC) if named else None,
+                "seeded" if named else None,
+                created_at,
+                "s3" if status == "applied" else None,
+                "newer_proposal" if status == "superseded" else None,
+            ),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        for signal_id in signal_ids:
+            await conn.execute(
+                "INSERT INTO intel_proposal_signals (proposal_id, signal_id) VALUES (%s, %s)",
+                (row[0], signal_id),
+            )
+    proposal_id: UUID = row[0]
+    return proposal_id
