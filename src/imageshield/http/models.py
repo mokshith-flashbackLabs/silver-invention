@@ -1029,3 +1029,38 @@ class IntelVocabularyRequest(ServiceModel):
     scoring_version: str = Field(min_length=1)
     quiz_version: str = Field(min_length=1)
     document: IntelVocabDocument
+
+
+IntelProposalKind = Literal[
+    "weight_change", "threat_event", "protection_event", "weight_suggestion", "coverage_gap"
+]
+IntelProposalStatus = Literal[
+    "pending", "approved", "rejected", "superseded", "applied", "delivered"
+]
+
+
+class IntelDecisionRequest(ServiceModel):
+    """spec 4.7. ``values`` is kind-shaped (a weight change's is exactly ``{delta: int}``) and
+    validated inside the decision, against the proposal's kind and the live vocabulary, as
+    ``422 values_out_of_bounds``. ``applies_regardless_of_location`` is step 4's; it is
+    accepted now so the backend can send one body shape for every kind."""
+
+    decision: Literal["approved", "rejected"]
+    values: dict[str, Any] | None = None
+    reason: str = Field(min_length=3, max_length=500)
+    applies_regardless_of_location: bool | None = None
+    operator: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _values_only_on_approval(self) -> IntelDecisionRequest:
+        if self.decision == "rejected" and self.values is not None:
+            raise ValueError("values are only for an approval")
+        return self
+
+
+class IntelAppliedRequest(ServiceModel):
+    """The second system write (spec 4.7): no operator. The backend's publishing operator is
+    named on its own intel.weights_published audit row."""
+
+    scoring_version: str = Field(min_length=1, max_length=64)
+    proposal_ids: tuple[UUID, ...] = Field(min_length=1, max_length=500)

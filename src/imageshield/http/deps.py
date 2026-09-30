@@ -23,7 +23,9 @@ if TYPE_CHECKING:
     from imageshield.articles.store import ArticleStore
     from imageshield.enrolment.faceindex import FaceIndex
     from imageshield.enrolment.store import EnrolmentStore
+    from imageshield.intel.decisions import DecisionStore
     from imageshield.intel.evidence_store import EvidenceStore
+    from imageshield.intel.proposal_store import ProposalStore
     from imageshield.intel.store import IntelStore
     from imageshield.liveness.provider import LivenessProvider
     from imageshield.liveness.store import LivenessStore
@@ -163,4 +165,14 @@ def get_intel_store(request: Request) -> IntelStore:
 
 def get_evidence_store(request: Request) -> EvidenceStore:
     store: EvidenceStore = _required_state(request, "evidence_store")  # type: ignore[assignment]
+    return store
+
+
+def get_proposal_store(request: Request) -> ProposalStore:
+    store: ProposalStore = _required_state(request, "proposal_store")  # type: ignore[assignment]
+    return store
+
+
+def get_decision_store(request: Request) -> DecisionStore:
+    store: DecisionStore = _required_state(request, "decision_store")  # type: ignore[assignment]
     return store

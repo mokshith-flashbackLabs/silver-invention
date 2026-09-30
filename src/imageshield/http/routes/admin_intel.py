@@ -1,10 +1,11 @@
-"""Likeness intel — the operator surface, step 1 (spec §4.7).
+"""Likeness intel — the admin surface (step 1 plus step 2's proposals) (spec §4.7).
 
 Both tokens at router level, like every admin router — a route added later to
 this file is guarded structurally rather than by memory. Every operator write
 names the operator and is audited inside the store's own transaction
-(``intel/store.py``, ``intel/evidence_store.py``); ``PUT /vocabulary`` is the
-one exception, a system write with no operator at all.
+(``intel/store.py``, ``intel/evidence_store.py``); ``PUT /vocabulary`` and
+``POST /proposals/applied`` are the
+two exceptions, system writes with no operator at all.
 
 Two refusals need the STORED row rather than the request body alone, and so
 live here rather than in a pydantic validator: a saved query naming a person
@@ -24,18 +25,30 @@ import structlog
 from fastapi import APIRouter, Depends, Query
 
 from imageshield.http.auth import require_admin_service_token, require_service_token
-from imageshield.http.deps import get_evidence_store, get_intel_store
+from imageshield.http.deps import (
+    get_decision_store,
+    get_evidence_store,
+    get_intel_store,
+    get_proposal_store,
+)
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
+    IntelAppliedRequest,
+    IntelDecisionRequest,
     IntelDocumentRequest,
     IntelOperatorRequest,
+    IntelProposalKind,
+    IntelProposalStatus,
     IntelRetractRequest,
     IntelSourceCreateRequest,
     IntelSourcePatchRequest,
     IntelVocabularyRequest,
 )
+from imageshield.intel.decisions import DecisionStore
 from imageshield.intel.evidence_store import EvidenceStore
 from imageshield.intel.pii import contains_pii
+from imageshield.intel.proposal_models import DecisionRefused
+from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, membership_problems
 from imageshield.search.urlhash import url_hash
@@ -287,3 +300,104 @@ async def put_vocabulary(
         applied=applied,
     )
     return {"applied": applied}
+
+
+# -- proposals (step 2) -------------------------------------------------------
+
+# Every decision refusal by name (spec 4.7). The backend maps each code, so none may
+# collapse into a generic 409/422.
+_REFUSAL_STATUS: dict[str, int] = {
+    "proposal_not_found": 404,
+    "proposal_not_pending": 409,
+    "proposal_not_decidable": 409,
+    "proposal_evidence_retracted": 409,
+    "proposal_uncorroborated": 409,
+    "proposal_tags_unmapped": 409,
+    "proposal_cell_awaiting_publish": 409,
+    "values_out_of_bounds": 422,
+}
+
+
+@router.get("/proposals")
+async def list_proposals(
+    statuses: list[IntelProposalStatus] | None = Query(default=None, alias="status"),
+    kinds: list[IntelProposalKind] | None = Query(default=None, alias="kind"),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    proposals: ProposalStore = Depends(get_proposal_store),
+) -> dict[str, Any]:
+    rows = await proposals.list_proposals(
+        statuses=statuses, kinds=kinds, cursor=_decode_cursor(cursor), limit=limit
+    )
+    next_cursor = (
+        _encode_cursor(rows[-1]["created_at"], rows[-1]["proposal_id"])
+        if len(rows) == limit
+        else None
+    )
+    return {"proposals": rows, "next_cursor": next_cursor}
+
+
+@router.get("/proposals/{proposal_id}")
+async def get_proposal(
+    proposal_id: UUID, proposals: ProposalStore = Depends(get_proposal_store)
+) -> Any:
+    row = await proposals.get_proposal(proposal_id)
+    if row is None:
+        raise ServiceError(
+            404, "proposal_not_found", "No proposal with this id.", retryable=False
+        )
+    return row
+
+
+@router.post("/proposals/applied")
+async def proposals_applied(
+    body: IntelAppliedRequest, decisions: DecisionStore = Depends(get_decision_store)
+) -> dict[str, list[UUID]]:
+    result = await decisions.mark_applied(
+        scoring_version=body.scoring_version, proposal_ids=body.proposal_ids
+    )
+    if result.not_applied:
+        # ids only: a withdrawal that raced a publish, or an id this build never wrote.
+        log.warning(
+            "intel.applied_ack_unmatched",
+            scoring_version=body.scoring_version,
+            proposal_ids=[str(i) for i in result.not_applied],
+        )
+    return {
+        "applied": list(result.applied),
+        "already_applied": list(result.already_applied),
+        "not_applied": list(result.not_applied),
+    }
+
+
+@router.post("/proposals/{proposal_id}/decision")
+async def decide_proposal(
+    proposal_id: UUID,
+    body: IntelDecisionRequest,
+    decisions: DecisionStore = Depends(get_decision_store),
+) -> dict[str, Any]:
+    try:
+        result = await decisions.decide(
+            proposal_id,
+            decision=body.decision,
+            values=body.values,
+            reason=body.reason,
+            operator=body.operator,
+        )
+    except DecisionRefused as refused:
+        raise ServiceError(
+            _REFUSAL_STATUS[refused.code], refused.code, refused.message, retryable=False
+        ) from refused
+    log.info(
+        "intel.proposal_decided_via_admin",
+        proposal_id=str(proposal_id),
+        decision=body.decision,
+        operator=body.operator,
+    )
+    return {
+        "proposal_id": result.proposal_id,
+        "kind": result.kind,
+        "status": result.status,
+        "applied_ref": result.applied_ref,
+        "decided": result.decided,
+    }
