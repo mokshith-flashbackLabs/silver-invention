@@ -275,6 +275,20 @@ def test_the_filters_reach_the_store_and_quarantined_is_not_offered() -> None:
     assert len(review.list_calls) == 1
 
 
+def test_has_verdict_reaches_the_store_and_is_absent_by_default() -> None:
+    """The reviewer's to-do filter (2026-09-30). Absent means "every hit",
+    exactly as before, so no existing caller changes behaviour."""
+    client, review, _preview, _crop = make_client()
+
+    todo = client.get("/v1/admin/hits", params={"has_verdict": "false"}, headers=ADMIN)
+    plain = client.get("/v1/admin/hits", headers=ADMIN)
+
+    assert todo.status_code == 200
+    assert plain.status_code == 200
+    assert review.list_calls[0]["has_verdict"] is False
+    assert review.list_calls[1]["has_verdict"] is None
+
+
 def test_a_hit_serialises_with_its_nested_objects() -> None:
     client, _review, _preview, _crop = make_client(
         page=HitsPage(

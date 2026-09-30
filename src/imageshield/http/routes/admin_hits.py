@@ -131,6 +131,7 @@ async def list_hits(
     confirm_state: HitFilterConfirmState | None = Query(None),
     user_ref: UUID | None = Query(None),
     since: datetime | None = Query(None),
+    has_verdict: bool | None = Query(None),
     store: ReviewStore = Depends(get_review_store),
 ) -> AdminHitsResponse:
     """Every hit a reviewer may look at, newest first.
@@ -147,6 +148,7 @@ async def list_hits(
         confirm_state=confirm_state,
         user_ref=UserRef(user_ref) if user_ref is not None else None,
         since=since,
+        has_verdict=has_verdict,
     )
     hits = [AdminHitItem(**hit) for hit in page.hits]
     next_cursor = (
