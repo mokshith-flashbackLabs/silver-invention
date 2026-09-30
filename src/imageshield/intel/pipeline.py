@@ -23,6 +23,13 @@ output is validated in code (intel/generation.py) and written with proposals_wri
 transaction (intel/proposal_store.py), so a reclaimed run never generates twice. A verdict
 (refusal, max_tokens, unparseable) is consumed like any other; a gate skip or an unavailable
 model leaves generation undone and stops the run.
+
+EVENTS AND REGENERATION (step 3). The generation call also sees the pending event proposals and
+live threat events whose tags overlap the run's evidence, and may propose threat_events and
+attach new evidence to a pending one (intel/generation.py decides what is written). A
+``gap_regenerate`` run reads nothing: its evidence is the signals the reconcile named when it
+closed a gap (spec §4.9), and it proposes events only. A gate refusal leaves it unwritten, and
+the reconcile's gap pass queues it again later.
 """
 
 from __future__ import annotations
@@ -40,7 +47,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from imageshield.intel.bounds import (
     COVERAGE_GAP_POOL_MAX,
@@ -51,6 +58,7 @@ from imageshield.intel.bounds import (
     MAX_PROMPT_TAGS,
     MIN_POLICY_TEXT_CHARS,
     PROPOSAL_CONTEXT_DAYS,
+    PROPOSAL_CONTEXT_MAX_EVENTS,
     PROPOSAL_CONTEXT_MAX_SIGNALS,
 )
 from imageshield.intel.evidence_store import (
@@ -62,6 +70,8 @@ from imageshield.intel.evidence_store import (
 from imageshield.intel.fetch_client import FETCHER_SIDE_CODES, FetchFailure, TextFetch, TextFetcher
 from imageshield.intel.generation import (
     GeneratedBatch,
+    prompt_live_event,
+    prompt_pending_event,
     prompt_quiz,
     prompt_registry,
     prompt_signal,
@@ -79,6 +89,7 @@ from imageshield.intel.prompts import (
     extraction_request,
     proposal_request,
 )
+from imageshield.intel.proposal_models import GapRegenerateRequest
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.publisher import publisher_domain
 from imageshield.intel.reconcile import Reconciler
@@ -161,6 +172,7 @@ class _Ctx:
     counts: Counter[str] = field(default_factory=Counter)
     model_calls: int = 0
     cost_usd: Decimal = Decimal("0")
+    regenerate: GapRegenerateRequest | None = None
 
     def calls_left(self) -> bool:
         return self.model_calls < self.deps.max_calls_per_run
@@ -215,7 +227,14 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
             await _discovery(ctx)
         elif claimed.kind == "adhoc_url":
             await _adhoc(ctx)
-        else:  # weight_suggestion / renewal_check / gap_regenerate arrive in later steps
+        elif claimed.kind == "gap_regenerate":
+            # Nothing to read: the evidence is the signals the reconcile named (spec §4.9), and
+            # the generation step below is the whole run.
+            try:
+                ctx.regenerate = GapRegenerateRequest.model_validate(claimed.request)
+            except ValidationError:
+                return RunResult("failed", ctx.outcome(), "request_unreadable")
+        else:  # weight_suggestion (step 5) / renewal_check (step 4)
             return RunResult("failed", ctx.outcome(), "kind_not_supported_yet")
     except _CallCap:
         ctx.counts["stopped_call_cap"] += 1
@@ -675,27 +694,42 @@ def _verified_signal(
     )
 
 
-# ── proposal generation (step 2) ───────────────────────────────────────────────
+# ── proposal generation (steps 2 and 3) ────────────────────────────────────────
 
 
 async def _generate(ctx: _Ctx) -> None:
-    """spec §4.3, the step-2 kinds (weight_change, coverage_gap). Raises _Stop only for a
-    gate skip or an unavailable model; everything the model can SAY is consumed."""
+    """spec §4.3: weight_change, coverage_gap and threat_event proposals, plus attach. A
+    gap_regenerate run's evidence is the signals its request names, and it proposes events
+    only (§4.9). Raises _Stop only for a gate skip or an unavailable model; everything the
+    model can SAY is consumed."""
     store = ctx.deps.proposals
-    new = await store.run_signals(ctx.run.run_id)
-    if not new:
-        return
+    regenerate = ctx.regenerate
+    if regenerate is not None:
+        new = await store.signals_by_id(regenerate.signal_ids)
+        if not new:
+            ctx.counts["gap_regenerate_no_active_signals"] += 1
+            return
+    else:
+        new = await store.run_signals(ctx.run.run_id)
+        if not new:
+            return
     if await store.proposals_written(ctx.run.run_id):
         ctx.counts["proposals_already_written"] += 1
         return
     vocabulary = parse_vocabulary(ctx.vocabulary) if ctx.vocabulary is not None else None
     if vocabulary is None:
+        # Every kind needs it: a weight change its cells, a threat event its registered tags
+        # (spec §3.8, corrected 2026-09-30).
         ctx.counts["proposals_skipped_vocabulary_missing"] += 1
         return
     now = ctx.deps.clock()
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
     tags = sorted({t for s in new for t in s.tags})
+    if regenerate is not None and regenerate.tag not in tags:
+        # A gap's signals name the subject as unregistered, so they carry no tag: the newly
+        # mapped tag is what finds related events and pending proposals.
+        tags = sorted([*tags, regenerate.tag])
     related = await store.related_signals(
         exclude=[s.signal_id for s in new],
         tags=tags,
@@ -709,6 +743,10 @@ async def _generate(ctx: _Ctx) -> None:
         unmapped_tags=sorted((registry.active | registry.retired) - vocabulary.mapped_tags),
         limit=COVERAGE_GAP_POOL_MAX,
     )
+    pending_events = await store.pending_event_proposals(
+        tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
+    )
+    live_events = await store.active_threat_events(tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS)
     relevant = set(tags) | {t for s in related for t in s.tags} | set(vocabulary.mapped_tags)
     system, user = proposal_request(
         [prompt_signal(s) for s in new],
@@ -716,6 +754,9 @@ async def _generate(ctx: _Ctx) -> None:
         quiz=prompt_quiz(vocabulary),
         registry_tags=prompt_registry(vocabulary, relevant),
         mapped_tags=sorted(vocabulary.mapped_tags),
+        pending_events=[prompt_pending_event(e) for e in pending_events],
+        live_events=[prompt_live_event(e) for e in live_events],
+        events_only=regenerate is not None,
     )
     call = await _call_model(ctx, lambda: ctx.deps.model.propose(system, user), capped=False)
     batch = GeneratedBatch()
@@ -729,6 +770,9 @@ async def _generate(ctx: _Ctx) -> None:
             vocabulary=vocabulary,
             now=now,
             counts=ctx.counts,
+            pending_events={e.proposal_id: e for e in pending_events},
+            new_signal_ids=frozenset(s.signal_id for s in new),
+            events_only=regenerate is not None,
         )
     result = await store.write_generated(
         ctx.run.run_id,
@@ -737,12 +781,17 @@ async def _generate(ctx: _Ctx) -> None:
         against_release_no=vocabulary.release_no,
         model_id=call.answered_by,
         prompt_version=PROPOSE_PROMPT_VERSION,
+        attachments=batch.attachments,
     )
     if result is None:
         ctx.counts["proposals_already_written"] += 1
         return
     ctx.counts["proposals_written"] += len(result.written)
     ctx.counts["proposals_superseded"] += len(result.superseded)
+    if result.attached:
+        ctx.counts["proposals_attached"] += len(result.attached)
+    if result.attach_dropped:
+        ctx.counts["attach_dropped_not_pending"] += result.attach_dropped
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

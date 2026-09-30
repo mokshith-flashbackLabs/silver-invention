@@ -97,6 +97,7 @@ class FakeModel:
         self.propose_unavailable = propose_unavailable
         self.propose_calls = 0
         self.proposal_users: list[str] = []
+        self.proposal_systems: list[str] = []
 
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]:
         self.extract_calls += 1
@@ -134,6 +135,7 @@ class FakeModel:
         signals the run under test just wrote."""
         self.propose_calls += 1
         self.proposal_users.append(user)
+        self.proposal_systems.append(system)
         if self.propose_unavailable is not None:
             raise self.propose_unavailable
         output: ProposalOutput | None = None
