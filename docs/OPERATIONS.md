@@ -292,7 +292,8 @@ at least a budget outage will not also relax everyone's cadence.
   anything useful ahead of an earlier one:**
   1. **The owner runs the step-0 live probe** (`devtools/intel_access_probe.py`)
      against the real Claude Platform on AWS workspace for that environment —
-     this has not run yet (`docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
+     **Done 2026-09-29 for both environments** — both models and web search answered
+     (`docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
   2. **Substitute the placeholder workspace id, `pending-step0`, in all three
      places it appears**, with the id the probe confirmed: the dev and prod
      `intel-worker` containers' `ANTHROPIC_AWS_WORKSPACE_ID`
@@ -301,11 +302,15 @@ at least a budget outage will not also relax everyone's cadence.
      ARN (`infra/ecs/policies/services-task-role.json`). Leaving any one of the
      three on the placeholder means the grant is scoped to a workspace that
      does not exist, so every call fails closed rather than reaching the
-     wrong workspace.
+     wrong workspace. **Done 2026-09-29**: dev `wrkspc_01A2ZZVekB1bXvKKimttBQGF`
+     (ap-south-1), prod `wrkspc_01Pyst4AzZBMDsgNsTHDSWuV` (us-east-1).
   3. **Set the owner's daily cap by migration** (prod DB access is read-only):
      `UPDATE providers SET daily_budget_usd = <n> WHERE provider_id =
      'claude_intel';`. The number is a finance decision, not an engineering
-     one — nothing here picks it for you.
+     one — nothing here picks it for you. **Done: migration 0039 sets USD 50 a
+     day in every environment** (owner, 2026-09-30). It is a safety ceiling
+     against a runaway, not a spending plan; a different number is a new
+     migration.
   4. **`POST /v1/admin/providers/claude_intel/enable`** (the backend relays it
      at developer tier) — the row itself; a NULL budget above still refuses
      every run even once this flips.

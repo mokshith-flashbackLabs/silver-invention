@@ -1,0 +1,12 @@
+-- claude_intel gets its daily budget: USD 50, the same in every environment
+-- (owner decision; the likeness-intel design spec, section 3.9).
+--
+-- A SAFETY CEILING, NOT A SPENDING PLAN. Intel's cost scales with the number of
+-- sources and how often they change, never with the number of users, so an
+-- ordinary day spends a few dollars at most. The cap exists so a bug or a runaway
+-- loop cannot spend the month in a day. Until this row, the NULL budget refused
+-- every run as budget_unset.
+--
+-- Enabling the provider is NOT done here: it stays a per-environment operator
+-- action (the providers enable route), so production waits for its IAM grant.
+UPDATE providers SET daily_budget_usd = 50.00 WHERE provider_id = 'claude_intel';

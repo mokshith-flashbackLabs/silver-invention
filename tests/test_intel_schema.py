@@ -4,12 +4,24 @@ only place a role's real grants show (test_articles_store precedent)."""
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 from uuid import uuid4
 
 import psycopg
 import pytest
 
 from tests.db import run_migrate
+
+
+def _steps_through(version: str) -> str:
+    """How many ``down --steps N`` roll back ``version`` and everything after it.
+
+    Counted from the migration files, never hardcoded: a literal ``1`` silently
+    retargets the next migration the day one is added on top (0039 did exactly
+    that to this test).
+    """
+    ups = sorted(p.name for p in (Path(__file__).parent.parent / "migrations").glob("*.up.sql"))
+    return str(sum(1 for name in ups if name >= version))
 
 
 @pytest.fixture
@@ -31,6 +43,10 @@ def test_providers_kind_is_text_with_llm_allowed(migrated_db: str) -> None:
             "SELECT kind, enabled, calibrated FROM providers WHERE provider_id = 'claude_intel'"
         ).fetchone()
         assert row == ("llm", False, False)
+        (budget,) = conn.execute(  # type: ignore[misc]
+            "SELECT daily_budget_usd FROM providers WHERE provider_id = 'claude_intel'"
+        ).fetchone()
+        assert budget == Decimal("50.00")  # 0039: the owner's daily ceiling, provider still off
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(
                 "UPDATE providers SET calibrated = true WHERE provider_id = 'claude_intel'"
@@ -306,7 +322,7 @@ def test_down_succeeds_after_claude_intel_was_metered(migrated_db: str) -> None:
             "INSERT INTO provider_spend (provider_id, spend_date, call_count, cost_usd)"
             " VALUES ('claude_intel', current_date, 1, 0.01)"
         )
-    down = run_migrate(migrated_db, "down", "--steps", "1")
+    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0038_"))
     assert down.returncode == 0, down.stderr
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         assert conn.execute("SELECT 1 FROM pg_type WHERE typname = 'provider_kind'").fetchone() == (

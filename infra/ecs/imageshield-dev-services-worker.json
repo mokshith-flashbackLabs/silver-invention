@@ -124,7 +124,7 @@
         { "name": "LOG_LEVEL", "value": "info" },
         { "name": "DB_SSLMODE", "value": "require" },
         { "name": "DB_POOL_MAX_SIZE", "value": "2" },
-        { "name": "INTEL_ENABLED", "value": "false" },
+        { "name": "INTEL_ENABLED", "value": "true" },
         { "name": "INTEL_MODEL_PROVIDER", "value": "claude" },
         { "name": "INTEL_ANTHROPIC_REGION", "value": "ap-south-1" },
         { "name": "ANTHROPIC_AWS_WORKSPACE_ID", "value": "wrkspc_01A2ZZVekB1bXvKKimttBQGF" },

@@ -952,8 +952,8 @@ real money, prod must not silently read nothing" pair `SEARCH_PROVIDER` enforces
 caps, poll interval, lease seconds, breaker tuning) has a sane default — see the task-5 build report
 for the full field table if you need one not listed here.
 
-**Both dev and prod ship `INTEL_ENABLED=false` today**, and a placeholder workspace id,
-`pending-step0`, sits in **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
+**As of 2026-09-30 dev ships `INTEL_ENABLED=true` and prod `INTEL_ENABLED=false`.** The workspace ids
+confirmed by the step-0 probe (2026-09-29) replaced the `pending-step0` placeholder in all **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
 (`infra/ecs/imageshield-dev-services-worker.json`), the prod container's (`infra/ecs/prod/services-worker.json`),
 and the task role's IAM `Resource` ARN
 (`infra/ecs/policies/services-task-role.json`, `Sid: ClaudePlatformInvoke`,
@@ -965,12 +965,11 @@ workspace the container never asks for, which fails closed rather than reaching 
 steps, is `docs/OPERATIONS.md` §4's `claude_intel` entry — this is the deploy-time framing of the
 same five steps):
 
-1. Owner runs the step-0 live probe against the real workspace for that environment (not run yet —
-   `docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
-2. Substitute `pending-step0` with the confirmed workspace id in all three files above, redeploy the
-   task definition and reapply the IAM policy.
-3. Set `claude_intel.daily_budget_usd` by migration (the owner's number — a finance decision, not an
-   engineering one).
+1. Owner runs the step-0 live probe against the real workspace for that environment (**done
+   2026-09-29, both** — `docs/superpowers/specs/2026-09-28-likeness-intel-step0-findings.md`).
+2. Substitute `pending-step0` with the confirmed workspace id in all three files above (**done**), redeploy
+   the task definition and reapply the IAM policy.
+3. Set `claude_intel.daily_budget_usd` by migration (**done: 0039, USD 50 a day in every environment**).
 4. `POST /v1/admin/providers/claude_intel/enable`.
 5. Only then set `INTEL_ENABLED=true` on the container and redeploy — **and in production, only
    after the backend repo's own prod IAM grant for this surface is applied there.** The services-side
