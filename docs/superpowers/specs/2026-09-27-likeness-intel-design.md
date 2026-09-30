@@ -316,6 +316,13 @@ So **an approved proposal cannot exist without a name on it and its exact number
 | `weight_suggestion` | `{question_key, options: [{option, deduction \| null, rationale, signal_ids, suggested_tags, new_tag?}]}` | — | — |
 | `coverage_gap` | `{subject, suggested_tag?: {slug, label, kind}, suggested_question?, regenerated_by_run_id?}` | — | — |
 
+*Clarified 2026-09-30 (step-3 plan):* a `threat_event` carries no `body`. §6.3's "event `title` and `body`" names the
+free-text leaves an event kind may have, and a threat proposal has only `title`; the approval inserts `body = ''`, and
+the backend renders its generic reason under an event with no body. An operator's `values` on a threat approval may
+name any subset of `{kind, title, severity, expires_in_days, tags}`. It is merged over `suggested` and the proposal's
+own `target.tags`, and the merged result must pass §4.5, so a partial edit changes only what it names and a complete
+one is exactly §4.7's "`decided` is set to the operator's `values`".
+
 **Supersession needs a reason.** `supersede_reason` is non-NULL exactly when `status = 'superseded'`. It is one of
 `newer_proposal`, `cell_changed` or `resolved_by_quiz` (§4.9).
 
@@ -376,6 +383,12 @@ and `ThreatEventItem`.
 2. Drop the widened CHECK, looked up by definition.
 3. **Restore the old CHECK as `NOT VALID`.** Retracted tag-only rows keep their shape, and nothing updates them,
    because retract only touches active rows. Validating the constraint would fail on them.
+
+*Clarified 2026-09-30 (step-3 plan):* the step-3 migration is `0042_intel_scoped_threats`. Both legs find a relevance
+CHECK by its definition with whitespace, parentheses and any ` NOT VALID` suffix ignored, because a down leaves the
+old CHECK `NOT VALID`. The up adds the widened CHECK (named `threat_events_relevant`) `NOT VALID` and then validates
+it, leaving it unvalidated only when an earlier 0042 down grandfathered a retracted tag-only row whose tags left with
+the column. Otherwise a re-up after a down would fail on that row.
 
 **`intel_rw` gains `SELECT, INSERT` on `threat_events`**, because approving a proposal creates the event in one
 transaction. **The follow-up migration that drops the dormant score tables must re-home the `threat_events` and
@@ -467,6 +480,9 @@ weights release, bootstrap), **after every tag or mapping change**, once at work
   mid-run. `against_scoring_version` and `against_release_no` record which copy it was.
 - **With no vocabulary yet** (before the first push), weight-kind proposals and suggestions are skipped, with the
   outcome `vocabulary_missing`. Signals and event proposals still flow.
+  *Corrected 2026-09-30 (step-3 plan):* event proposals do not flow without a vocabulary either. Every tag of a
+  `threat_event` must be registered in the loaded vocabulary (§4.5), and with none loaded no tag is, so the run makes
+  no generation call at all (`proposals_skipped_vocabulary_missing`), as step 2 already does. Signals still flow.
 - The backend **re-validates every proposal against the live model when applying it.** Stale is refused there, not
   trusted here.
 
@@ -710,6 +726,20 @@ consumer has not shipped (`409 proposal_not_decidable`). So no approval can crea
 - Without a vocabulary, step 2 makes no generation call at all (`proposals_skipped_vocabulary_missing`), because it
   has no event kind to let through yet.
 
+*Clarified 2026-09-30 (step-3 plan):*
+- The structured output gains `threat_events` and `attach`, still with no numeric bounds; §4.5's severity and expiry
+  bounds run per proposal, in code. A threat title is dropped past 200 characters (`MAX_EVENT_TITLE_CHARS`), never
+  truncated.
+- Duplicate detection runs in code against the pending event proposals the run loaded: the same overlapping-tag set,
+  at most 40, that the prompt carries. **A shared document means a shared page**: two signals' documents are one
+  document when their canonical URL hash (`intel_documents.url_hash`) is equal, so a page a later run reads again
+  (a new `intel_documents` row, since documents are unique per run) is the same document. A converted duplicate
+  attaches only the run's own new signals, and one citing none is dropped. Two event proposals in one batch with the
+  same kind and tag set that share a document keep the first.
+- A `gap_regenerate` run's evidence is the signals its request names, not signals it read, and it writes event
+  proposals and attachments only. A weight change or coverage gap it returns is dropped
+  (`proposal_dropped_not_an_event`).
+
 ### 4.4 The model seam
 
 - **`intel/model.py`** is the only module that imports `anthropic`, and a boundary test enforces that. It builds
@@ -860,6 +890,20 @@ re-checked inside it.
 - `applies_regardless_of_location` is accepted on every decision body and read only from step 4.
 - `values` on a rejection is a body-shape `422 validation_error`.
 
+*Clarified 2026-09-30 (step-3 plan), for threat approvals:*
+- A tag the final values *add* that is unregistered is `422 unknown_tag`, and one that is retired is `422 tag_retired`,
+  both naming `slugs`. That is §3.1's rule, and the backend's inline resync (its §6.3) relies on `unknown_tag`. Every
+  other out-of-bounds value is `422 values_out_of_bounds`. The protection bullet above answers tags with
+  `values_out_of_bounds`; step 4 reconciles it with §3.1.
+- A final tag set that is entirely unmapped is `409 proposal_tags_unmapped`, as the proposal's own is, so an edit
+  cannot create an event that reaches nobody.
+- An approved event proposal answers `status: 'applied'`, with `applied_ref` the new event's id. The row gets
+  `domains = '{}'`, `is_global = false`, `starts_at = now()`, `expires_at = now() + expires_in_days`,
+  `decay_days = expires_in_days` and `created_by` the operator.
+- `GET /proposals/{id}` carries `related_events` on every read: `[]` for a weight change or a gap, and for an event
+  kind the active, tag-carrying threat events that overlap its tags (at most 40), never the proposal's own event.
+  Each is `{event_id, direction, kind, title, severity, tags, is_global, starts_at, expires_at, proposal_id}`.
+
 **Error codes** (the envelope from §9 of the services manual): `proposal_not_found`, `proposal_not_pending`,
 `proposal_uncorroborated`, `proposal_not_decidable`, `proposal_evidence_retracted`, `proposal_cell_awaiting_publish`,
 `proposal_tags_unmapped`, `values_out_of_bounds`, `unknown_tag`, `tag_retired`, `known_hit_location`,
@@ -923,6 +967,17 @@ mutable, deduction moved, and the reads of approved rows.
 - **Which renames apply to a proposal:** those above both `reconciled_release_no` and the release the proposal was
   generated against. They are folded one release at a time, and each release's entries apply simultaneously, so a
   swap inside one release moves A to B.
+
+*Clarified 2026-09-30 (step-3 plan):*
+- The gap pass runs on every worker tick, after the pair reconcile and in its own transaction. So it is state-based,
+  as the note above requires, and a gap mapped before step 3 deployed is resolved on its first tick.
+- A regeneration's input is bounded like proposal context: the gap's own active signals first, then matching active
+  signals from the last 90 days, at most 60 in all.
+- **A gate refusal does not lose the evidence.** A regeneration run that ends `refused` or `failed` without writing
+  proposals is queued again by the same pass once it has been finished for six hours (`GAP_REGENERATE_RETRY_HOURS`),
+  up to five runs per gap (`GAP_REGENERATE_MAX_RUNS`), so the last one always falls after a UTC-midnight budget
+  reset. The superseded gap's `regenerated_by_run_id` follows the newest run. A run whose model call was consumed (a
+  refusal, a `max_tokens` stop) has written its proposals mark and is not retried.
 
 ### 4.10 Sources chosen per question — amended 2026-09-30 (decision 11)
 
@@ -1199,6 +1254,8 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 
 *Clarified 2026-09-30 (step-2 plan):* row 2's `weight_suggestion` belongs to step 5 (see the §4.3 note). Step 2's
 services migration is `0041_intel_proposal_cost` (see the §3.9 note), and it changes no table.
+
+*Clarified 2026-09-30 (step-3 plan):* step 3's services migration is `0042_intel_scoped_threats`.
 
 **Per-step deploy gates:**
 - **Services always deploy first** on the way up: every new body field is refused (`422`) by an older services build.
