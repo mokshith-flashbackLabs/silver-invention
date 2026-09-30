@@ -30,6 +30,7 @@ from imageshield.intel.models import Run, Vocabulary
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
 from imageshield.intel.pricing import Usage
 from imageshield.intel.proposal_store import PostgresProposalStore
+from imageshield.intel.reconcile import PostgresReconciler
 from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractedSignal,
@@ -210,6 +211,7 @@ def make_deps(
         model=model,
         control=control,
         proposals=PostgresProposalStore(pool),
+        reconciler=PostgresReconciler(pool),
         clock=clock or (lambda: NOW),
         max_calls_per_run=max_calls_per_run,
         max_document_chars=max_document_chars,
@@ -306,6 +308,23 @@ def scoring(
     )
     assert parsed is not None
     return parsed
+
+
+def renamed_document(old: str, new: str, *, release_no: int) -> dict[str, Any]:
+    """QUIZ_VOCABULARY after the quiz editor renamed ``old`` to ``new`` on the platforms
+    question at ``release_no``: same deduction, the option's tags carried, the rename logged."""
+    doc = copy.deepcopy(QUIZ_VOCABULARY)
+    platforms = doc["questions"][0]
+    platforms["options"] = [new if o == old else o for o in platforms["options"]]
+    platforms["deductions"] = {
+        (new if o == old else o): d for o, d in platforms["deductions"].items()
+    }
+    for row in doc["option_tags"]:
+        if row["question_key"] == "platforms" and row["option"] == old:
+            row["option"] = new
+    doc["renamed"] = [{"release_no": release_no, "question_key": "platforms",
+                       "old_option": old, "new_option": new}]
+    return doc
 
 
 async def seed_quiz_vocabulary(

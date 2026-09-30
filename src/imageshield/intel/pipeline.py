@@ -81,6 +81,7 @@ from imageshield.intel.prompts import (
 )
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.publisher import publisher_domain
+from imageshield.intel.reconcile import Reconciler
 from imageshield.intel.schemas import ExtractedSignal
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, is_well_formed
@@ -113,7 +114,9 @@ class PipelineDeps:
     """Everything a run touches. Mutable on purpose: the worker's tests move
     ``clock`` past a lease. ``max_calls_per_run`` and ``max_document_chars`` are
     ``INTEL_MAX_CALLS_PER_RUN`` / ``INTEL_MAX_DOCUMENT_CHARS`` and have NO default
-    here -- a second default beside IntelConfig's would be a second source of truth."""
+    here -- a second default beside IntelConfig's would be a second source of truth.
+    ``reconciler`` is not part of a run: the worker's tick calls it before claiming
+    (spec §4.9)."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -121,6 +124,7 @@ class PipelineDeps:
     model: IntelModel
     control: ProviderControlStore
     proposals: ProposalStore
+    reconciler: Reconciler
     clock: Callable[[], datetime]
     max_calls_per_run: int
     max_document_chars: int

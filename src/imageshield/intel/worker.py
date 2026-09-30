@@ -28,6 +28,7 @@ from imageshield.intel.fetch_client import HttpTextFetcher
 from imageshield.intel.model import ClaudeIntelModel, IntelModel
 from imageshield.intel.pipeline import PipelineDeps, run
 from imageshield.intel.proposal_store import PostgresProposalStore
+from imageshield.intel.reconcile import PostgresReconciler
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
 
@@ -43,11 +44,13 @@ def _build_model(config: IntelConfig) -> IntelModel:
 
 
 async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
-    """One pass: expire exhausted runs, schedule due sources, claim at most one
-    run, execute it, finish it. Returns whether a run was executed, so the
+    """One pass: reconcile a new vocabulary, expire exhausted runs, schedule due
+    sources, claim at most one run, execute it, finish it. Returns whether a run was executed, so the
     caller can poll again immediately while there is work and back off once the
     queue is empty."""
     now = deps.clock()
+    # spec §4.9: react to a new vocabulary within one poll, before any run loads it.
+    await deps.reconciler.reconcile()
     await deps.store.expire_exhausted(now)
     await deps.store.schedule_due(now)
     claimed = await deps.store.claim_next(now, lease_seconds=lease_seconds)
@@ -106,6 +109,7 @@ async def run_forever(config: IntelConfig) -> None:
             max_cooldown_seconds=config.breaker_cooldown_max_seconds,
         ),
         proposals=PostgresProposalStore(pool),
+        reconciler=PostgresReconciler(pool),
         clock=lambda: datetime.now(UTC),
         # No default on PipelineDeps for either of these (task 10) -- a second
         # default beside IntelConfig's would be a second source of truth.
