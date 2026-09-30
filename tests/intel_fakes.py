@@ -463,3 +463,91 @@ async def seed_proposal(
             )
     proposal_id: UUID = row[0]
     return proposal_id
+
+
+THREAT_SUGGESTED: dict[str, Any] = {
+    "kind": "leak",
+    "title": "Instagram breach exposes private photos",
+    "severity": 3,
+    "expires_in_days": 30,
+}
+
+
+def mapped_document(option: str, tag: str) -> dict[str, Any]:
+    """QUIZ_VOCABULARY after an operator mapped the platforms question's ``option`` to ``tag``
+    (the backend's map_version would move; push it with a higher map_version)."""
+    doc = copy.deepcopy(QUIZ_VOCABULARY)
+    doc["option_tags"] = [
+        *doc["option_tags"],
+        {"question_key": "platforms", "option": option, "tags": [tag]},
+    ]
+    return doc
+
+
+async def seed_threat_proposal(
+    pool: AsyncConnectionPool,
+    *,
+    signal_ids: list[UUID],
+    tags: tuple[str, ...] = ("instagram",),
+    status: str = "pending",
+    decided: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
+) -> UUID:
+    """A threat_event proposal row written directly, shaped as generation writes one."""
+    return await seed_proposal(
+        pool,
+        signal_ids=signal_ids,
+        kind="threat_event",
+        status=status,
+        target={"tags": list(tags)},
+        suggested=dict(THREAT_SUGGESTED),
+        decided=decided,
+        created_at=created_at,
+    )
+
+
+async def seed_threat_event(
+    pool: AsyncConnectionPool,
+    *,
+    tags: tuple[str, ...] = ("instagram",),
+    domains: tuple[str, ...] = (),
+    is_global: bool = False,
+    status: str = "active",
+    title: str = "Seeded incident",
+    proposal_id: UUID | None = None,
+    starts_in_days: int = 0,
+    ends_in_days: int = 30,
+) -> UUID:
+    """A threat_events row written directly (superuser), for the live-event reads."""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO threat_events (kind, title, severity, tags, domains, is_global,"
+            " starts_at, expires_at, decay_days, status, created_by, proposal_id)"
+            " VALUES ('leak', %s, 4, %s::text[], %s::text[], %s,"
+            " now() + make_interval(days => %s), now() + make_interval(days => %s), 30, %s,"
+            " 'seed-op', %s) RETURNING event_id",
+            (
+                title,
+                list(tags),
+                list(domains),
+                is_global,
+                starts_in_days,
+                ends_in_days,
+                status,
+                proposal_id,
+            ),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    event_id: UUID = row[0]
+    return event_id
+
+
+async def settle_runs(pool: AsyncConnectionPool) -> None:
+    """Finish every queued run. ``seed_signal`` queues an adhoc run per call, and a test that
+    then claims ITS run must not have claim_next hand it a seed's run instead."""
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE intel_runs SET status = 'completed', completed_at = now()"
+            " WHERE status = 'queued'"
+        )
