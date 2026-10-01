@@ -122,6 +122,7 @@ the type is the `CUSTOM_TYPES` pin in `tests/test_migrations.py:47`.
 | `0039_likeness_intel` | step 1 | `providers.kind` becomes TEXT (below); the `claude_intel` row; `provider_calls.intel_run_id`; every `intel_*` table in §3.1–§3.6 and §3.8; the `intel_rw` role and its grants. **No threat or protection change, and no view.** |
 | `<next free>_intel_scoped_threats` | step 3 | `threat_events.tags` and `proposal_id`; the relevance-CHECK swap; `intel_rw` grants on `threat_events`; `svc.v_active_scoped_events` with **the threat half only**, and its grant. |
 | `<next free>_intel_protection_events` | step 4 | `protection_events`; the view dropped and re-created as the UNION, **with its grant re-issued in the same file**, because `DROP VIEW` loses it. |
+| `0045_intel_renewal_lookup_indexes` | final review (2026-10-01, M10) | Indexes only: `intel_runs ((request ->> 'event_id'), created_at DESC, run_id DESC) WHERE kind = 'renewal_check'` and `intel_proposals ((target ->> 'renews_event_id'), created_at DESC, proposal_id DESC) WHERE kind = 'protection_event'`, the two lookups behind the credit list and the renewal schedule. |
 
 If steps 3 and 4 ship together, the first of the two numbers carries both halves and the second is not used. The four hand-maintained contract
 pins change in the file that creates the view (§3.7).
@@ -278,6 +279,11 @@ context, weight-suggestion retrieval, the corroboration count and the `coverage_
 left with no active signal reads `approvable = false, why_not = 'evidence_retracted'`, and approving it is `409
 proposal_evidence_retracted`. **An approved or applied proposal is never changed automatically.** Its detail read
 shows `evidence_retracted: true` so an operator can decide whether to retract the event or roll the weight back.
+
+*Amended 2026-10-01 (final review M1):* "everywhere" includes the pending event proposals generation reads as duplicate
+candidates and attach targets. Their signal ids, pages and categories are aggregated over active signals only, and a
+proposal left with none is not loaded at all. A page read again after its only signal was retracted therefore opens a
+fresh proposal written from the new evidence, rather than an attach reviving the old one.
 
 ### 3.6 Proposals
 
@@ -783,6 +789,17 @@ consumer has not shipped (`409 proposal_not_decidable`). So no approval can crea
   attach to it, and duplicate detection compares it like any other.
 - A `gap_regenerate` run writes protection events too: they are event proposals.
 
+*Amended 2026-10-01 (final review):*
+- **An attached signal must concern its target (M2).** A tagged signal shares at least one tag with the target
+  proposal; an untagged one, which has no tag to compare, shares a category with the target's own active evidence.
+  Otherwise the whole attach is dropped (`attach_dropped_unrelated`). Corroboration counts every linked publisher, so
+  without this floor the model's word alone could make a web-only proposal approvable with an unrelated second domain.
+  A duplicate converted by code (same kind, tag set and a shared page) is unaffected.
+- **The new signals are bounded too (M7).** At most `PROPOSAL_CONTEXT_MAX_NEW_SIGNALS` (40, `intel/bounds.py`), the
+  newest; the excess is counted (`proposal_new_signals_over_cap`), is not attach evidence for the run, and stays out of
+  the related list. With 60 related signals, 40 each of pending proposals, live threats and live credits, and the
+  registry, the input stays inside the 60k tokens behind 0041's worst-case estimate.
+
 ### 4.4 The model seam
 
 - **`intel/model.py`** is the only module that imports `anthropic`, and a boundary test enforces that. It builds
@@ -937,6 +954,9 @@ re-checked inside it.
   - An event kind whose consumer has not shipped is `409 proposal_not_decidable` (§4.3).
   - **A renewal** (`target.renews_event_id`) inserts the new event with `starts_at = old.review_by`, so the two never
     overlap: the view filters `starts_at <= now()`. That allows no double credit and no gap.
+    *Amended 2026-10-01 (final review M3):* it is approvable only while the old credit is live (`status = 'active' AND
+    review_by > now()`), so the new credit always starts in the future and approving it moves nobody. A renewal of a
+    credit past its review date is `409 proposal_not_pending`, the code a retracted or already renewed one gets.
 - **`approved` on `weight_change`.** `decided = {delta}`, from `values.delta` or `suggested.delta`, re-checked. The
   proposal becomes `approved`, waiting in the backend's publish queue. The cell index may answer `409
   proposal_cell_awaiting_publish`.
@@ -1046,6 +1066,12 @@ A renewal is approved like any other proposal (§4.7). No year-old evidence is e
   proposal, whatever became of it, is never checked again.
 - A renewal makes no model call, so the provider gate, the budget and the kill switch do not apply to it. It runs only
   while `INTEL_ENABLED` is true; with the worker off, credits lapse, which is the safe direction.
+
+*Amended 2026-10-01 (final review M3/M4):* a pending renewal whose credit was retracted or has reached its review date
+reads `approvable: false, why_not: 'renewed_credit_ended'` on both reads, second in the fixed order after
+`not_decidable`, and the decision refuses it `409 proposal_not_pending` (§4.7). This also covers the one the
+retraction's `SKIP LOCKED` passes over while an approval holds it: it no longer reads approvable while every approval
+409s. It can still be rejected. A credit that lapsed with its renewal unapproved stays lapsed.
 
 ### 4.9 Adapting to quiz changes — no deploy, no hand edits
 
@@ -1208,6 +1234,19 @@ option. Everything tied to an option arrives through this flow, so it carries th
   - A PATCH `enabled: true` on a source whose tags are all unmapped is `409 source_tags_unmapped`, never a success the
     next tick undoes.
   - The suggestion run's immediate read ignores `enabled`, so a draft option's source is read even while paused.
+
+*Amended 2026-10-01 (final review):*
+- **A person-shaped query refuses stage 3's whole body (I1).** `POST /source-validations` answers `422
+  query_names_a_person`, the refusal `POST /sources` and stage 4 give, when any candidate's `query_text` holds a phone-
+  or email-shaped run. As a per-candidate verdict the string was kept for ever in the run's request and results,
+  served by the poll and `GET /runs`, and logged. The run's own check stays as a second line. The worker's
+  `intel.run_finished` line now carries only an outcome's scalar values.
+- **`POST /sources` with all-unmapped tags is `409 source_tags_unmapped` (M5)**, with the tags as `slugs`: the PATCH
+  rule above, applied to a create.
+- **A retried press reads what a refused one left (M6).** Besides the newly registered sources, the suggestion run
+  reads each named source with no evidence yet: never checked, or whose last check stopped before its page was read
+  (`last_run_status = 'deferred_<reason>'`, a gate refusal or the model down). An operator-disabled source is left
+  alone.
 
 ## 5. Cost and controls — the existing provider gate, with a new kind
 

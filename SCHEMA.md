@@ -1316,6 +1316,26 @@ the UNION of the threat half (0042's, byte for byte) and the protection half: `d
 types are unchanged. The down restores the threat half and drops the table, **every credit with it**: on a real
 environment retract them and roll the backend back first.
 
+## 2i. Likeness intel — renewal lookup indexes (migration 0045)
+
+Indexes only (final review M10, 2026-10-01). `intel/protection_store.py` finds a credit's renewal check by
+`intel_runs.request ->> 'event_id'` and its renewal proposal by `intel_proposals.target ->> 'renews_event_id'`, for
+every listed credit and on every worker tick, and both tables grow with every source check:
+
+```sql
+CREATE INDEX intel_runs_renewal_event_idx
+  ON intel_runs ((request ->> 'event_id'), created_at DESC, run_id DESC)
+  WHERE kind = 'renewal_check';
+CREATE INDEX intel_proposals_renews_event_idx
+  ON intel_proposals ((target ->> 'renews_event_id'), created_at DESC, proposal_id DESC)
+  WHERE kind = 'protection_event';
+```
+
+Each is partial on the predicate every query states and ordered as the list's `LATERAL ... ORDER BY ... LIMIT 1`
+reads, so one index serves that and the equality probes (`tests/test_intel_schema.py` asserts the planner picks both
+for the store's own SQL). `intel_runs_one_open_renewal` (0044) covers only queued and running checks. The down drops
+both; no grant or data changes either way.
+
 ---
 
 ## 3. Adjudication service
