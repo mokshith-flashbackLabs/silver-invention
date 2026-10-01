@@ -301,7 +301,7 @@ _LIST_HITS_SQL = """
       AND (%(confirm_state)s::text IS NULL OR i.confirm_state = %(confirm_state)s)
       AND (%(user_ref)s::uuid IS NULL OR i.user_ref = %(user_ref)s)
       AND (%(since)s::timestamptz IS NULL OR i.first_seen_at >= %(since)s)
-      -- The reviewer's to-do list (2026-09-30): whether ANY verdict exists,
+      -- The reviewer's to-do list: whether ANY verdict exists,
       -- read off the same LATERAL that supplies latest_verdict, so the filter
       -- and the column can never disagree about a row.
       AND (%(has_verdict)s::boolean IS NULL
