@@ -24,7 +24,10 @@ Approving a protection_event (step 4) also goes straight to 'applied', inserting
 protection limited to some places is rejected, never approved (spec §3.7). A renewal starts at
 the old credit's review_by, and the old credit is locked AFTER the proposal -- the order the
 retraction takes too (intel/protection_store.py) -- so a racing retraction is seen, never
-deadlocked on.
+deadlocked on. It is approvable only while that credit is still LIVE, active and before its
+review date: so the new credit always starts in the future and approving it moves nobody, and
+a late or orphaned renewal is refused (409 proposal_not_pending) exactly as both reads report
+it (``why_not = renewed_credit_ended``; final review M3/M4, 2026-10-01).
 
 The acknowledgement (``mark_applied``) is the second system write (spec §4.7). It moves only
 approved weight changes, keeps the approval's decided_by, decided_at and decision_reason, and
@@ -70,6 +73,7 @@ from imageshield.intel.proposal_models import (
     WeightDelta,
 )
 from imageshield.intel.proposal_store import (
+    LIVE_CREDIT_SQL,
     PROPOSAL_COLUMNS,
     fetch_linked_signals,
     load_scoring_vocabulary,
@@ -100,8 +104,11 @@ _MESSAGES: dict[DecisionRefusal, str] = {
     "tag_retired": "A retired tag cannot be added.",
 }
 
+_RENEWAL_ENDED = "The protection this renews has been retracted or has reached its review date."
+
 _WHY_NOT_REFUSAL: dict[str, DecisionRefusal] = {
     "not_decidable": "proposal_not_decidable",
+    "renewed_credit_ended": "proposal_not_pending",
     "evidence_retracted": "proposal_evidence_retracted",
     "uncorroborated": "proposal_uncorroborated",
     "tags_unmapped": "proposal_tags_unmapped",
@@ -267,19 +274,29 @@ def _protection_decided(
     return decided.model_dump(mode="json")
 
 
-async def _renewed_review_by(conn: AsyncConnection[Any], event_id: UUID) -> datetime:
+def _renews_of(proposal: ProposalRecord) -> UUID | None:
+    """The credit a protection proposal renews, or None. A target that does not parse renews
+    nothing here: the approval refuses it as values_out_of_bounds."""
+    if proposal.kind != "protection_event":
+        return None
+    try:
+        return ProtectionEventTarget.model_validate(proposal.target).renews_event_id
+    except ValidationError:
+        return None
+
+
+async def _renewed_review_by(conn: AsyncConnection[Any], event_id: UUID) -> datetime | None:
     """Where a renewal starts: the review date of the credit it continues, locked so a racing
-    retraction is seen. A credit no longer active is no longer renewable."""
+    retraction is seen. None when that credit is no longer live -- retracted, or at or past its
+    review date -- and so no longer renewable (final review M3)."""
     cur = await conn.execute(
-        "SELECT review_by FROM protection_events WHERE event_id = %s AND status = 'active'"
+        f"SELECT review_by FROM protection_events WHERE event_id = %s AND {LIVE_CREDIT_SQL}"
         " FOR UPDATE",
         (event_id,),
     )
     row = await cur.fetchone()
     if row is None:
-        raise DecisionRefused(
-            "proposal_not_pending", "The protection this renews is no longer active."
-        )
+        return None
     review_by: datetime = row[0]
     return review_by
 
@@ -291,8 +308,8 @@ async def _insert_protection_event(
     operator: str,
     *,
     renews: UUID | None,
+    starts: datetime | None,
 ) -> UUID:
-    starts = await _renewed_review_by(conn, renews) if renews is not None else None
     cur = await conn.execute(
         _INSERT_PROTECTION_SQL,
         {
@@ -320,13 +337,16 @@ def _approval_decided(
     values: dict[str, Any] | None,
     *,
     attested: bool | None = None,
+    renewed_credit_ended: bool = False,
 ) -> dict[str, Any]:
     """The exact values an approval stores, or a refusal."""
     if proposal.kind not in APPROVABLE_KINDS:
         raise _refuse("proposal_not_decidable")
     if proposal.status != "pending":
         raise _refuse("proposal_not_pending")
-    reason = why_not(proposal, active, vocabulary)
+    reason = why_not(proposal, active, vocabulary, renewed_credit_ended=renewed_credit_ended)
+    if reason == "renewed_credit_ended":
+        raise DecisionRefused("proposal_not_pending", _RENEWAL_ENDED)
     if reason is not None:
         raise _refuse(_WHY_NOT_REFUSAL[reason])
     if proposal.kind == "threat_event":
@@ -419,6 +439,10 @@ class PostgresDecisionStore:
                 proposal = record_of(row)
                 vocabulary = await load_scoring_vocabulary(conn)
                 if decision == "approved":
+                    # The credit a renewal continues, locked now -- still after the proposal,
+                    # the retraction's order -- so the predicate below sees it as it stands.
+                    renews = _renews_of(proposal)
+                    starts = await _renewed_review_by(conn, renews) if renews else None
                     linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
                     active = [s for s in linked if s.status == "active"]
                     decided = _approval_decided(
@@ -427,6 +451,7 @@ class PostgresDecisionStore:
                         vocabulary,
                         values,
                         attested=applies_regardless_of_location,
+                        renewed_credit_ended=renews is not None and starts is None,
                     )
                     from_status = "pending"
                     if proposal.kind == "threat_event":
@@ -442,11 +467,8 @@ class PostgresDecisionStore:
                             },
                         )
                     elif proposal.kind == "protection_event":
-                        renews = ProtectionEventTarget.model_validate(
-                            proposal.target
-                        ).renews_event_id
                         event_id = await _insert_protection_event(
-                            conn, proposal_id, decided, operator, renews=renews
+                            conn, proposal_id, decided, operator, renews=renews, starts=starts
                         )
                         await cur.execute(
                             _APPLY_EVENT_SQL,

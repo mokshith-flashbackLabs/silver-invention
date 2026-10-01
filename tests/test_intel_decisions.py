@@ -833,21 +833,61 @@ async def test_an_approved_renewal_starts_exactly_where_the_old_credit_stops(
     ) == [old]
 
 
-async def test_a_renewal_approved_after_the_old_credit_lapsed_resumes_it_at_once(
+async def test_a_renewal_of_a_credit_past_its_review_date_is_refused_and_reads_so(
     intel_pool: AsyncConnectionPool,
 ) -> None:
-    """Review Focus 4: it starts at the old review date, in the past, so it is live now and
-    runs no longer than approved."""
+    """Final review M3, reversing Review Focus 4's ruling. A renewal starts at the old review
+    date, so approving it late inserted a credit live at once -- or, past review_in_days,
+    already over yet answered 'applied' -- and "approving a renewal moves nobody" (backend spec
+    §6.1) stopped being true. It is refused as a dead predecessor is (409 proposal_not_pending),
+    both reads say why, and the operator can still reject it."""
     await seed_quiz_vocabulary(intel_pool)
     old = await seed_protection_event(intel_pool, starts_in_days=-200, ends_in_days=-1)
     renewal = await _protection_approvable(intel_pool, renews=old)
+    store = PostgresProposalStore(intel_pool)
+    read = await store.get_proposal(renewal)
+    assert read is not None
+    assert (read["approvable"], read["why_not"]) == (False, "renewed_credit_ended")
+    (listed,) = [
+        r
+        for r in await store.list_proposals(statuses=None, kinds=None, cursor=None, limit=50)
+        if r["proposal_id"] == renewal
+    ]
+    assert (listed["approvable"], listed["why_not"]) == (False, "renewed_credit_ended")
+    with pytest.raises(DecisionRefused) as refused:
+        await _decide_protection(intel_pool, renewal)
+    assert refused.value.code == "proposal_not_pending"
+    assert "review date" in refused.value.message
+    assert (
+        await _scalar(
+            intel_pool, "SELECT count(*) FROM protection_events WHERE proposal_id = %s", renewal
+        )
+        == 0
+    )
+    assert (await _decide_protection(intel_pool, renewal, "rejected")).status == "rejected"
+
+
+async def test_an_approved_renewal_of_a_live_credit_is_scheduled_and_moves_nobody(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Final review M3: the only renewal that can be approved starts in the future."""
+    await seed_quiz_vocabulary(intel_pool)
+    old = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=2)
+    renewal = await _protection_approvable(intel_pool, renews=old)
+    read = await PostgresProposalStore(intel_pool).get_proposal(renewal)
+    assert read is not None and (read["approvable"], read["why_not"]) == (True, None)
     decided = await _decide_protection(intel_pool, renewal)
     assert decided.applied_ref is not None
     assert await _scalar(
         intel_pool,
+        "SELECT starts_at > now() FROM protection_events WHERE event_id = %s",
+        UUID(decided.applied_ref),
+    )
+    assert await _scalar(
+        intel_pool,
         "SELECT array_agg(event_id) FROM svc.v_active_scoped_events"
         " WHERE direction = 'protection'",
-    ) == [UUID(decided.applied_ref)]
+    ) == [old]
 
 
 async def test_a_renewal_of_a_retracted_or_already_renewed_credit_is_refused(
@@ -864,6 +904,11 @@ async def test_a_renewal_of_a_retracted_or_already_renewed_credit_is_refused(
             " retracted_at = now(), retract_reason = 'withdrawn' WHERE event_id = %s",
             (retracted,),
         )
+    # Final review M4: the retraction's SKIP LOCKED can leave such a proposal pending; it then
+    # reads unapprovable rather than approvable-and-409-for-ever.
+    read = await PostgresProposalStore(intel_pool).get_proposal(stale)
+    assert read is not None and read["status"] == "pending"
+    assert (read["approvable"], read["why_not"]) == (False, "renewed_credit_ended")
     assert await _refused_protection(intel_pool, stale) == "proposal_not_pending"
     renewed = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=20)
     await seed_protection_event(intel_pool, renews=renewed, starts_in_days=20, ends_in_days=200)

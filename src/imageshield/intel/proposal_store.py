@@ -145,6 +145,13 @@ _LIVE_PROTECTIONS_SQL = """
 """
 
 
+# A credit a renewal may still continue: active and not yet at its review date. The decision
+# locks the credit with it (intel/decisions.py) and the reads ask it (``ended_renewals``), so
+# the panel and the decision cannot disagree about a late or orphaned renewal (final review
+# M3/M4, 2026-10-01).
+LIVE_CREDIT_SQL = "status = 'active' AND review_by > now()"
+
+
 def _context(row: dict[str, Any]) -> ContextSignal:
     return ContextSignal(
         signal_id=row["signal_id"],
@@ -246,6 +253,34 @@ async def fetch_linked_signals(
     for row in await cur.fetchall():
         linked[row["linked_to"]].append(_context(row))
     return linked
+
+
+async def ended_renewals(
+    conn: AsyncConnection[Any], rows: Sequence[dict[str, Any]]
+) -> frozenset[UUID]:
+    """The PENDING renewal proposals among ``rows`` whose credit is no longer live (retracted,
+    or past its review date): ``why_not = renewed_credit_ended``. Only pending ones, since an
+    applied renewal's predecessor lapses by design the moment the renewal takes over."""
+    renews: dict[UUID, UUID] = {}
+    for row in rows:
+        if row["kind"] != "protection_event" or row["status"] != "pending":
+            continue
+        raw = (row["target"] or {}).get("renews_event_id")
+        if not isinstance(raw, str):
+            continue
+        try:
+            renews[row["proposal_id"]] = UUID(raw)
+        except ValueError:
+            continue
+    if not renews:
+        return frozenset()
+    cur = await conn.execute(
+        f"SELECT event_id FROM protection_events WHERE event_id = ANY(%s::uuid[])"
+        f" AND {LIVE_CREDIT_SQL}",
+        (sorted(set(renews.values())),),
+    )
+    live = {r[0] for r in await cur.fetchall()}
+    return frozenset(pid for pid, event in renews.items() if event not in live)
 
 
 async def live_threat_events(
@@ -593,7 +628,11 @@ class PostgresProposalStore:
             rows = await cur.fetchall()
             vocabulary = await load_scoring_vocabulary(conn)
             linked = await fetch_linked_signals(conn, [r["proposal_id"] for r in rows])
-        return [_annotated(row, linked[row["proposal_id"]], vocabulary) for row in rows]
+            ended = await ended_renewals(conn, rows)
+        return [
+            _annotated(row, linked[row["proposal_id"]], vocabulary, row["proposal_id"] in ended)
+            for row in rows
+        ]
 
     async def get_proposal(self, proposal_id: UUID) -> dict[str, Any] | None:
         async with self._pool.connection() as conn:
@@ -607,6 +646,7 @@ class PostgresProposalStore:
                 return None
             vocabulary = await load_scoring_vocabulary(conn)
             linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
+            ended = await ended_renewals(conn, [row])
             signal_ids = [s.signal_id for s in linked]
             await cur.execute(
                 "SELECT signal_id, document_id, category, direction, tags, unregistered_subjects,"
@@ -652,7 +692,7 @@ class PostgresProposalStore:
         for excerpt in excerpts:
             by_signal.setdefault(excerpt.pop("signal_id"), []).append(excerpt)
         return {
-            **_annotated(row, linked, vocabulary),
+            **_annotated(row, linked, vocabulary, proposal_id in ended),
             "related_events": related,
             "signals": [
                 {
@@ -668,10 +708,15 @@ class PostgresProposalStore:
 
 
 def _annotated(
-    row: dict[str, Any], linked: list[ContextSignal], vocabulary: ScoringVocabulary | None
+    row: dict[str, Any],
+    linked: list[ContextSignal],
+    vocabulary: ScoringVocabulary | None,
+    renewed_credit_ended: bool = False,
 ) -> dict[str, Any]:
     return {
         **row,
         "signal_ids": [s.signal_id for s in linked],
-        **read_flags(record_of(row), linked, vocabulary),
+        **read_flags(
+            record_of(row), linked, vocabulary, renewed_credit_ended=renewed_credit_ended
+        ),
     }

@@ -146,3 +146,14 @@ def test_no_active_signal_reads_evidence_retracted() -> None:
     flags = read_flags(_proposal(), [_signal(status="retracted")], scoring())
     assert flags["evidence_retracted"] is True and flags["why_not"] == "evidence_retracted"
     assert flags["approvable"] is False
+
+
+def test_a_renewal_whose_credit_ended_is_not_approvable_whatever_its_evidence() -> None:
+    """Final review M3/M4: second in the fixed order, after not_decidable -- no evidence can
+    make a renewal of a retracted or lapsed credit approvable."""
+    renewal = _proposal("protection_event", target={"tags": ["instagram"], "renews_event_id": "x"})
+    flags = read_flags(renewal, [], scoring(), renewed_credit_ended=True)
+    assert (flags["approvable"], flags["why_not"]) == (False, "renewed_credit_ended")
+    assert why_not(renewal, [], scoring(), renewed_credit_ended=False) == "evidence_retracted"
+    gap = _proposal("coverage_gap", target={"subject": "Bumble"})
+    assert why_not(gap, [], scoring(), renewed_credit_ended=True) == "not_decidable"

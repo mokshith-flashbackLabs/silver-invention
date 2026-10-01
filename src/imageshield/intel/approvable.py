@@ -1,5 +1,12 @@
 """The approvability predicate (spec §3.6). ``why_not`` answers every refusal knowable at
-read time, in a fixed order: not_decidable, evidence_retracted, uncorroborated, tags_unmapped.
+read time, in a fixed order: not_decidable, renewed_credit_ended, evidence_retracted,
+uncorroborated, tags_unmapped.
+
+``renewed_credit_ended`` (final review M3/M4, 2026-10-01) is a pending renewal whose credit is
+no longer live -- retracted, or past its review date. A renewal starts at that credit's
+review_by, so approving one late would insert a credit that is live at once or already over;
+the decision refuses it (409 proposal_not_pending) and both reads say so, rather than showing
+approvable a proposal the decision then refuses for ever.
 
 Both reads call it (through ``read_flags``) and so does the decision, inside its transaction.
 So a proposal the panel shows as approvable is never one the decision refuses with a 409,
@@ -28,7 +35,13 @@ from imageshield.intel.proposal_models import (
 )
 from imageshield.intel.vocabulary import ScoringVocabulary
 
-WhyNot = Literal["not_decidable", "evidence_retracted", "uncorroborated", "tags_unmapped"]
+WhyNot = Literal[
+    "not_decidable",
+    "renewed_credit_ended",
+    "evidence_retracted",
+    "uncorroborated",
+    "tags_unmapped",
+]
 
 APPROVABLE_KINDS: frozenset[str] = frozenset({"weight_change", "threat_event", "protection_event"})
 # A coverage_gap can only be dismissed (§4.7); a weight_suggestion is never decidable.
@@ -66,9 +79,16 @@ def why_not(
     proposal: ProposalRecord,
     active_signals: Sequence[ContextSignal],
     vocabulary: ScoringVocabulary | None,
+    *,
+    renewed_credit_ended: bool = False,
 ) -> WhyNot | None:
+    """``renewed_credit_ended`` is the caller's read of the credit a pending renewal continues:
+    the reads take it from ``proposal_store.ended_renewals`` and the decision from the credit
+    it has locked."""
     if proposal.kind not in APPROVABLE_KINDS:
         return "not_decidable"
+    if renewed_credit_ended:
+        return "renewed_credit_ended"
     if not active_signals:
         return "evidence_retracted"
     if uncorroborated(active_signals):
@@ -82,6 +102,8 @@ def read_flags(
     proposal: ProposalRecord,
     linked_signals: Sequence[ContextSignal],
     vocabulary: ScoringVocabulary | None,
+    *,
+    renewed_credit_ended: bool = False,
 ) -> dict[str, Any]:
     """The read-time fields of both proposal reads.
 
@@ -90,7 +112,7 @@ def read_flags(
     approvable by that rule, and the approval answers 422 values_out_of_bounds (§4.5 re-check).
     """
     active = [s for s in linked_signals if s.status == "active"]
-    why = why_not(proposal, active, vocabulary)
+    why = why_not(proposal, active, vocabulary, renewed_credit_ended=renewed_credit_ended)
     why_stale: StaleReason | None = None
     pending_ack = False
     if (
