@@ -15,6 +15,7 @@ import contextlib
 import signal
 import sys
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 import structlog
@@ -35,6 +36,18 @@ from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
 
 log = structlog.get_logger("imageshield.intel.worker")
+
+
+def loggable_outcome(outcome: dict[str, Any]) -> dict[str, Any]:
+    """The scalar half of a run's outcome: its counts, cost and verdict words. A question run's
+    outcome also carries lists -- the candidates it judged, the sources it proposed -- and those
+    stay in intel_runs, never in a log line, where the structlog processor masks phone shapes
+    only (final review I1, 2026-10-01)."""
+    return {
+        key: value
+        for key, value in outcome.items()
+        if value is None or isinstance(value, (bool, int, float, str))
+    }
 
 
 def _build_model(config: IntelConfig) -> IntelModel:
@@ -84,7 +97,7 @@ async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
         run_id=str(claimed.run_id),
         kind=claimed.kind,
         status=result.status,
-        outcome=result.outcome,
+        outcome=loggable_outcome(result.outcome),
     )
     return True
 

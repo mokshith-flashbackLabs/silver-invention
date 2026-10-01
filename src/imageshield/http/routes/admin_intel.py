@@ -93,6 +93,14 @@ def _refuse(code: str, message: str, **extra: Any) -> ServiceError:
     return ServiceError(422, code, message, retryable=False, extra=extra or None)
 
 
+def _query_names_a_person() -> ServiceError:
+    """The one refusal for an operator-typed query holding a phone- or email-shaped run (spec
+    §6.1), raised wherever such a query would be STORED: a source's create and patch, a
+    validation request and a suggestion's chosen sources. Refusing it at the door is what keeps
+    the string out of intel_runs, the polls and the logs, since intel data is never deleted."""
+    return _refuse("query_names_a_person", "a saved query must not contain a phone number or email")
+
+
 def _source_not_found() -> ServiceError:
     return ServiceError(
         404, "intel_source_not_found", "No intel source with this id.", retryable=False
@@ -157,9 +165,7 @@ async def create_source(
     body: IntelSourceCreateRequest, store: IntelStore = Depends(get_intel_store)
 ) -> Any:
     if body.query_text is not None and contains_pii(body.query_text):
-        raise _refuse(
-            "query_names_a_person", "a saved query must not contain a phone number or email"
-        )
+        raise _query_names_a_person()
     await _check_url(store, body.source_url)
     await _check_tags(store, body.tags)
     source = await store.create_source(
@@ -192,9 +198,7 @@ async def patch_source(
                 "query_text may only be set on a search_query source",
             )
         if contains_pii(body.query_text):
-            raise _refuse(
-                "query_names_a_person", "a saved query must not contain a phone number or email"
-            )
+            raise _query_names_a_person()
     if body.tags is not None:
         added = tuple(tag for tag in body.tags if tag not in existing.tags)
         await _check_tags(store, added)
@@ -550,7 +554,12 @@ async def source_proposal_poll(
 async def validate_sources(
     body: IntelSourceValidationRequest, questions: QuestionStore = Depends(get_question_store)
 ) -> dict[str, UUID]:
-    """Stage 3 of spec §4.10: queue a source_validation run."""
+    """Stage 3 of spec §4.10: queue a source_validation run. A person-shaped query refuses the
+    whole body, as POST /sources and POST /weight-suggestions do, so the string is never written
+    to the run's request or echoed in its results, its poll, GET /runs or a log line (final
+    review I1, 2026-10-01). A known hit location stays the run's per-candidate verdict."""
+    if any(c.query_text is not None and contains_pii(c.query_text) for c in body.candidates):
+        raise _query_names_a_person()
     run_id = await questions.queue_source_validation(
         body.validation_request(), operator=body.operator
     )
@@ -591,9 +600,7 @@ async def suggest_weights(
         )
     for source in body.sources:
         if source.query_text is not None and contains_pii(source.query_text):
-            raise _refuse(
-                "query_names_a_person", "a saved query must not contain a phone number or email"
-            )
+            raise _query_names_a_person()
         await _check_url(store, source.source_url)
     row = await store.load_vocabulary()
     registry = row.registry() if row is not None else TagRegistry(frozenset(), frozenset())

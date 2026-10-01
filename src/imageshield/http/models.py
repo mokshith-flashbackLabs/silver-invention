@@ -1173,8 +1173,9 @@ class IntelCandidate(ServiceModel):
 
 
 class IntelSourceValidationRequest(ServiceModel):
-    """POST /source-validations: stage 3 of spec §4.10. A known hit location or a PII-shaped
-    query is the run's per-candidate verdict, never a refusal of this body."""
+    """POST /source-validations: stage 3 of spec §4.10. A known hit location is the run's
+    per-candidate verdict, never a refusal of this body. A PII-shaped query is refused by the
+    route (422 query_names_a_person), so it is never stored (final review I1, 2026-10-01)."""
 
     candidates: tuple[IntelCandidate, ...] = Field(
         min_length=1, max_length=MAX_VALIDATION_CANDIDATES

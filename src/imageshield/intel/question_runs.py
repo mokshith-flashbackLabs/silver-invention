@@ -228,7 +228,9 @@ async def _validate_search(
     ctx: _Ctx, query: str, refused: str | None
 ) -> tuple[str | None, str | None]:
     """One search_query candidate, as ``(reason, refused)``. ``refused`` carries a gate refusal
-    (or the run's call cap) forward, so no later candidate asks again (Review Focus 2)."""
+    (or the run's call cap) forward, so no later candidate asks again (Review Focus 2). The
+    route refuses a person-shaped query before it is stored (final review I1); this check is
+    the second line, for a run queued any other way, and still searches nothing."""
     if contains_pii(query):
         return "query_names_a_person", refused
     if refused is not None:

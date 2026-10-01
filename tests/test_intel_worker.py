@@ -8,9 +8,11 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+import structlog
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.bounds import MAX_RUN_ATTEMPTS
+from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.intel.worker import tick
 from tests.intel_fakes import NOW, POLICY, FakeFetcher, FakeModel, make_deps, make_page, make_signal
@@ -93,3 +95,25 @@ async def test_a_run_exhausted_at_max_attempts_fails_for_good(
     assert await tick(deps, lease_seconds=900) is False  # nothing left to claim
     (run,) = await store.list_runs(cursor=None, limit=5)
     assert run.status == "failed" and run.error_code == "attempts_exhausted"
+
+
+async def test_the_finished_runs_log_line_carries_its_counts_and_never_its_lists(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Final review I1: a question run's outcome carries lists -- here the candidates a
+    validation judged -- and the log line takes only the outcome's scalars. The lists stay in
+    intel_runs."""
+    terms = "https://p.example/terms"
+    candidate = {"option": "Instagram", "kind": "policy_page", "source_url": terms}
+    await PostgresQuestionStore(intel_pool).queue_source_validation(
+        {"candidates": [{**candidate, "query_text": None}]}, operator="ann"
+    )
+    deps = make_deps(intel_pool, FakeFetcher({terms: make_page(POLICY, terms)}), FakeModel())
+    with structlog.testing.capture_logs() as logs:
+        assert await tick(deps, lease_seconds=900) is True
+    (finished,) = [e for e in logs if e["event"] == "intel.run_finished"]
+    assert finished["kind"] == "source_validation" and finished["status"] == "completed"
+    assert finished["outcome"]["candidate_ready"] == 1 and "results" not in finished["outcome"]
+    assert terms not in repr(finished)
+    stored = await _scalar(intel_pool, "SELECT outcome FROM intel_runs")
+    assert stored["results"][0]["candidate"]["source_url"] == terms

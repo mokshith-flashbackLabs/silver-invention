@@ -265,6 +265,43 @@ def test_a_validation_is_queued_with_the_candidates_as_sent() -> None:
 
 
 @pytest.mark.parametrize(
+    "query", ["leaks about jane@example.com", "Instagram leak call +44 20 7946 0958"]
+)
+def test_a_person_shaped_query_refuses_the_validation_and_nothing_is_stored(query: str) -> None:
+    """Final review I1: the run would store the string in its request and echo it in its
+    results, the poll, GET /runs and the worker's log, forever. Refused at the door instead,
+    with the refusal POST /sources and POST /weight-suggestions answer, whichever candidate
+    carries it."""
+    app = create_app(config=make_config())
+    questions = FakeQuestionStore()
+    app.state.question_store = questions
+    app.state.intel_store = object()  # refused before any store is touched
+    client = TestClient(app)
+    person = {"option": "Bumble", "kind": "search_query", "source_url": None, "query_text": query}
+    r = _post(
+        client, "source-validations", {"candidates": [_candidate(), person], "operator": "ann"}
+    )
+    assert r.status_code == 422 and r.json()["error"]["code"] == "query_names_a_person"
+    assert questions.queued == [] and query not in r.text
+    same = client.post(
+        "/v1/admin/intel/sources",
+        json={
+            "kind": "search_query",
+            "query_text": query,
+            "tags": [],
+            "check_every_hours": 24,
+            "terms_note": "automated access permitted",
+            "operator": "ann",
+        },
+        headers=ADMIN,
+    )
+    assert same.status_code == 422
+    assert {k: v for k, v in same.json()["error"].items() if k != "request_id"} == {
+        k: v for k, v in r.json()["error"].items() if k != "request_id"
+    }
+
+
+@pytest.mark.parametrize(
     "candidate",
     [
         _candidate(kind="search_query"),  # a query kind carrying a URL
