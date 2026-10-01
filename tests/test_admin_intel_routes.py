@@ -33,7 +33,11 @@ class FakeIntelStore:
         self.created: list[dict[str, Any]] = []
         self.known_hits: set[str] = set()
         self.vocab_applied = True
-        self.option_tags: list[dict[str, Any]] = []
+        # instagram is mapped, so a source carrying it can run; a test about unmapped tags
+        # clears this.
+        self.option_tags: list[dict[str, Any]] = [
+            {"question_key": "q", "option": "o", "tags": ["instagram"]}
+        ]
         self.registry_tags = [
             {"slug": "instagram", "label": "Instagram", "description": "", "retired": False},
             {"slug": "vine", "label": "Vine", "description": "", "retired": True},
@@ -568,12 +572,30 @@ def test_enabling_a_source_whose_tags_are_all_unmapped_is_409() -> None:
     client, store = _client()
     created = client.post("/v1/admin/intel/sources", json=_source(), headers=ADMIN).json()
     url = f"/v1/admin/intel/sources/{created['source_id']}"
+    mapped = store.option_tags
+    store.option_tags = []  # its option left the live quiz since
     r = client.patch(url, json={"enabled": True, "operator": "alice"}, headers=ADMIN)
     assert r.status_code == 409 and r.json()["error"]["code"] == "source_tags_unmapped"
     assert r.json()["error"]["slugs"] == ["instagram"]
-    store.option_tags = [{"question_key": "q", "option": "o", "tags": ["instagram"]}]
+    store.option_tags = mapped
     r = client.patch(url, json={"enabled": True, "operator": "alice"}, headers=ADMIN)
     assert r.status_code == 200
+
+
+def test_creating_a_source_whose_tags_are_all_unmapped_is_409_and_creates_nothing() -> None:
+    """Final review M5: the tick would pause it within one poll, so the create is refused as
+    the enable is (spec §4.10: never a success the next tick undoes). Untagged, or with one
+    mapped tag beside an unmapped one, it is created."""
+    client, store = _client()
+    store.registry_tags.append(
+        {"slug": "linkedin", "label": "LinkedIn", "description": "", "retired": False}
+    )
+    r = client.post("/v1/admin/intel/sources", json=_source(tags=["linkedin"]), headers=ADMIN)
+    assert r.status_code == 409 and r.json()["error"]["code"] == "source_tags_unmapped"
+    assert r.json()["error"]["slugs"] == ["linkedin"] and store.created == []
+    for tags in ([], ["linkedin", "instagram"]):
+        body = _source(tags=tags, source_url=f"https://p.example/{len(tags)}")
+        assert client.post("/v1/admin/intel/sources", json=body, headers=ADMIN).status_code == 201
 
 
 def test_enabling_an_untagged_source_or_clearing_its_tags_on_the_way_is_allowed() -> None:

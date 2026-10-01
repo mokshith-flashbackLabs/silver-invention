@@ -151,13 +151,27 @@ async def _check_url(store: IntelStore, url: str | None) -> None:
 
 async def _all_tags_unmapped(store: IntelStore, tags: tuple[str, ...]) -> bool:
     """spec §4.10: a source whose non-empty tags are all unmapped cannot run -- the tick would
-    pause it again within one poll -- so enabling one is refused rather than silently undone.
-    With no readable vocabulary nothing counts as unmapped, exactly as the tick sees it."""
+    pause it again within one poll -- so creating or enabling one is refused rather than
+    silently undone. With no readable vocabulary nothing counts as unmapped, exactly as the
+    tick sees it."""
     if not tags:
         return False
     row = await store.load_vocabulary()
     vocabulary = parse_vocabulary(row) if row is not None else None
     return vocabulary is not None and not set(tags) & vocabulary.mapped_tags
+
+
+def _tags_unmapped(tags: tuple[str, ...]) -> ServiceError:
+    """409 source_tags_unmapped, naming the tags as top-level ``slugs``: "never a success the
+    next tick undoes" (spec §4.10), for a create (final review M5) as for an enable."""
+    return ServiceError(
+        409,
+        "source_tags_unmapped",
+        "No option of the live quiz maps to any of this source's tags; map one, or clear"
+        " its tags, before enabling it.",
+        retryable=False,
+        extra={"slugs": list(tags)},
+    )
 
 
 @router.post("/sources", status_code=201)
@@ -168,6 +182,8 @@ async def create_source(
         raise _query_names_a_person()
     await _check_url(store, body.source_url)
     await _check_tags(store, body.tags)
+    if await _all_tags_unmapped(store, body.tags):
+        raise _tags_unmapped(body.tags)
     source = await store.create_source(
         kind=body.kind,
         source_url=body.source_url,
@@ -205,14 +221,7 @@ async def patch_source(
     if body.enabled is True:
         tags = body.tags if body.tags is not None else existing.tags
         if await _all_tags_unmapped(store, tags):
-            raise ServiceError(
-                409,
-                "source_tags_unmapped",
-                "No option of the live quiz maps to any of this source's tags; map one, or clear"
-                " its tags, before enabling it.",
-                retryable=False,
-                extra={"slugs": list(tags)},
-            )
+            raise _tags_unmapped(tags)
     source = await store.patch_source(
         source_id,
         operator=body.operator,
