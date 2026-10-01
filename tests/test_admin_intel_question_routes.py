@@ -272,6 +272,8 @@ def test_a_validation_is_queued_with_the_candidates_as_sent() -> None:
         _candidate(source_url=None),
         _candidate(query_text="also a query"),
         _candidate(option=""),
+        _candidate(option="   "),  # blank after trimming
+        _candidate(source_url="https://"),  # no host is malformed, not "check again later"
         _candidate(kind="bogus"),
     ],
 )

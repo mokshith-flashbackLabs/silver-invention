@@ -920,6 +920,13 @@ def _source_shape_problem(kind: str, source_url: str | None, query_text: str | N
         return "query_text is for search_query only"
     if source_url is not None and not source_url.startswith("https://"):
         return "source_url must be https"
+    if source_url is not None:
+        try:
+            host = urlsplit(source_url).hostname
+        except ValueError:
+            host = None
+        if not host:
+            return "source_url must name a host"
     return None
 
 
@@ -1137,6 +1144,8 @@ class IntelCandidate(ServiceModel):
 
     @model_validator(mode="after")
     def _shape(self) -> IntelCandidate:
+        if not self.option.strip():
+            raise ValueError("option must not be blank")
         problem = _source_shape_problem(self.kind, self.source_url, self.query_text)
         if problem is not None:
             raise ValueError(problem)

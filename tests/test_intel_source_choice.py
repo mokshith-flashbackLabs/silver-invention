@@ -15,6 +15,7 @@ from imageshield.intel.source_choice import (
     candidate_key,
     clean_candidates,
     identity,
+    is_https,
     merge_by_identity,
     option_tags,
     url_verdict,
@@ -183,3 +184,9 @@ def test_a_source_chosen_for_two_options_is_one_source_with_both_options_tags() 
         ("Instagram", "https://p.example/terms", ("instagram", "threads")),
         ("Bumble", "https://b.example/terms", ()),
     ]
+
+
+def test_a_url_with_no_host_is_not_https() -> None:
+    assert is_https("https://p.example/terms")
+    for bad in ("https://", "https:///path", "  https://  ", "http://p.example", ""):
+        assert not is_https(bad)

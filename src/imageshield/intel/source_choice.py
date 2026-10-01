@@ -50,8 +50,10 @@ CandidateKey = tuple[str, str]
 
 
 def is_https(url: str) -> bool:
+    """An https URL that names a host: a bare ``https://`` is malformed, not a URL to fetch."""
     try:
-        return urlsplit(url.strip()).scheme.lower() == "https"
+        parts = urlsplit(url.strip())
+        return parts.scheme.lower() == "https" and bool(parts.hostname)
     except ValueError:
         return False
 
