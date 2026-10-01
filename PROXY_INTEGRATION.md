@@ -959,6 +959,10 @@ The suggestion is a `weight_suggestion` proposal born `delivered`. It is advice 
 decidable. A source registered this way carries its option's tags, and pauses on its own (`disabled_reason:
 'unmapped'`) while none of those tags is mapped in the live quiz. Map every code below by name.
 
+*Owner decision 2026-10-01 (final review I2):* a source registered through this flow for an option that has NO tags
+is left as is. It never pauses on its own, and it keeps being checked weekly, counted toward the `claude_intel` daily
+cap ($50/day), until an operator disables it on the Sources screen. Services change nothing for it.
+
 | # | Route | Body | Success | Semantic errors |
 |---|---|---|---|---|
 | S1 | `POST /v1/admin/intel/source-proposals` | `{question_key: 1–128, prompt: 1–1000, options: 1–50 distinct strings of 1–200, tags?: {option: slug[]}, operator: 1–64}`. `tags` keys must be options, and slugs well-formed and distinct (**shape only**; when present, even `{}`, it replaces the vocabulary's map for this run) | `202 {run_id}` | none besides `422 validation_error` |

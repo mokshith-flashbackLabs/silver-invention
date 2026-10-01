@@ -1248,6 +1248,11 @@ option. Everything tied to an option arrives through this flow, so it carries th
   (`last_run_status = 'deferred_<reason>'`, a gate refusal or the model down). An operator-disabled source is left
   alone.
 
+*Owner decision 2026-10-01 (final review I2):* a source registered through the Suggest flow with NO tags (its option
+had none mapped, the common case for a brand-new option) is left as is. It never auto-pauses, and it keeps being
+checked weekly, counted toward the $50/day cap, until an operator disables it on the Sources screen. The pause logic
+above is unchanged.
+
 ## 5. Cost and controls — the existing provider gate, with a new kind
 
 Every model call goes through `providers/gate.decide("claude_intel", ...)`: ENABLED → BREAKER → BUDGET, exactly as
