@@ -356,6 +356,7 @@ async def test_a_fetcher_outage_blocks_the_candidate_as_transient(
 SUGGEST_REQUEST: dict[str, Any] = {**QUESTION, "type": "mutable", "cap": 8}
 NEW_TERMS = "https://p.example/instagram-terms"
 NEW_SAFETY = "https://p.example/instagram-safety"
+NEW_HELP = "https://p.example/instagram-help"
 
 
 async def _rows(pool: AsyncConnectionPool, query: str, *params: Any) -> list[tuple[Any, ...]]:
@@ -590,3 +591,42 @@ async def test_a_draft_options_source_paused_before_its_first_read_is_still_read
         source_id,
     )
     assert (enabled, reason) == (False, "unmapped")
+
+
+async def test_a_retried_press_reads_the_named_sources_a_refused_one_left_unread(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Final review M6. The first press registered three sources and was refused by the gate:
+    the first one's check stopped before its page was read (deferred_provider_disabled) and the
+    others were never checked. The second press reuses all three -- none is new -- yet the two
+    with no evidence are read. The one an operator disabled meanwhile is not."""
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresQuestionStore(intel_pool)
+    chosen = [_chosen(), _chosen(NEW_SAFETY), _chosen(NEW_HELP)]
+    first = await store.register_and_queue_suggestion(SUGGEST_REQUEST, chosen, operator="ann")
+    terms, safety, help_page = first.registered
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE providers SET enabled = false WHERE provider_id = 'claude_intel'"
+        )
+    pages = {url: make_page(POLICY, url) for url in (NEW_TERMS, NEW_SAFETY, NEW_HELP)}
+    model = FakeQuestionModel(make_signal(tags=["instagram"]), suggest_with=_cite_everything())
+    refused = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher(pages), model))
+    assert refused.status == "refused" and model.extract_calls == 0
+    status = "SELECT last_run_status FROM intel_sources WHERE source_id = %s"
+    assert await _scalar(intel_pool, status, terms) == "deferred_provider_disabled"
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE providers SET enabled = true WHERE provider_id = 'claude_intel'"
+        )
+        await conn.execute(
+            "UPDATE intel_sources SET enabled = false WHERE source_id = %s", (help_page,)
+        )
+    second = await store.register_and_queue_suggestion(SUGGEST_REQUEST, chosen, operator="ann")
+    assert second.registered == () and set(second.reused) == {terms, safety, help_page}
+    fetcher = FakeFetcher(pages)
+    result = await run_once(intel_pool, make_deps(intel_pool, fetcher, model))
+    assert result.status == "completed", result
+    assert fetcher.fetched == [NEW_TERMS, NEW_SAFETY] and result.outcome["sources_read"] == 2
+    assert await _scalar(intel_pool, status, terms) == "checked"
+    assert await _scalar(intel_pool, status, help_page) is None

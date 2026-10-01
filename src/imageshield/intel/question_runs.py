@@ -6,7 +6,8 @@
 - ``source_validation``: code alone gives every candidate a verdict. A URL candidate makes no
   model request; a search_query candidate costs one metered web search, whose pages code then
   judges exactly like a URL.
-- ``weight_suggestion``: the immediate read of the sources stage 4 registered, under
+- ``weight_suggestion``: the immediate read of the sources stage 4 registered (and of any
+  named source no check has read yet, so a retried press reads what a refused one left), under
   INTEL_MAX_CALLS_PER_SUGGESTION_RUN and through ``read_source`` (the scheduled check's own code),
   then retrieval and ONE suggestion call (intel/suggestion.py decides what is kept), then the
   ordinary generation over what was read.
@@ -34,6 +35,7 @@ from imageshield.intel.bounds import (
 )
 from imageshield.intel.fetch_client import FetchFailure
 from imageshield.intel.generation import prompt_registry, prompt_signal
+from imageshield.intel.models import Source
 from imageshield.intel.pii import contains_pii
 from imageshield.intel.pipeline import (
     RunResult,
@@ -289,15 +291,36 @@ async def _weight_suggestion(ctx: _Ctx) -> RunResult:
     return RunResult(status, outcome, error)
 
 
+def _unread(source: Source) -> bool:
+    """A named source this run reads although it registered nothing, because no check of it has
+    produced evidence yet (final review M6): never checked, or its last check stopped before
+    the page was read (``deferred_<reason>``: a gate refusal or the model down). An earlier
+    press may have registered it and then been refused, and a source paused for unmapped tags
+    (a draft option) gets no scheduled check until the draft publishes, so without this its
+    evidence would never reach a suggestion. One an operator disabled is left alone."""
+    no_evidence = source.last_checked_at is None or (source.last_run_status or "").startswith(
+        "deferred_"
+    )
+    return no_evidence and (source.enabled or source.disabled_reason == "unmapped")
+
+
 async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop | None:
-    """Each newly registered source, in the request's order, until the cap, a gate refusal or
-    an outage ends reading. Every source left unread or part-read is made due, so its first
-    scheduled check comes at once rather than a full interval later. Returns the stop."""
-    listed = await ctx.deps.questions.sources_by_ids(request.new_source_ids)
+    """Each newly registered source in the request's order, then each other named source no check
+    has read yet (``_unread``), until the cap, a gate refusal or an outage ends reading. Every
+    source left unread or part-read is made due, so its first scheduled check comes at once
+    rather than a full interval later. Returns the stop."""
+    listed = await ctx.deps.questions.sources_by_ids(
+        list(dict.fromkeys([*request.new_source_ids, *request.source_ids]))
+    )
     by_id = {source.source_id: source for source in listed}
+    to_read = list(request.new_source_ids)
+    for named in request.source_ids:
+        source = by_id.get(named)
+        if named not in to_read and source is not None and _unread(source):
+            to_read.append(named)
     deferred: list[UUID] = []
     stop: _Stop | None = None
-    for source_id in request.new_source_ids:
+    for source_id in to_read:
         source = by_id.get(source_id)
         if source is None:
             ctx.counts["source_missing"] += 1
