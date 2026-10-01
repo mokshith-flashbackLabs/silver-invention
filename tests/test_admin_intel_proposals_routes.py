@@ -234,3 +234,54 @@ def test_applied_takes_no_operator_and_answers_three_lists() -> None:
         json={"scoring_version": "s", "proposal_ids": []},
     )
     assert empty.status_code == 422
+
+
+def test_the_location_attestation_reaches_the_decision() -> None:
+    client, _, decisions = _client()
+    r = client.post(
+        f"/v1/admin/intel/proposals/{uuid4()}/decision",
+        headers=ADMIN,
+        json=_decision(applies_regardless_of_location=True),
+    )
+    assert r.status_code == 200, r.text
+    assert decisions.decisions[0]["applies_regardless_of_location"] is True
+    client.post(f"/v1/admin/intel/proposals/{uuid4()}/decision", headers=ADMIN, json=_decision())
+    assert decisions.decisions[1]["applies_regardless_of_location"] is None
+
+
+def test_the_location_attestation_must_be_a_json_boolean() -> None:
+    client, _, decisions = _client()
+    r = client.post(
+        f"/v1/admin/intel/proposals/{uuid4()}/decision",
+        headers=ADMIN,
+        json=_decision(applies_regardless_of_location="true"),
+    )
+    assert r.status_code == 422 and r.json()["error"]["code"] == "validation_error"
+    assert decisions.decisions == []
+
+
+def test_a_protection_approval_answers_applied_with_the_event_id() -> None:
+    client, _, decisions = _client()
+    pid, event_id = uuid4(), uuid4()
+    decided = {
+        "title": "t",
+        "strength": 2,
+        "review_in_days": 180,
+        "tags": ["x"],
+        "is_global": False,
+        "applies_regardless_of_location": True,
+    }
+    decisions.result = Decided(pid, "protection_event", "applied", str(event_id), decided)
+    r = client.post(
+        f"/v1/admin/intel/proposals/{pid}/decision",
+        headers=ADMIN,
+        json=_decision(applies_regardless_of_location=True),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "proposal_id": str(pid),
+        "kind": "protection_event",
+        "status": "applied",
+        "applied_ref": str(event_id),
+        "decided": decided,
+    }

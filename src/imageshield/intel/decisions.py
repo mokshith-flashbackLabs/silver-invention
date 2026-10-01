@@ -19,6 +19,13 @@ threat_events row from ``decided`` alone, with intel's own SQL (the threat store
 importable from intel/), and records the event id as ``applied_ref``. The event is on
 svc.v_active_scoped_events the moment this commits, which is what the backend reads next.
 
+Approving a protection_event (step 4) also goes straight to 'applied', inserting the credit from
+``decided`` alone. It requires the operator's ``applies_regardless_of_location: true``: a
+protection limited to some places is rejected, never approved (spec §3.7). A renewal starts at
+the old credit's review_by, and the old credit is locked AFTER the proposal -- the order the
+retraction takes too (intel/protection_store.py) -- so a racing retraction is seen, never
+deadlocked on.
+
 The acknowledgement (``mark_applied``) is the second system write (spec §4.7). It moves only
 approved weight changes, keeps the approval's decided_by, decided_at and decision_reason, and
 is audited only for rows that actually move.
@@ -27,6 +34,7 @@ is audited only for rows that actually move.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -52,6 +60,9 @@ from imageshield.intel.proposal_models import (
     DecisionRefusal,
     DecisionRefused,
     ProposalRecord,
+    ProtectionEventDecided,
+    ProtectionEventTarget,
+    ProtectionEventValues,
     ThreatEventDecided,
     ThreatEventTarget,
     ThreatEventValues,
@@ -70,6 +81,11 @@ from imageshield.intel.vocabulary import ScoringVocabulary
 log = structlog.get_logger("imageshield.intel")
 
 _CELL_INDEX = "intel_proposals_one_approved_per_cell"
+_RENEWED_ONCE = "protection_events_renews_event_id_key"
+_ATTESTATION_REQUIRED = (
+    "A protection is approved only with applies_regardless_of_location: true;"
+    " one limited to some places is rejected."
+)
 
 _MESSAGES: dict[DecisionRefusal, str] = {
     "proposal_not_found": "No proposal with this id.",
@@ -119,6 +135,18 @@ _INSERT_THREAT_SQL = """
     VALUES (%(kind)s, %(title)s, %(severity)s, %(tags)s, '{}', false,
         now() + make_interval(days => %(days)s), %(days)s, 'active', %(operator)s,
         %(proposal_id)s)
+    RETURNING event_id
+"""
+
+# body is '': a protection proposal carries only a title. starts_at is now(), or for a renewal
+# the old credit's review_by, so the two never overlap and never leave a gap (spec §4.7).
+_INSERT_PROTECTION_SQL = """
+    INSERT INTO protection_events (title, body, strength, tags, is_global, starts_at, review_by,
+        status, proposal_id, renews_event_id, created_by)
+    VALUES (%(title)s, '', %(strength)s, %(tags)s::text[], %(is_global)s,
+        coalesce(%(starts)s::timestamptz, now()),
+        coalesce(%(starts)s::timestamptz, now()) + make_interval(days => %(days)s),
+        'active', %(proposal_id)s, %(renews)s::uuid, %(operator)s)
     RETURNING event_id
 """
 
@@ -197,11 +225,101 @@ async def _insert_threat_event(
     return event_id
 
 
+def _protection_decided(
+    proposal: ProposalRecord,
+    vocabulary: ScoringVocabulary | None,
+    values: dict[str, Any] | None,
+    attested: bool | None,
+) -> dict[str, Any]:
+    """The exact values a protection approval stores (spec §3.6, §4.7 as amended 2026-09-30):
+    the operator's ``values`` merged over ``suggested`` and the target's own scope, re-checked
+    against §4.5, plus the location attestation, which must be true. Tags follow the threat rule
+    (§3.1, the controller's ruling): a tag the edit ADDS that is unregistered is unknown_tag, one
+    that is retired tag_retired, both naming it; a tag already on the target may be retired. A
+    final scope of only unmapped tags would reach nobody: proposal_tags_unmapped."""
+    if attested is not True:
+        raise DecisionRefused("values_out_of_bounds", _ATTESTATION_REQUIRED)
+    try:
+        target = ProtectionEventTarget.model_validate(proposal.target)
+        edit = ProtectionEventValues.model_validate(values or {})
+        decided = ProtectionEventDecided.model_validate(
+            {
+                **proposal.suggested,
+                "tags": list(target.tags),
+                "is_global": target.is_global,
+                **edit.model_dump(exclude_unset=True),
+                "applies_regardless_of_location": True,
+            }
+        )
+    except ValidationError as exc:
+        raise _refuse("values_out_of_bounds") from exc
+    registry = (
+        vocabulary.registry() if vocabulary is not None else TagRegistry(frozenset(), frozenset())
+    )
+    added = [t for t in decided.tags if t not in target.tags]
+    unknown, retired = membership_problems(added, registry)
+    if unknown:
+        raise DecisionRefused("unknown_tag", _MESSAGES["unknown_tag"], slugs=tuple(unknown))
+    if retired:
+        raise DecisionRefused("tag_retired", _MESSAGES["tag_retired"], slugs=tuple(retired))
+    if all_tags_unmapped({"tags": list(decided.tags), "is_global": decided.is_global}, vocabulary):
+        raise _refuse("proposal_tags_unmapped")
+    return decided.model_dump(mode="json")
+
+
+async def _renewed_review_by(conn: AsyncConnection[Any], event_id: UUID) -> datetime:
+    """Where a renewal starts: the review date of the credit it continues, locked so a racing
+    retraction is seen. A credit no longer active is no longer renewable."""
+    cur = await conn.execute(
+        "SELECT review_by FROM protection_events WHERE event_id = %s AND status = 'active'"
+        " FOR UPDATE",
+        (event_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        raise DecisionRefused(
+            "proposal_not_pending", "The protection this renews is no longer active."
+        )
+    review_by: datetime = row[0]
+    return review_by
+
+
+async def _insert_protection_event(
+    conn: AsyncConnection[Any],
+    proposal_id: UUID,
+    decided: dict[str, Any],
+    operator: str,
+    *,
+    renews: UUID | None,
+) -> UUID:
+    starts = await _renewed_review_by(conn, renews) if renews is not None else None
+    cur = await conn.execute(
+        _INSERT_PROTECTION_SQL,
+        {
+            "title": decided["title"],
+            "strength": decided["strength"],
+            "tags": list(decided["tags"]),
+            "is_global": decided["is_global"],
+            "starts": starts,
+            "days": decided["review_in_days"],
+            "proposal_id": proposal_id,
+            "renews": renews,
+            "operator": operator,
+        },
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    event_id: UUID = row[0]
+    return event_id
+
+
 def _approval_decided(
     proposal: ProposalRecord,
     active: Sequence[ContextSignal],
     vocabulary: ScoringVocabulary | None,
     values: dict[str, Any] | None,
+    *,
+    attested: bool | None = None,
 ) -> dict[str, Any]:
     """The exact values an approval stores, or a refusal."""
     if proposal.kind not in APPROVABLE_KINDS:
@@ -213,6 +331,8 @@ def _approval_decided(
         raise _refuse(_WHY_NOT_REFUSAL[reason])
     if proposal.kind == "threat_event":
         return _threat_decided(proposal, vocabulary, values)
+    if proposal.kind == "protection_event":
+        return _protection_decided(proposal, vocabulary, values, attested)
     try:
         target = WeightChangeTarget.model_validate(proposal.target)
         delta = WeightDelta.model_validate(values if values is not None else proposal.suggested)
@@ -262,6 +382,7 @@ class DecisionStore(Protocol):
         values: dict[str, Any] | None,
         reason: str,
         operator: str,
+        applies_regardless_of_location: bool | None = None,
     ) -> Decided: ...
     async def mark_applied(
         self, *, scoring_version: str, proposal_ids: Sequence[UUID]
@@ -280,8 +401,10 @@ class PostgresDecisionStore:
         values: dict[str, Any] | None,
         reason: str,
         operator: str,
+        applies_regardless_of_location: bool | None = None,
     ) -> Decided:
         event_id: UUID | None = None
+        renews: UUID | None = None
         try:
             async with self._pool.connection() as conn, conn.transaction():
                 cur = conn.cursor(row_factory=dict_row)
@@ -298,10 +421,33 @@ class PostgresDecisionStore:
                 if decision == "approved":
                     linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
                     active = [s for s in linked if s.status == "active"]
-                    decided = _approval_decided(proposal, active, vocabulary, values)
+                    decided = _approval_decided(
+                        proposal,
+                        active,
+                        vocabulary,
+                        values,
+                        attested=applies_regardless_of_location,
+                    )
                     from_status = "pending"
                     if proposal.kind == "threat_event":
                         event_id = await _insert_threat_event(conn, proposal_id, decided, operator)
+                        await cur.execute(
+                            _APPLY_EVENT_SQL,
+                            {
+                                "proposal_id": proposal_id,
+                                "decided": Jsonb(decided),
+                                "applied_ref": str(event_id),
+                                "operator": operator,
+                                "reason": reason,
+                            },
+                        )
+                    elif proposal.kind == "protection_event":
+                        renews = ProtectionEventTarget.model_validate(
+                            proposal.target
+                        ).renews_event_id
+                        event_id = await _insert_protection_event(
+                            conn, proposal_id, decided, operator, renews=renews
+                        )
                         await cur.execute(
                             _APPLY_EVENT_SQL,
                             {
@@ -351,6 +497,15 @@ class PostgresDecisionStore:
                                 "decided": updated["decided"],
                                 "reason": reason,
                                 **({"event_id": str(event_id)} if event_id is not None else {}),
+                                **(
+                                    {
+                                        "applies_regardless_of_location": True,
+                                        "renews_event_id": str(renews) if renews else None,
+                                    }
+                                    if decision == "approved"
+                                    and proposal.kind == "protection_event"
+                                    else {}
+                                ),
                             }
                         ),
                     },
@@ -358,6 +513,10 @@ class PostgresDecisionStore:
         except UniqueViolation as exc:
             if exc.diag.constraint_name == _CELL_INDEX:
                 raise _refuse("proposal_cell_awaiting_publish") from exc
+            if exc.diag.constraint_name == _RENEWED_ONCE:
+                raise DecisionRefused(
+                    "proposal_not_pending", "This protection has already been renewed."
+                ) from exc
             raise
         return Decided(
             proposal_id=proposal_id,

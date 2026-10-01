@@ -82,7 +82,7 @@ def test_a_retracted_signal_does_not_count() -> None:
 
 def test_why_not_answers_in_the_spec_order() -> None:
     v = scoring()
-    # not_decidable first: step 3 approves weight changes and threat events only
+    # not_decidable first: a coverage gap is only dismissed, a suggestion never decided
     assert (
         why_not(_proposal(kind="coverage_gap", target={"subject": "Bumble"}), [], v)
         == "not_decidable"
@@ -90,10 +90,13 @@ def test_why_not_answers_in_the_spec_order() -> None:
     assert (
         why_not(_proposal(kind="weight_suggestion", status="delivered"), [], v) == "not_decidable"
     )
-    assert (
-        why_not(_proposal(kind="protection_event", target={"tags": ["instagram"]}), [], v)
-        == "not_decidable"
-    )  # step 4's
+    protection = _proposal(
+        kind="protection_event", target={"tags": ["linkedin"], "is_global": False}
+    )
+    assert why_not(protection, [], v) == "evidence_retracted"
+    assert why_not(protection, [_signal(trust="listed")], v) == "tags_unmapped"
+    everyone = _proposal(kind="protection_event", target={"tags": [], "is_global": True})
+    assert why_not(everyone, [_signal(trust="listed")], v) is None  # reaches everyone
     threat = _proposal(kind="threat_event", target={"tags": ["linkedin"]})
     assert why_not(threat, [], v) == "evidence_retracted"
     assert why_not(threat, [_signal(trust="listed")], v) == "tags_unmapped"

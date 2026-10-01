@@ -20,11 +20,15 @@ from imageshield.intel.proposal_models import Decided, DecisionRefused
 from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.publisher import publisher_domain
 from tests.intel_fakes import (
+    PROTECTION_SUGGESTED,
     QUIZ_VOCABULARY,
     THREAT_SUGGESTED,
     mapped_document,
+    protection_decided,
     quiz_document,
     seed_proposal,
+    seed_protection_event,
+    seed_protection_proposal,
     seed_quiz_vocabulary,
     seed_signal,
     seed_threat_proposal,
@@ -252,7 +256,6 @@ async def test_a_gap_is_dismissed_never_approved(intel_pool: AsyncConnectionPool
 @pytest.mark.parametrize(
     ("kind", "status", "target"),
     [
-        ("protection_event", "pending", {"tags": ["instagram"], "is_global": False}),
         ("weight_suggestion", "delivered", {"question_key": "platforms", "options": []}),
     ],
 )
@@ -585,3 +588,315 @@ async def test_a_threat_approval_needs_no_grant_intel_rw_lacks(
             (UUID(decided.applied_ref),),
         )
         assert await cur.fetchone() == (pid, 7, timedelta(days=7))
+
+
+async def _row(pool: AsyncConnectionPool, query: str, *params: Any) -> tuple[Any, ...]:
+    async with pool.connection() as conn:
+        cur = await conn.execute(query, params)
+        row = await cur.fetchone()
+    assert row is not None
+    return tuple(row)
+
+
+async def _protection_approvable(pool: AsyncConnectionPool, **kw: Any) -> UUID:
+    sid = await seed_signal(pool, tags=("instagram",))  # listed: corroborated alone
+    return await seed_protection_proposal(pool, signal_ids=[sid], **kw)
+
+
+async def _decide_protection(
+    pool: AsyncConnectionPool,
+    pid: UUID,
+    decision: str = "approved",
+    *,
+    values: dict[str, Any] | None = None,
+    attested: bool | None = True,
+    operator: str = "ann",
+) -> Decided:
+    return await PostgresDecisionStore(pool).decide(
+        pid,
+        decision=decision,  # type: ignore[arg-type]
+        values=values,
+        reason="re-checked the sources",
+        operator=operator,
+        applies_regardless_of_location=attested,
+    )
+
+
+async def _refused_protection(pool: AsyncConnectionPool, pid: UUID, **kw: Any) -> str:
+    with pytest.raises(DecisionRefused) as caught:
+        await _decide_protection(pool, pid, **kw)
+    return caught.value.code
+
+
+async def test_approving_a_protection_creates_the_credit_from_decided_in_one_transaction(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    decided = await _decide_protection(intel_pool, pid)
+    assert (decided.kind, decided.status) == ("protection_event", "applied")
+    assert decided.decided == protection_decided()
+    assert decided.applied_ref is not None
+    event_id = UUID(decided.applied_ref)
+    assert await _row(
+        intel_pool,
+        "SELECT title, strength, tags, is_global, status, created_by, proposal_id,"
+        " renews_event_id, review_by - starts_at, body FROM protection_events"
+        " WHERE event_id = %s",
+        event_id,
+    ) == (
+        PROTECTION_SUGGESTED["title"],
+        2,
+        ["instagram"],
+        False,
+        "active",
+        "ann",
+        pid,
+        None,
+        timedelta(days=180),
+        "",
+    )
+    assert await _scalar(
+        intel_pool,
+        "SELECT ARRAY[direction, kind, magnitude::text] FROM svc.v_active_scoped_events"
+        " WHERE event_id = %s",
+        event_id,
+    ) == ["protection", "protection", "2"]
+    metadata = await _scalar(
+        intel_pool, "SELECT metadata FROM audit_log WHERE action = 'intel.proposal_decided'"
+    )
+    assert metadata["event_id"] == str(event_id) and metadata["operator"] == "ann"
+    assert metadata["applies_regardless_of_location"] is True
+
+
+@pytest.mark.parametrize("attested", [None, False])
+async def test_a_protection_approval_without_the_location_attestation_is_refused(
+    intel_pool: AsyncConnectionPool, attested: bool | None
+) -> None:
+    """spec §3.7, §10: a protection limited to some places is rejected, never approved."""
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    assert await _refused_protection(intel_pool, pid, attested=attested) == "values_out_of_bounds"
+    assert await _scalar(intel_pool, "SELECT count(*) FROM protection_events") == 0
+    assert (
+        await _scalar(intel_pool, "SELECT status FROM intel_proposals WHERE proposal_id = %s", pid)
+        == "pending"
+    )
+
+
+async def test_rejecting_a_protection_needs_no_attestation_and_creates_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    rejected = await _decide_protection(intel_pool, pid, "rejected", attested=None)
+    assert (rejected.status, rejected.applied_ref, rejected.decided) == ("rejected", None, None)
+    assert await _scalar(intel_pool, "SELECT count(*) FROM protection_events") == 0
+
+
+async def test_a_partial_protection_edit_changes_only_what_it_names(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    decided = await _decide_protection(
+        intel_pool, pid, values={"strength": 4, "review_in_days": 90}
+    )
+    assert decided.decided == protection_decided(strength=4, review_in_days=90)
+    assert await _row(
+        intel_pool,
+        "SELECT strength, review_by - starts_at FROM protection_events WHERE proposal_id = %s",
+        pid,
+    ) == (4, timedelta(days=90))
+
+
+async def test_an_out_of_bounds_protection_edit_is_refused_and_creates_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    for bad in (
+        {"strength": 6},
+        {"strength": 2.5},
+        {"strength": True},
+        {"review_in_days": 29},
+        {"review_in_days": 367},
+        {"title": "   "},
+        {"tags": []},  # tag-scoped with no tags
+        {"is_global": True},  # both scopes: a global edit sends tags [] with it
+        {"tags": ["Instagram"]},
+        {"tags": ["instagram", "instagram"]},
+        {"is_global": "yes"},
+        {"body": "a protection carries no body"},
+        {"applies_regardless_of_location": True},  # a body field, never a value
+        {"renews_event_id": str(uuid4())},
+        {"severity": 3},
+    ):
+        pid = await _protection_approvable(intel_pool)
+        assert await _refused_protection(intel_pool, pid, values=bad) == "values_out_of_bounds", bad
+    assert await _scalar(intel_pool, "SELECT count(*) FROM protection_events") == 0
+
+
+async def test_an_operator_makes_a_credit_global_by_naming_both_halves_of_the_scope(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Review Focus 3."""
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    decided = await _decide_protection(intel_pool, pid, values={"is_global": True, "tags": []})
+    assert decided.decided == protection_decided(tags=(), is_global=True)
+    assert decided.applied_ref is not None
+    assert await _row(
+        intel_pool,
+        "SELECT tags, is_global FROM svc.v_active_scoped_events WHERE event_id = %s",
+        UUID(decided.applied_ref),
+    ) == ([], True)
+
+
+async def test_adding_an_unregistered_or_retired_tag_to_a_protection_is_refused_naming_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The controller's 2026-09-30 ruling: the §3.1 codes, exactly as for threats."""
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    with pytest.raises(DecisionRefused) as unknown:
+        await _decide_protection(intel_pool, pid, values={"tags": ["instagram", "tiktok"]})
+    assert (unknown.value.code, unknown.value.slugs) == ("unknown_tag", ("tiktok",))
+    with pytest.raises(DecisionRefused) as retired:
+        await _decide_protection(intel_pool, pid, values={"tags": ["instagram", "myspace"]})
+    assert (retired.value.code, retired.value.slugs) == ("tag_retired", ("myspace",))
+    assert await _scalar(intel_pool, "SELECT count(*) FROM protection_events") == 0
+
+
+async def test_an_all_unmapped_protection_waits_and_an_edit_to_only_unmapped_tags_is_refused(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)  # linkedin: registered, not mapped
+    sid = await seed_signal(intel_pool, tags=("linkedin",))
+    waiting = await seed_protection_proposal(intel_pool, signal_ids=[sid], tags=("linkedin",))
+    read = await PostgresProposalStore(intel_pool).get_proposal(waiting)
+    assert read is not None and (read["approvable"], read["why_not"]) == (False, "tags_unmapped")
+    assert await _refused_protection(intel_pool, waiting) == "proposal_tags_unmapped"
+    pid = await _protection_approvable(intel_pool)
+    assert (
+        await _refused_protection(intel_pool, pid, values={"tags": ["linkedin"]})
+        == "proposal_tags_unmapped"
+    )
+    await seed_quiz_vocabulary(
+        intel_pool, map_version=2, document=mapped_document("LinkedIn", "linkedin")
+    )
+    assert (await _decide_protection(intel_pool, waiting)).status == "applied"
+
+
+async def test_two_simultaneous_protection_approvals_make_one_credit(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    results = await asyncio.gather(
+        _decide_protection(intel_pool, pid, operator="ann"),
+        _decide_protection(intel_pool, pid, operator="bob"),
+        return_exceptions=True,
+    )
+    (refused,) = [r for r in results if isinstance(r, DecisionRefused)]
+    assert refused.code == "proposal_not_pending"
+    assert (
+        await _scalar(
+            intel_pool, "SELECT count(*) FROM protection_events WHERE proposal_id = %s", pid
+        )
+        == 1
+    )
+
+
+async def test_an_approved_renewal_starts_exactly_where_the_old_credit_stops(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec §4.7, §10: no overlap (the view reads starts_at <= now()) and no gap."""
+    await seed_quiz_vocabulary(intel_pool)
+    old = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=20)
+    renewal = await _protection_approvable(intel_pool, renews=old)
+    decided = await _decide_protection(intel_pool, renewal)
+    assert decided.status == "applied" and decided.applied_ref is not None
+    new = UUID(decided.applied_ref)
+    old_review_by = await _scalar(
+        intel_pool, "SELECT review_by FROM protection_events WHERE event_id = %s", old
+    )
+    assert await _row(
+        intel_pool,
+        "SELECT starts_at, review_by - starts_at, renews_event_id FROM protection_events"
+        " WHERE event_id = %s",
+        new,
+    ) == (old_review_by, timedelta(days=180), old)
+    assert await _scalar(  # the old credit carries the scope until its review date
+        intel_pool,
+        "SELECT array_agg(event_id) FROM svc.v_active_scoped_events"
+        " WHERE direction = 'protection'",
+    ) == [old]
+
+
+async def test_a_renewal_approved_after_the_old_credit_lapsed_resumes_it_at_once(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Review Focus 4: it starts at the old review date, in the past, so it is live now and
+    runs no longer than approved."""
+    await seed_quiz_vocabulary(intel_pool)
+    old = await seed_protection_event(intel_pool, starts_in_days=-200, ends_in_days=-1)
+    renewal = await _protection_approvable(intel_pool, renews=old)
+    decided = await _decide_protection(intel_pool, renewal)
+    assert decided.applied_ref is not None
+    assert await _scalar(
+        intel_pool,
+        "SELECT array_agg(event_id) FROM svc.v_active_scoped_events"
+        " WHERE direction = 'protection'",
+    ) == [UUID(decided.applied_ref)]
+
+
+async def test_a_renewal_of_a_retracted_or_already_renewed_credit_is_refused(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Review Focus 4. The retract route also rejects a pending renewal (Task 7); this is the
+    lock that holds when anything else retracted the credit first."""
+    await seed_quiz_vocabulary(intel_pool)
+    retracted = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=20)
+    stale = await _protection_approvable(intel_pool, renews=retracted)
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE protection_events SET status = 'retracted', retracted_by = 'bob',"
+            " retracted_at = now(), retract_reason = 'withdrawn' WHERE event_id = %s",
+            (retracted,),
+        )
+    assert await _refused_protection(intel_pool, stale) == "proposal_not_pending"
+    renewed = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=20)
+    await seed_protection_event(intel_pool, renews=renewed, starts_in_days=20, ends_in_days=200)
+    twice = await _protection_approvable(intel_pool, renews=renewed)
+    assert await _refused_protection(intel_pool, twice) == "proposal_not_pending"
+    assert (
+        await _scalar(
+            intel_pool,
+            "SELECT count(*) FROM protection_events WHERE proposal_id = ANY(%s::uuid[])",
+            [stale, twice],
+        )
+        == 0
+    )
+
+
+async def test_a_renewal_carries_a_global_scope_and_a_retired_tag_forward(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Review Focus 5, and spec §10: a proposal whose own tag was retired since is still
+    approvable with no values."""
+    doc = quiz_document()
+    doc["tags"][0]["retired"] = True  # instagram, still mapped to the Instagram option
+    await seed_quiz_vocabulary(intel_pool, document=doc)
+    everyone = await seed_protection_event(
+        intel_pool, tags=(), is_global=True, starts_in_days=-160, ends_in_days=20
+    )
+    global_renewal = await _protection_approvable(
+        intel_pool, tags=(), is_global=True, renews=everyone
+    )
+    renewed = await _decide_protection(intel_pool, global_renewal)
+    assert renewed.decided == protection_decided(tags=(), is_global=True)
+    tagged = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=20)
+    retired_renewal = await _protection_approvable(intel_pool, renews=tagged)
+    assert (await _decide_protection(intel_pool, retired_renewal)).status == "applied"
+    plain = await _protection_approvable(intel_pool)
+    assert (await _decide_protection(intel_pool, plain)).status == "applied"

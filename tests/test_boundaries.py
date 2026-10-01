@@ -599,3 +599,18 @@ def test_only_the_threat_store_and_the_decision_path_insert_threat_events() -> N
         }
     )
     assert hits == ["imageshield/intel/decisions.py", "imageshield/threats/store.py"]
+
+
+def test_only_the_decision_path_inserts_protection_events() -> None:
+    """PERMANENT. INVARIANTS #48 (step 4): a protection credit exists only as a named operator's
+    approval, inserted from ``decided`` in the decision's own transaction. There is no
+    hand-created credit (proposal_id is NOT NULL), and nothing else creates one."""
+    insert = re.compile(r"INSERT\s+INTO\s+protection_events\b", re.IGNORECASE)
+    hits = sorted(
+        {
+            p.relative_to(SRC).as_posix()
+            for p in _source_files()
+            if insert.search(p.read_text(encoding="utf-8"))
+        }
+    )
+    assert hits == ["imageshield/intel/decisions.py"]

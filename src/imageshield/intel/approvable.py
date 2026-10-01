@@ -6,9 +6,9 @@ So a proposal the panel shows as approvable is never one the decision refuses wi
 except for races the transaction itself catches (proposal_not_pending,
 proposal_cell_awaiting_publish).
 
-Which kinds are decidable depends on the build step (spec §4.3). Step 3 adds threat_event,
-whose consumer (svc.v_active_scoped_events) ships with it; step 4 adds protection_event. So
-no approval can create an event nothing reads.
+Which kinds are decidable depends on the build step (spec §4.3). Step 3 added threat_event
+and step 4 protection_event, each with its consumer (svc.v_active_scoped_events). So no
+approval can create an event nothing reads.
 """
 
 from __future__ import annotations
@@ -30,9 +30,11 @@ from imageshield.intel.vocabulary import ScoringVocabulary
 
 WhyNot = Literal["not_decidable", "evidence_retracted", "uncorroborated", "tags_unmapped"]
 
-APPROVABLE_KINDS: frozenset[str] = frozenset({"weight_change", "threat_event"})
+APPROVABLE_KINDS: frozenset[str] = frozenset({"weight_change", "threat_event", "protection_event"})
 # A coverage_gap can only be dismissed (§4.7); a weight_suggestion is never decidable.
-REJECTABLE_KINDS: frozenset[str] = frozenset({"weight_change", "coverage_gap", "threat_event"})
+REJECTABLE_KINDS: frozenset[str] = frozenset(
+    {"weight_change", "coverage_gap", "threat_event", "protection_event"}
+)
 EVENT_KINDS: frozenset[str] = frozenset({"threat_event", "protection_event"})
 
 

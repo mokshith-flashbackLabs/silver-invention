@@ -385,6 +385,7 @@ async def decide_proposal(
             values=body.values,
             reason=body.reason,
             operator=body.operator,
+            applies_regardless_of_location=body.applies_regardless_of_location,
         )
     except DecisionRefused as refused:
         raise ServiceError(

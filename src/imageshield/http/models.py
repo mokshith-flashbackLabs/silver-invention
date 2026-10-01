@@ -17,6 +17,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     field_validator,
     model_validator,
@@ -1046,16 +1047,18 @@ IntelProposalStatus = Literal[
 
 class IntelDecisionRequest(ServiceModel):
     """spec 4.7. ``values`` is kind-shaped -- a weight change's is exactly ``{delta: int}``; a
-    threat event's is any subset of ``{kind, title, severity, expires_in_days, tags}``, merged
-    over the proposal's own -- and validated inside the decision, against the proposal's kind
-    and the live vocabulary, as ``422 values_out_of_bounds`` (or ``unknown_tag`` /
-    ``tag_retired`` for a tag the edit adds). ``applies_regardless_of_location`` is step 4's; it
-    is accepted now so the backend can send one body shape for every kind."""
+    threat event's any subset of ``{kind, title, severity, expires_in_days, tags}``; a
+    protection event's any subset of ``{title, strength, review_in_days, tags, is_global}``,
+    both merged over the proposal's own -- and validated inside the decision, against the
+    proposal's kind and the live vocabulary, as ``422 values_out_of_bounds`` (or ``unknown_tag``
+    / ``tag_retired`` for a tag the edit adds). ``applies_regardless_of_location`` must be
+    ``true`` to approve a protection event (spec 3.7: one limited to some places is rejected)
+    and is ignored on every other decision. It is a strict JSON boolean."""
 
     decision: Literal["approved", "rejected"]
     values: dict[str, Any] | None = None
     reason: str = Field(min_length=3, max_length=500)
-    applies_regardless_of_location: bool | None = None
+    applies_regardless_of_location: StrictBool | None = None
     operator: str = Field(min_length=1, max_length=64)
 
     @model_validator(mode="after")
