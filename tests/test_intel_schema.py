@@ -4,6 +4,7 @@ only place a role's real grants show (test_articles_store precedent)."""
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -686,3 +687,83 @@ def test_0044_down_restores_the_threat_only_view_with_its_grant(migrated_db: str
         ).fetchone() == ("failed", "migration_down")
     up = run_migrate(migrated_db, "up")
     assert up.returncode == 0, up.stderr
+
+
+# ── 0045: the renewal lookups are indexed (final review M10) ──────────────────
+
+_0045_INDEXES = ("intel_runs_renewal_event_idx", "intel_proposals_renews_event_idx")
+
+
+def _plan(conn: psycopg.Connection[Any], query: str, params: dict[str, Any]) -> str:
+    """The plan of ``query`` with sequential scans priced out, so an index that CAN serve the
+    query's own predicates is the one chosen even on an empty table."""
+    conn.execute("SET enable_seqscan = off")
+    cur = psycopg.ClientCursor(conn)
+    cur.execute("EXPLAIN " + query, params)
+    plan = "\n".join(row[0] for row in cur.fetchall())
+    conn.execute("RESET enable_seqscan")
+    return plan
+
+
+def test_0045_the_renewal_lookups_use_their_indexes(migrated_db: str) -> None:
+    """The planner can use each index for the exact predicates intel/protection_store.py sends:
+    the list's two LATERAL lookups, the retraction's lock and the schedule's probes."""
+    from imageshield.intel.bounds import (
+        PROTECTION_RENEWAL_WINDOW_DAYS,
+        RENEWAL_MAX_RUNS,
+        RENEWAL_RETRY_HOURS,
+    )
+    from imageshield.intel.protection_store import (
+        _LIST_SELECT,
+        _LOCK_PENDING_RENEWALS_SQL,
+        _SCHEDULE_RENEWALS_SQL,
+        CONCLUSIVE_RENEWAL_RESULTS,
+    )
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _protection(conn)
+        listed = _plan(
+            conn,
+            f"{_LIST_SELECT} WHERE true ORDER BY e.created_at DESC, e.event_id DESC"
+            " LIMIT %(limit)s",
+            {"window": PROTECTION_RENEWAL_WINDOW_DAYS, "limit": 50},
+        )
+        for index in _0045_INDEXES:
+            assert index in listed, listed
+        locked = _plan(conn, _LOCK_PENDING_RENEWALS_SQL, {"event": str(uuid4())})
+        assert "intel_proposals_renews_event_idx" in locked, locked
+        scheduled = _plan(  # EXPLAIN without ANALYZE inserts nothing
+            conn,
+            _SCHEDULE_RENEWALS_SQL,
+            {
+                "now": datetime(2026, 10, 1, tzinfo=UTC),
+                "window": PROTECTION_RENEWAL_WINDOW_DAYS,
+                "retry": RENEWAL_RETRY_HOURS,
+                "max_runs": RENEWAL_MAX_RUNS,
+                "conclusive": list(CONCLUSIVE_RENEWAL_RESULTS),
+            },
+        )
+        for index in _0045_INDEXES:
+            assert index in scheduled, scheduled
+
+
+def test_0045_is_reversible(migrated_db: str) -> None:
+    def present(conn: psycopg.Connection[Any]) -> set[str]:
+        rows = conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE indexname = ANY(%s)", (list(_0045_INDEXES),)
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert present(conn) == set(_0045_INDEXES)
+    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0045_"))
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert present(conn) == set()
+        assert conn.execute("SELECT to_regclass('public.protection_events')").fetchone() != (
+            None,
+        )  # 0044 is untouched
+    up = run_migrate(migrated_db, "up")
+    assert up.returncode == 0, up.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert present(conn) == set(_0045_INDEXES)
