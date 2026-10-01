@@ -7,12 +7,15 @@ from collections import Counter
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from imageshield.intel.proposal_models import ContextSignal, SuggestedTag
+from imageshield.intel.approvable import read_flags
+from imageshield.intel.models import Run
+from imageshield.intel.proposal_models import ContextSignal, ProposalRecord, SuggestedTag
 from imageshield.intel.schemas import ProposedTag, SuggestedOptionWeight, SuggestionOutput
 from imageshield.intel.suggestion import (
     OptionSuggestion,
     SuggestionCandidates,
     mentions,
+    render_suggestion,
     select_context,
     slugs_named_by,
     suggestion_options,
@@ -229,3 +232,72 @@ def test_the_read_side_judges_each_option_by_its_own_signals() -> None:
         ("E", False, "no_evidence"),
     ]
     assert rows[0]["deduction"] == 3 and rows[0]["signal_ids"] == [str(listed.signal_id)]
+
+
+def _suggestion_run(status: str, outcome: dict[str, object]) -> Run:
+    return Run(
+        run_id=uuid4(),
+        kind="weight_suggestion",
+        source_id=None,
+        request={},
+        status=status,
+        attempts=1,
+        requested_by="ann",
+        outcome=outcome,
+        error_code=None,
+        created_at=T0,
+        completed_at=T0 if status == "completed" else None,
+    )
+
+
+def test_the_poll_has_no_options_until_a_suggestion_is_written() -> None:
+    queued = _suggestion_run("queued", {})
+    assert render_suggestion(queued, None) == {
+        "run_id": queued.run_id,
+        "status": "queued",
+        "proposal_id": None,
+        "error_code": None,
+        "options": None,
+        "sources_deferred": 0,
+    }
+    done = _suggestion_run("completed", {"sources_deferred": 2, "model_calls": 5})
+    proposal_id = uuid4()
+    options = [{"option": "Instagram", "corroborated": True, "why_not": None}]
+    body = render_suggestion(done, (proposal_id, options))
+    assert (body["proposal_id"], body["options"], body["sources_deferred"]) == (
+        proposal_id,
+        options,
+        2,
+    )
+
+
+def test_a_suggestion_that_cites_nothing_is_not_evidence_retracted() -> None:
+    """Review Focus 5: "no evidence, operator's call" is an answer, not a retraction."""
+    suggestion = ProposalRecord(
+        proposal_id=uuid4(),
+        kind="weight_suggestion",
+        status="delivered",
+        target={"question_key": "platforms", "options": []},
+        suggested={},
+        decided=None,
+        against_release_no=2,
+        created_at=T0,
+    )
+    flags = read_flags(suggestion, [], scoring())
+    assert (flags["evidence_retracted"], flags["why_not"], flags["approvable"]) == (
+        False,
+        "not_decidable",
+        False,
+    )
+    assert read_flags(suggestion, [_signal(status="retracted")], scoring())["evidence_retracted"]
+    change = ProposalRecord(
+        proposal_id=uuid4(),
+        kind="weight_change",
+        status="pending",
+        target={"question_key": "platforms", "option": "Instagram", "current": 3},
+        suggested={"delta": 1},
+        decided=None,
+        against_release_no=2,
+        created_at=T0,
+    )
+    assert read_flags(change, [], scoring())["evidence_retracted"] is True  # unchanged

@@ -327,3 +327,37 @@ async def test_marking_a_source_due_brings_its_first_check_forward_never_back(
     await store.mark_sources_due([source_id], now=now + timedelta(hours=1))
     query = "SELECT next_check_at FROM intel_sources WHERE source_id = %s"
     assert await _rows(intel_pool, query, source_id) == [(now,)]
+
+
+async def test_a_suggestion_reads_back_per_option_by_run_and_by_proposal(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    store = PostgresQuestionStore(intel_pool)
+    listed = await seed_signal(intel_pool, tags=("instagram",))
+    web = await seed_signal(intel_pool, trust="web", publisher="a.example")
+    run_id = await _suggestion_run(intel_pool)
+    written = await store.write_suggestion(
+        run_id,
+        question_key="platforms",
+        options=[
+            OptionSuggestion("Instagram", 3, "r", (listed,), ("instagram",), None),
+            OptionSuggestion("Bumble", None, "", (web,), (), None),
+            OptionSuggestion("Hinge", None, "", (), (), None),
+        ],
+        **META,
+    )
+    assert written is not None
+    (proposal_id,) = written.written
+    found = await store.suggestion_of_run(run_id)
+    assert found is not None and found[0] == proposal_id
+    assert [(o["option"], o["deduction"], o["corroborated"], o["why_not"]) for o in found[1]] == [
+        ("Instagram", 3, True, None),
+        ("Bumble", None, False, "uncorroborated"),
+        ("Hinge", None, False, "no_evidence"),
+    ]
+    assert await store.options_of_suggestion(proposal_id) == found[1]
+    assert await store.suggestion_of_run(await _suggestion_run(intel_pool)) is None
+    # The per-option read is computed now, not stored: a later retraction shows at once.
+    await PostgresEvidenceStore(intel_pool).retract_signal(listed, operator="ann", reason="wrong")
+    instagram = (await store.options_of_suggestion(proposal_id))[0]
+    assert (instagram["corroborated"], instagram["why_not"]) == (False, "evidence_retracted")

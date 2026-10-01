@@ -42,6 +42,7 @@ from imageshield.intel.bounds import (
     MAX_TAG_LABEL_CHARS,
 )
 from imageshield.intel.corroboration import uncorroborated
+from imageshield.intel.models import Run
 from imageshield.intel.pii import mask
 from imageshield.intel.prompts import PromptSuggestionOption, PromptSuggestionQuestion
 from imageshield.intel.proposal_models import ContextSignal, SuggestedTag
@@ -345,3 +346,18 @@ def prompt_suggestion_question(
             for option in request.options
         ],
     )
+
+
+def render_suggestion(run: Run, found: tuple[UUID, list[dict[str, Any]]] | None) -> dict[str, Any]:
+    """GET /weight-suggestions/{run_id} (spec §4.6, §4.10). ``proposal_id`` and ``options`` are
+    null until the run wrote a suggestion (``found``, from the store); ``sources_deferred``
+    counts the sources left for their first scheduled check."""
+    deferred = run.outcome.get("sources_deferred", 0)
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "proposal_id": found[0] if found is not None else None,
+        "error_code": run.error_code,
+        "options": found[1] if found is not None else None,
+        "sources_deferred": deferred if isinstance(deferred, int) else 0,
+    }

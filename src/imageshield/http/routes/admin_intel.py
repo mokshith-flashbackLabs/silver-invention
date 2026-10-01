@@ -22,7 +22,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from imageshield.http.auth import require_admin_service_token, require_service_token
 from imageshield.http.deps import (
@@ -67,6 +67,7 @@ from imageshield.intel.source_choice import (
     validation_problems,
 )
 from imageshield.intel.store import IntelStore
+from imageshield.intel.suggestion import render_suggestion
 from imageshield.intel.tags import TagRegistry, membership_problems
 from imageshield.intel.text import normalise
 from imageshield.intel.vocabulary import parse_vocabulary
@@ -380,13 +381,18 @@ async def list_proposals(
 
 @router.get("/proposals/{proposal_id}")
 async def get_proposal(
-    proposal_id: UUID, proposals: ProposalStore = Depends(get_proposal_store)
+    proposal_id: UUID, request: Request, proposals: ProposalStore = Depends(get_proposal_store)
 ) -> Any:
     row = await proposals.get_proposal(proposal_id)
     if row is None:
         raise ServiceError(
             404, "proposal_not_found", "No proposal with this id.", retryable=False
         )
+    if row["kind"] == "weight_suggestion":
+        # spec §4.6: the per-option read. The question store is looked up only here, so every
+        # other kind's detail reads exactly as step 2 built it.
+        questions = get_question_store(request)
+        row = {**row, "options": await questions.options_of_suggestion(proposal_id)}
     return row
 
 
@@ -582,3 +588,11 @@ async def suggest_weights(
         reused=len(queued.reused),
     )
     return {"run_id": queued.run_id}
+
+
+@router.get("/weight-suggestions/{run_id}")
+async def weight_suggestion_poll(
+    run_id: UUID, questions: QuestionStore = Depends(get_question_store)
+) -> dict[str, Any]:
+    run = await _question_run(questions, run_id, "weight_suggestion")
+    return render_suggestion(run, await questions.suggestion_of_run(run_id))

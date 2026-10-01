@@ -22,7 +22,12 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.models import Run, Source
 from imageshield.intel.proposal_models import ContextSignal, WriteResult
-from imageshield.intel.proposal_store import _CONTEXT_COLUMNS, _CONTEXT_FROM, _context
+from imageshield.intel.proposal_store import (
+    _CONTEXT_COLUMNS,
+    _CONTEXT_FROM,
+    _context,
+    fetch_linked_signals,
+)
 from imageshield.intel.source_choice import (
     NewSource,
     Registered,
@@ -32,7 +37,12 @@ from imageshield.intel.source_choice import (
     ready_keys,
 )
 from imageshield.intel.store import RUN_COLUMNS, SOURCE_COLUMNS
-from imageshield.intel.suggestion import CATEGORY_CLASS, OptionSuggestion, SuggestionCandidates
+from imageshield.intel.suggestion import (
+    CATEGORY_CLASS,
+    OptionSuggestion,
+    SuggestionCandidates,
+    suggestion_options,
+)
 from imageshield.search.urlhash import NORMALISATION_VERSION, url_hash
 
 log = structlog.get_logger("imageshield.intel")
@@ -80,6 +90,8 @@ class QuestionStore(Protocol):
     async def queue_source_proposal(self, request: dict[str, Any], *, operator: str) -> UUID: ...
     async def queue_source_validation(self, request: dict[str, Any], *, operator: str) -> UUID: ...
     async def get_run(self, run_id: UUID) -> Run | None: ...
+    async def suggestion_of_run(self, run_id: UUID) -> tuple[UUID, list[dict[str, Any]]] | None: ...
+    async def options_of_suggestion(self, proposal_id: UUID) -> list[dict[str, Any]]: ...
     async def sources_by_ids(self, source_ids: Sequence[UUID]) -> list[Source]: ...
     async def sources_with_tags(self, tags: Sequence[str]) -> list[Source]: ...
     async def known_hits(self, url_hashes: Sequence[str]) -> frozenset[str]: ...
@@ -469,3 +481,32 @@ class PostgresQuestionStore:
                 },
             )
         return WriteResult((proposal_id,), tuple(superseded))
+
+    async def suggestion_of_run(self, run_id: UUID) -> tuple[UUID, list[dict[str, Any]]] | None:
+        """The weight_suggestion a run wrote, as ``(proposal_id, per-option read)``; None until
+        it wrote one. The read is computed from the links now, never stored."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT proposal_id, target FROM intel_proposals"
+                " WHERE kind = 'weight_suggestion' AND run_id = %s",
+                (run_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            linked = (await fetch_linked_signals(conn, [row[0]]))[row[0]]
+        return row[0], suggestion_options(row[1], linked)
+
+    async def options_of_suggestion(self, proposal_id: UUID) -> list[dict[str, Any]]:
+        """The per-option read of one weight_suggestion, for GET /proposals/{id} (S7)."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT target FROM intel_proposals"
+                " WHERE proposal_id = %s AND kind = 'weight_suggestion'",
+                (proposal_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return []
+            linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
+        return suggestion_options(row[0], linked)

@@ -128,10 +128,13 @@ def read_flags(
                         else -1
                     ),
                 )
+    # A weight_suggestion may cite nothing (spec §3.6, note of 2026-09-30): having no evidence is
+    # not having evidence retracted.
+    cited_nothing = proposal.kind == "weight_suggestion" and not linked_signals
     return {
         "approvable": proposal.status == "pending" and why is None,
         "why_not": why,
-        "evidence_retracted": not active,
+        "evidence_retracted": not active and not cited_nothing,
         "stale": why_stale is not None,
         "why_stale": why_stale,
         "applied_pending_ack": pending_ack,
