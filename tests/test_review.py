@@ -1066,6 +1066,36 @@ async def test_list_hits_carries_the_whole_reviewer_row(
     assert hit["seed_kind"] == "user_supplied"
 
 
+async def test_list_hits_filters_on_whether_a_reviewer_has_graded_it(
+    migrated_db: str,
+    stores: tuple[PostgresConfirmStore, PostgresReviewStore],
+) -> None:
+    """``has_verdict=False`` is the reviewer's to-do list (2026-09-30): only
+    hits nobody has graded yet. Filtered in the store's WHERE, so a page of
+    fifty ungraded hits is fifty rows rather than fifty minus whatever a
+    client would have had to drop."""
+    confirm_store, review_store = stores
+    _ref_a, graded = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    _ref_b, ungraded = await _seeded_infringement(
+        migrated_db, confirm_store, severity="benign_copy"
+    )
+    await review_store.record_verdict(
+        graded, operator="alice", verdict="true_positive", note=None
+    )
+
+    async def ids(has_verdict: bool | None) -> set[UUID]:
+        page = await review_store.list_hits(limit=50, has_verdict=has_verdict)
+        return {hit["infringement_id"] for hit in page.hits}
+
+    todo, done, every = await ids(False), await ids(True), await ids(None)
+
+    assert ungraded in todo and graded not in todo
+    assert graded in done and ungraded not in done
+    assert {graded, ungraded} <= every
+
+
 async def test_list_hits_carries_when_the_hit_was_last_found(
     migrated_db: str,
     stores: tuple[PostgresConfirmStore, PostgresReviewStore],
