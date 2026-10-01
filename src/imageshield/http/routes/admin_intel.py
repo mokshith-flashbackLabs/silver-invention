@@ -1,4 +1,5 @@
-"""Likeness intel — the admin surface (step 1 plus step 2's proposals) (spec §4.7).
+"""Likeness intel — the admin surface (step 1, step 2's proposals and step 4's
+protection credits) (spec §4.7).
 
 Both tokens at router level, like every admin router — a route added later to
 this file is guarded structurally rather than by memory. Every operator write
@@ -30,6 +31,7 @@ from imageshield.http.deps import (
     get_evidence_store,
     get_intel_store,
     get_proposal_store,
+    get_protection_store,
 )
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
@@ -39,6 +41,7 @@ from imageshield.http.models import (
     IntelOperatorRequest,
     IntelProposalKind,
     IntelProposalStatus,
+    IntelProtectionStatus,
     IntelRetractRequest,
     IntelSourceCreateRequest,
     IntelSourcePatchRequest,
@@ -49,6 +52,7 @@ from imageshield.intel.evidence_store import EvidenceStore
 from imageshield.intel.pii import contains_pii
 from imageshield.intel.proposal_models import DecisionRefused
 from imageshield.intel.proposal_store import ProposalStore
+from imageshield.intel.protection_store import ProtectionStore
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, membership_problems
 from imageshield.search.urlhash import url_hash
@@ -300,6 +304,54 @@ async def put_vocabulary(
         applied=applied,
     )
     return {"applied": applied}
+
+
+# -- protection credits (step 4) ----------------------------------------------
+
+
+@router.get("/protection-events")
+async def list_protection_events(
+    statuses: list[IntelProtectionStatus] | None = Query(default=None, alias="status"),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    protections: ProtectionStore = Depends(get_protection_store),
+) -> dict[str, Any]:
+    rows = await protections.list_events(
+        statuses=statuses, cursor=_decode_cursor(cursor), limit=limit
+    )
+    next_cursor = (
+        _encode_cursor(rows[-1]["created_at"], rows[-1]["event_id"]) if len(rows) == limit else None
+    )
+    return {"events": rows, "next_cursor": next_cursor}
+
+
+@router.post("/protection-events/{event_id}/retract")
+async def retract_protection_event(
+    event_id: UUID,
+    body: IntelRetractRequest,
+    protections: ProtectionStore = Depends(get_protection_store),
+) -> dict[str, Any]:
+    retraction = await protections.retract(event_id, operator=body.operator, reason=body.reason)
+    if retraction is None:
+        raise ServiceError(
+            404,
+            "protection_event_not_found",
+            "No protection event with this id.",
+            retryable=False,
+        )
+    log.info(
+        "intel.protection_retracted_via_admin",
+        event_id=str(event_id),
+        operator=body.operator,
+        already_retracted=retraction.already_retracted,
+        also_retracted=len(retraction.also_retracted),
+    )
+    return {
+        "event_id": retraction.event_id,
+        "status": "retracted",
+        "also_retracted": list(retraction.also_retracted),
+        "renewal_proposals_rejected": list(retraction.renewal_proposals_rejected),
+    }
 
 
 # -- proposals (step 2) -------------------------------------------------------

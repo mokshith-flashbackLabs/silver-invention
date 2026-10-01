@@ -1043,6 +1043,7 @@ IntelProposalKind = Literal[
 IntelProposalStatus = Literal[
     "pending", "approved", "rejected", "superseded", "applied", "delivered"
 ]
+IntelProtectionStatus = Literal["active", "retracted"]
 
 
 class IntelDecisionRequest(ServiceModel):
