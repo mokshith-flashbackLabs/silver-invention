@@ -3,10 +3,19 @@ which proposed candidates survive. No database."""
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 
 from imageshield.intel.schemas import ProposedOptionSources, ProposedSource, SourceProposalOutput
-from imageshield.intel.source_choice import candidate_key, clean_candidates, identity, option_tags
+from imageshield.intel.source_choice import (
+    BLOCKED_REASONS,
+    FETCH_REASONS,
+    candidate_key,
+    clean_candidates,
+    identity,
+    option_tags,
+    url_verdict,
+)
 from tests.intel_fakes import scoring
 
 
@@ -119,3 +128,21 @@ def test_a_reason_is_masked_and_bounded() -> None:
     ]
     assert "press@example.com" not in candidate.reason and len(candidate.reason) == 300
     assert counts["pii_masked_candidate_reason"] == 1
+
+
+def test_every_blocked_reason_is_a_token_the_backend_accepts() -> None:
+    """Pinned for the backend's client (image_backend c02d78c): it drops any reason that does not
+    match this pattern."""
+    pattern = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+    assert BLOCKED_REASONS and all(pattern.fullmatch(reason) for reason in BLOCKED_REASONS)
+    assert set(FETCH_REASONS.values()) <= BLOCKED_REASONS
+
+
+def test_the_text_floor_depends_on_the_kind_and_a_feed_needs_items() -> None:
+    assert url_verdict("policy_page", "x" * 499, None) == "too_short"
+    assert url_verdict("policy_page", "x" * 500, None) is None
+    assert url_verdict("news", "x" * 199, None) == "too_short"
+    assert url_verdict("search_result", "x" * 200, None) is None
+    assert url_verdict("feed", "", [{"title": "t", "link": "https://n.example/1"}]) is None
+    assert url_verdict("feed", "x" * 5000, []) == "no_items"
+    assert url_verdict("feed", "x" * 5000, None) == "no_items"  # it did not parse as a feed

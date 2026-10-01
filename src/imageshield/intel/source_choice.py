@@ -10,8 +10,13 @@ Identity. A source is one canonical URL (its url_hash) or one search query (norm
 case-folded), whatever kind it was proposed as: the registry reuses a row by that. A validation
 result is keyed by kind AND identity, because the text floor depends on the kind.
 
-A candidate is model-written, so its reason is masked (§6.3) and bounded. Nothing here is
-registered: the operator chooses at stage 2, and code checks at stage 3.
+Stage 3, validating. Code alone decides: a known hit location, the fetch (https on every hop,
+robots.txt honoured), and then the text floor for the kind -- or, for a feed, at least one item.
+A search_query's one web search only supplies pages for the same checks. Every reason is a
+lowercase token (BLOCKED_REASONS), and the transient ones mean "check again later".
+
+A candidate is model-written at stage 1, so its reason is masked (§6.3) and bounded. Nothing here
+is registered: the operator chooses at stage 2, and stage 4 registers only what stage 3 passed.
 """
 
 from __future__ import annotations
@@ -19,13 +24,20 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from imageshield.intel.bounds import MAX_CANDIDATE_REASON_CHARS, MAX_QUERY_TEXT_CHARS
+from imageshield.intel.bounds import (
+    MAX_CANDIDATE_REASON_CHARS,
+    MAX_QUERY_TEXT_CHARS,
+    MIN_POLICY_TEXT_CHARS,
+    MIN_SOURCE_TEXT_CHARS,
+    VALIDATION_TTL_HOURS,
+)
 from imageshield.intel.models import Run, Source
 from imageshield.intel.pii import contains_pii, mask
 from imageshield.intel.prompts import PromptSourceOption, PromptSourceQuestion
@@ -230,4 +242,106 @@ def render_source_proposal(run: Run, sources: Mapping[UUID, Source]) -> dict[str
         "status": run.status,
         "error_code": run.error_code,
         "options": options,
+    }
+
+
+# ── stage 3: validation (spec §4.10) ─────────────────────────────────────────
+
+# Verdicts about the source itself.
+SOURCE_VERDICTS: frozenset[str] = frozenset(
+    {
+        "known_hit_location",
+        "not_https",
+        "unreachable",
+        "unsupported_type",
+        "robots_disallowed",
+        "robots_unreachable",
+        "too_short",
+        "no_items",
+        "query_names_a_person",
+        "no_results",
+    }
+)
+# Says nothing about the source: check again later. The last four are the provider gate's own.
+TRANSIENT_REASONS: frozenset[str] = frozenset(
+    {
+        "search_unavailable",
+        "fetcher_unavailable",
+        "run_call_cap",
+        "budget_exceeded",
+        "breaker_open",
+        "provider_disabled",
+        "budget_unset",
+    }
+)
+BLOCKED_REASONS: frozenset[str] = SOURCE_VERDICTS | TRANSIENT_REASONS
+
+# The fetcher client's failure codes, as a validation reason.
+FETCH_REASONS: dict[str, str] = {
+    "robots_disallowed": "robots_disallowed",
+    "robots_unreachable": "robots_unreachable",
+    "not_https": "not_https",
+    "unsupported_type": "unsupported_type",
+    "refused_private_address": "unreachable",
+    "redirect_limit": "unreachable",
+    "unfetchable": "unreachable",
+    "too_large": "unreachable",
+    "fetcher_unreachable": "fetcher_unavailable",
+    "fetcher_error": "fetcher_unavailable",
+}
+
+
+class ValidationCandidate(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    option: str
+    kind: str
+    source_url: str | None = None
+    query_text: str | None = None
+
+    def as_json(self) -> dict[str, Any]:
+        """The candidate exactly as submitted: what a result echoes."""
+        return {
+            "option": self.option,
+            "kind": self.kind,
+            "source_url": self.source_url,
+            "query_text": self.query_text,
+        }
+
+
+class ValidationRequest(BaseModel):
+    """A source_validation run's stored request, as POST /source-validations writes it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    candidates: tuple[ValidationCandidate, ...]
+
+
+def url_verdict(kind: str, text: str, items: Sequence[object] | None) -> str | None:
+    """After a successful fetch; ``text`` is already normalised. A feed must list at least one
+    item (its text is a listing the fetcher builds, so no text floor applies to it); a policy
+    page must reach MIN_POLICY_TEXT_CHARS; anything else, a search result included,
+    MIN_SOURCE_TEXT_CHARS. None means ready."""
+    if kind == "feed":
+        return None if items else "no_items"
+    floor = MIN_POLICY_TEXT_CHARS if kind == "policy_page" else MIN_SOURCE_TEXT_CHARS
+    return None if len(text) >= floor else "too_short"
+
+
+def render_validation(run: Run) -> dict[str, Any]:
+    """GET /source-validations/{run_id}: an object, never a bare list. ``results`` answers the
+    submitted candidates one for one and in order, and is null until the run completes;
+    ``honoured_until`` is when stage 4 stops accepting them (§4.10)."""
+    results = run.outcome.get("results")
+    completed = run.status == "completed" and run.completed_at is not None
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "error_code": run.error_code,
+        "results": results if isinstance(results, list) else None,
+        "honoured_until": (
+            run.completed_at + timedelta(hours=VALIDATION_TTL_HOURS)
+            if completed and run.completed_at is not None
+            else None
+        ),
     }

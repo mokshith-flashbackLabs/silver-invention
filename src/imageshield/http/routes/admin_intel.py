@@ -44,6 +44,7 @@ from imageshield.http.models import (
     IntelSourceCreateRequest,
     IntelSourcePatchRequest,
     IntelSourceProposalRequest,
+    IntelSourceValidationRequest,
     IntelVocabularyRequest,
 )
 from imageshield.intel.decisions import DecisionStore
@@ -53,7 +54,11 @@ from imageshield.intel.pii import contains_pii
 from imageshield.intel.proposal_models import DecisionRefused
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.question_store import QuestionStore
-from imageshield.intel.source_choice import existing_source_ids, render_source_proposal
+from imageshield.intel.source_choice import (
+    existing_source_ids,
+    render_source_proposal,
+    render_validation,
+)
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, membership_problems
 from imageshield.intel.vocabulary import parse_vocabulary
@@ -465,3 +470,26 @@ async def source_proposal_poll(
     run = await _question_run(questions, run_id, "source_proposal")
     sources = await questions.sources_by_ids(existing_source_ids(run))
     return render_source_proposal(run, {s.source_id: s for s in sources})
+
+
+@router.post("/source-validations", status_code=202)
+async def validate_sources(
+    body: IntelSourceValidationRequest, questions: QuestionStore = Depends(get_question_store)
+) -> dict[str, UUID]:
+    """Stage 3 of spec §4.10: queue a source_validation run."""
+    run_id = await questions.queue_source_validation(
+        body.validation_request(), operator=body.operator
+    )
+    log.info(
+        "intel.source_validation_queued_via_admin",
+        operator=body.operator,
+        candidates=len(body.candidates),
+    )
+    return {"run_id": run_id}
+
+
+@router.get("/source-validations/{run_id}")
+async def source_validation_poll(
+    run_id: UUID, questions: QuestionStore = Depends(get_question_store)
+) -> dict[str, Any]:
+    return render_validation(await _question_run(questions, run_id, "source_validation"))

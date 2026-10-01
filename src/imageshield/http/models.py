@@ -23,7 +23,11 @@ from pydantic import (
 )
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
-from imageshield.intel.bounds import MAX_QUESTION_OPTIONS
+from imageshield.intel.bounds import (
+    MAX_QUERY_TEXT_CHARS,
+    MAX_QUESTION_OPTIONS,
+    MAX_VALIDATION_CANDIDATES,
+)
 from imageshield.intel.tags import TAG_SLUG_RE, is_well_formed
 from imageshield.search.feedback import FeedbackSignal
 from imageshield.types import UserRef
@@ -1117,3 +1121,42 @@ class IntelQuestionBody(ServiceModel):
 
 class IntelSourceProposalRequest(IntelQuestionBody):
     """POST /source-proposals: stage 1 of spec §4.10."""
+
+
+class IntelCandidate(ServiceModel):
+    """A source chosen or kept at stage 2 (spec §4.10): the option it is for, and a locator under
+    the one rule every source follows."""
+
+    option: str = Field(min_length=1, max_length=200)
+    kind: IntelSourceKind
+    source_url: str | None = None
+    query_text: str | None = Field(default=None, min_length=1, max_length=MAX_QUERY_TEXT_CHARS)
+
+    @model_validator(mode="after")
+    def _shape(self) -> IntelCandidate:
+        problem = _source_shape_problem(self.kind, self.source_url, self.query_text)
+        if problem is not None:
+            raise ValueError(problem)
+        return self
+
+    def stored(self) -> dict[str, Any]:
+        """All four keys, the absent locator null: what a validation result echoes back."""
+        return {
+            "option": self.option,
+            "kind": self.kind,
+            "source_url": self.source_url,
+            "query_text": self.query_text,
+        }
+
+
+class IntelSourceValidationRequest(ServiceModel):
+    """POST /source-validations: stage 3 of spec §4.10. A known hit location or a PII-shaped
+    query is the run's per-candidate verdict, never a refusal of this body."""
+
+    candidates: tuple[IntelCandidate, ...] = Field(
+        min_length=1, max_length=MAX_VALIDATION_CANDIDATES
+    )
+    operator: str = Field(min_length=1, max_length=64)
+
+    def validation_request(self) -> dict[str, Any]:
+        return {"candidates": [c.stored() for c in self.candidates]}

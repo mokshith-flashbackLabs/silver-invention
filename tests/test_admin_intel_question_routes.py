@@ -4,7 +4,7 @@ Postgres in test_intel_question_runs.py, the store in test_intel_question_store.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -77,6 +77,10 @@ class FakeQuestionStore:
 
     async def queue_source_proposal(self, request: dict[str, Any], *, operator: str) -> UUID:
         self.queued.append(("source_proposal", request, operator))
+        return uuid4()
+
+    async def queue_source_validation(self, request: dict[str, Any], *, operator: str) -> UUID:
+        self.queued.append(("source_validation", request, operator))
         return uuid4()
 
     async def get_run(self, run_id: UUID) -> Run | None:
@@ -186,3 +190,96 @@ def test_a_queued_source_proposal_polls_with_no_options() -> None:
     questions.runs[run.run_id] = run
     body = client.get(f"/v1/admin/intel/source-proposals/{run.run_id}", headers=ADMIN).json()
     assert (body["status"], body["options"]) == ("queued", None)
+
+
+# ── stage 3 ───────────────────────────────────────────────────────────────────
+
+
+def _candidate(**changes: Any) -> dict[str, Any]:
+    return {
+        "option": "Instagram",
+        "kind": "policy_page",
+        "source_url": "https://p.example/terms",
+        **changes,
+    }
+
+
+def test_a_validation_is_queued_with_the_candidates_as_sent() -> None:
+    client, questions = _client()
+    query = {"option": "Bumble", "kind": "search_query", "query_text": "Bumble privacy news"}
+    r = _post(
+        client, "source-validations", {"candidates": [_candidate(), query], "operator": "ann"}
+    )
+    assert r.status_code == 202 and UUID(r.json()["run_id"])
+    ((kind, request, operator),) = questions.queued
+    assert (kind, operator) == ("source_validation", "ann")
+    assert request == {
+        "candidates": [
+            {
+                "option": "Instagram",
+                "kind": "policy_page",
+                "source_url": "https://p.example/terms",
+                "query_text": None,
+            },
+            {
+                "option": "Bumble",
+                "kind": "search_query",
+                "source_url": None,
+                "query_text": "Bumble privacy news",
+            },
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        _candidate(kind="search_query"),  # a query kind carrying a URL
+        _candidate(source_url="http://p.example/terms"),
+        _candidate(source_url=None),
+        _candidate(query_text="also a query"),
+        _candidate(option=""),
+        _candidate(kind="bogus"),
+    ],
+)
+def test_a_malformed_candidate_is_422(candidate: dict[str, Any]) -> None:
+    client, questions = _client()
+    r = _post(client, "source-validations", {"candidates": [candidate], "operator": "ann"})
+    assert r.status_code == 422 and questions.queued == []
+
+
+def test_a_validation_takes_up_to_250_candidates() -> None:
+    client, _ = _client()
+    many = [_candidate(source_url=f"https://p.example/{i}") for i in range(251)]
+    assert (
+        _post(client, "source-validations", {"candidates": many, "operator": "a"}).status_code
+        == 422
+    )
+    body = {"candidates": many[:250], "operator": "a"}
+    assert _post(client, "source-validations", body).status_code == 202
+
+
+def test_the_validation_poll_answers_an_object_with_ordered_results_and_an_expiry() -> None:
+    client, questions = _client()
+    results = [
+        {"candidate": _candidate(query_text=None), "status": "ready", "reason": None},
+        {
+            "candidate": _candidate(source_url="https://p.example/app", query_text=None),
+            "status": "blocked",
+            "reason": "too_short",
+        },
+    ]
+    done = _now()
+    run = _run("source_validation", outcome={"results": results}, completed_at=done)
+    questions.runs[run.run_id] = run
+    body = client.get(f"/v1/admin/intel/source-validations/{run.run_id}", headers=ADMIN).json()
+    assert (body["status"], body["results"]) == ("completed", results)
+    assert datetime.fromisoformat(body["honoured_until"]) == done + timedelta(hours=24)
+    queued = _run("source_validation", status="queued")
+    questions.runs[queued.run_id] = queued
+    body = client.get(f"/v1/admin/intel/source-validations/{queued.run_id}", headers=ADMIN).json()
+    assert (body["results"], body["honoured_until"]) == (None, None)
+    other = _run("source_proposal")
+    questions.runs[other.run_id] = other
+    r = client.get(f"/v1/admin/intel/source-validations/{other.run_id}", headers=ADMIN)
+    assert r.status_code == 404

@@ -10,11 +10,26 @@ from uuid import UUID
 
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.intel.fetch_client import FetchFailure
+from imageshield.intel.pipeline import RunResult
 from imageshield.intel.question_store import PostgresQuestionStore
-from imageshield.intel.schemas import ProposedOptionSources, ProposedSource, SourceProposalOutput
+from imageshield.intel.schemas import (
+    DiscoveryCandidate,
+    DiscoveryOutput,
+    ProposedOptionSources,
+    ProposedSource,
+    SourceProposalOutput,
+)
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.search.urlhash import url_hash
-from tests.intel_fakes import FakeFetcher, make_deps, run_once, seed_quiz_vocabulary
+from tests.intel_fakes import (
+    POLICY,
+    FakeFetcher,
+    make_deps,
+    make_page,
+    run_once,
+    seed_quiz_vocabulary,
+)
 from tests.question_fakes import QUESTION, FakeQuestionModel
 
 ABUSE = "https://abuse.example/x"
@@ -170,3 +185,159 @@ async def test_queueing_a_source_proposal_is_audited_with_the_operator(
         await _scalar(intel_pool, "SELECT requested_by FROM intel_runs WHERE run_id = %s", run_id)
         == "ann"
     )
+
+
+# ── stage 3: validation ──────────────────────────────────────────────────────
+
+TERMS = "https://p.example/terms"
+SHELL = "https://app.example/terms"
+HOPS_TO_HTTP = "https://p.example/moved"
+DISALLOWED = "https://p.example/private"
+FEED = "https://n.example/feed"
+EMPTY_FEED = "https://n.example/empty"
+ARTICLE = "https://n.example/article"
+
+
+def _candidate(
+    kind: str, url: str | None = None, query: str | None = None, option: str = "Instagram"
+) -> dict[str, Any]:
+    return {"option": option, "kind": kind, "source_url": url, "query_text": query}
+
+
+async def _validate(
+    pool: AsyncConnectionPool,
+    candidates: list[dict[str, Any]],
+    model: FakeQuestionModel,
+    fetcher: FakeFetcher,
+) -> RunResult:
+    await PostgresQuestionStore(pool).queue_source_validation(
+        {"candidates": candidates}, operator="ann"
+    )
+    return await run_once(pool, make_deps(pool, fetcher, model))
+
+
+async def test_validation_blocks_each_failure_with_its_reason_and_makes_no_model_call(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec §10: validation blocks a known hit location, a non-https final URL, an app shell under
+    the text floor, a robots.txt-disallowed path, a feed with no items, and a search query whose
+    search returns no fetchable page, each with its reason, and makes no model call."""
+    await _known_hit(intel_pool, ABUSE)
+    one_item = [{"title": "t", "link": "https://n.example/1", "published": None}]
+    fetcher = FakeFetcher(
+        {
+            TERMS: make_page(POLICY, TERMS),
+            SHELL: make_page("Loading...", SHELL),
+            HOPS_TO_HTTP: FetchFailure(code="not_https"),
+            FEED: make_page("t", FEED, items=one_item),
+            EMPTY_FEED: make_page("t", EMPTY_FEED, items=[]),
+        },
+        robots_disallowed={DISALLOWED},
+    )
+    unfetchable = DiscoveryOutput(
+        candidates=[DiscoveryCandidate(url="https://gone.example/a", reason="r")]
+    )
+    model = FakeQuestionModel(searches={"nothing fetchable": unfetchable})
+    candidates = [
+        _candidate("policy_page", TERMS),
+        _candidate("news", ABUSE),
+        _candidate("news", HOPS_TO_HTTP),
+        _candidate("policy_page", SHELL),
+        _candidate("policy_page", DISALLOWED),
+        _candidate("feed", FEED),
+        _candidate("feed", EMPTY_FEED),
+        _candidate("search_query", query="nothing fetchable"),
+    ]
+    result = await _validate(intel_pool, candidates, model, fetcher)
+    assert result.status == "completed"
+    assert [(r["status"], r["reason"]) for r in result.outcome["results"]] == [
+        ("ready", None),
+        ("blocked", "known_hit_location"),
+        ("blocked", "not_https"),
+        ("blocked", "too_short"),
+        ("blocked", "robots_disallowed"),
+        ("ready", None),
+        ("blocked", "no_items"),
+        ("blocked", "no_results"),
+    ]
+    # One result per candidate, in the submitted order, each echoing its candidate verbatim.
+    assert [r["candidate"] for r in result.outcome["results"]] == candidates
+    calls = (
+        model.extract_calls,
+        model.propose_calls,
+        model.suggest_calls,
+        model.source_proposal_calls,
+    )
+    assert calls == (0, 0, 0, 0) and model.search_calls == 1  # one search, no other request
+    assert ABUSE not in fetcher.fetched  # a known hit location is never fetched
+    assert {TERMS, DISALLOWED} <= set(fetcher.robots_checked)
+
+
+async def test_a_search_query_is_ready_once_one_result_page_passes(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    fetcher = FakeFetcher({ARTICLE: make_page(POLICY, ARTICLE)})
+    found = DiscoveryOutput(
+        candidates=[
+            DiscoveryCandidate(url="http://n.example/plain", reason="not https"),
+            DiscoveryCandidate(url="https://gone.example/a", reason="unfetchable"),
+            DiscoveryCandidate(url=ARTICLE, reason="an article"),
+        ]
+    )
+    model = FakeQuestionModel(searches={"Instagram privacy change": found})
+    candidate = _candidate("search_query", query="Instagram privacy change")
+    result = await _validate(intel_pool, [candidate], model, fetcher)
+    assert [(r["status"], r["reason"]) for r in result.outcome["results"]] == [("ready", None)]
+    assert fetcher.fetched == ["https://gone.example/a", ARTICLE]  # the http page never
+
+
+async def test_a_person_shaped_query_is_blocked_without_a_search(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    model = FakeQuestionModel()
+    candidate = _candidate("search_query", query="leaks about jane@example.com")
+    result = await _validate(intel_pool, [candidate], model, FakeFetcher({}))
+    assert result.outcome["results"][0]["reason"] == "query_names_a_person"
+    assert model.search_calls == 0
+
+
+async def test_a_gate_refusal_blocks_every_later_search_and_urls_are_still_judged(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Review Focus 2: once the gate refuses, no further search is even asked for, and every
+    candidate still gets a verdict."""
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE providers SET enabled = false WHERE provider_id = 'claude_intel'"
+        )
+    fetcher = FakeFetcher({TERMS: make_page(POLICY, TERMS)})
+    model = FakeQuestionModel()
+    candidates = [
+        _candidate("search_query", query="first query"),
+        _candidate("policy_page", TERMS),
+        _candidate("search_query", query="second query"),
+    ]
+    result = await _validate(intel_pool, candidates, model, fetcher)
+    assert result.status == "completed"
+    assert [r["reason"] for r in result.outcome["results"]] == [
+        "provider_disabled",
+        None,
+        "provider_disabled",
+    ]
+    assert model.search_calls == 0
+    assert (
+        await _scalar(
+            intel_pool, "SELECT count(*) FROM provider_calls WHERE provider_id = 'claude_intel'"
+        )
+        == 1  # the gate was asked once, not once per search candidate
+    )
+
+
+async def test_a_fetcher_outage_blocks_the_candidate_as_transient(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    fetcher = FakeFetcher({TERMS: FetchFailure(code="fetcher_unreachable")})
+    result = await _validate(
+        intel_pool, [_candidate("policy_page", TERMS)], FakeQuestionModel(), fetcher
+    )
+    assert result.outcome["results"][0]["reason"] == "fetcher_unavailable"

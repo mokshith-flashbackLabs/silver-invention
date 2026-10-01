@@ -124,6 +124,17 @@ def source_proposal_request(
     return _SOURCE_PROPOSAL_SYSTEM, user
 
 
+_VALIDATION_SEARCH_SYSTEM = """Run exactly one web search for the query below, then list the https
+pages that search returned, each with a one-line reason. List only pages the search returned; add
+nothing from memory. Leave out any page that hosts explicit or abusive content."""
+
+
+def validation_search_request(query: str) -> tuple[str, str]:
+    """spec §4.10 stage 3: a search_query candidate's one test search. The pages it lists are
+    then judged by code, never by the model."""
+    return _VALIDATION_SEARCH_SYSTEM, json.dumps({"query": query}, ensure_ascii=False)
+
+
 class PromptSignal(TypedDict):
     signal_id: str
     category: str

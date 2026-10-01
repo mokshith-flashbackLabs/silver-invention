@@ -31,6 +31,7 @@ _AUDIT_SQL = """
 
 class QuestionStore(Protocol):
     async def queue_source_proposal(self, request: dict[str, Any], *, operator: str) -> UUID: ...
+    async def queue_source_validation(self, request: dict[str, Any], *, operator: str) -> UUID: ...
     async def get_run(self, run_id: UUID) -> Run | None: ...
     async def sources_by_ids(self, source_ids: Sequence[UUID]) -> list[Source]: ...
     async def sources_with_tags(self, tags: Sequence[str]) -> list[Source]: ...
@@ -70,6 +71,14 @@ class PostgresQuestionStore:
             request,
             operator=operator,
             metadata={"question_key": request.get("question_key")},
+        )
+
+    async def queue_source_validation(self, request: dict[str, Any], *, operator: str) -> UUID:
+        return await self._queue(
+            "source_validation",
+            request,
+            operator=operator,
+            metadata={"candidates": len(request.get("candidates", []))},
         )
 
     async def get_run(self, run_id: UUID) -> Run | None:
