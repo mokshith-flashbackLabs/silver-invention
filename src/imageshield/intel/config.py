@@ -49,6 +49,12 @@ class IntelConfig(BaseSettings):
     intel_blocked_domains: list[str] = []
     intel_max_calls_per_run: int = 20
     intel_max_document_chars: int = 200_000
+    # Source proposal (step 5, spec §4.10): stage 1's web-search budget. Required with no default,
+    # like every key the spec gives none (§4.1).
+    intel_max_source_proposal_searches: int
+    # A weight suggestion's first read of the sources it registered is legitimately larger than a
+    # weekly check (§4.10), so it has its own call cap.
+    intel_max_calls_per_suggestion_run: int = 60
 
     provider_config_cache_seconds: float = 10.0
     provider_failure_threshold: int = 5
@@ -78,6 +84,8 @@ class IntelConfig(BaseSettings):
         "intel_max_web_searches_per_run",
         "intel_max_calls_per_run",
         "intel_max_document_chars",
+        "intel_max_source_proposal_searches",
+        "intel_max_calls_per_suggestion_run",
         "intel_lease_seconds",
         "db_pool_max_size",
         "provider_failure_threshold",

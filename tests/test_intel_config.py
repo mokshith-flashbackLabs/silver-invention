@@ -24,6 +24,7 @@ BASE = {
     "INTEL_EXTRACTION_MODEL": "claude-sonnet-5",
     "INTEL_PROPOSAL_MODEL": "claude-opus-5-5",
     "INTEL_WEB_SEARCH_TOOL_TYPE": "web_search_20260209",
+    "INTEL_MAX_SOURCE_PROPOSAL_SEARCHES": "5",
     "FETCHER_BASE_URL": "http://localhost:8083",
     "FETCHER_TOKEN": "fetcher-token-for-tests-0003",
 }
@@ -105,4 +106,22 @@ def test_intel_proposal_model_is_required(clean_env: pytest.MonkeyPatch) -> None
     _env(clean_env)
     clean_env.delenv("INTEL_PROPOSAL_MODEL")
     with pytest.raises(ConfigError, match="INTEL_PROPOSAL_MODEL"):
+        load_intel_config()
+
+
+def test_intel_max_source_proposal_searches_is_required(clean_env: pytest.MonkeyPatch) -> None:
+    """spec §4.1: none has a default unless one is given, and §4.10 gives this one none."""
+    _env(clean_env)
+    clean_env.delenv("INTEL_MAX_SOURCE_PROPOSAL_SEARCHES")
+    with pytest.raises(ConfigError, match="INTEL_MAX_SOURCE_PROPOSAL_SEARCHES"):
+        load_intel_config()
+
+
+def test_the_suggestion_call_cap_defaults_to_sixty_and_must_be_positive(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    _env(clean_env)
+    assert load_intel_config().intel_max_calls_per_suggestion_run == 60
+    clean_env.setenv("INTEL_MAX_CALLS_PER_SUGGESTION_RUN", "0")
+    with pytest.raises(ConfigError, match="INTEL_MAX_CALLS_PER_SUGGESTION_RUN"):
         load_intel_config()
