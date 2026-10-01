@@ -20,9 +20,13 @@ from imageshield.intel.proposal_store import PostgresProposalStore, active_subje
 from imageshield.intel.store import PostgresIntelStore
 from tests.intel_fakes import (
     NOW,
+    PROTECTION_SUGGESTED,
     QUIZ_VOCABULARY,
     THREAT_SUGGESTED,
+    protection_decided,
     seed_proposal,
+    seed_protection_event,
+    seed_protection_proposal,
     seed_quiz_vocabulary,
     seed_signal,
     seed_threat_event,
@@ -624,3 +628,85 @@ async def test_active_subject_signals_are_the_windows_active_signals_naming_a_su
     assert [s.signal_id for s in found] == [second, first]
     assert [s.signal_id for s in newest] == [second]
     assert all(s.document_key is not None for s in found)
+
+
+def _protection(signal_id: UUID) -> NewProposal:
+    return NewProposal(
+        "protection_event",
+        {"tags": ["instagram"], "is_global": False},
+        dict(PROTECTION_SUGGESTED),
+        "because",
+        (signal_id,),
+    )
+
+
+async def test_a_protection_proposal_is_written_pending_and_supersedes_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    store = PostgresProposalStore(intel_pool)
+    first = await _write(store, await _run(intel_pool), _protection(sid))
+    second = await _write(store, await _run(intel_pool), _protection(sid))
+    assert second.superseded == () and len(second.written) == 1
+    rows = await store.list_proposals(
+        statuses=["pending"], kinds=["protection_event"], cursor=None, limit=10
+    )
+    assert {r["proposal_id"] for r in rows} == {*first.written, *second.written}
+    assert all(r["against_release_no"] is None for r in rows)
+    assert rows[0]["suggested"] == PROTECTION_SUGGESTED
+
+
+async def test_active_protection_events_are_live_on_the_tags_or_global_with_their_evidence(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    applied = await seed_protection_proposal(
+        intel_pool, signal_ids=[sid], status="applied", decided=protection_decided()
+    )
+    live = await seed_protection_event(intel_pool, proposal_id=applied, title="live")
+    await seed_protection_event(intel_pool, tags=(), is_global=True, title="everyone")
+    await seed_protection_event(intel_pool, title="retracted", status="retracted")
+    await seed_protection_event(intel_pool, title="lapsed", starts_in_days=-100, ends_in_days=-1)
+    await seed_protection_event(intel_pool, title="scheduled", starts_in_days=10, ends_in_days=100)
+    await seed_protection_event(intel_pool, title="other tag", tags=("linkedin",))
+    store = PostgresProposalStore(intel_pool)
+    events = await store.active_protection_events(tags=["instagram"], limit=40)
+    assert {e.title for e in events} == {"live", "everyone"}
+    (approved,) = [e for e in events if e.event_id == live]
+    assert approved.signal_ids == (sid,) and approved.proposal_id == applied
+    assert approved.strength == 2 and approved.renews_event_id is None
+    assert [e.title for e in await store.active_protection_events(tags=[], limit=40)] == [
+        "everyone"
+    ]
+
+
+async def test_each_event_kind_is_related_to_the_live_events_of_its_own_direction(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    protection = await seed_protection_proposal(intel_pool, signal_ids=[sid])
+    threat = await seed_threat_proposal(intel_pool, signal_ids=[sid])
+    credit = await seed_protection_event(intel_pool, title="Live opt-out")
+    incident = await seed_threat_event(intel_pool, title="Live breach")
+    store = PostgresProposalStore(intel_pool)
+    detail = await store.get_proposal(protection)
+    assert detail is not None
+    (related,) = detail["related_events"]
+    assert related["event_id"] == credit and related["direction"] == "protection"
+    assert set(related) == {
+        "event_id",
+        "direction",
+        "kind",
+        "title",
+        "strength",
+        "tags",
+        "is_global",
+        "starts_at",
+        "review_by",
+        "proposal_id",
+    }
+    threat_detail = await store.get_proposal(threat)
+    assert threat_detail is not None
+    assert [e["event_id"] for e in threat_detail["related_events"]] == [incident]

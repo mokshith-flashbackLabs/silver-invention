@@ -553,3 +553,106 @@ async def settle_runs(pool: AsyncConnectionPool) -> None:
             "UPDATE intel_runs SET status = 'completed', completed_at = now()"
             " WHERE status = 'queued'"
         )
+
+
+PROTECTION_SUGGESTED: dict[str, Any] = {
+    "title": "Instagram lets people keep their photos out of AI training",
+    "strength": 2,
+    "review_in_days": 180,
+}
+
+
+def protection_decided(
+    *, tags: tuple[str, ...] = ("instagram",), is_global: bool = False, **values: Any
+) -> dict[str, Any]:
+    """``decided`` as a protection approval stores it: the suggested values, the final scope and
+    the location attestation."""
+    return {
+        **PROTECTION_SUGGESTED,
+        "tags": list(tags),
+        "is_global": is_global,
+        "applies_regardless_of_location": True,
+        **values,
+    }
+
+
+async def seed_protection_proposal(
+    pool: AsyncConnectionPool,
+    *,
+    signal_ids: list[UUID],
+    tags: tuple[str, ...] = ("instagram",),
+    is_global: bool = False,
+    renews: UUID | None = None,
+    status: str = "pending",
+    decided: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
+) -> UUID:
+    """A protection_event proposal row written directly, shaped as generation (or, with
+    ``renews``, a renewal) writes one."""
+    target: dict[str, Any] = {"tags": list(tags), "is_global": is_global}
+    if renews is not None:
+        target["renews_event_id"] = str(renews)
+    return await seed_proposal(
+        pool,
+        signal_ids=signal_ids,
+        kind="protection_event",
+        status=status,
+        target=target,
+        suggested=dict(PROTECTION_SUGGESTED),
+        decided=decided,
+        created_at=created_at,
+    )
+
+
+async def seed_protection_event(
+    pool: AsyncConnectionPool,
+    *,
+    proposal_id: UUID | None = None,
+    tags: tuple[str, ...] = ("instagram",),
+    is_global: bool = False,
+    strength: int = 2,
+    title: str = "Seeded protection",
+    status: str = "active",
+    starts_in_days: int = 0,
+    ends_in_days: int = 90,
+    renews: UUID | None = None,
+) -> UUID:
+    """A protection_events row written directly (superuser). Every credit hangs on a proposal
+    (proposal_id is NOT NULL), so with none given an applied one with no evidence is written."""
+    if proposal_id is None:
+        proposal_id = await seed_protection_proposal(
+            pool,
+            signal_ids=[],
+            tags=tags,
+            is_global=is_global,
+            status="applied",
+            decided=protection_decided(tags=tags, is_global=is_global),
+        )
+    retracted = status == "retracted"
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO protection_events (title, strength, tags, is_global, starts_at,"
+            " review_by, status, proposal_id, renews_event_id, created_by, retracted_by,"
+            " retracted_at, retract_reason)"
+            " VALUES (%s, %s, %s::text[], %s, now() + make_interval(days => %s),"
+            " now() + make_interval(days => %s), %s, %s, %s, 'seed-op', %s,"
+            " CASE WHEN %s THEN now() END, %s) RETURNING event_id",
+            (
+                title,
+                strength,
+                list(tags),
+                is_global,
+                starts_in_days,
+                ends_in_days,
+                status,
+                proposal_id,
+                renews,
+                "seed-op" if retracted else None,
+                retracted,
+                "seeded retraction" if retracted else None,
+            ),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    event_id: UUID = row[0]
+    return event_id

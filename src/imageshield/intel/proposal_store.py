@@ -10,8 +10,9 @@ Three modules write this table, so that "which code can approve" is answerable b
 Statuses are SQL LITERALS here, never parameters: tests/test_boundaries.py relies on it.
 Nothing DELETEs, because intel_rw holds no DELETE grant (0039).
 
-This module also reads threat_events, with its own SQL (the threat store is not importable from
-intel/, spec §6.1): live tag-carrying events for the prompt and the detail read's related_events.
+This module also reads threat_events and protection_events, with its own SQL (the threat store is
+not importable from intel/, spec §6.1): the live events for the prompt, and each event proposal's
+related_events, which are the live events of its own direction.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from imageshield.intel.proposal_models import (
     Attachment,
     ContextSignal,
     LiveEvent,
+    LiveProtection,
     NewProposal,
     PendingEvent,
     ProposalRecord,
@@ -118,6 +120,23 @@ _PENDING_EVENTS_SQL = """
      LIMIT %(limit)s
 """
 
+# The protection half of svc.v_active_scoped_events, read from the base table (intel_rw has no
+# USAGE on svc), plus every live GLOBAL credit: a global credit overlaps every proposal. A
+# credit's evidence is its approving proposal's linked signals.
+_LIVE_PROTECTIONS_SQL = """
+    SELECT e.event_id, e.title, e.strength, e.tags, e.is_global, e.starts_at, e.review_by,
+           e.proposal_id, e.renews_event_id,
+           coalesce(array_agg(ps.signal_id ORDER BY ps.signal_id)
+                    FILTER (WHERE ps.signal_id IS NOT NULL), '{}') AS signal_ids
+      FROM protection_events e
+      LEFT JOIN intel_proposal_signals ps ON ps.proposal_id = e.proposal_id
+     WHERE e.status = 'active' AND e.starts_at <= now() AND e.review_by > now()
+       AND (e.is_global OR e.tags && %(tags)s::text[])
+     GROUP BY e.event_id
+     ORDER BY e.created_at DESC, e.event_id DESC
+     LIMIT %(limit)s
+"""
+
 
 def _context(row: dict[str, Any]) -> ContextSignal:
     return ContextSignal(
@@ -177,6 +196,21 @@ def _pending_event(row: dict[str, Any]) -> PendingEvent:
     )
 
 
+def _live_protection(row: dict[str, Any]) -> LiveProtection:
+    return LiveProtection(
+        event_id=row["event_id"],
+        title=row["title"],
+        strength=row["strength"],
+        tags=tuple(row["tags"]),
+        is_global=row["is_global"],
+        starts_at=row["starts_at"],
+        review_by=row["review_by"],
+        proposal_id=row["proposal_id"],
+        renews_event_id=row["renews_event_id"],
+        signal_ids=tuple(row["signal_ids"]),
+    )
+
+
 async def load_scoring_vocabulary(conn: AsyncConnection[Any]) -> ScoringVocabulary | None:
     cur = conn.cursor(row_factory=dict_row)
     await cur.execute(
@@ -218,6 +252,16 @@ async def live_threat_events(
     return [_live_event(row) for row in await cur.fetchall()]
 
 
+async def live_protection_events(
+    conn: AsyncConnection[Any], *, tags: Sequence[str], limit: int
+) -> list[LiveProtection]:
+    """Live protection credits carrying a tag in ``tags``, plus every live global credit,
+    newest first, bounded. Empty ``tags`` still finds the global ones."""
+    cur = conn.cursor(row_factory=dict_row)
+    await cur.execute(_LIVE_PROTECTIONS_SQL, {"tags": list(tags), "limit": limit})
+    return [_live_protection(row) for row in await cur.fetchall()]
+
+
 async def active_subject_signals(
     conn: AsyncConnection[Any], *, since: datetime, limit: int
 ) -> list[ContextSignal]:
@@ -254,6 +298,10 @@ class ProposalStore(Protocol):
         self, *, tags: Sequence[str], limit: int
     ) -> list[PendingEvent]: ...
     async def active_threat_events(self, *, tags: Sequence[str], limit: int) -> list[LiveEvent]: ...
+
+    async def active_protection_events(
+        self, *, tags: Sequence[str], limit: int
+    ) -> list[LiveProtection]: ...
     async def write_generated(
         self,
         run_id: UUID,
@@ -382,6 +430,12 @@ class PostgresProposalStore:
         async with self._pool.connection() as conn:
             return await live_threat_events(conn, tags=tags, limit=limit)
 
+    async def active_protection_events(
+        self, *, tags: Sequence[str], limit: int
+    ) -> list[LiveProtection]:
+        async with self._pool.connection() as conn:
+            return await live_protection_events(conn, tags=tags, limit=limit)
+
     async def write_generated(
         self,
         run_id: UUID,
@@ -409,9 +463,9 @@ class PostgresProposalStore:
                 return None
             pending_gaps: list[tuple[UUID, dict[str, Any]]] | None = None
             for proposal in proposals:
-                # A weight change and a coverage gap supersede their pending twin. A threat
-                # event supersedes nothing: a repeat of a pending one was made an attachment
-                # before it got here (spec §4.3), so what arrives is new.
+                # A weight change and a coverage gap supersede their pending twin. An event
+                # proposal of either kind supersedes nothing: a repeat of a pending one was
+                # made an attachment before it got here (spec §4.3), so what arrives is new.
                 if proposal.kind == "weight_change":
                     cur = await conn.execute(
                         _SUPERSEDE_CELL_SQL,
@@ -566,16 +620,24 @@ class PostgresProposalStore:
             )
             documents = {d["document_id"]: d for d in await cur.fetchall()}
             related: list[dict[str, Any]] = []
-            if row["kind"] in EVENT_KINDS:
-                own_tags = row["target"].get("tags") or []
+            own_tags = [t for t in (row["target"].get("tags") or []) if isinstance(t, str)]
+            # The live events of the proposal's OWN direction: what it could duplicate. Never
+            # the proposal's own event.
+            if row["kind"] == "threat_event":
                 related = [
                     event.related()
                     for event in await live_threat_events(
-                        conn,
-                        tags=[t for t in own_tags if isinstance(t, str)],
-                        limit=PROPOSAL_CONTEXT_MAX_EVENTS,
+                        conn, tags=own_tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
                     )
-                    if event.proposal_id != proposal_id  # never the proposal's own event
+                    if event.proposal_id != proposal_id
+                ]
+            elif row["kind"] == "protection_event":
+                related = [
+                    credit.related()
+                    for credit in await live_protection_events(
+                        conn, tags=own_tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
+                    )
+                    if credit.proposal_id != proposal_id
                 ]
         by_signal: dict[UUID, list[dict[str, Any]]] = {}
         for excerpt in excerpts:

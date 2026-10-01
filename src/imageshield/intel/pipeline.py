@@ -30,6 +30,10 @@ attach new evidence to a pending one (intel/generation.py decides what is writte
 ``gap_regenerate`` run reads nothing: its evidence is the signals the reconcile named when it
 closed a gap (spec §4.9), and it proposes events only. A gate refusal leaves it unwritten, and
 the reconcile's gap pass queues it again later.
+
+PROTECTIONS (step 4). The generation call also sees the live protection credits on the evidence's
+tags (and every live global one), and may propose protection_events, never global ones. A
+``renewal_check`` run is different in kind: it makes no model call (spec §4.8).
 """
 
 from __future__ import annotations
@@ -71,6 +75,7 @@ from imageshield.intel.fetch_client import FETCHER_SIDE_CODES, FetchFailure, Tex
 from imageshield.intel.generation import (
     GeneratedBatch,
     prompt_live_event,
+    prompt_live_protection,
     prompt_pending_event,
     prompt_quiz,
     prompt_registry,
@@ -747,6 +752,9 @@ async def _generate(ctx: _Ctx) -> None:
         tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
     )
     live_events = await store.active_threat_events(tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS)
+    live_protections = await store.active_protection_events(
+        tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
+    )
     relevant = set(tags) | {t for s in related for t in s.tags} | set(vocabulary.mapped_tags)
     system, user = proposal_request(
         [prompt_signal(s) for s in new],
@@ -756,6 +764,7 @@ async def _generate(ctx: _Ctx) -> None:
         mapped_tags=sorted(vocabulary.mapped_tags),
         pending_events=[prompt_pending_event(e) for e in pending_events],
         live_events=[prompt_live_event(e) for e in live_events],
+        live_protections=[prompt_live_protection(e) for e in live_protections],
         events_only=regenerate is not None,
     )
     call = await _call_model(ctx, lambda: ctx.deps.model.propose(system, user), capped=False)

@@ -21,6 +21,7 @@ from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.schemas import (
     ProposalOutput,
     ProposedAttach,
+    ProposedProtectionEvent,
     ProposedThreatEvent,
     ProposedWeightChange,
 )
@@ -28,6 +29,7 @@ from imageshield.intel.store import PostgresIntelStore
 from tests.intel_fakes import (
     NOW,
     POLICY,
+    PROTECTION_SUGGESTED,
     QUIZ_VOCABULARY,
     THREAT_SUGGESTED,
     FakeFetcher,
@@ -39,6 +41,7 @@ from tests.intel_fakes import (
     mapped_document,
     run_once,
     seed_proposal,
+    seed_protection_event,
     seed_quiz_vocabulary,
     seed_signal,
     seed_threat_event,
@@ -757,3 +760,62 @@ async def test_an_unavailable_model_fails_a_regeneration_and_leaves_it_unwritten
         intel_pool,
         "SELECT proposals_written_at IS NULL FROM intel_runs WHERE kind = 'gap_regenerate'",
     ) == [(True,)]
+
+
+def propose_protection(**fields: Any) -> Callable[[dict[str, Any]], ProposalOutput]:
+    """A fake model that proposes one protection credit on instagram citing every new signal."""
+
+    def build(payload: dict[str, Any]) -> ProposalOutput:
+        ids = [s["signal_id"] for s in payload["new_evidence"]]
+        values: dict[str, Any] = {
+            **PROTECTION_SUGGESTED,
+            "tags": ["instagram"],
+            "rationale": "The platform shipped an opt-out.",
+            **fields,
+        }
+        return ProposalOutput(
+            protection_events=[ProposedProtectionEvent(**values, signal_ids=ids)]
+        )
+
+    return build
+
+
+async def test_a_run_proposes_a_protection_and_is_shown_the_live_credits_on_its_tags(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    live = await seed_protection_event(intel_pool, title="Live opt-out")
+    everyone = await seed_protection_event(intel_pool, tags=(), is_global=True, title="For all")
+    await seed_protection_event(intel_pool, tags=("linkedin",))  # another tag: not shown
+    await PostgresIntelStore(intel_pool).queue_adhoc(URL, operator="a")
+    model = _model(propose_with=propose_protection())
+    result = await run_once(
+        intel_pool, make_deps(intel_pool, FakeFetcher({URL: make_page(POLICY, URL)}), model)
+    )
+    assert result.status == "completed" and result.outcome["proposals_written"] == 1
+    payload = json.loads(model.proposal_users[0])
+    assert {e["event_id"] for e in payload["live_protections"]} == {str(live), str(everyone)}
+    rows = await _rows(
+        intel_pool,
+        "SELECT kind, target, suggested FROM intel_proposals WHERE status = 'pending'",
+    )
+    assert rows == [
+        ("protection_event", {"tags": ["instagram"], "is_global": False}, PROTECTION_SUGGESTED)
+    ]
+
+
+async def test_a_model_proposed_global_protection_is_never_written(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec §10: the model cannot know a protection applies wherever a person lives."""
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresIntelStore(intel_pool).queue_adhoc(URL, operator="a")
+    model = _model(propose_with=propose_protection(is_global=True))
+    result = await run_once(
+        intel_pool, make_deps(intel_pool, FakeFetcher({URL: make_page(POLICY, URL)}), model)
+    )
+    assert result.outcome["proposal_dropped_global_not_proposable"] == 1
+    assert result.outcome.get("proposals_written", 0) == 0
+    assert await _rows(
+        intel_pool, "SELECT count(*) FROM intel_proposals WHERE kind = 'protection_event'"
+    ) == [(0,)]
