@@ -453,6 +453,18 @@ GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
   declares it **optional**, like `v_articles`.
 - **Deploy order:** services first on the way up, backend first on the way down.
 
+*Clarified 2026-09-30 (step-4 plan):*
+- The step-4 migration is `0044_intel_protection_events` (pre-assigned: steps 5–6 took `0043` on their branch).
+- It re-creates the view with `CREATE OR REPLACE VIEW`, which Postgres refuses if any of the ten columns would be
+  renamed, reordered or retyped. So the contract is held by the database itself, and the grant survives; it is still
+  re-issued in the same file. The threat half is byte-identical to 0042's, and the down restores it.
+- `protection_events.strength` is `SMALLINT`, so `magnitude` stays `smallint`. `body` is always `''` from an approval
+  (a protection proposal carries only a title, as a threat does). The retraction CHECK is two-sided: an active credit
+  carries no retraction fields, a retracted one all three.
+- A partial unique index holds one queued or running `renewal_check` per credit (§4.8), as
+  `intel_runs_one_open_per_source` does for sources. `intel_runs.kind` has allowed `renewal_check` since 0039, so no
+  CHECK is re-created.
+
 ### 3.8 Scoring vocabulary cache
 
 `intel_vocabulary`, a single row (`id smallint PK CHECK (id = 1)`):
@@ -745,6 +757,15 @@ consumer has not shipped (`409 proposal_not_decidable`). So no approval can crea
   proposals and attachments only. A weight change or coverage gap it returns is dropped
   (`proposal_dropped_not_an_event`).
 
+*Clarified 2026-09-30 (step-4 plan):*
+- The structured output gains `protection_events`, still with no numeric bounds. It carries `is_global`, so a model that
+  believes a protection covers everyone says so, and code drops that proposal (`global_not_proposable`, §4.5) rather
+  than never hearing it. Strength and review bounds run in code, and a title past 200 characters is dropped.
+- The prompt also carries `live_protections`: live credits overlapping the evidence's tags, plus every live global
+  credit, at most 40. A pending renewal proposal (§4.8) is a pending event proposal like any other, so new evidence may
+  attach to it, and duplicate detection compares it like any other.
+- A `gap_regenerate` run writes protection events too: they are event proposals.
+
 ### 4.4 The model seam
 
 - **`intel/model.py`** is the only module that imports `anthropic`, and a boundary test enforces that. It builds
@@ -909,6 +930,37 @@ re-checked inside it.
   kind the active, tag-carrying threat events that overlap its tags (at most 40), never the proposal's own event.
   Each is `{event_id, direction, kind, title, severity, tags, is_global, starts_at, expires_at, proposal_id}`.
 
+*Amended 2026-09-30 (step-4 plan, controller ruling), for protection approvals:*
+- **The protection bullet's tag answer is replaced.** A tag the final values *add* that is unregistered is `422
+  unknown_tag`, and one that is retired is `422 tag_retired`, both naming `slugs`, exactly as for threats (§3.1). A
+  missing or false `applies_regardless_of_location` stays `422 values_out_of_bounds`, as does every other bound.
+- **A protection limited to some jurisdictions is rejected, never approved as global or tag-wide** (§3.7). The
+  attestation is the enforcement: an operator who cannot give it rejects. A rejection needs no attestation.
+- `values` may name any subset of `{title, strength, review_in_days, tags, is_global}`. It is merged over `suggested`
+  and the target's own `tags` and `is_global`, as for threats, and the merged scope must be exactly one of tags or
+  global. So making a credit global sends `{is_global: true, tags: []}`, and `{is_global: true}` alone is
+  `values_out_of_bounds`. `decided` also stores `applies_regardless_of_location: true`. A final scope of only unmapped
+  tags is `409 proposal_tags_unmapped`.
+- `applies_regardless_of_location` is a strict JSON boolean: any other value is a body-shape `422 validation_error`.
+- An approved protection answers `status: 'applied'` with the new event's id in `applied_ref`. The row gets
+  `body = ''`, `starts_at = now()` (a renewal's: the old credit's `review_by`), `review_by = starts_at +
+  review_in_days` and `created_by` the operator.
+- **A renewal whose credit is no longer active, or already renewed, is `409 proposal_not_pending`.** The approval locks
+  the old credit after its proposal, the same order the retraction takes, so a racing retraction is seen.
+- `GET /proposals/{id}` gives a `protection_event` the live credits overlapping its tags, plus every live global one,
+  as `related_events`, never its own: `{event_id, direction: 'protection', kind: 'protection', title, strength, tags,
+  is_global, starts_at, review_by, proposal_id}`. A threat's stay threats.
+- `GET /protection-events?status=&cursor=&limit=` is keyset-paged on `(created_at, event_id)` like every list, and
+  answers `{events, next_cursor}`. Each row also carries `state` (`scheduled`, `live`, `lapsed`, `retracted`) and
+  `renewal` (its latest check and its renewal proposal, or null). `renewal_due` is a live credit within 30 days of
+  `review_by` that no renewal continues yet.
+- `POST /protection-events/{id}/retract` takes `{reason, operator}` and answers `{event_id, status: 'retracted',
+  also_retracted, renewal_proposals_rejected}`. **Retraction also retracts the credit's renewal that has not started
+  yet, and rejects its pending renewal proposal**, in the same transaction and in the retracting operator's name:
+  otherwise a retracted protection would come back at its own review date. A renewal that has started is its own live
+  credit and is untouched. Retracting an already-retracted credit answers `200` and writes nothing, so a retried call
+  is harmless; an unknown id, a threat's included, is `404 protection_event_not_found`.
+
 **Error codes** (the envelope from §9 of the services manual): `proposal_not_found`, `proposal_not_pending`,
 `proposal_uncorroborated`, `proposal_not_decidable`, `proposal_evidence_retracted`, `proposal_cell_awaiting_publish`,
 `proposal_tags_unmapped`, `values_out_of_bounds`, `unknown_tag`, `tag_retired`, `known_hit_location`,
@@ -934,6 +986,26 @@ pydantic `validation_error` 422 stays unmapped on purpose.
   `review_by`. The operator sees why on `GET /protection-events`.
 
 A renewal is approved like any other proposal (§4.7). No year-old evidence is ever re-cited without being re-checked.
+
+*Clarified 2026-09-30 (step-4 plan):*
+- **"The evidence still verifies" means at least one cited excerpt** is still a verbatim substring of its page,
+  fetched again now, by the extraction's own `verify_quote`. Only excerpts that verify are re-cited. A signal left with
+  none is not renewed. Each drop is counted by reason on the run.
+- The renewal's new signals copy the old ones' category, direction, tags, subjects, summary, `model_id` and
+  `prompt_version`, under new documents of the renewal run with `trust = listed`. The proposal is written by code:
+  `model_id = 'code:renewal'`, `prompt_version = 'renewal-v1'`, and a code-written rationale. Its `target = {tags,
+  is_global, renews_event_id}` and its `suggested = {title, strength, review_in_days}` both come from the credit
+  itself.
+- **Every guard of a read applies:** https only, and a cited page that has since become a known hit location is never
+  fetched (§4.3).
+- **A page the fetcher could not reach says nothing.** A check that verified nothing because a page was `unfetchable`
+  records `renewal_evidence_unreachable`, and a fetcher outage fails the run. Either is queued again after
+  `RENEWAL_RETRY_HOURS` (24) while the credit is still due, up to `RENEWAL_MAX_RUNS` (7) checks per credit. Every
+  other result is conclusive: `renewal_proposed`, `renewal_evidence_gone`, or `renewal_not_due` (retracted, renewed,
+  lapsed, or already given a renewal proposal when the run executed). A credit that has been given a renewal
+  proposal, whatever became of it, is never checked again.
+- A renewal makes no model call, so the provider gate, the budget and the kill switch do not apply to it. It runs only
+  while `INTEL_ENABLED` is true; with the worker off, credits lapse, which is the safe direction.
 
 ### 4.9 Adapting to quiz changes — no deploy, no hand edits
 
@@ -1261,6 +1333,8 @@ The deviation from the original "allowlist from `content_items`" letter is recor
 services migration is `0041_intel_proposal_cost` (see the §3.9 note), and it changes no table.
 
 *Clarified 2026-09-30 (step-3 plan):* step 3's services migration is `0042_intel_scoped_threats`.
+
+*Clarified 2026-09-30 (step-4 plan):* step 4's services migration is `0044_intel_protection_events`.
 
 **Per-step deploy gates:**
 - **Services always deploy first** on the way up: every new body field is refused (`422`) by an older services build.
