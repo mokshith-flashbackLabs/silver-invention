@@ -87,6 +87,22 @@ class ProposedAttach(_Out):
     signal_ids: list[str] = Field(default_factory=list)
 
 
+class ProposedProtectionEvent(_Out):
+    """No numeric bounds here either (see ProposedWeightChange): §4.5's strength and review
+    bounds run per proposal in intel/generation.py. ``is_global`` is here so a model that
+    believes a protection covers everyone SAYS so, and code drops that proposal
+    (global_not_proposable, §4.5) rather than never hearing it: a global credit exists only by
+    an operator's edit on approval."""
+
+    title: str
+    strength: int
+    review_in_days: int
+    tags: list[str] = Field(default_factory=list)
+    is_global: bool = False
+    rationale: str
+    signal_ids: list[str] = Field(default_factory=list)
+
+
 class ProposalOutput(_Out):
     """Step 2's kinds as two typed lists rather than one list keyed by ``kind``, so each
     kind's shape is closed. Step 3 adds threat_events and attach; step 4 adds
@@ -96,3 +112,4 @@ class ProposalOutput(_Out):
     coverage_gaps: list[ProposedCoverageGap] = Field(default_factory=list)
     threat_events: list[ProposedThreatEvent] = Field(default_factory=list)
     attach: list[ProposedAttach] = Field(default_factory=list)
+    protection_events: list[ProposedProtectionEvent] = Field(default_factory=list)

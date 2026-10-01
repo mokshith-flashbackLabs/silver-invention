@@ -347,7 +347,7 @@ async def test_a_gap_regenerate_run_proposes_events_from_the_signals_it_names(
     assert result.outcome["proposals_written"] == 1
     assert result.outcome["proposal_dropped_not_an_event"] == 1
     assert model.extract_calls == 0 and model.propose_calls == 1
-    assert "Propose only threat_events and attach" in model.proposal_systems[0]
+    assert "Propose only threat_events, protection_events and attach" in model.proposal_systems[0]
     payload = json.loads(model.proposal_users[0])
     assert {s["signal_id"] for s in payload["new_evidence"]} == {str(s) for s in signals}
     (row,) = await PostgresProposalStore(intel_pool).list_proposals(

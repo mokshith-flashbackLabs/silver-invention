@@ -1,7 +1,7 @@
 """Safety limits for likeness intel (spec §4.5). CODE CONSTANTS, not env: moving one
 costs a code change, a review and a `git blame`, the argument REPORT_FACE_MATCH_MIN
 makes on the backend. Proposal bounds are step 2's; threat-event and regeneration
-bounds are step 3's."""
+bounds are step 3's; protection and renewal bounds are step 4's."""
 
 from __future__ import annotations
 
@@ -49,3 +49,18 @@ PROPOSAL_CONTEXT_MAX_EVENTS = 40
 # UTC-midnight budget reset (spec §4.9, note 2026-09-30).
 GAP_REGENERATE_RETRY_HOURS = 6
 GAP_REGENERATE_MAX_RUNS = 5
+
+# ── protection credits (step 4, spec §4.5, §4.8) ─────────────────────────────
+PROTECTION_STRENGTH_MIN = 1
+PROTECTION_STRENGTH_MAX = 5
+PROTECTION_REVIEW_MIN_DAYS = 30
+PROTECTION_REVIEW_MAX_DAYS = 366
+# A live credit whose review_by is this close is renewal_due, and the worker queues its one
+# renewal_check (spec §4.8).
+PROTECTION_RENEWAL_WINDOW_DAYS = 30
+# A renewal check that could not decide -- the fetcher down, a cited page unreachable -- is
+# queued again after this many hours while the credit is still due, up to RENEWAL_MAX_RUNS
+# checks per credit: a week of daily retries inside the thirty-day window (spec note
+# 2026-09-30).
+RENEWAL_RETRY_HOURS = 24
+RENEWAL_MAX_RUNS = 7

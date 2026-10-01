@@ -393,3 +393,19 @@ def test_the_threat_output_parses_out_of_range_numbers_for_code_to_drop() -> Non
 async def test_the_stub_proposes_nothing() -> None:
     call = await StubIntelModel().propose("s", "u")
     assert call.outcome == "ok" and call.output == ProposalOutput()
+
+
+def test_the_protection_output_parses_out_of_range_numbers_for_code_to_drop() -> None:
+    """Review Focus 1 of step 2, extended to step 4: no numeric bounds in the schema, so a
+    strength of 9 or a global claim reaches intel/generation.py, which drops that one proposal
+    instead of failing the whole response in the SDK."""
+    schema = json.dumps(ProposalOutput.model_json_schema())
+    for keyword in ("minimum", "maximum", "maxLength", "minLength"):
+        assert keyword not in schema
+    assert "protection_events" in schema
+    parsed = ProposalOutput.model_validate_json(
+        '{"protection_events": [{"title": "t", "strength": 9, "review_in_days": 4000,'
+        ' "tags": [], "is_global": true, "rationale": "r", "signal_ids": []}]}'
+    )
+    (proposed,) = parsed.protection_events
+    assert proposed.strength == 9 and proposed.is_global is True

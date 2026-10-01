@@ -14,10 +14,22 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from imageshield.intel.bounds import (
     MAX_EVENT_TITLE_CHARS,
+    PROTECTION_REVIEW_MAX_DAYS,
+    PROTECTION_REVIEW_MIN_DAYS,
+    PROTECTION_STRENGTH_MAX,
+    PROTECTION_STRENGTH_MIN,
     THREAT_EXPIRES_MAX_DAYS,
     THREAT_EXPIRES_MIN_DAYS,
     THREAT_SEVERITY_MAX,
@@ -121,6 +133,84 @@ class ThreatEventValues(_Stored):
     tags: tuple[str, ...] | None = None
 
 
+def _one_scope(tags: tuple[str, ...], is_global: bool) -> None:
+    if is_global == bool(tags):
+        raise ValueError("a protection is scoped by tags or is global, exactly one")
+
+
+class ProtectionEventTarget(_Stored):
+    """What a protection_event is about (spec §3.6): exposure tags or everyone, never both and
+    never neither. ``renews_event_id`` is set only on a renewal, which code writes (§4.8). A
+    generated proposal is never global (§4.5): a global credit exists only by an operator's
+    edit, or by renewing one."""
+
+    tags: tuple[str, ...] = ()
+    is_global: StrictBool = False
+    renews_event_id: UUID | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _distinct_slugs(value)
+
+    @model_validator(mode="after")
+    def _scope(self) -> ProtectionEventTarget:
+        _one_scope(self.tags, self.is_global)
+        return self
+
+
+class ProtectionEventSuggested(_Stored):
+    """A protection_event's ``suggested``: the model's numbers and text, or on a renewal the
+    prior decided values (§4.8). The bounds are §4.5's and hold for an operator's final values
+    too (ProtectionEventDecided). No ``body``: a protection proposal carries only a title, as a
+    threat does (spec note 2026-09-30)."""
+
+    title: str = Field(min_length=1, max_length=MAX_EVENT_TITLE_CHARS)
+    strength: StrictInt = Field(ge=PROTECTION_STRENGTH_MIN, le=PROTECTION_STRENGTH_MAX)
+    review_in_days: StrictInt = Field(ge=PROTECTION_REVIEW_MIN_DAYS, le=PROTECTION_REVIEW_MAX_DAYS)
+
+    @field_validator("title")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("title must not be blank")
+        return value
+
+
+class ProtectionEventDecided(ProtectionEventSuggested):
+    """The exact values an approval stores and the credit is inserted from (spec §3.6): the
+    suggested keys, the final scope, and the operator's location attestation. It is always
+    true: a protection limited to some places is rejected, never approved (§3.7)."""
+
+    tags: tuple[str, ...] = ()
+    is_global: StrictBool
+    applies_regardless_of_location: Literal[True]
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _distinct_slugs(value)
+
+    @model_validator(mode="after")
+    def _scope(self) -> ProtectionEventDecided:
+        _one_scope(self.tags, self.is_global)
+        return self
+
+
+class ProtectionEventValues(_Stored):
+    """An operator's edit of a protection approval: any subset of ``{title, strength,
+    review_in_days, tags, is_global}``, and nothing else. Merged over ``suggested`` and the
+    target's scope; the result must parse as ProtectionEventDecided. So making a credit global
+    names both halves of the scope, ``{is_global: true, tags: []}`` (spec note 2026-09-30).
+    Types only here; the bounds are ProtectionEventDecided's."""
+
+    title: str | None = None
+    strength: StrictInt | None = None
+    review_in_days: StrictInt | None = None
+    tags: tuple[str, ...] | None = None
+    is_global: StrictBool | None = None
+
+
 @dataclass(frozen=True)
 class ContextSignal:
     """An active-or-retracted signal with the provenance the predicates need. ``trust`` and
@@ -145,10 +235,9 @@ class ContextSignal:
 @dataclass(frozen=True)
 class NewProposal:
     """One validated proposal, pre-insert. ``document_keys`` are the canonical URL hashes of
-    its cited signals' documents: duplicate detection compares them (spec §4.3). Step 4
-    widens ``kind``."""
+    its cited signals' documents: duplicate detection compares them (spec §4.3)."""
 
-    kind: Literal["weight_change", "coverage_gap", "threat_event"]
+    kind: Literal["weight_change", "coverage_gap", "threat_event", "protection_event"]
     target: dict[str, Any]
     suggested: dict[str, Any]
     rationale: str
@@ -216,6 +305,38 @@ class LiveEvent:
 
 
 @dataclass(frozen=True)
+class LiveProtection:
+    """A live protection credit: the prompt's live_protections and a protection proposal's
+    related_events (spec §4.3, §4.7)."""
+
+    event_id: UUID
+    title: str
+    strength: int
+    tags: tuple[str, ...]
+    is_global: bool
+    starts_at: datetime
+    review_by: datetime
+    proposal_id: UUID
+    renews_event_id: UUID | None
+    signal_ids: tuple[UUID, ...]
+
+    def related(self) -> dict[str, Any]:
+        """One ``related_events`` item of a protection proposal's detail read."""
+        return {
+            "event_id": self.event_id,
+            "direction": "protection",
+            "kind": "protection",
+            "title": self.title,
+            "strength": self.strength,
+            "tags": list(self.tags),
+            "is_global": self.is_global,
+            "starts_at": self.starts_at,
+            "review_by": self.review_by,
+            "proposal_id": self.proposal_id,
+        }
+
+
+@dataclass(frozen=True)
 class Attachment:
     """New evidence for a still-pending event proposal (spec §4.3 ``attach``). It never
     changes the proposal's target, suggested or rationale."""
@@ -230,6 +351,12 @@ class GapRegenerateRequest(_Stored):
     coverage_gap_id: UUID
     tag: str
     signal_ids: tuple[UUID, ...]
+
+
+class RenewalRequest(_Stored):
+    """``intel_runs.request`` of a renewal_check run (spec §3.4, §4.8). Never person data."""
+
+    event_id: UUID
 
 
 @dataclass(frozen=True)

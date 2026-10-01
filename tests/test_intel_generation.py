@@ -23,6 +23,7 @@ from imageshield.intel.generation import (
 from imageshield.intel.prompts import (
     PROPOSE_PROMPT_VERSION,
     PromptLiveEvent,
+    PromptLiveProtection,
     PromptPendingEvent,
     proposal_request,
 )
@@ -574,11 +575,11 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     payload = json.loads(user)
     assert payload["pending_events"] == [pending] and payload["live_events"] == [live]
     assert "threat_events" in system and "attach" in system
-    assert "Propose only threat_events and attach" not in system
+    assert "Propose only threat_events, protection_events and attach" not in system
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
-    assert "Propose only threat_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v2"
+    assert "Propose only threat_events, protection_events and attach" in regenerate
+    assert PROPOSE_PROMPT_VERSION == "propose-v3"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -597,3 +598,28 @@ def test_the_event_prompt_items_carry_ids_as_strings() -> None:
     item = prompt_live_event(live)
     assert item["event_id"] == str(eid) and item["expires_at"] == ends.isoformat()
     assert item["signal_ids"] == [str(sid)] and item["severity"] == 4
+
+
+def test_the_prompt_carries_live_protections_and_asks_for_protection_events() -> None:
+    live = PromptLiveProtection(
+        event_id=str(uuid4()),
+        title="Instagram opt-out from AI training",
+        strength=2,
+        tags=["instagram"],
+        is_global=False,
+        review_by="2027-03-30T00:00:00+00:00",
+        signal_ids=[],
+    )
+    system, user = proposal_request(
+        [],
+        [],
+        quiz=prompt_quiz(V),
+        registry_tags=prompt_registry(V, set()),
+        mapped_tags=sorted(V.mapped_tags),
+        live_protections=[live],
+    )
+    payload = json.loads(user)
+    assert payload["live_protections"] == [live] and payload["live_events"] == []
+    assert "protection_events" in system and "is_global: always false" in system
+    assert "only in some countries" in system and "live_protections" in system
+    assert PROPOSE_PROMPT_VERSION == "propose-v3"
