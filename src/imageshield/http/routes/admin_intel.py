@@ -30,6 +30,7 @@ from imageshield.http.deps import (
     get_evidence_store,
     get_intel_store,
     get_proposal_store,
+    get_question_store,
 )
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
@@ -42,13 +43,17 @@ from imageshield.http.models import (
     IntelRetractRequest,
     IntelSourceCreateRequest,
     IntelSourcePatchRequest,
+    IntelSourceProposalRequest,
     IntelVocabularyRequest,
 )
 from imageshield.intel.decisions import DecisionStore
 from imageshield.intel.evidence_store import EvidenceStore
+from imageshield.intel.models import Run
 from imageshield.intel.pii import contains_pii
 from imageshield.intel.proposal_models import DecisionRefused
 from imageshield.intel.proposal_store import ProposalStore
+from imageshield.intel.question_store import QuestionStore
+from imageshield.intel.source_choice import existing_source_ids, render_source_proposal
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, membership_problems
 from imageshield.intel.vocabulary import parse_vocabulary
@@ -424,3 +429,39 @@ async def decide_proposal(
         "applied_ref": result.applied_ref,
         "decided": result.decided,
     }
+
+
+# -- sources per question and weight suggestions (step 5, spec 4.6 and 4.10) --------------
+
+
+def _run_not_found() -> ServiceError:
+    return ServiceError(
+        404, "intel_run_not_found", "No run of this kind with this id.", retryable=False
+    )
+
+
+async def _question_run(questions: QuestionStore, run_id: UUID, kind: str) -> Run:
+    """A poll answers only for a run of its own kind: another kind's id is as unknown as no id."""
+    run = await questions.get_run(run_id)
+    if run is None or run.kind != kind:
+        raise _run_not_found()
+    return run
+
+
+@router.post("/source-proposals", status_code=202)
+async def propose_sources(
+    body: IntelSourceProposalRequest, questions: QuestionStore = Depends(get_question_store)
+) -> dict[str, UUID]:
+    """Stage 1 of spec §4.10: queue a source_proposal run. Nothing is registered."""
+    run_id = await questions.queue_source_proposal(body.question_request(), operator=body.operator)
+    log.info("intel.source_proposal_queued_via_admin", operator=body.operator)
+    return {"run_id": run_id}
+
+
+@router.get("/source-proposals/{run_id}")
+async def source_proposal_poll(
+    run_id: UUID, questions: QuestionStore = Depends(get_question_store)
+) -> dict[str, Any]:
+    run = await _question_run(questions, run_id, "source_proposal")
+    sources = await questions.sources_by_ids(existing_source_ids(run))
+    return render_source_proposal(run, {s.source_id: s for s in sources})

@@ -103,3 +103,13 @@ class FakeQuestionModel(FakeModel):
             Decimal("0.05"),
             1,
         )
+
+
+# The question a quiz editor asks about in these tests: a live option (Instagram, mapped to
+# `instagram` in QUIZ_VOCABULARY) and a draft one (Bumble) with no tag yet.
+QUESTION: dict[str, Any] = {
+    "question_key": "platforms",
+    "prompt": "Where do you post photos of yourself?",
+    "options": ["Instagram", "Bumble"],
+    "tags": {"Instagram": ["instagram"]},
+}

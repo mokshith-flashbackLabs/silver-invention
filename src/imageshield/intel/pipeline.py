@@ -35,7 +35,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -81,6 +81,7 @@ from imageshield.intel.prompts import (
 )
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.publisher import publisher_domain
+from imageshield.intel.question_store import QuestionStore
 from imageshield.intel.reconcile import Reconciler
 from imageshield.intel.schemas import ExtractedSignal
 from imageshield.intel.store import IntelStore
@@ -107,6 +108,9 @@ _DIFF_CONTEXT_SENTENCES = 2
 _DIFF_MAX_SENTENCES = 10_000
 _HUNK_SEPARATOR = "\n[...]\n"
 _SENTENCE_END = re.compile(r"(?<=[.!?]) ")
+# The run kinds a quiz question drives rather than a source (spec §4.10): intel/question_runs.py
+# executes them. See run().
+_QUESTION_RUN_KINDS = frozenset({"source_proposal", "source_validation", "weight_suggestion"})
 
 
 @dataclass
@@ -116,7 +120,7 @@ class PipelineDeps:
     ``INTEL_MAX_CALLS_PER_RUN`` / ``INTEL_MAX_DOCUMENT_CHARS`` and have NO default
     here -- a second default beside IntelConfig's would be a second source of truth.
     ``reconciler`` is not part of a run: the worker's tick calls it before claiming
-    (spec §4.9)."""
+    (spec §4.9). ``questions`` is the question runs' store (step 5, ``intel/question_store.py``)."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -128,12 +132,15 @@ class PipelineDeps:
     clock: Callable[[], datetime]
     max_calls_per_run: int
     max_document_chars: int
+    questions: QuestionStore
 
 
 @dataclass(frozen=True)
 class RunResult:
     status: RunStatus
-    outcome: dict[str, int | str]
+    # Counts; a question run adds its results (spec §4.10: "their results live in the run's
+    # outcome").
+    outcome: dict[str, Any]
     error_code: str | None = None
 
 
@@ -207,6 +214,12 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
         vocabulary=vocabulary,
         registry=vocabulary.registry() if vocabulary is not None else None,
     )
+    if claimed.kind in _QUESTION_RUN_KINDS:
+        # A question run reads no source by itself and returns its own result (spec §4.10).
+        # Imported here: question_runs imports this module.
+        from imageshield.intel.question_runs import run_question
+
+        return await run_question(ctx)
     stop: _Stop | None = None
     try:
         if claimed.kind == "source_check":

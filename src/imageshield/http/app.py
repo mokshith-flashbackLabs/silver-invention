@@ -54,6 +54,7 @@ from imageshield.http.routes.subjects import router as subjects_router
 from imageshield.intel.decisions import PostgresDecisionStore
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.proposal_store import PostgresProposalStore
+from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.liveness.provider import RekognitionLivenessProvider
 from imageshield.liveness.store import PostgresLivenessStore
@@ -139,6 +140,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.proposal_store = PostgresProposalStore(pool)
     if getattr(app.state, "decision_store", None) is None:
         app.state.decision_store = PostgresDecisionStore(pool)
+    if getattr(app.state, "question_store", None) is None:
+        app.state.question_store = PostgresQuestionStore(pool)
     log = structlog.get_logger("imageshield.http")
     log.info("service.started", version=APP_VERSION, environment=cfg.environment)
     # Which AWS account and region, before anything touches Rekognition.

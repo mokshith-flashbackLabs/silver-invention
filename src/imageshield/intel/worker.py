@@ -28,6 +28,7 @@ from imageshield.intel.fetch_client import HttpTextFetcher
 from imageshield.intel.model import ClaudeIntelModel, IntelModel
 from imageshield.intel.pipeline import PipelineDeps, run
 from imageshield.intel.proposal_store import PostgresProposalStore
+from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.reconcile import PostgresReconciler
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
@@ -118,6 +119,7 @@ async def run_forever(config: IntelConfig) -> None:
         # default beside IntelConfig's would be a second source of truth.
         max_calls_per_run=config.intel_max_calls_per_run,
         max_document_chars=config.intel_max_document_chars,
+        questions=PostgresQuestionStore(pool),
     )
     log.info("intel.started", enabled=config.intel_enabled, provider=config.intel_model_provider)
     try:

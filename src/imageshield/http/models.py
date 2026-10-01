@@ -23,6 +23,7 @@ from pydantic import (
 )
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
+from imageshield.intel.bounds import MAX_QUESTION_OPTIONS
 from imageshield.intel.tags import TAG_SLUG_RE, is_well_formed
 from imageshield.search.feedback import FeedbackSignal
 from imageshield.types import UserRef
@@ -903,6 +904,18 @@ IntelSourceKind = Literal[
 ]
 
 
+def _source_shape_problem(kind: str, source_url: str | None, query_text: str | None) -> str | None:
+    """One rule for a source's locator, wherever a source is named: a ``search_query`` carries
+    ``query_text`` and no ``source_url``; every other kind an https ``source_url`` and no query."""
+    if (kind == "search_query") != (source_url is None):
+        return "search_query takes query_text and no source_url; every other kind a source_url"
+    if (kind == "search_query") != (query_text is not None):
+        return "query_text is for search_query only"
+    if source_url is not None and not source_url.startswith("https://"):
+        return "source_url must be https"
+    return None
+
+
 class IntelSourceCreateRequest(ServiceModel):
     kind: IntelSourceKind
     source_url: str | None = None
@@ -914,14 +927,9 @@ class IntelSourceCreateRequest(ServiceModel):
 
     @model_validator(mode="after")
     def _shape(self) -> IntelSourceCreateRequest:
-        if (self.kind == "search_query") != (self.source_url is None):
-            raise ValueError(
-                "search_query takes query_text and no source_url; every other kind a source_url"
-            )
-        if (self.kind == "search_query") != (self.query_text is not None):
-            raise ValueError("query_text is for search_query only")
-        if self.source_url is not None and not self.source_url.startswith("https://"):
-            raise ValueError("source_url must be https")
+        problem = _source_shape_problem(self.kind, self.source_url, self.query_text)
+        if problem is not None:
+            raise ValueError(problem)
         if any(not is_well_formed(t) for t in self.tags) or len(set(self.tags)) != len(self.tags):
             raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
         return self
@@ -1064,3 +1072,48 @@ class IntelAppliedRequest(ServiceModel):
 
     scoring_version: str = Field(min_length=1, max_length=64)
     proposal_ids: tuple[UUID, ...] = Field(min_length=1, max_length=500)
+
+
+# ── likeness intel: sources per question and weight suggestions (step 5, spec §4.6, §4.10) ──
+
+
+class IntelQuestionBody(ServiceModel):
+    """The question a Suggest points press is about (spec §4.6, §4.10). ``tags`` is the backend's
+    option-to-tag rows for these options, keyed by option text, so it can hold rows for options
+    that exist only in a draft. Shape only here: services check membership only where a write
+    would give a new source a tag (POST /weight-suggestions)."""
+
+    question_key: str = Field(min_length=1, max_length=128)
+    prompt: str = Field(min_length=1, max_length=1000)
+    options: tuple[str, ...] = Field(min_length=1, max_length=MAX_QUESTION_OPTIONS)
+    tags: dict[str, tuple[str, ...]] | None = None
+    operator: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _question_shape(self) -> IntelQuestionBody:
+        if any(not option.strip() or len(option) > 200 for option in self.options):
+            raise ValueError("each option must be 1-200 characters and not blank")
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("options must be distinct")
+        for option, slugs in (self.tags or {}).items():
+            if option not in self.options:
+                raise ValueError("every tags key must be one of options")
+            if any(not is_well_formed(t) for t in slugs) or len(set(slugs)) != len(slugs):
+                raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
+        return self
+
+    def question_request(self) -> dict[str, Any]:
+        """The run's stored request: the question, never the operator (``requested_by`` holds
+        that). An absent ``tags`` stays absent: it means "use the vocabulary's map"."""
+        stored: dict[str, Any] = {
+            "question_key": self.question_key,
+            "prompt": self.prompt,
+            "options": list(self.options),
+        }
+        if self.tags is not None:
+            stored["tags"] = {option: list(slugs) for option, slugs in self.tags.items()}
+        return stored
+
+
+class IntelSourceProposalRequest(IntelQuestionBody):
+    """POST /source-proposals: stage 1 of spec §4.10."""
