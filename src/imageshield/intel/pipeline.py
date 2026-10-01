@@ -67,6 +67,7 @@ from imageshield.intel.bounds import (
     MIN_POLICY_TEXT_CHARS,
     PROPOSAL_CONTEXT_DAYS,
     PROPOSAL_CONTEXT_MAX_EVENTS,
+    PROPOSAL_CONTEXT_MAX_NEW_SIGNALS,
     PROPOSAL_CONTEXT_MAX_SIGNALS,
 )
 from imageshield.intel.evidence_store import (
@@ -98,7 +99,7 @@ from imageshield.intel.prompts import (
     extraction_request,
     proposal_request,
 )
-from imageshield.intel.proposal_models import GapRegenerateRequest, RenewalRequest
+from imageshield.intel.proposal_models import ContextSignal, GapRegenerateRequest, RenewalRequest
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.protection_store import (
     RENEWAL_EVIDENCE_GONE,
@@ -797,13 +798,15 @@ async def _generate(ctx: _Ctx) -> None:
     now = ctx.deps.clock()
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
+    run_signal_ids = [s.signal_id for s in new]
+    new = _newest(new, ctx)
     tags = sorted({t for s in new for t in s.tags})
     if regenerate is not None and regenerate.tag not in tags:
         # A gap's signals name the subject as unregistered, so they carry no tag: the newly
         # mapped tag is what finds related events and pending proposals.
         tags = sorted([*tags, regenerate.tag])
     related = await store.related_signals(
-        exclude=[s.signal_id for s in new],
+        exclude=run_signal_ids,
         tags=tags,
         categories=sorted({s.category for s in new}),
         since=now - timedelta(days=PROPOSAL_CONTEXT_DAYS),
@@ -868,6 +871,19 @@ async def _generate(ctx: _Ctx) -> None:
         ctx.counts["proposals_attached"] += len(result.attached)
     if result.attach_dropped:
         ctx.counts["attach_dropped_not_pending"] += result.attach_dropped
+
+
+def _newest(signals: list[ContextSignal], ctx: _Ctx) -> list[ContextSignal]:
+    """At most PROPOSAL_CONTEXT_MAX_NEW_SIGNALS of a run's new signals, the newest, in the order
+    given; the excess is counted on the run's outcome (final review M7). What the prompt is not
+    shown, the model cannot cite or attach, and it is left out of related evidence too."""
+    excess = len(signals) - PROPOSAL_CONTEXT_MAX_NEW_SIGNALS
+    if excess <= 0:
+        return signals
+    ctx.counts["proposal_new_signals_over_cap"] += excess
+    newest = sorted(signals, key=lambda s: (s.created_at, s.signal_id), reverse=True)
+    kept = {s.signal_id for s in newest[:PROPOSAL_CONTEXT_MAX_NEW_SIGNALS]}
+    return [s for s in signals if s.signal_id in kept]
 
 
 # ── protection renewal (step 4) ────────────────────────────────────────────────

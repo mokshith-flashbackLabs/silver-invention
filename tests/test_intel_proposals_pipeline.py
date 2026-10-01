@@ -390,6 +390,37 @@ async def test_a_gap_regenerate_run_proposes_events_from_the_signals_it_names(
     assert set(row["signal_ids"]) == set(signals) and row["approvable"] is True
 
 
+async def test_the_prompt_carries_the_newest_new_signals_up_to_the_cap_and_counts_the_rest(
+    intel_pool: AsyncConnectionPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Final review M7: the new-signal list is bounded like the related one, newest first, so
+    the input stays inside 0041's worst-case estimate. What is not shown is neither attach
+    evidence for the run nor related evidence."""
+    monkeypatch.setattr("imageshield.intel.pipeline.PROPOSAL_CONTEXT_MAX_NEW_SIGNALS", 2)
+    await seed_quiz_vocabulary(
+        intel_pool, map_version=2, document=mapped_document("LinkedIn", "linkedin")
+    )
+    oldest, middle, newest = [
+        await seed_signal(
+            intel_pool, subjects=("LinkedIn",), created_at=NOW - timedelta(hours=hours)
+        )
+        for hours in (3, 2, 1)
+    ]
+    await settle_runs(intel_pool)
+    await _queue_regeneration(
+        intel_pool, gap=uuid4(), tag="linkedin", signal_ids=[oldest, middle, newest]
+    )
+    calls = _spy_on_validation(monkeypatch)
+    model = FakeModel()
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert result.outcome["proposal_new_signals_over_cap"] == 1
+    payload = json.loads(model.proposal_users[0])
+    assert [s["signal_id"] for s in payload["new_evidence"]] == [str(middle), str(newest)]
+    assert str(oldest) not in model.proposal_users[0]
+    (call,) = calls
+    assert call["new_signal_ids"] == frozenset({middle, newest})
+
+
 async def test_a_regeneration_whose_evidence_was_retracted_makes_no_call(
     intel_pool: AsyncConnectionPool,
 ) -> None:

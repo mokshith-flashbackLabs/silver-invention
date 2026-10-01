@@ -55,6 +55,13 @@ COVERAGE_GAP_WINDOW_DAYS = 90
 COVERAGE_GAP_POOL_MAX = 2000
 PROPOSAL_CONTEXT_DAYS = 90
 PROPOSAL_CONTEXT_MAX_SIGNALS = 60
+# A run's own new signals the generation prompt carries, newest first; the rest are counted on
+# the run (proposal_new_signals_over_cap) and are never attach evidence for it (final review
+# M7, 2026-10-01). A weight suggestion may read 60 calls' worth of signals. Bounded, the input
+# stays inside the 60k tokens behind 0041's worst-case estimate: about 180 tokens a signal for
+# 40 new and 60 related (~18k), 40 each of pending proposals, live threats and live credits
+# (~14k), a registry of up to 300 tags (~12k), the quiz and the instructions (~8k).
+PROPOSAL_CONTEXT_MAX_NEW_SIGNALS = 40
 MAX_RATIONALE_CHARS = 2000
 MAX_GAP_SUBJECT_CHARS = 120
 MAX_SUGGESTED_QUESTION_CHARS = 300
