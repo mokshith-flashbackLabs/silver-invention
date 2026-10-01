@@ -565,13 +565,19 @@ def test_only_the_decision_path_moves_a_proposal_to_approved() -> None:
     """PERMANENT. INVARIANTS #48: no proposal takes effect except through ``decided``, values
     a named operator approved. Proposal statuses are SQL LITERALS by rule
     (intel/proposal_store.py), so this grep sees every transition. Verified to fire by adding
-    ``SET status = 'approved'`` to intel/reconcile.py."""
-    approve = re.compile(r"SET\s+status\s*=\s*'approved'", re.IGNORECASE)
-    hits = sorted(
-        {p.relative_to(SRC).as_posix() for p in _source_files() if approve.search(
-            p.read_text(encoding="utf-8"))}
-    )
-    assert hits == ["imageshield/intel/decisions.py"]
+    ``SET status = 'approved'`` to intel/reconcile.py. 'applied' too (final review M9): an
+    event approval goes straight to it and the acknowledgement moves an approved weight change
+    to it, both in decisions.py, so a second writer of either state is caught."""
+    for status in ("approved", "applied"):
+        moves = re.compile(rf"SET\s+status\s*=\s*'{status}'", re.IGNORECASE)
+        hits = sorted(
+            {
+                p.relative_to(SRC).as_posix()
+                for p in _source_files()
+                if moves.search(p.read_text(encoding="utf-8"))
+            }
+        )
+        assert hits == ["imageshield/intel/decisions.py"], status
     # Scoped to intel_proposals' SET clause, anywhere in it: intel/store.py's
     # ``UPDATE intel_runs SET status = %s`` is a run's status, legitimately a parameter.
     parameterised = re.compile(
@@ -583,7 +589,8 @@ def test_only_the_decision_path_moves_a_proposal_to_approved() -> None:
     for path in sorted(INTEL.rglob("*.py")):
         text = path.read_text(encoding="utf-8")
         for match in re.finditer(r"INSERT\s+INTO\s+intel_proposals\b", text, re.IGNORECASE):
-            assert "'approved'" not in text[match.end() : match.end() + 600], path.name
+            inserted = text[match.end() : match.end() + 600]
+            assert "'approved'" not in inserted and "'applied'" not in inserted, path.name
 
 
 def test_only_the_threat_store_and_the_decision_path_insert_threat_events() -> None:
