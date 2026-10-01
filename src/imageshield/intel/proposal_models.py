@@ -287,3 +287,11 @@ class ReconcileResult:
     map_version: int
     retargeted: int
     superseded: int
+
+
+@dataclass(frozen=True)
+class GapPass:
+    """One gap pass of the reconcile (spec §4.9): gaps resolved, regenerations queued again."""
+
+    resolved: int
+    retried: int

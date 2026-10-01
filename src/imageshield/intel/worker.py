@@ -44,13 +44,16 @@ def _build_model(config: IntelConfig) -> IntelModel:
 
 
 async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
-    """One pass: reconcile a new vocabulary, expire exhausted runs, schedule due
-    sources, claim at most one run, execute it, finish it. Returns whether a run was executed,
-    so the caller can poll again immediately while there is work and back off once
-    the queue is empty."""
+    """One pass: reconcile a new vocabulary, resolve newly mapped gaps, expire exhausted runs,
+    schedule due sources, claim at most one run, execute it, finish it. Returns whether a run
+    was executed, so the caller can poll again immediately while there is work and back off
+    once the queue is empty."""
     now = deps.clock()
-    # spec §4.9: react to a new vocabulary within one poll, before any run loads it.
+    # spec §4.9: react to a new vocabulary within one poll, before any run loads it; then
+    # resolve every pending gap the live quiz now maps (state-based), so its regeneration run
+    # is claimable on this same tick.
     await deps.reconciler.reconcile()
+    await deps.reconciler.resolve_gaps(now)
     await deps.store.expire_exhausted(now)
     await deps.store.schedule_due(now)
     claimed = await deps.store.claim_next(now, lease_seconds=lease_seconds)

@@ -118,15 +118,27 @@ class ScoringVocabulary:
             for r in self.renamed
         )
 
+    def tag_keys(self, slug: str) -> frozenset[str]:
+        """The normalised slug and label a subject is compared against (spec §4.9)."""
+        entry = self.tags.get(slug)
+        label = entry.label if entry is not None else slug
+        return frozenset({normalise_subject(slug), normalise_subject(label)})
+
+    def mapped_tag_for(self, subject_key: str, suggested_slug: str | None = None) -> str | None:
+        """The MAPPED tag a normalised subject names, or None. A suggested tag that is mapped
+        wins; otherwise the first mapped tag, in slug order, whose slug or label normalises to
+        the subject. Exact, never fuzzy (§4.9)."""
+        if suggested_slug is not None and suggested_slug in self.mapped_tags:
+            return suggested_slug
+        for slug in sorted(self.mapped_tags):
+            if subject_key in self.tag_keys(slug):
+                return slug
+        return None
+
     def subject_is_mapped(self, subject_key: str) -> bool:
         """Whether a normalised subject already names a MAPPED tag, by slug or label. The quiz
         covers such a subject, so it is never a coverage gap."""
-        for slug in self.mapped_tags:
-            entry = self.tags.get(slug)
-            label = entry.label if entry is not None else slug
-            if subject_key in (normalise_subject(slug), normalise_subject(label)):
-                return True
-        return False
+        return self.mapped_tag_for(subject_key) is not None
 
 
 def _int(value: Any) -> int:

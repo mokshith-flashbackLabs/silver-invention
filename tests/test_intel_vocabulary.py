@@ -9,7 +9,13 @@ import pytest
 from imageshield.intel.cells import cell_problem, published_unacknowledged, stale_reason
 from imageshield.intel.models import Vocabulary
 from imageshield.intel.vocabulary import normalise_subject, parse_vocabulary
-from tests.intel_fakes import QUIZ_VOCABULARY, VOCABULARY, quiz_document, scoring
+from tests.intel_fakes import (
+    QUIZ_VOCABULARY,
+    VOCABULARY,
+    mapped_document,
+    quiz_document,
+    scoring,
+)
 
 
 def _renamed(entries: list[tuple[int, str, str]]) -> list[dict[str, object]]:
@@ -103,6 +109,16 @@ def test_subject_is_mapped_only_for_a_mapped_tags_slug_or_label() -> None:
     assert v.subject_is_mapped("instagram")
     assert not v.subject_is_mapped("linkedin")  # registered, unmapped
     assert not v.subject_is_mapped("bumble")  # unregistered
+
+
+def test_mapped_tag_for_prefers_the_suggested_tag_then_an_exact_slug_or_label() -> None:
+    v = scoring(mapped_document("LinkedIn", "linkedin"), map_version=2)
+    assert v.mapped_tag_for("anything at all", "linkedin") == "linkedin"
+    assert v.mapped_tag_for(normalise_subject("LinkedIn")) == "linkedin"
+    assert v.mapped_tag_for(normalise_subject("LinkedIn"), "tiktok") == "linkedin"
+    assert v.mapped_tag_for(normalise_subject("Linked In")) is None  # exact, never fuzzy
+    assert scoring().mapped_tag_for(normalise_subject("LinkedIn")) is None  # registered, unmapped
+    assert v.tag_keys("linkedin") == frozenset({"linkedin"})
 
 
 @pytest.mark.parametrize(
