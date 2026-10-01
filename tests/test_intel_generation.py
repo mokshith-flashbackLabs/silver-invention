@@ -510,6 +510,40 @@ def test_an_attach_is_dropped_whole_for_a_retracted_absent_or_malformed_signal()
     assert counts["attach_dropped_signal_not_new"] == 4
 
 
+def test_an_attach_needs_a_signal_that_concerns_its_target() -> None:
+    """Final review M2: corroboration counts every linked publisher, so an attached signal must
+    share a tag with the target -- or, carrying no tag, a category with its active evidence --
+    and the whole attach is dropped otherwise."""
+    other_tag = replace(_sig(tags=("linkedin",), publisher="b.example"), category="incident")
+    untagged_same = replace(_sig(publisher="c.example"), category="incident")
+    untagged_other = _sig(publisher="d.example")  # category policy
+    shared = _sig(tags=("linkedin", "instagram"), publisher="e.example")
+    pid = uuid4()
+    target = replace(_pending(pid), categories=frozenset({"incident"}))
+    signals = [other_tag, untagged_same, untagged_other, shared]
+    out = ProposalOutput(
+        attach=[
+            ProposedAttach(proposal_id=str(pid), signal_ids=[str(s.signal_id)]) for s in signals
+        ]
+    )
+    batch, counts = _validate(
+        out, signals, pending={pid: target}, new={s.signal_id for s in signals}
+    )
+    assert batch.attachments == [
+        Attachment(pid, (untagged_same.signal_id,)),
+        Attachment(pid, (shared.signal_id,)),
+    ]
+    assert counts["attach_dropped_unrelated"] == 2
+    both = ProposedAttach(
+        proposal_id=str(pid), signal_ids=[str(shared.signal_id), str(other_tag.signal_id)]
+    )
+    new = {shared.signal_id, other_tag.signal_id}
+    batch, counts = _validate(
+        ProposalOutput(attach=[both]), signals, pending={pid: target}, new=new
+    )
+    assert batch.attachments == [] and counts["attach_dropped_unrelated"] == 1
+
+
 def test_a_regeneration_writes_events_and_nothing_else() -> None:
     s = _sig(tags=("instagram",))
     pool = _bumble_pool("a.example", "b.example", "c.example")

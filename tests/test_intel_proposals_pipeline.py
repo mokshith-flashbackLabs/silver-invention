@@ -328,6 +328,37 @@ async def test_the_same_incident_read_again_adds_evidence_rather_than_a_second_p
     assert await _rows(intel_pool, "SELECT count(*) FROM intel_proposal_signals") == [(2,)]
 
 
+async def test_a_page_read_again_after_its_only_signal_was_retracted_opens_a_fresh_proposal(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Final review M1. The first proposal's only signal was retracted, so it is no duplicate
+    candidate and no attach target: the same incident read again is written as a NEW proposal
+    from the new evidence, and the old one is not revived by an attachment (spec §3.5)."""
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresIntelStore(intel_pool)
+    fetcher = FakeFetcher({URL: make_page(POLICY, URL)})
+    await store.queue_adhoc(URL, operator="a")
+    await run_once(
+        intel_pool, make_deps(intel_pool, fetcher, _model(propose_with=propose_threat()))
+    )
+    ((first, retracted),) = await _rows(
+        intel_pool, "SELECT proposal_id, signal_id FROM intel_proposal_signals"
+    )
+    assert await PostgresEvidenceStore(intel_pool).retract_signal(
+        retracted, operator="ann", reason="wrong page"
+    ) == "retracted"
+    await store.queue_adhoc(URL, operator="b")
+    model = _model(propose_with=propose_threat())
+    second = await run_once(intel_pool, make_deps(intel_pool, fetcher, model))
+    assert json.loads(model.proposal_users[0])["pending_events"] == []
+    assert second.outcome["proposals_written"] == 1
+    assert "proposal_converted_to_attach" not in second.outcome
+    assert await _rows(
+        intel_pool, f"SELECT count(*) FROM intel_proposal_signals WHERE proposal_id = '{first}'"
+    ) == [(1,)]
+    assert await _rows(intel_pool, "SELECT count(*) FROM intel_proposals") == [(2,)]
+
+
 async def test_a_gap_regenerate_run_proposes_events_from_the_signals_it_names(
     intel_pool: AsyncConnectionPool,
 ) -> None:

@@ -346,6 +346,34 @@ async def test_pending_event_proposals_are_the_open_overlapping_ones_with_their_
     assert await store.pending_event_proposals(tags=[], limit=40) == []
 
 
+async def test_pending_event_proposals_read_only_active_evidence(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Final review M1: a retracted signal is excluded everywhere (spec §3.5). It leaves a
+    proposal's ids, pages and categories, and a proposal left with none is no candidate."""
+    await seed_quiz_vocabulary(intel_pool)
+    kept = await seed_signal(intel_pool, tags=("instagram",), category="incident")
+    gone = await seed_signal(intel_pool, tags=("instagram",), category="policy")
+    lone = await seed_signal(intel_pool, tags=("instagram",))
+    both = await seed_threat_proposal(intel_pool, signal_ids=[kept, gone])
+    await seed_threat_proposal(intel_pool, signal_ids=[lone])
+    evidence = PostgresEvidenceStore(intel_pool)
+    for sid in (gone, lone):
+        assert await evidence.retract_signal(sid, operator="ann", reason="wrong") == "retracted"
+    (found,) = await PostgresProposalStore(intel_pool).pending_event_proposals(
+        tags=["instagram"], limit=40
+    )
+    page = await _scalar(
+        intel_pool,
+        "SELECT d.url_hash FROM intel_signals s JOIN intel_documents d USING (document_id)"
+        " WHERE s.signal_id = %s",
+        kept,
+    )
+    assert found.proposal_id == both and found.signal_ids == (kept,)
+    assert found.document_keys == frozenset({page})
+    assert found.categories == frozenset({"incident"})
+
+
 async def test_active_threat_events_are_live_tagged_and_carry_the_approvals_evidence(
     intel_pool: AsyncConnectionPool,
 ) -> None:

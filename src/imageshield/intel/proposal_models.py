@@ -261,7 +261,8 @@ class ProposalRecord:
 class PendingEvent:
     """A pending event proposal as generation reads it: for the prompt, for attach
     validation, and for duplicate detection (same kind and tag set, a shared document --
-    ``document_keys`` are its signals' documents' canonical URL hashes)."""
+    ``document_keys`` are its signals' documents' canonical URL hashes). Every evidence field
+    is over its ACTIVE signals only; ``categories`` are theirs, for the attach floor."""
 
     proposal_id: UUID
     kind: str
@@ -270,6 +271,7 @@ class PendingEvent:
     severity: int | None
     signal_ids: tuple[UUID, ...]
     document_keys: frozenset[str]
+    categories: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

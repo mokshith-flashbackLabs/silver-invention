@@ -105,10 +105,16 @@ _LIVE_EVENTS_SQL = """
      LIMIT %(limit)s
 """
 
+# Over ACTIVE signals only (spec §3.5: a retracted signal is excluded everywhere). A proposal
+# whose every signal was retracted is no duplicate candidate and no attach target, so a page
+# read again opens a fresh proposal written from the new evidence rather than reviving it
+# (final review M1, 2026-10-01). ``categories`` feeds the attach floor (M2).
 _PENDING_EVENTS_SQL = """
     SELECT p.proposal_id, p.kind, p.target, p.suggested,
-           array_agg(ps.signal_id ORDER BY ps.signal_id) AS signal_ids,
-           array_agg(DISTINCT d.url_hash) AS document_keys
+           array_agg(ps.signal_id ORDER BY ps.signal_id)
+             FILTER (WHERE s.status = 'active') AS signal_ids,
+           array_agg(DISTINCT d.url_hash) FILTER (WHERE s.status = 'active') AS document_keys,
+           array_agg(DISTINCT s.category) FILTER (WHERE s.status = 'active') AS categories
       FROM intel_proposals p
       JOIN intel_proposal_signals ps ON ps.proposal_id = p.proposal_id
       JOIN intel_signals s ON s.signal_id = ps.signal_id
@@ -116,6 +122,7 @@ _PENDING_EVENTS_SQL = """
      WHERE p.kind = ANY(%(kinds)s::text[]) AND p.status = 'pending'
        AND ARRAY(SELECT jsonb_array_elements_text(p.target -> 'tags')) && %(tags)s::text[]
      GROUP BY p.proposal_id
+    HAVING bool_or(s.status = 'active')
      ORDER BY p.created_at DESC, p.proposal_id DESC
      LIMIT %(limit)s
 """
@@ -193,6 +200,7 @@ def _pending_event(row: dict[str, Any]) -> PendingEvent:
         severity=severity if isinstance(severity, int) and not isinstance(severity, bool) else None,
         signal_ids=tuple(row["signal_ids"]),
         document_keys=frozenset(row["document_keys"]),
+        categories=frozenset(row["categories"]),
     )
 
 
@@ -414,8 +422,9 @@ class PostgresProposalStore:
         self, *, tags: Sequence[str], limit: int
     ) -> list[PendingEvent]:
         """Pending event proposals whose tags overlap ``tags``, newest first, bounded, each with
-        its linked signals and their documents (spec §4.3: prompt context, attach targets and
-        duplicate candidates)."""
+        its ACTIVE linked signals, their documents and categories (spec §4.3: prompt context,
+        attach targets and duplicate candidates). One whose every signal was retracted is left
+        out (§3.5)."""
         if not tags:
             return []
         async with self._pool.connection() as conn:

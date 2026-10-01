@@ -528,8 +528,8 @@ def _attachment(
     counts: Counter[str],
 ) -> Attachment | None:
     """spec §4.3: the target must be a pending EVENT proposal the run loaded, and every signal
-    the run's own new, active evidence. The write transaction re-checks that the target is
-    still pending (intel/proposal_store.py)."""
+    the run's own new, active evidence that concerns the target (``_concerns_target``). The
+    write transaction re-checks that the target is still pending (intel/proposal_store.py)."""
     try:
         proposal_id = UUID(item.proposal_id)
     except ValueError:
@@ -552,9 +552,22 @@ def _attachment(
         if signal_id not in new_signal_ids or signal is None or signal.status != "active":
             counts["attach_dropped_signal_not_new"] += 1
             return None
+        if not _concerns_target(signal, pending[proposal_id]):
+            counts["attach_dropped_unrelated"] += 1
+            return None
         if signal_id not in ids:
             ids.append(signal_id)
     return Attachment(proposal_id, tuple(ids))
+
+
+def _concerns_target(signal: ContextSignal, target: PendingEvent) -> bool:
+    """The code floor under an attach (final review M2, 2026-10-01). Corroboration counts every
+    linked signal's publisher, so the model's word that a second domain "backs" a proposal must
+    not be enough on its own: a TAGGED signal shares a tag with the target, and an untagged one,
+    which has no tag to compare, shares a category with the target's own active evidence."""
+    if signal.tags:
+        return bool(set(signal.tags) & set(target.tags))
+    return signal.category in target.categories
 
 
 def prompt_signal(signal: ContextSignal) -> PromptSignal:
