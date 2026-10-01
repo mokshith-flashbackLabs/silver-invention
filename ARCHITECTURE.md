@@ -526,8 +526,8 @@ through one more metered call (`INTEL_PROPOSAL_MODEL`). A proposal is validated 
 - The backend acknowledges a published change on `POST /proposals/applied`.
 - The worker's reconcile keeps pending weight changes in step with every new vocabulary.
 
-The admin surface is fourteen routes (step 1's ten plus four). Quiz weight suggestions (step 5) and events (steps 3
-and 4) are still to come.
+The admin surface is fourteen routes (step 1's ten plus four). Quiz weight suggestions (step 5) are still to come; events
+(steps 3 and 4) are built, see below.
 
 *Built 2026-09-30 (step 3):* threat events.
 - The generation call also proposes `threat_event`s aimed at exposure tags, and attaches new evidence to a pending
@@ -539,7 +539,17 @@ and 4) are still to come.
   re-proposes its evidence as event proposals.
 - Hand-created threat events accept `tags`.
 
-Protection events and renewal (step 4) are still to come.
+*Built 2026-09-30 (step 4):* protection credits.
+- The generation call also proposes `protection_event`s aimed at exposure tags, never global ones: a global credit
+  exists only by an operator's edit on approval.
+- Approving one needs the operator's attestation that it applies wherever a person lives, and inserts the credit from
+  `decided` in the decision's transaction (migration 0044, `protection_events`). `svc.v_active_scoped_events` carries
+  it beside tag-scoped threats, and the backend adds its capped credit to the score.
+- A credit lapses at its review date. Thirty days before, the worker fetches the pages behind its cited excerpts
+  again, re-verifies each verbatim with no model call (`intel/renewal.py`), and writes a pending renewal an operator
+  must approve; an approved renewal starts exactly where the old credit stops.
+- `GET /protection-events` and `POST /protection-events/{id}/retract` are the two new admin routes. A retraction also
+  retracts the credit's unstarted renewal and rejects its pending one.
 
 **Disabled in both environments until an owner action.** `INTEL_ENABLED=false` on both dev and prod
 `intel-worker` containers, `claude_intel` seeded disabled with a NULL `daily_budget_usd`

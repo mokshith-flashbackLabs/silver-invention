@@ -857,6 +857,88 @@ while an active or draft tag-only threat exists, so retract those first.
 10. **A model-proposed threat's `body` is `''`** (flag 4), and on `v_active_scoped_events` too.
 11. **`applied_ref` is the new event's id as a canonical UUID string.**
 
+### Likeness intel admin surface (step 4 — protection credits)
+
+**New 2026-09-30.** Something that lowers the risk to people exposed through an exposure tag becomes a
+`protection_event` proposal. Approving one needs `applies_regardless_of_location: true` (a protection limited to some
+places is rejected, never approved) and creates the credit in the same transaction: `status: "applied"` with the
+credit's id in `applied_ref`. It is on `svc.v_active_scoped_events` as a `direction = 'protection'` row from its
+`starts_at`. Thirty days before a credit's review date we fetch its cited pages again and propose a renewal; an
+unrenewed credit leaves the view at `review_by`. Two new routes list and retract credits. Tag refusals are
+`unknown_tag` / `tag_retired` with `error.slugs`, as for threats.
+
+Every services route the backend calls in step 4, and the view it reads. Both tokens (`X-Service-Token`,
+`X-Admin-Service-Token`) on every call; every body is `extra='forbid'`. Errors use the envelope `{error: {code,
+message, retryable, request_id}}`, with extra fields inside `error` where named. Every route also answers the framework
+`401` and `422 validation_error` for a body or query that fails its own shape.
+
+| # | Route | Body / query | Success | Semantic errors |
+|---|---|---|---|---|
+| 1 | `POST /v1/admin/intel/proposals/{proposal_id}/decision` (the protection half) | `{decision: "approved"\|"rejected", values?: {title?, strength?, review_in_days?, tags?, is_global?}, reason: 3–500, applies_regardless_of_location?: boolean, operator: 1–64}`. `values` is **merged** over `suggested` and the target's `tags` and `is_global`; any subset of the five keys. Making a credit global: `{is_global: true, tags: []}`; narrowing a global one: `{is_global: false, tags: [...]}`. An approval requires `applies_regardless_of_location: true`, a strict JSON boolean; a rejection needs none. `values` on a rejection is `422 validation_error`. | Approve: `200 {proposal_id, kind: "protection_event", status: "applied", applied_ref: "<event uuid>", decided: {title, strength, review_in_days, tags, is_global, applies_regardless_of_location: true}}`. A new credit starts now and is on the view at once. A renewal (`target.renews_event_id`) starts at the old credit's `review_by`, so it is on the view only from then. Reject: `200 {…, status: "rejected", applied_ref: null, decided: null}`. | `404 proposal_not_found`; `409 proposal_not_pending` (also: the credit a renewal continues was retracted or already renewed), `proposal_evidence_retracted`, `proposal_uncorroborated`, `proposal_tags_unmapped` (the proposal's own tags, or the edited final tags, are all unmapped and it is not global); `422 values_out_of_bounds` (strength outside 1–5, review outside 30–366, both or neither of tags and global, an unknown key, or the attestation missing or false); `422 unknown_tag` with `error.slugs`; `422 tag_retired` with `error.slugs`; `422 validation_error` (body shape, including a non-boolean attestation) |
+| 2 | `GET /v1/admin/intel/proposals/{proposal_id}` | — | Step 3's shape. A `protection_event`'s `related_events` are the live credits overlapping its tags plus every live global credit, never its own: `RelatedProtection` items. A threat's are unchanged. A renewal's `target` carries `renews_event_id`. | `404 proposal_not_found` |
+| 3 | `GET /v1/admin/intel/proposals?kind=protection_event` | unchanged | rows appear `pending`, `approvable` per the one predicate. Renewals appear too, with `model_id: "code:renewal"` and `prompt_version: "renewal-v1"`. | unchanged |
+| 4 | `GET /v1/admin/intel/protection-events?status=&cursor=&limit=` (**new**) | `status` repeatable, `active` · `retracted` (anything else `422 validation_error`); keyset on `(created_at, event_id)`, newest first; `limit` 1–200, default 50 | `200 {events: [ProtectionEvent], next_cursor: string \| null}` | `422 invalid_cursor` |
+| 5 | `POST /v1/admin/intel/protection-events/{event_id}/retract` (**new**) | `{reason: 3–500, operator: 1–64}` | `200 {event_id, status: "retracted", also_retracted: [uuid], renewal_proposals_rejected: [uuid]}`: BOTH are lists of UUID strings, not counts. `also_retracted` is the credit's renewal that had not started (it credited nobody yet); `renewal_proposals_rejected` is the ids of its pending renewal proposals that were rejected (one being decided at that instant is skipped and stays pending; its approval is then `409 proposal_not_pending`). A repeat retract of a retracted credit answers 200 with both lists empty and writes nothing. | `404 protection_event_not_found` (unknown id, a threat's included) |
+| 6 | `GET /v1/admin/intel/runs` | unchanged | may list runs of kind `renewal_check` (`requested_by: "schedule"`, `source_id: null`, `request: {event_id}`); outcome keys `renewal_proposed`, `renewal_evidence_gone`, `renewal_evidence_unreachable`, `renewal_not_due`, `renewal_excerpts_checked`, `renewal_excerpts_verified`, `renewal_excerpt_dropped_<reason>` | — |
+
+**`ProtectionEvent`** is `{event_id, title, body ("" always), strength: int 1–5, tags: string[], is_global: bool,
+starts_at, review_by, status: "active"|"retracted", state: "scheduled"|"live"|"lapsed"|"retracted", renewal_due:
+bool, renewal: null | {run_id: uuid|null, run_status: string|null, result:
+"proposed"|"evidence_gone"|"evidence_unreachable"|"not_due"|null, error_code: string|null, completed_at:
+timestamptz|null, proposal_id: uuid|null, proposal_status: string|null}, proposal_id: uuid, renews_event_id:
+uuid|null, created_by, created_at, retracted_by, retracted_at, retract_reason}`. `renewal_due` is a live credit
+within 30 days of `review_by` that no renewal continues yet.
+
+**`RelatedProtection`** is `{event_id: uuid, direction: "protection", kind: "protection", title: string, strength:
+int 1–5, tags: string[], is_global: bool, starts_at: timestamptz, review_by: timestamptz, proposal_id: uuid}`.
+
+**`svc.v_active_scoped_events`** (re-created by 0044), granted `SELECT` to `imageshield_proxy_ro`. **Columns and types
+are unchanged** — the backend's `CONTRACT_VIEW_COLUMNS` and `CONTRACT_VIEW_TYPES` need no edit:
+
+| Column | Type (`format_type`) | Threat half (0042, unchanged) | Protection half (0044) |
+|---|---|---|---|
+| `event_id` | `uuid` | `threat_events.event_id` | `protection_events.event_id` |
+| `direction` | `text` | `'threat'` | `'protection'` |
+| `kind` | `text` | `threat_events.kind` | `'protection'` |
+| `title` | `text` | `title` | `title` |
+| `body` | `text` | `body` | `body` (`''` for every intel-approved credit) |
+| `magnitude` | `smallint` | `severity` | `strength` (1–5) |
+| `tags` | `text[]` | `tags` | `tags` (`'{}'` on a global credit) |
+| `is_global` | `boolean` | `is_global` | `is_global` |
+| `starts_at` | `timestamp with time zone` | `starts_at` | `starts_at` |
+| `ends_at` | `timestamp with time zone` | `expires_at` | `review_by` |
+
+Rows of the protection half: `status = 'active' AND starts_at <= now() AND review_by > now()`. No person column.
+**Deploy:** services' 0044 first on the way up; the backend first on the way down. 0044's down drops every credit, so
+on a real environment retract them (and let the backend clear its credit) first.
+
+**Notes for your step-4 build** (the services spec wins where the two differ).
+
+Answers to the seven assumptions the backend's step-4 build made:
+
+| Assumption | Answer |
+|---|---|
+| 1. `values` keys `{title, strength, review_in_days, tags, is_global}`, partial, merged over `suggested` and `target.{tags, is_global}`; global is `{is_global: true, tags: []}` | **Confirmed.** The merge does NOT drop the target's tags: `{is_global: true}` alone is `422 values_out_of_bounds` (D5) |
+| 2. A protection approval without `applies_regardless_of_location: true` is `422 values_out_of_bounds`; `decided` echoes it as `true` | **Confirmed**, and `false` is refused the same way. A non-boolean is `422 validation_error` (D4) |
+| 3. `422 unknown_tag` / `422 tag_retired` with `error.slugs`, like threats | **Confirmed** (the controller's ruling, recorded in spec §4.7). Only tags the edit ADDS are checked (D6) |
+| 4. `applied_ref` is the new event's canonical UUID; a renewal's is the NEW event, starting at the renewed event's `review_by` | **Confirmed** |
+| 5. The retract answers `200 {event_id, status: 'retracted'}`; a repeat answers 200; a non-protection id (a threat's included) is `404 protection_event_not_found` | **Confirmed, and the body is a superset** (D2) |
+| 6. The list envelope is `{events, next_cursor}`, keyset on `cursor` and `limit` | **Confirmed.** The rows carry more than C3 names (D1), and the route takes an optional filter (D3) |
+| 7. The view's protection half is exactly §3.7's SQL; `strength` is `SMALLINT`, so `magnitude` stays `smallint` | **Confirmed.** The migration the backend's Task 9 diffs against is `migrations/0044_intel_protection_events.up.sql` |
+
+The differences. Each D-row names who owes a fix. None changes a backend code path's correctness:
+
+| # | Difference | Services (this plan) | Fix owed |
+|---|---|---|---|
+| D1 | **The list row's renewal state is a `renewal` object, not the raw run outcome** | each row carries `state` (`scheduled` · `live` · `lapsed` · `retracted`), `renewal_due`, and `renewal`: `null` or `{run_id, run_status, result, error_code, completed_at, proposal_id, proposal_status}`, where `result` is `proposed` · `evidence_gone` · `evidence_unreachable` · `not_due` (or `null` while undecided). Also `body`, `created_by`, `created_at`, `retracted_by`, `retracted_at`, `retract_reason` | **Backend**: the control-room contract §4 reads `renewal.result === "evidence_gone"` (and names `state`, `evidence_unreachable` = "checked again tomorrow"); the fake's rows gain `state` and `renewal`. The relay is verbatim, so no route code changes |
+| D2 | **The retract body is a superset** | `{event_id, status: "retracted", also_retracted: uuid[], renewal_proposals_rejected: uuid[]}`. `also_retracted` is the credit's approved renewal that had not started; it was never on the view and credited nobody, so it needs no fan-out. A repeat retract answers 200 with both lists empty and writes nothing | **Backend (optional)**: the fake returns both lists, and the control-room contract §5 may say "also retracted its scheduled renewal". The before-read of the matches stays correct: a renewal that had started is its own event and is untouched |
+| D3 | **The list takes an optional filter** | `status` (repeatable, `active` · `retracted`); without it, every credit | **None required.** Unfiltered is every credit. Add `status` to the strict query only if the panel wants the filter |
+| D4 | **The attestation's strictness** | `false` is `422 values_out_of_bounds` like a missing one; `"true"` or `1` is `422 validation_error` | **None.** Both mappings already exist (`INTEL_VALUES_OUT_OF_BOUNDS`, `VALIDATION_FAILED`) |
+| D5 | **Making a credit global needs both halves** | `{is_global: true}` alone merges over the target's tags, which is both scopes: `422 values_out_of_bounds` | **Backend**: the panel contract must say the `tags: []` is REQUIRED, not harmless. Narrowing a global credit is `{is_global: false, tags: [...]}` |
+| D6 | **Which tags are refused** | only tags the edit ADDS: unregistered → `unknown_tag`, retired → `tag_retired`. A retired tag already on the target, a renewal's carried-forward tags included, is approvable with no `values` | **None.** The retry is still right. The panel should not tell an operator to drop a retired tag that was already on the proposal |
+| D7 | **A renewal whose credit was retracted or already renewed** | `409 proposal_not_pending` (message: "The protection this renews is no longer active." / "…has already been renewed.") | **None.** No new code. The panel's copy for that code may cover the case |
+| D8 | **Renewal proposals and renewal runs on the existing reads** | a renewal is an ordinary pending `protection_event` proposal with `target.renews_event_id`, `model_id: "code:renewal"`, `prompt_version: "renewal-v1"`. `GET /runs` lists `kind: "renewal_check"` runs (`requested_by: "schedule"`, `source_id: null`, `request: {event_id}`) with outcome keys `renewal_proposed`, `renewal_evidence_gone`, `renewal_evidence_unreachable`, `renewal_not_due`, `renewal_excerpts_checked`, `renewal_excerpts_verified`, `renewal_excerpt_dropped_<reason>` | **Backend (contract only)**: the control-room contract gives the panel words for the `renewal_check` kind and those keys, and labels a `code:renewal` proposal "Renewal" |
+
 
 ---
 
@@ -917,7 +999,7 @@ feedback signal and a new `hit_status` value threaded through both `v_person_hit
 | `svc.v_person_recommendations` *(0023)* | `rec_id`, `person_ref`, `kind`, `params`, `status`, `source_event_id`, `created_at`, `completed_at`, `expires_at` — **granted, no longer written (2026-09-24)** |
 | `svc.v_person_threat_context` *(0023)* | `person_ref`, `event_id`, `kind`, `title`, `body`, `severity`, `starts_at`, `expires_at` — pre-filtered to `status = 'active' AND expires_at > now()`; a `draft` or `retracted` event never appears here |
 | `svc.v_articles` *(0026)* | `article_id`, `title`, `summary`, `body`, `images`, `sources`, `published_at`, `updated_at` — published rows only; operator content for every user, no person column |
-| `svc.v_active_scoped_events` *(0042)* | `event_id`, `direction`, `kind`, `title`, `body`, `magnitude`, `tags`, `is_global`, `starts_at`, `ends_at` — **events, never people**: the threat half is active, started, unexpired threats carrying at least one tag; step 4 adds the protection half as a UNION. Required by our `/readyz`; optional on yours |
+| `svc.v_active_scoped_events` *(0042)* | `event_id`, `direction`, `kind`, `title`, `body`, `magnitude`, `tags`, `is_global`, `starts_at`, `ends_at` — **events, never people**: the threat half is active, started, unexpired threats carrying at least one tag; since 0044 (step 4) the protection half joins as a UNION: `direction` and `kind` `'protection'`, `magnitude` the strength, `ends_at` the review date, `tags` empty on a global credit, `body` always `''`. Required by our `/readyz`; optional on yours |
 
 **`v_person_score`, `v_person_score_events` and `v_person_recommendations` write no data since
 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`) — the protection score is
@@ -1036,6 +1118,8 @@ GRANT SELECT ON svc.v_person_score, svc.v_person_score_events,
 -- 0026, same role, same idiom:
 GRANT SELECT ON svc.v_articles TO imageshield_proxy_ro;
 -- 0042, same role, same idiom:
+GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
+-- 0044 re-created the view with CREATE OR REPLACE and re-issued the grant:
 GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
 ```
 

@@ -825,6 +825,10 @@ override lane) and `::test_a_subject_cannot_overturn_a_machine_confirm`.
 - *Step 3, 2026-09-30:* a threat event reaches `threat_events` from intel only through the decision route, inserted
   from `decided` in the approval's transaction with `proposal_id` set (`intel/decisions.py`). Nothing the model
   writes creates one.
+- *Step 4, 2026-09-30:* a protection credit exists only as a named operator's approval: `protection_events.proposal_id`
+  is NOT NULL, and only `intel/decisions.py` inserts one, from `decided`, with the operator's attestation that it
+  applies regardless of location. A renewal is written by code, never by the model, and approved like any other
+  proposal.
 - There is no timeout, confidence level or source trust that auto-approves.
 - A known hit location is never fetched for it.
 - An operator query must not name an individual. That is policy, and the PII-shape refusal is its only enforcement.
@@ -833,7 +837,8 @@ Check: the boundary tests (§6.1), the shape CHECKs (§3.6), and a test that no 
 `approved` except the decision route: `tests/test_boundaries.py::test_only_the_decision_path_moves_a_proposal_to_approved`
 `tests/test_intel_decisions.py::test_approvable_on_the_read_equals_the_decision_not_409ing`,
 `tests/test_boundaries.py::test_only_the_threat_store_and_the_decision_path_insert_threat_events`
-and `tests/test_intel_decisions.py::test_approving_a_threat_creates_the_event_from_decided_in_one_transaction`.
+and `tests/test_intel_decisions.py::test_approving_a_threat_creates_the_event_from_decided_in_one_transaction`,
+`tests/test_boundaries.py::test_only_the_decision_path_inserts_protection_events`.
 
 **49. Every citation is a verbatim substring of text we fetched.**
 - An excerpt's normalised text is a substring of the normalised document text fetched through our fetcher, at the
@@ -843,7 +848,8 @@ and `tests/test_intel_decisions.py::test_approving_a_threat_creates_the_event_fr
 - An excerpt holding a phone- or email-shaped run is dropped, never redacted. Model-written text is masked.
 - A renewal re-verifies every excerpt before it can be proposed.
 
-Check: a fabricated quote is rejected; a paraphrase is rejected; a PII-bearing quote is dropped.
+Check: a fabricated quote is rejected; a paraphrase is rejected; a PII-bearing quote is dropped; a renewal whose excerpts no longer verify writes no proposal
+(`tests/test_intel_renewal.py::test_a_renewal_whose_excerpts_no_longer_verify_writes_nothing_and_the_credit_lapses`).
 
 **50. A web-only claim needs corroboration.** A proposal whose every active signal came from model web search cannot
 be approved until signals from at least `CORROBORATION_MIN_PUBLISHERS` distinct registrable domains back it. One

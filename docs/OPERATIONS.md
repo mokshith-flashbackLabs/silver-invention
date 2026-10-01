@@ -359,6 +359,23 @@ at least a budget outage will not also relax everyone's cadence.
   (`POST /v1/admin/threat-events/{id}/retract`); the proposal stays `applied` as the record of the approval.
 - **Migration 0042's down refuses while an active or draft threat is scoped by tags alone.** Retract those first.
 
+**Protection credits and renewal (step 4, 2026-09-30).**
+- **Approving a `protection_event` proposal creates the credit.** It needs `applies_regardless_of_location: true`: a
+  protection limited to some places is rejected, never approved. A global credit exists only by an operator's edit,
+  `{is_global: true, tags: []}`; the model may not propose one (`proposal_dropped_global_not_proposable`).
+- **A credit lapses at `review_by` unless a renewal is approved.** Thirty days before, the worker queues one
+  `renewal_check` (`requested_by: schedule`, `request: {event_id}`). It makes **no model call**, so the budget and the
+  `claude_intel` kill switch do not stop it, but it runs only while `INTEL_ENABLED` is true: with the worker off,
+  credits lapse, which is the safe direction.
+- **Renewal outcome counters on `GET /runs`:** `renewal_proposed`; `renewal_evidence_gone` (conclusive, the credit
+  lapses); `renewal_evidence_unreachable` (a cited page could not be fetched; checked again daily, up to seven
+  checks); `renewal_not_due`; `renewal_excerpts_checked`, `renewal_excerpts_verified` and
+  `renewal_excerpt_dropped_<reason>`. `GET /protection-events` shows each credit's `state`, `renewal_due` and latest
+  check. A renewal proposal reads `model_id: code:renewal`.
+- **Retracting a credit** also retracts its approved renewal that has not started yet and rejects its pending renewal
+  proposal, in the retracting operator's name. One `intel.protection_retracted` audit row names all of them.
+- **Migration 0044's down drops every credit.** Retract them and roll the backend back first.
+
 ---
 
 ## 5. A provider has returned zero successful calls for 24h

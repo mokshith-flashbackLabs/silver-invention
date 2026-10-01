@@ -1251,9 +1251,39 @@ because 0037's down re-checks the NOT VALID constraint when it updates them.)
 `svc.v_active_scoped_events` is the **tenth contract view**, granted to `imageshield_proxy_ro`: `event_id`,
 `direction` (`'threat'`), `kind`, `title`, `body`, `magnitude` (severity, `smallint`), `tags` (`text[]`),
 `is_global`, `starts_at`, `ends_at` (`expires_at`), over threats that are active, started, unexpired and carry a tag.
-It carries events and no person column. Step 4 re-creates it as a UNION with `protection_events`, re-issuing the
-grant in the same file. It is REQUIRED in `EXPECTED_VIEWS`, so a database reverted past 0042 answers `/readyz` 503.
+It carries events and no person column. Since 0044 (step 4) it is a UNION with `protection_events`, re-created with the
+grant re-issued in the same file. It is REQUIRED in `EXPECTED_VIEWS`, so a database reverted past 0042 answers `/readyz` 503.
 Coordinated deploy: services first on the way up, the backend first on the way down.
+
+---
+
+## 2h. Likeness intel — protection credits (migration 0044)
+
+*§2g is steps 5–6's (`0043`, built on their branch); the letters follow the migrations.*
+
+`protection_events` (spec `2026-09-27-likeness-intel-design.md` §3.7, §4.8):
+
+```sql
+event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid()
+title           TEXT NOT NULL CHECK (title <> '')
+body            TEXT NOT NULL DEFAULT ''          -- always '' from an approval; control room only
+strength        SMALLINT NOT NULL CHECK (strength BETWEEN 1 AND 5)
+tags            TEXT[] NOT NULL DEFAULT '{}'       -- intel_tags_well_formed
+is_global       BOOLEAN NOT NULL DEFAULT false     -- exactly one of tags or global (two CHECKs)
+starts_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+review_by       TIMESTAMPTZ NOT NULL               -- > starts_at, <= starts_at + 366 days
+status          TEXT NOT NULL DEFAULT 'active'     -- active | retracted, two-sided retraction CHECK
+proposal_id     UUID NOT NULL UNIQUE REFERENCES intel_proposals  -- no hand-created credit
+renews_event_id UUID UNIQUE REFERENCES protection_events         -- set on a renewal
+created_by, created_at, retracted_by, retracted_at, retract_reason
+```
+
+`intel_rw` holds `SELECT, INSERT, UPDATE` (no `DELETE`). `intel_runs_one_open_renewal` is a partial unique index: one
+queued or running `renewal_check` per credit. `svc.v_active_scoped_events` was re-created with `CREATE OR REPLACE` as
+the UNION of the threat half (0042's, byte for byte) and the protection half: `direction` and `kind` `'protection'`,
+`magnitude` the strength, `ends_at` the review date, rows active, started and before `review_by`. Its ten columns and
+types are unchanged. The down restores the threat half and drops the table, **every credit with it**: on a real
+environment retract them and roll the backend back first.
 
 ---
 

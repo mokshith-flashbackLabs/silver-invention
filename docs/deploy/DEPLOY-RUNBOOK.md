@@ -969,6 +969,15 @@ The backend's decision and applied relays call routes an older services build an
 Rolling back: the backend first (it reads the view as optional), then services. 0042's down refuses while an active
 or draft threat event is scoped by tags alone; retract those first.
 
+*Step 4 (2026-09-30):* no new configuration. Deploy order:
+1. services migration 0044 (the view's protection half; this service's `/readyz` keeps requiring the view);
+2. the services image;
+3. the backend's step-4 migration and engine term together, on api and worker;
+4. only then may anyone approve a protection proposal.
+
+Rolling back: clear the credit first (retract or let lapse every protection), then the backend, then services. 0044's
+down drops every protection credit.
+
 **As of 2026-09-30 dev ships `INTEL_ENABLED=true` and prod `INTEL_ENABLED=false`.** The workspace ids
 confirmed by the step-0 probe (2026-09-29) replaced the `pending-step0` placeholder in all **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
 (`infra/ecs/imageshield-dev-services-worker.json`), the prod container's (`infra/ecs/prod/services-worker.json`),
