@@ -21,6 +21,8 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.models import Run, Source
+from imageshield.intel.proposal_models import ContextSignal, WriteResult
+from imageshield.intel.proposal_store import _CONTEXT_COLUMNS, _CONTEXT_FROM, _context
 from imageshield.intel.source_choice import (
     NewSource,
     Registered,
@@ -30,6 +32,7 @@ from imageshield.intel.source_choice import (
     ready_keys,
 )
 from imageshield.intel.store import RUN_COLUMNS, SOURCE_COLUMNS
+from imageshield.intel.suggestion import CATEGORY_CLASS, OptionSuggestion, SuggestionCandidates
 from imageshield.search.urlhash import NORMALISATION_VERSION, url_hash
 
 log = structlog.get_logger("imageshield.intel")
@@ -49,6 +52,29 @@ _REGISTER_SQL = """
     RETURNING source_id
 """
 
+_SUPERSEDE_SUGGESTION_SQL = """
+    UPDATE intel_proposals SET status = 'superseded', supersede_reason = 'newer_proposal'
+     WHERE kind = 'weight_suggestion' AND status = 'delivered'
+       AND target->>'question_key' = %s
+    RETURNING proposal_id
+"""
+
+_INSERT_SUGGESTION_SQL = """
+    INSERT INTO intel_proposals (kind, status, target, suggested, rationale,
+        against_scoring_version, against_release_no, run_id, model_id, prompt_version)
+    VALUES ('weight_suggestion', 'delivered', %(target)s, '{}'::jsonb, '', %(asv)s, %(arn)s,
+            %(run_id)s, %(model_id)s, %(prompt_version)s)
+    RETURNING proposal_id
+"""
+
+# The four retrieval classes (spec §4.6). intel/suggestion.py orders, filters and bounds them.
+_CANDIDATE_CLASSES = (
+    "d.source_id = ANY(%(sources)s::uuid[])",
+    "s.tags && %(tags)s::text[]",
+    "cardinality(s.unregistered_subjects) > 0",
+    "s.category = ANY(%(categories)s::text[])",
+)
+
 
 class QuestionStore(Protocol):
     async def queue_source_proposal(self, request: dict[str, Any], *, operator: str) -> UUID: ...
@@ -64,6 +90,22 @@ class QuestionStore(Protocol):
     async def register_and_queue_suggestion(
         self, request: dict[str, Any], sources: Sequence[NewSource], *, operator: str
     ) -> Registered: ...
+    async def mark_sources_due(self, source_ids: Sequence[UUID], *, now: datetime) -> None: ...
+    async def suggestion_candidates(
+        self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int
+    ) -> SuggestionCandidates: ...
+    async def suggestion_written(self, run_id: UUID) -> bool: ...
+    async def write_suggestion(
+        self,
+        run_id: UUID,
+        *,
+        question_key: str,
+        options: Sequence[OptionSuggestion],
+        against_scoring_version: str,
+        against_release_no: int,
+        model_id: str,
+        prompt_version: str,
+    ) -> WriteResult | None: ...
 
 
 class PostgresQuestionStore:
@@ -311,3 +353,119 @@ class PostgresQuestionStore:
         )
         row = await cur.fetchone()
         return row[0] if row is not None else None
+
+    async def mark_sources_due(self, source_ids: Sequence[UUID], *, now: datetime) -> None:
+        """A source the suggestion run could not finish reading: its first scheduled check comes
+        on the next tick instead of a full interval later (spec §4.10). Only ever earlier."""
+        if not source_ids:
+            return
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "UPDATE intel_sources SET next_check_at = %s, updated_at = now()"
+                " WHERE source_id = ANY(%s::uuid[]) AND next_check_at > %s",
+                (now, list(source_ids), now),
+            )
+
+    async def suggestion_candidates(
+        self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int
+    ) -> SuggestionCandidates:
+        """Each class: active signals since ``since``, newest first, at most ``limit``."""
+        params = {
+            "since": since,
+            "limit": limit,
+            "sources": list(source_ids),
+            "tags": list(tags),
+            "categories": sorted(CATEGORY_CLASS),
+        }
+        found: list[tuple[ContextSignal, ...]] = []
+        async with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            for clause in _CANDIDATE_CLASSES:
+                await cur.execute(
+                    f"SELECT {_CONTEXT_COLUMNS} FROM {_CONTEXT_FROM}"
+                    f" WHERE s.status = 'active' AND s.created_at >= %(since)s AND {clause}"
+                    " ORDER BY s.created_at DESC, s.signal_id DESC LIMIT %(limit)s",
+                    params,
+                )
+                found.append(tuple(_context(row) for row in await cur.fetchall()))
+        from_sources, by_tag, with_subjects, by_category = found
+        return SuggestionCandidates(from_sources, by_tag, with_subjects, by_category)
+
+    async def suggestion_written(self, run_id: UUID) -> bool:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT 1 FROM intel_proposals WHERE kind = 'weight_suggestion' AND run_id = %s",
+                (run_id,),
+            )
+            return await cur.fetchone() is not None
+
+    async def write_suggestion(
+        self,
+        run_id: UUID,
+        *,
+        question_key: str,
+        options: Sequence[OptionSuggestion],
+        against_scoring_version: str,
+        against_release_no: int,
+        model_id: str,
+        prompt_version: str,
+    ) -> WriteResult | None:
+        """spec §3.6: born 'delivered', superseding the older delivered suggestion for the same
+        question_key, in ONE transaction with its signal links and its audit row. The links are
+        every option's cited signals, and there may be none: "no evidence, operator's call" is an
+        answer (§3.6, note of 2026-09-30). None when this run already wrote one: a reclaimed run
+        never writes twice. The advisory lock orders two suggestions for one question."""
+        signal_ids: list[UUID] = []
+        for option in options:
+            signal_ids += [s for s in option.signal_ids if s not in signal_ids]
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock("
+                "hashtextextended('intel_weight_suggestion:' || %s::text, 0))",
+                (question_key,),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM intel_proposals WHERE kind = 'weight_suggestion' AND run_id = %s",
+                (run_id,),
+            )
+            if await cur.fetchone() is not None:
+                return None
+            cur = await conn.execute(_SUPERSEDE_SUGGESTION_SQL, (question_key,))
+            superseded = [r[0] for r in await cur.fetchall()]
+            target = {"question_key": question_key, "options": [o.as_json() for o in options]}
+            cur = await conn.execute(
+                _INSERT_SUGGESTION_SQL,
+                {
+                    "target": Jsonb(target),
+                    "asv": against_scoring_version,
+                    "arn": against_release_no,
+                    "run_id": run_id,
+                    "model_id": model_id,
+                    "prompt_version": prompt_version,
+                },
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            proposal_id: UUID = row[0]
+            if signal_ids:
+                await conn.execute(
+                    "INSERT INTO intel_proposal_signals (proposal_id, signal_id)"
+                    " SELECT %s, unnest(%s::uuid[])",
+                    (proposal_id, signal_ids),
+                )
+            await conn.execute(
+                _AUDIT_SQL,
+                {
+                    "actor_type": "service",
+                    "action": "intel.weight_suggestion_written",
+                    "resource_id": proposal_id,
+                    "metadata": Jsonb(
+                        {
+                            "run_id": str(run_id),
+                            "question_key": question_key,
+                            "superseded": [str(i) for i in superseded],
+                        }
+                    ),
+                },
+            )
+        return WriteResult((proposal_id,), tuple(superseded))

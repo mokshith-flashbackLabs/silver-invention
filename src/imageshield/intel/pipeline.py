@@ -120,7 +120,9 @@ class PipelineDeps:
     ``INTEL_MAX_CALLS_PER_RUN`` / ``INTEL_MAX_DOCUMENT_CHARS`` and have NO default
     here -- a second default beside IntelConfig's would be a second source of truth.
     ``reconciler`` is not part of a run: the worker's tick calls it before claiming
-    (spec §4.9). ``questions`` is the question runs' store (step 5, ``intel/question_store.py``)."""
+    (spec §4.9). ``questions`` is the question runs' store (step 5, ``intel/question_store.py``).
+    ``max_calls_per_suggestion_run`` is ``INTEL_MAX_CALLS_PER_SUGGESTION_RUN``, a weight
+    suggestion's reading cap (spec §4.10), with no default for the same reason."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -133,6 +135,7 @@ class PipelineDeps:
     max_calls_per_run: int
     max_document_chars: int
     questions: QuestionStore
+    max_calls_per_suggestion_run: int
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,10 @@ class _Ctx:
     cost_usd: Decimal = Decimal("0")
 
     def calls_left(self) -> bool:
+        """The reading cap: a weight suggestion's first read of the sources it registered has its
+        own, because it is legitimately larger than a weekly check (spec §4.10)."""
+        if self.run.kind == "weight_suggestion":
+            return self.model_calls < self.deps.max_calls_per_suggestion_run
         return self.model_calls < self.deps.max_calls_per_run
 
     def outcome(self) -> dict[str, int | str]:
@@ -259,12 +266,18 @@ async def _source_check(ctx: _Ctx) -> None:
     if source is None or source.source_url is None:
         ctx.counts["source_missing"] += 1
         return
+    await _check_listed(ctx, source, source.source_url)
+
+
+async def _check_listed(ctx: _Ctx, source: Source, url: str) -> None:
+    """One check of a listed source, recorded on the source. ``read_source`` reuses it for a
+    weight suggestion's immediate read."""
     # Before the fetch, not only after it: a listed URL that IS a known hit location
     # is never requested at all (spec §4.3, §6.1).
-    if await _known_hit(ctx, source.source_url):
+    if await _known_hit(ctx, url):
         await ctx.deps.evidence.record_check(source.source_id, ok=True, status="known_hit_location")
         return
-    fetched = await _fetch(ctx, source.source_url)  # a fetcher-side failure raises _Stop
+    fetched = await _fetch(ctx, url)  # a fetcher-side failure raises _Stop
     if isinstance(fetched, FetchFailure):
         await ctx.deps.evidence.record_check(source.source_id, ok=False, status=fetched.code)
         return
@@ -439,6 +452,11 @@ async def _discovery(ctx: _Ctx) -> None:
     if source is None or source.query_text is None:
         ctx.counts["source_missing"] += 1
         return
+    await _check_query(ctx, source)
+
+
+async def _check_query(ctx: _Ctx, source: Source) -> None:
+    """One check of a saved search query, recorded on the source. ``read_source`` reuses it."""
     try:
         await _discover(ctx, source)
     except _Stop as stop:
@@ -447,6 +465,21 @@ async def _discovery(ctx: _Ctx) -> None:
         )
         raise
     await ctx.deps.evidence.record_check(source.source_id, ok=True, status="checked")
+
+
+async def read_source(ctx: _Ctx, source: Source) -> None:
+    """Read one registered source now, exactly as its scheduled check would, whether or not it
+    is enabled: a weight suggestion's immediate read of the sources it registered (spec §4.10).
+    Raises _CallCap and _Stop as a check does."""
+    if source.kind == "search_query":
+        if source.query_text is None:
+            ctx.counts["source_missing"] += 1
+            return
+        await _check_query(ctx, source)
+    elif source.source_url is None:
+        ctx.counts["source_missing"] += 1
+    else:
+        await _check_listed(ctx, source, source.source_url)
 
 
 async def _discover(ctx: _Ctx, source: Source) -> None:

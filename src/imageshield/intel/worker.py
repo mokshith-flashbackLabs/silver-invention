@@ -120,6 +120,7 @@ async def run_forever(config: IntelConfig) -> None:
         max_calls_per_run=config.intel_max_calls_per_run,
         max_document_chars=config.intel_max_document_chars,
         questions=PostgresQuestionStore(pool),
+        max_calls_per_suggestion_run=config.intel_max_calls_per_suggestion_run,
     )
     log.info("intel.started", enabled=config.intel_enabled, provider=config.intel_model_provider)
     try:

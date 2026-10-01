@@ -5,13 +5,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.source_choice import NewSource, candidate_key, identity
 from imageshield.intel.store import PostgresIntelStore
+from imageshield.intel.suggestion import OptionSuggestion
+from tests.intel_fakes import seed_signal
 from tests.question_fakes import QUESTION
 
 REQUEST = {**QUESTION, "type": "mutable", "cap": 8}
@@ -222,3 +226,104 @@ async def test_proposed_identities_read_the_questions_stage_one_runs_since_the_c
         "platforms", since=datetime.now(UTC) - timedelta(hours=24)
     )
     assert found == frozenset({identity("policy_page", "https://p.example/recent", None)})
+
+
+# ── the weight suggestion ────────────────────────────────────────────────────
+
+META: dict[str, Any] = {
+    "against_scoring_version": "s2",
+    "against_release_no": 2,
+    "model_id": "claude-opus-5-5",
+    "prompt_version": "suggest-v1",
+}
+
+
+async def _suggestion_run(pool: AsyncConnectionPool) -> UUID:
+    ((run_id,),) = await _rows(
+        pool,
+        "INSERT INTO intel_runs (kind, status, requested_by)"
+        " VALUES ('weight_suggestion', 'running', 'ann') RETURNING run_id",
+    )
+    return run_id
+
+
+async def test_a_suggestion_is_born_delivered_and_supersedes_its_questions_older_one(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    store = PostgresQuestionStore(intel_pool)
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    cited = OptionSuggestion("Instagram", 3, "r", (sid,), ("instagram",), None)
+    empty = OptionSuggestion("Instagram", None, "", (), (), None)
+    first, other, second = [await _suggestion_run(intel_pool) for _ in range(3)]
+    one = await store.write_suggestion(first, question_key="platforms", options=[cited], **META)
+    two = await store.write_suggestion(other, question_key="dating", options=[empty], **META)
+    three = await store.write_suggestion(second, question_key="platforms", options=[empty], **META)
+    assert one is not None and two is not None and three is not None
+    assert three.superseded == one.written and two.superseded == ()
+    statuses = dict(await _rows(intel_pool, "SELECT proposal_id, status FROM intel_proposals"))
+    assert statuses == {
+        one.written[0]: "superseded",
+        two.written[0]: "delivered",
+        three.written[0]: "delivered",
+    }
+    # "No evidence, operator's call" is an answer: a suggestion may link no signal.
+    links = await _rows(intel_pool, "SELECT proposal_id, signal_id FROM intel_proposal_signals")
+    assert links == [(one.written[0], sid)]
+    # A reclaimed run never writes twice.
+    again = await store.write_suggestion(second, question_key="platforms", options=[empty], **META)
+    assert again is None
+    assert await store.suggestion_written(second)
+    assert not await store.suggestion_written(await _suggestion_run(intel_pool))
+    audited = "SELECT count(*) FROM audit_log WHERE action = 'intel.weight_suggestion_written'"
+    assert await _rows(intel_pool, audited) == [(3,)]
+
+
+async def test_suggestion_candidates_read_the_four_classes_active_and_inside_the_window(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    chosen = await PostgresIntelStore(intel_pool).create_source(
+        kind="policy_page",
+        source_url="https://p.example/chosen",
+        query_text=None,
+        tags=(),
+        check_every_hours=24,
+        terms_note="automated access permitted",
+        operator="alice",
+    )
+    from_source = await seed_signal(intel_pool, category="law")
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE intel_documents SET source_id = %s WHERE document_id ="
+            " (SELECT document_id FROM intel_signals WHERE signal_id = %s)",
+            (chosen.source_id, from_source),
+        )
+    tagged = await seed_signal(intel_pool, tags=("instagram",), category="law")
+    subject = await seed_signal(intel_pool, subjects=("Bumble",), category="law")
+    research = await seed_signal(intel_pool, category="research")
+    now = datetime.now(UTC)
+    await seed_signal(intel_pool, tags=("instagram",), created_at=now - timedelta(days=400))
+    gone = await seed_signal(intel_pool, tags=("instagram",))
+    await PostgresEvidenceStore(intel_pool).retract_signal(gone, operator="ann", reason="wrong")
+    found = await PostgresQuestionStore(intel_pool).suggestion_candidates(
+        source_ids=[chosen.source_id],
+        tags=["instagram"],
+        since=now - timedelta(days=365),
+        limit=50,
+    )
+    assert [s.signal_id for s in found.from_sources] == [from_source]
+    assert [s.signal_id for s in found.by_tag] == [tagged]
+    assert [s.signal_id for s in found.with_subjects] == [subject]
+    assert [s.signal_id for s in found.by_category] == [research]
+
+
+async def test_marking_a_source_due_brings_its_first_check_forward_never_back(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    store = PostgresQuestionStore(intel_pool)
+    registered = await store.register_and_queue_suggestion(REQUEST, [_new()], operator="ann")
+    (source_id,) = registered.registered
+    now = datetime.now(UTC)
+    await store.mark_sources_due([source_id], now=now)
+    await store.mark_sources_due([source_id], now=now + timedelta(hours=1))
+    query = "SELECT next_check_at FROM intel_sources WHERE source_id = %s"
+    assert await _rows(intel_pool, query, source_id) == [(now,)]

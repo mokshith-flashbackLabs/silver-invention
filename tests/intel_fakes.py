@@ -210,6 +210,7 @@ def make_deps(
     model: FakeModel,
     *,
     max_calls_per_run: int = 20,
+    max_calls_per_suggestion_run: int = 60,
     max_document_chars: int = 200_000,
     clock: Callable[[], datetime] | None = None,
 ) -> PipelineDeps:
@@ -232,6 +233,7 @@ def make_deps(
         max_calls_per_run=max_calls_per_run,
         max_document_chars=max_document_chars,
         questions=PostgresQuestionStore(pool),
+        max_calls_per_suggestion_run=max_calls_per_suggestion_run,
     )
 
 
