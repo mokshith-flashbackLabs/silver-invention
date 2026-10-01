@@ -17,7 +17,7 @@ ADD that is unknown or retired in the loaded vocabulary.
 from __future__ import annotations
 
 import base64
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -46,7 +46,9 @@ from imageshield.http.models import (
     IntelSourceProposalRequest,
     IntelSourceValidationRequest,
     IntelVocabularyRequest,
+    IntelWeightSuggestionRequest,
 )
+from imageshield.intel.bounds import DEFAULT_SOURCE_CHECK_EVERY_HOURS, PROPOSAL_ORIGIN_DAYS
 from imageshield.intel.decisions import DecisionStore
 from imageshield.intel.evidence_store import EvidenceStore
 from imageshield.intel.models import Run
@@ -55,14 +57,20 @@ from imageshield.intel.proposal_models import DecisionRefused
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.question_store import QuestionStore
 from imageshield.intel.source_choice import (
+    NewSource,
     existing_source_ids,
+    identity,
+    merge_by_identity,
+    option_tags,
     render_source_proposal,
     render_validation,
+    validation_problems,
 )
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, membership_problems
+from imageshield.intel.text import normalise
 from imageshield.intel.vocabulary import parse_vocabulary
-from imageshield.search.urlhash import url_hash
+from imageshield.search.urlhash import canonicalise, url_hash
 
 log = structlog.get_logger("imageshield.intel")
 
@@ -493,3 +501,84 @@ async def source_validation_poll(
     run_id: UUID, questions: QuestionStore = Depends(get_question_store)
 ) -> dict[str, Any]:
     return render_validation(await _question_run(questions, run_id, "source_validation"))
+
+
+@router.post("/weight-suggestions", status_code=202)
+async def suggest_weights(
+    body: IntelWeightSuggestionRequest,
+    store: IntelStore = Depends(get_intel_store),
+    questions: QuestionStore = Depends(get_question_store),
+) -> dict[str, UUID]:
+    """Stage 4 of spec §4.10 (and §4.6). Every chosen source must be ready in its validation run
+    within 24 hours. The known-hit and PII checks run again, because registration is one of the
+    places §6.1 names. A tag a chosen source would carry must be registered (§3.1), and a retired
+    one is left off the new source. Then ONE transaction registers or reuses the sources and
+    queues the run. Nothing is registered when any check refuses."""
+    now = datetime.now(UTC)
+    validations = await questions.validations(sorted({s.validation_run_id for s in body.sources}))
+    problems = validation_problems(body.sources, validations, now=now)
+    if problems:
+        raise _refuse(
+            "source_not_validated",
+            "a chosen source is not ready in its validation run",
+            entries=problems,
+        )
+    for source in body.sources:
+        if source.query_text is not None and contains_pii(source.query_text):
+            raise _refuse(
+                "query_names_a_person", "a saved query must not contain a phone number or email"
+            )
+        await _check_url(store, source.source_url)
+    row = await store.load_vocabulary()
+    registry = row.registry() if row is not None else TagRegistry(frozenset(), frozenset())
+    vocabulary = parse_vocabulary(row) if row is not None else None
+    tags_by_option = {
+        s.option: option_tags(
+            s.option,
+            question_key=body.question_key,
+            request_tags=body.tags,
+            vocabulary=vocabulary,
+        )
+        for s in body.sources
+    }
+    unknown = sorted(
+        {
+            tag
+            for tags in tags_by_option.values()
+            for tag in tags
+            if tag not in registry.active and tag not in registry.retired
+        }
+    )
+    if unknown:
+        raise _refuse("unknown_tag", "a tag is not registered", slugs=unknown)
+    proposed: frozenset[str] = frozenset()
+    if body.sources:
+        proposed = await questions.proposed_identities(
+            body.question_key, since=now - timedelta(days=PROPOSAL_ORIGIN_DAYS)
+        )
+    chosen: list[NewSource] = []
+    for s in body.sources:
+        was_proposed = identity(s.kind, s.source_url, s.query_text) in proposed
+        chosen.append(
+            NewSource(
+                kind=s.kind,
+                source_url=canonicalise(s.source_url) if s.source_url is not None else None,
+                query_text=normalise(s.query_text) if s.query_text is not None else None,
+                tags=tuple(t for t in tags_by_option[s.option] if t not in registry.retired),
+                check_every_hours=s.check_every_hours or DEFAULT_SOURCE_CHECK_EVERY_HOURS,
+                terms_note=s.terms_note,
+                origin="suggested" if was_proposed else "operator",
+                question_key=body.question_key,
+                option=s.option,
+            )
+        )
+    queued = await questions.register_and_queue_suggestion(
+        body.question_request(), merge_by_identity(chosen), operator=body.operator
+    )
+    log.info(
+        "intel.weight_suggestion_queued_via_admin",
+        operator=body.operator,
+        registered=len(queued.registered),
+        reused=len(queued.reused),
+    )
+    return {"run_id": queued.run_id}

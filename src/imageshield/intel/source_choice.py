@@ -23,9 +23,9 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from datetime import timedelta
-from typing import Any
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -345,3 +345,127 @@ def render_validation(run: Run) -> dict[str, Any]:
             else None
         ),
     }
+
+
+# ── stage 4: registration (spec §4.10) ───────────────────────────────────────
+
+# Why a chosen source is not validated: the closed set of `source_not_validated` entry reasons.
+NOT_VALIDATED_REASONS: frozenset[str] = frozenset({"unknown_run", "expired", "not_ready"})
+
+
+@dataclass(frozen=True)
+class Validation:
+    """A completed source_validation run, as stage 4 checks it: when it completed, and the
+    (kind, identity) of every candidate it found ready."""
+
+    completed_at: datetime
+    ready: frozenset[CandidateKey]
+
+
+def ready_keys(outcome: Mapping[str, Any]) -> frozenset[CandidateKey]:
+    keys: set[CandidateKey] = set()
+    results = outcome.get("results")
+    for result in results if isinstance(results, list) else []:
+        if not isinstance(result, dict) or result.get("status") != "ready":
+            continue
+        candidate = result.get("candidate")
+        if isinstance(candidate, dict) and isinstance(candidate.get("kind"), str):
+            keys.add(
+                candidate_key(
+                    candidate["kind"], candidate.get("source_url"), candidate.get("query_text")
+                )
+            )
+    return frozenset(keys)
+
+
+def proposal_identities(outcome: Mapping[str, Any]) -> frozenset[str]:
+    """Every candidate a source-proposal run proposed, for any option, by identity: a chosen
+    source among them registers with origin 'suggested'."""
+    found: set[str] = set()
+    options = outcome.get("options")
+    for option in options if isinstance(options, list) else []:
+        proposed = option.get("proposed") if isinstance(option, dict) else None
+        for candidate in proposed if isinstance(proposed, list) else []:
+            if isinstance(candidate, dict) and isinstance(candidate.get("kind"), str):
+                found.add(
+                    identity(
+                        candidate["kind"], candidate.get("source_url"), candidate.get("query_text")
+                    )
+                )
+    return frozenset(found)
+
+
+class _Chosen(Protocol):
+    @property
+    def kind(self) -> str: ...
+    @property
+    def source_url(self) -> str | None: ...
+    @property
+    def query_text(self) -> str | None: ...
+    @property
+    def validation_run_id(self) -> UUID: ...
+
+
+def validation_problems(
+    sources: Sequence[_Chosen], validations: Mapping[UUID, Validation], *, now: datetime
+) -> list[dict[str, Any]]:
+    """spec §4.10 stage 4: each chosen source must be ready, as its kind, in its validation run,
+    and that run must have completed within VALIDATION_TTL_HOURS. The failing entries, as
+    ``{index, reason}`` in ascending index. They name nothing the request sent: the envelope is
+    what the backend logs (http/errors.py)."""
+    horizon = now - timedelta(hours=VALIDATION_TTL_HOURS)
+    problems: list[dict[str, Any]] = []
+    for index, source in enumerate(sources):
+        validation = validations.get(source.validation_run_id)
+        key = candidate_key(source.kind, source.source_url, source.query_text)
+        if validation is None:
+            reason = "unknown_run"
+        elif validation.completed_at < horizon:
+            reason = "expired"
+        elif key not in validation.ready:
+            reason = "not_ready"
+        else:
+            continue
+        problems.append({"index": index, "reason": reason})
+    return problems
+
+
+@dataclass(frozen=True)
+class NewSource:
+    """One chosen source, ready to register, or to reuse the registry row with its identity.
+    ``source_url`` is canonical and ``query_text`` normalised."""
+
+    kind: str
+    source_url: str | None
+    query_text: str | None
+    tags: tuple[str, ...]
+    check_every_hours: int
+    terms_note: str
+    origin: str
+    question_key: str
+    option: str
+
+    @property
+    def identity(self) -> str:
+        return identity(self.kind, self.source_url, self.query_text)
+
+
+def merge_by_identity(sources: Sequence[NewSource]) -> list[NewSource]:
+    """One source per identity, in first-seen order. A source chosen for two options registers
+    once and carries both options' tags; its other fields are the first choice's."""
+    merged: dict[str, NewSource] = {}
+    for source in sources:
+        first = merged.get(source.identity)
+        if first is None:
+            merged[source.identity] = source
+        else:
+            extra = tuple(t for t in source.tags if t not in first.tags)
+            merged[source.identity] = replace(first, tags=first.tags + extra)
+    return list(merged.values())
+
+
+@dataclass(frozen=True)
+class Registered:
+    run_id: UUID
+    registered: tuple[UUID, ...]
+    reused: tuple[UUID, ...]

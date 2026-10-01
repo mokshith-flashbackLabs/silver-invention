@@ -24,8 +24,11 @@ from pydantic import (
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
 from imageshield.intel.bounds import (
+    DEDUCTION_MAX,
+    DEDUCTION_MIN,
     MAX_QUERY_TEXT_CHARS,
     MAX_QUESTION_OPTIONS,
+    MAX_SUGGESTION_SOURCES,
     MAX_VALIDATION_CANDIDATES,
 )
 from imageshield.intel.tags import TAG_SLUG_RE, is_well_formed
@@ -1160,3 +1163,33 @@ class IntelSourceValidationRequest(ServiceModel):
 
     def validation_request(self) -> dict[str, Any]:
         return {"candidates": [c.stored() for c in self.candidates]}
+
+
+class IntelChosenSource(IntelCandidate):
+    """A source to register at stage 4 (spec §4.10): a stage-3 candidate, the validation run that
+    found it ready, the operator's terms note (§3.2), and an optional cadence (default 168
+    hours). A kept existing registry source is sent the same way, and is reused."""
+
+    validation_run_id: UUID
+    terms_note: str = Field(min_length=10, max_length=500)
+    check_every_hours: int | None = Field(default=None, ge=6, le=720)
+
+
+class IntelWeightSuggestionRequest(IntelQuestionBody):
+    """POST /weight-suggestions (spec §4.6; stage 4 of §4.10). ``type`` is the draft question's
+    scoring type as the vocabulary push spells it (``mutable`` · ``escrowed`` · ``decaying`` ·
+    ``recoverable``), or null for an unscored question: required, and nullable. ``cap`` may be
+    omitted or null."""
+
+    type: str | None = Field(max_length=32)
+    cap: StrictInt | None = Field(default=None, ge=DEDUCTION_MIN, le=DEDUCTION_MAX)
+    sources: tuple[IntelChosenSource, ...] = Field(default=(), max_length=MAX_SUGGESTION_SOURCES)
+
+    @model_validator(mode="after")
+    def _sources_name_options(self) -> IntelWeightSuggestionRequest:
+        if any(source.option not in self.options for source in self.sources):
+            raise ValueError("every source must name one of options")
+        return self
+
+    def question_request(self) -> dict[str, Any]:
+        return {**super().question_request(), "type": self.type, "cap": self.cap}

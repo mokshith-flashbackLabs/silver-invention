@@ -4,6 +4,8 @@ Postgres in test_intel_question_runs.py, the store in test_intel_question_store.
 
 from __future__ import annotations
 
+import copy
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -12,8 +14,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
-from imageshield.intel.models import Run, Source
+from imageshield.intel.models import Run, Source, Vocabulary
+from imageshield.intel.source_choice import (
+    NewSource,
+    Registered,
+    Validation,
+    candidate_key,
+    identity,
+)
+from imageshield.search.urlhash import url_hash
 from tests.conftest import ADMIN_SERVICE_TOKEN, SERVICE_TOKEN, make_config
+from tests.intel_fakes import QUIZ_VOCABULARY
 from tests.question_fakes import QUESTION
 
 ADMIN = {"X-Service-Token": SERVICE_TOKEN, "X-Admin-Service-Token": ADMIN_SERVICE_TOKEN}
@@ -74,6 +85,9 @@ class FakeQuestionStore:
         self.queued: list[tuple[str, dict[str, Any], str]] = []
         self.runs: dict[UUID, Run] = {}
         self.sources: dict[UUID, Source] = {}
+        self.validation_records: dict[UUID, Validation] = {}
+        self.proposed: frozenset[str] = frozenset()
+        self.registrations: list[tuple[dict[str, Any], list[NewSource], str]] = []
 
     async def queue_source_proposal(self, request: dict[str, Any], *, operator: str) -> UUID:
         self.queued.append(("source_proposal", request, operator))
@@ -88,6 +102,18 @@ class FakeQuestionStore:
 
     async def sources_by_ids(self, source_ids: Any) -> list[Source]:
         return [self.sources[i] for i in source_ids if i in self.sources]
+
+    async def validations(self, run_ids: Any) -> dict[UUID, Validation]:
+        return {i: self.validation_records[i] for i in run_ids if i in self.validation_records}
+
+    async def proposed_identities(self, question_key: str, *, since: datetime) -> frozenset[str]:
+        return self.proposed
+
+    async def register_and_queue_suggestion(
+        self, request: dict[str, Any], sources: Any, *, operator: str
+    ) -> Registered:
+        self.registrations.append((request, list(sources), operator))
+        return Registered(uuid4(), (), ())
 
 
 def _client() -> tuple[TestClient, FakeQuestionStore]:
@@ -283,3 +309,237 @@ def test_the_validation_poll_answers_an_object_with_ordered_results_and_an_expir
     questions.runs[other.run_id] = other
     r = client.get(f"/v1/admin/intel/source-validations/{other.run_id}", headers=ADMIN)
     assert r.status_code == 404
+
+
+# ── stage 4 ───────────────────────────────────────────────────────────────────
+
+VALIDATION_RUN = uuid4()
+TERMS = "https://p.example/terms"
+TERMS_KEY = candidate_key("policy_page", TERMS, None)
+NOTE = "public terms page; automated reads allowed"
+
+
+class FakeRegistryStore:
+    """What the stage-4 route reads from the intel store: known hits and the vocabulary
+    (QUIZ_VOCABULARY: instagram mapped and active, linkedin active, myspace retired)."""
+
+    def __init__(self) -> None:
+        self.known_hits: set[str] = set()
+
+    async def is_known_hit(self, value: str) -> bool:
+        return value in self.known_hits
+
+    async def load_vocabulary(self) -> Vocabulary:
+        return Vocabulary(
+            release_no=2,
+            map_version=1,
+            scoring_version="s2",
+            quiz_version="q",
+            document=copy.deepcopy(QUIZ_VOCABULARY),
+        )
+
+
+def _suggest_client() -> tuple[TestClient, FakeQuestionStore, FakeRegistryStore]:
+    app = create_app(config=make_config())
+    questions, registry = FakeQuestionStore(), FakeRegistryStore()
+    app.state.question_store = questions
+    app.state.intel_store = registry
+    return TestClient(app), questions, registry
+
+
+def _chosen(**changes: Any) -> dict[str, Any]:
+    return {
+        "option": "Instagram",
+        "kind": "policy_page",
+        "source_url": TERMS,
+        "validation_run_id": str(VALIDATION_RUN),
+        "terms_note": NOTE,
+        **changes,
+    }
+
+
+def _suggest(sources: list[dict[str, Any]], **changes: Any) -> dict[str, Any]:
+    return {
+        **QUESTION,
+        "type": "mutable",
+        "cap": 8,
+        "sources": sources,
+        "operator": "ann",
+        **changes,
+    }
+
+
+def _ready(
+    questions: FakeQuestionStore, *keys: tuple[str, str], completed_at: datetime | None = None
+) -> None:
+    questions.validation_records[VALIDATION_RUN] = Validation(
+        completed_at or _now(), frozenset(keys)
+    )
+
+
+def test_a_suggestion_registers_its_validated_sources_and_queues_the_run() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    body = _suggest([_chosen(source_url=f"{TERMS}?utm_source=x")])  # the same canonical URL
+    r = _post(client, "weight-suggestions", body)
+    assert r.status_code == 202 and UUID(r.json()["run_id"])
+    ((request, sources, operator),) = questions.registrations
+    assert operator == "ann"
+    assert request == {
+        "question_key": "platforms",
+        "prompt": QUESTION["prompt"],
+        "options": ["Instagram", "Bumble"],
+        "tags": {"Instagram": ["instagram"]},
+        "type": "mutable",
+        "cap": 8,
+    }
+    assert sources == [
+        NewSource(
+            kind="policy_page",
+            source_url=TERMS,
+            query_text=None,
+            tags=("instagram",),
+            check_every_hours=168,
+            terms_note=NOTE,
+            origin="operator",
+            question_key="platforms",
+            option="Instagram",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("setup", "reason"),
+    [("missing", "unknown_run"), ("stale", "expired"), ("blocked", "not_ready")],
+)
+def test_a_source_that_is_not_validated_is_refused_and_nothing_registered(
+    setup: str, reason: str
+) -> None:
+    """spec §10: POST /weight-suggestions refuses a source that is not ready in the named
+    validation run, or whose result is older than 24 hours, and registers nothing."""
+    client, questions, _ = _suggest_client()
+    if setup == "stale":
+        _ready(questions, TERMS_KEY, completed_at=_now() - timedelta(hours=25))
+    elif setup == "blocked":
+        _ready(questions)  # the run completed and found nothing ready
+    r = _post(client, "weight-suggestions", _suggest([_chosen()]))
+    assert r.status_code == 422
+    error = r.json()["error"]
+    assert error["code"] == "source_not_validated"
+    assert error["entries"] == [{"index": 0, "reason": reason}]
+    assert {"code", "message", "retryable", "request_id", "entries"} <= set(error)
+    assert questions.registrations == []
+
+
+def test_only_the_failing_entries_are_named_by_index_and_kind_matters() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    sources = [_chosen(), _chosen(source_url="https://p.example/other"), _chosen(kind="news")]
+    r = _post(client, "weight-suggestions", _suggest(sources))
+    entries = r.json()["error"]["entries"]
+    assert entries == [
+        {"index": 1, "reason": "not_ready"},
+        {"index": 2, "reason": "not_ready"},  # ready as a policy_page is not ready as news
+    ]
+    pattern = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+    assert all(pattern.fullmatch(e["reason"]) for e in entries)
+    assert questions.registrations == []
+
+
+def test_a_known_hit_or_a_person_shaped_query_is_refused_even_when_validated() -> None:
+    client, questions, registry = _suggest_client()
+    leak = "leaks about jane@example.com"
+    _ready(questions, TERMS_KEY, candidate_key("search_query", None, leak))
+    chosen = _chosen(kind="search_query", source_url=None, query_text=leak)
+    r = _post(client, "weight-suggestions", _suggest([chosen]))
+    assert r.json()["error"]["code"] == "query_names_a_person"
+    registry.known_hits.add(url_hash(TERMS))
+    r = _post(client, "weight-suggestions", _suggest([_chosen()]))
+    assert r.json()["error"]["code"] == "known_hit_location"
+    assert questions.registrations == []
+
+
+def test_an_unknown_tag_is_refused_and_a_retired_one_is_dropped() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    body = _suggest([_chosen()], tags={"Instagram": ["instagram", "bumble"]})
+    r = _post(client, "weight-suggestions", body)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_tag"
+    assert r.json()["error"]["slugs"] == ["bumble"] and questions.registrations == []
+    body = _suggest([_chosen()], tags={"Instagram": ["instagram", "myspace"]})
+    assert _post(client, "weight-suggestions", body).status_code == 202
+    assert questions.registrations[-1][1][0].tags == ("instagram",)
+
+
+def test_an_unknown_tag_on_an_option_with_no_chosen_source_is_not_refused() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    body = _suggest([_chosen()], tags={"Instagram": ["instagram"], "Bumble": ["bumble"]})
+    assert _post(client, "weight-suggestions", body).status_code == 202
+
+
+def test_the_vocabularys_map_is_used_only_when_the_request_sends_none() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    body = _suggest([_chosen()])
+    del body["tags"]
+    assert _post(client, "weight-suggestions", body).status_code == 202
+    assert questions.registrations[-1][1][0].tags == ("instagram",)  # QUIZ_VOCABULARY's map
+    assert _post(client, "weight-suggestions", _suggest([_chosen()], tags={})).status_code == 202
+    assert questions.registrations[-1][1][0].tags == ()
+
+
+def test_a_source_the_stage_one_run_proposed_registers_as_suggested() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    questions.proposed = frozenset({identity("policy_page", TERMS, None)})
+    body = _suggest([_chosen(check_every_hours=24)])
+    assert _post(client, "weight-suggestions", body).status_code == 202
+    source = questions.registrations[-1][1][0]
+    assert (source.origin, source.check_every_hours) == ("suggested", 24)
+
+
+def test_one_source_chosen_for_two_options_is_registered_once_with_both_tags() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    tags = {"Instagram": ["instagram"], "Bumble": ["linkedin"]}
+    body = _suggest([_chosen(), _chosen(option="Bumble")], tags=tags)
+    assert _post(client, "weight-suggestions", body).status_code == 202
+    (source,) = questions.registrations[-1][1]
+    assert (source.option, source.tags) == ("Instagram", ("instagram", "linkedin"))
+
+
+def test_a_suggestion_without_sources_needs_no_validation() -> None:
+    client, questions, _ = _suggest_client()
+    assert _post(client, "weight-suggestions", _suggest([])).status_code == 202
+    assert questions.registrations[-1][1] == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"sources": [_chosen(option="Tinder")]},  # not one of the options
+        {"cap": 11},
+        {"sources": [_chosen(terms_note="short")]},
+        {"sources": [_chosen(check_every_hours=5)]},
+        {"sources": [_chosen(validation_run_id="not-a-uuid")]},
+        {"sources": [_chosen(source_url="http://p.example/terms")]},
+    ],
+)
+def test_a_malformed_suggestion_body_is_422(change: dict[str, Any]) -> None:
+    client, questions, _ = _suggest_client()
+    r = _post(client, "weight-suggestions", {**_suggest([]), **change})
+    assert r.status_code == 422 and r.json()["error"]["code"] == "validation_error"
+    assert questions.registrations == []
+
+
+def test_type_is_required_but_may_be_null_and_cap_may_be_omitted() -> None:
+    client, questions, _ = _suggest_client()
+    body = _suggest([], type=None)
+    del body["cap"]
+    assert _post(client, "weight-suggestions", body).status_code == 202
+    request = questions.registrations[-1][0]
+    assert (request["type"], request["cap"]) == (None, None)
+    missing = _suggest([])
+    del missing["type"]
+    assert _post(client, "weight-suggestions", missing).status_code == 422

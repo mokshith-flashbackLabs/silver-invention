@@ -10,9 +10,12 @@ from imageshield.intel.schemas import ProposedOptionSources, ProposedSource, Sou
 from imageshield.intel.source_choice import (
     BLOCKED_REASONS,
     FETCH_REASONS,
+    NOT_VALIDATED_REASONS,
+    NewSource,
     candidate_key,
     clean_candidates,
     identity,
+    merge_by_identity,
     option_tags,
     url_verdict,
 )
@@ -146,3 +149,37 @@ def test_the_text_floor_depends_on_the_kind_and_a_feed_needs_items() -> None:
     assert url_verdict("feed", "", [{"title": "t", "link": "https://n.example/1"}]) is None
     assert url_verdict("feed", "x" * 5000, []) == "no_items"
     assert url_verdict("feed", "x" * 5000, None) == "no_items"  # it did not parse as a feed
+
+
+def test_every_not_validated_reason_is_a_token_the_backend_accepts() -> None:
+    pattern = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+    assert {"unknown_run", "expired", "not_ready"} == NOT_VALIDATED_REASONS
+    assert all(pattern.fullmatch(reason) for reason in NOT_VALIDATED_REASONS)
+
+
+def _new(option: str, tags: tuple[str, ...], url: str = "https://p.example/terms") -> NewSource:
+    return NewSource(
+        kind="policy_page",
+        source_url=url,
+        query_text=None,
+        tags=tags,
+        check_every_hours=168,
+        terms_note="public terms page",
+        origin="operator",
+        question_key="platforms",
+        option=option,
+    )
+
+
+def test_a_source_chosen_for_two_options_is_one_source_with_both_options_tags() -> None:
+    merged = merge_by_identity(
+        [
+            _new("Instagram", ("instagram",)),
+            _new("Bumble", (), url="https://b.example/terms"),
+            _new("Threads", ("threads", "instagram")),
+        ]
+    )
+    assert [(m.option, m.source_url, m.tags) for m in merged] == [
+        ("Instagram", "https://p.example/terms", ("instagram", "threads")),
+        ("Bumble", "https://b.example/terms", ()),
+    ]
