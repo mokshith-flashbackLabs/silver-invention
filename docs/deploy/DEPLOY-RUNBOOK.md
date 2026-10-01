@@ -960,6 +960,15 @@ task definitions. Without it the container crash-loops at boot, whatever `INTEL_
 
 The backend's decision and applied relays call routes an older services build answers with 404.
 
+*Step 3 (2026-09-30):* no new configuration. Deploy order:
+1. services migration 0042 (this service's `/readyz` requires `svc.v_active_scoped_events` from then on);
+2. the services image;
+3. only then the backend's step-3 build. An older services build answers its `tags` field on
+   `POST /v1/admin/threat-events` with `422`.
+
+Rolling back: the backend first (it reads the view as optional), then services. 0042's down refuses while an active
+or draft threat event is scoped by tags alone; retract those first.
+
 **As of 2026-09-30 dev ships `INTEL_ENABLED=true` and prod `INTEL_ENABLED=false`.** The workspace ids
 confirmed by the step-0 probe (2026-09-29) replaced the `pending-step0` placeholder in all **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
 (`infra/ecs/imageshield-dev-services-worker.json`), the prod container's (`infra/ecs/prod/services-worker.json`),

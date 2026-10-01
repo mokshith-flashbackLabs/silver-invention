@@ -384,6 +384,11 @@ and `ThreatEventItem`.
 3. **Restore the old CHECK as `NOT VALID`.** Retracted tag-only rows keep their shape, and nothing updates them,
    because retract only touches active rows. Validating the constraint would fail on them.
 
+   *Corrected 2026-09-30 (step-3 build):* "nothing updates them" is false under `migrate down --all`. 0037's down sets
+   every NULL `penalty` to 0.01, and that UPDATE re-checks the NOT VALID relevance CHECK on the row it touches, which
+   a retracted tag-only row cannot satisfy. So 0042's down first sets `penalty = 0.01` on those rows itself, before
+   restoring the CHECK; the end state is the one 0037's down would have written, and a regression test pins it.
+
 *Clarified 2026-09-30 (step-3 plan):* the step-3 migration is `0042_intel_scoped_threats`. Both legs find a relevance
 CHECK by its definition with whitespace, parentheses and any ` NOT VALID` suffix ignored, because a down leaves the
 old CHECK `NOT VALID`. The up adds the widened CHECK (named `threat_events_relevant`) `NOT VALID` and then validates

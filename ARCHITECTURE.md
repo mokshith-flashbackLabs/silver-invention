@@ -529,6 +529,18 @@ through one more metered call (`INTEL_PROPOSAL_MODEL`). A proposal is validated 
 The admin surface is fourteen routes (step 1's ten plus four). Quiz weight suggestions (step 5) and events (steps 3
 and 4) are still to come.
 
+*Built 2026-09-30 (step 3):* threat events.
+- The generation call also proposes `threat_event`s aimed at exposure tags, and attaches new evidence to a pending
+  one. A repeat of a pending proposal (same kind, same tags, a shared document) becomes an attachment in code.
+- Approving one inserts the threat event from `decided` in the decision's transaction (migration 0042 gives
+  `threat_events` its `tags` and `proposal_id`), and the event is published on `svc.v_active_scoped_events`, the tenth
+  contract view. The backend matches tags against its own quiz answers and moves the score.
+- A pending coverage gap that the live quiz now maps is resolved on the next worker tick, and a `gap_regenerate` run
+  re-proposes its evidence as event proposals.
+- Hand-created threat events accept `tags`.
+
+Protection events and renewal (step 4) are still to come.
+
 **Disabled in both environments until an owner action.** `INTEL_ENABLED=false` on both dev and prod
 `intel-worker` containers, `claude_intel` seeded disabled with a NULL `daily_budget_usd`
 (`budget_unset` refuses every run), and a placeholder workspace id (`pending-step0`) sits in three

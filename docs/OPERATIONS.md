@@ -344,6 +344,21 @@ at least a budget outage will not also relax everyone's cadence.
 - **An approved change that reads `stale`** will be refused as `STALE` by the backend's publish. Withdraw it, which
   is `rejected` on an approved proposal, and approve a fresh one.
 
+**Threat events and gap regeneration (step 3, 2026-09-30).**
+- **New outcome counters on `GET /runs`:** `proposal_converted_to_attach` (a repeat of a pending proposal became
+  new evidence for it), `proposals_attached`, `attach_dropped_<reason>` and `attach_dropped_not_pending`,
+  `proposal_dropped_not_an_event` (a regeneration returned a weight change or gap), and
+  `gap_regenerate_no_active_signals`.
+- **`gap_regenerate` runs** (`requested_by: schedule`) are queued by the worker's gap pass when a mapping makes a
+  pending coverage gap's subject covered; the gap reads `superseded` / `resolved_by_quiz`, and its
+  `target.regenerated_by_run_id` names the run. One `intel.coverage_gaps_resolved` audit row per pass that changed
+  something.
+- **A regeneration refused by the gate is retried**: once it has been finished six hours, up to five runs per gap.
+  After the fifth, look at `GET /runs` for why every run failed; the evidence stays in the signals.
+- **Approving a threat proposal creates the event.** To take one back, retract the event
+  (`POST /v1/admin/threat-events/{id}/retract`); the proposal stays `applied` as the record of the approval.
+- **Migration 0042's down refuses while an active or draft threat is scoped by tags alone.** Retract those first.
+
 ---
 
 ## 5. A provider has returned zero successful calls for 24h

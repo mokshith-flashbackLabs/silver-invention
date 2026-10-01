@@ -152,7 +152,7 @@ crash-looping task reports `runningCount` equal to `desiredCount` for most of ea
 
 ```sh
 # Readiness: 200 with an empty `problems` array. 503 means the svc contract is broken,
-# which is a deploy gate — the proxy reads nine views out of that schema.
+# which is a deploy gate — the proxy reads ten views out of that schema.
 curl -s localhost:8081/readyz       # from the host, via SSM
 
 # Did a container start and then say nothing? That is the shape of a crash loop.

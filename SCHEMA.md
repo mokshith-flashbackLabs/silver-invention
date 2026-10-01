@@ -1038,7 +1038,9 @@ without them.
 
 - **Re-home threat grants before dropping `score_rw`.** `threat_events` and `threat_event_matches` are granted to
   `score_rw` (0022). The follow-up migration that drops the dormant score tables must grant them to a threats role
-  (or `intel_rw`) first, or `create_event` starts failing with permission denied. (Likeness intel spec §3.7.)
+  (or `intel_rw`) first, or `create_event` starts failing with permission denied. (Likeness intel spec §3.7.) *Since 0042 (2026-09-30), `intel_rw` also holds
+  `SELECT, INSERT` on `threat_events`, for approvals; the retract `UPDATE` and the match inserts still run as
+  `score_rw`.*
 
 New role `score_rw`, granted `SELECT, INSERT, UPDATE` on `protection_scores`, `recommendations`,
 `threat_events`, `threat_event_matches` — and **`SELECT, INSERT` only** (no `UPDATE`, no `DELETE`) on
@@ -1228,6 +1230,30 @@ Deploy order: `svc.v_articles` is a REQUIRED entry in `EXPECTED_VIEWS`
 running `0026 down` 503s this service's own `/readyz` in addition to degrading the proxy's
 (optional, on their side) articles reader to an empty feed. Reverting 0026 on a live database is a
 coordinated deploy, never a solo rollback.
+
+---
+
+## 2f. Likeness intel — tag-scoped threat events (migration 0042)
+
+`threat_events` gains two columns (spec `2026-09-27-likeness-intel-design.md` §3.7):
+
+```sql
+tags        TEXT[] NOT NULL DEFAULT '{}' CHECK (intel_tags_well_formed(tags)),  -- threat_events_tags_well_formed
+proposal_id UUID UNIQUE REFERENCES intel_proposals(proposal_id)                 -- NULL for a hand-created event
+```
+
+The relevance CHECK 0022 wrote unnamed is found by its definition and replaced with `threat_events_relevant`:
+`is_global OR cardinality(domains) > 0 OR cardinality(tags) > 0`. The down refuses while an active or draft event is
+scoped by tags alone, then restores the old CHECK `NOT VALID`, which grandfathers a retracted tag-only row. A later
+up validates the widened CHECK unless such a row exists. (The down also sets `penalty = 0.01` on such rows first,
+because 0037's down re-checks the NOT VALID constraint when it updates them.)
+
+`svc.v_active_scoped_events` is the **tenth contract view**, granted to `imageshield_proxy_ro`: `event_id`,
+`direction` (`'threat'`), `kind`, `title`, `body`, `magnitude` (severity, `smallint`), `tags` (`text[]`),
+`is_global`, `starts_at`, `ends_at` (`expires_at`), over threats that are active, started, unexpired and carry a tag.
+It carries events and no person column. Step 4 re-creates it as a UNION with `protection_events`, re-issuing the
+grant in the same file. It is REQUIRED in `EXPECTED_VIEWS`, so a database reverted past 0042 answers `/readyz` 503.
+Coordinated deploy: services first on the way up, the backend first on the way down.
 
 ---
 

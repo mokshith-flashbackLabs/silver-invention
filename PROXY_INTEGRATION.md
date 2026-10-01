@@ -783,6 +783,81 @@ adds `related_events` for event kinds, and step 5 adds `options` for `weight_sug
 
 `document.questions[]` is now validated as exactly `{key, prompt, type, options, deductions, cap}`.
 
+### Likeness intel admin surface (step 3 — threat events)
+
+**New 2026-09-30.** A time-limited incident the weekly scan finds becomes a `threat_event` proposal aimed at exposure
+tags. Approving one creates the threat event in the same transaction: the answer is `status: "applied"` with the new
+event's id in `applied_ref`, and the event is on `svc.v_active_scoped_events` from that moment. You match its tags
+against your own quiz answers; we never see a person or an answer. `proposal_tags_unmapped` (step 2's table) is now
+reachable, and a threat decision adds two codes, `unknown_tag` and `tag_retired`, each carrying `error.slugs`. Map
+them by name.
+
+Every route the backend calls in step 3, and the view it reads. Both tokens (`X-Service-Token`,
+`X-Admin-Service-Token`) on every call; every body is `extra='forbid'`. Errors use the envelope
+`{error: {code, message, retryable, request_id}}`, with extra fields inside `error` where named. Every route also
+answers the framework `401` and `422 validation_error` for a body that fails its own shape.
+
+| # | Route | Body | Success | Semantic errors |
+|---|---|---|---|---|
+| 1 | `POST /v1/admin/intel/proposals/{proposal_id}/decision` (the threat half) | `{decision: "approved"\|"rejected", values?: {kind?, title?, severity?, expires_in_days?, tags?}, reason: string 3–500, applies_regardless_of_location?: bool, operator: string 1–64}`. `values` is **merged** over the proposal's `suggested` and its own `target.tags`; any subset of the five keys is accepted, and a complete set replaces them all. `values` on a rejection is `422 validation_error`. `applies_regardless_of_location` is accepted and unused (step 4). | Approve: `200 {proposal_id, kind: "threat_event", status: "applied", applied_ref: "<event_id>", decided: {kind, title, severity, expires_in_days, tags}}`. The event exists, is `active` and is on `svc.v_active_scoped_events` from this moment. Reject: `200 {…, status: "rejected", applied_ref: null, decided: null}`. | `404 proposal_not_found`; `409 proposal_not_pending`, `proposal_not_decidable` (a `protection_event` until step 4; a `weight_suggestion`), `proposal_evidence_retracted`, `proposal_uncorroborated`, `proposal_tags_unmapped` (the proposal's own tags, or the edited final tags, are all unmapped); `422 values_out_of_bounds`, `422 unknown_tag` with `error.slugs`, `422 tag_retired` with `error.slugs` |
+| 2 | `GET /v1/admin/intel/proposals/{proposal_id}` | — | Step 2's shape plus `related_events: [RelatedEvent]` on **every** detail read: `[]` for a weight change or gap; for an event kind, the active, tag-carrying threat events overlapping its tags (at most 40), never the proposal's own event. | `404 proposal_not_found` |
+| 3 | `GET /v1/admin/intel/proposals` | unchanged | unchanged; `threat_event` rows now appear `pending`, `approvable` per the one predicate | unchanged |
+| 4 | `POST /v1/admin/threat-events` | step 1's body plus `tags?: string[]`, default `[]`, distinct slugs matching `^[a-z][a-z0-9_]{0,39}$`, **shape only**. The relevance rule becomes `is_global OR domains non-empty OR tags non-empty`, else `422 validation_error`. | unchanged: `201 {event_id, matched_count}`. `matched_count` counts domain and global matches only: tag matching is the backend's. | `422 validation_error` |
+| 5 | `POST /v1/admin/threat-events/{event_id}/retract` | unchanged: `{operator, reason 3–500}` | unchanged: `200 {event_id, matched_count, status: "retracted"}`. A tag-only event answers `matched_count: 0` and leaves the view. | `404 threat_event_not_found` |
+| 6 | `GET /v1/admin/threat-events` | — | each item gains `tags: string[]` | — |
+| 7 | `GET /v1/admin/intel/runs` | unchanged | may now list runs of kind `gap_regenerate` (`requested_by: "schedule"`, `source_id: null`) | — |
+
+**`RelatedEvent`** is `{event_id: uuid, direction: "threat", kind: string, title: string, severity: int 1–5,
+tags: string[], is_global: bool, starts_at: timestamptz, expires_at: timestamptz, proposal_id: uuid | null}`.
+
+**`svc.v_active_scoped_events`** (0042), granted `SELECT` to `imageshield_proxy_ro`. The backend's
+`CONTRACT_VIEW_COLUMNS` and its `fixtures/svc/10-svc-stubs.sql` stub must carry exactly these names and types:
+
+| Column | Type (`format_type`) | Source (threat half) |
+|---|---|---|
+| `event_id` | `uuid` | `threat_events.event_id` |
+| `direction` | `text` | `'threat'` (step 4 adds `'protection'`) |
+| `kind` | `text` | `threat_events.kind` |
+| `title` | `text` | `threat_events.title` |
+| `body` | `text` | `threat_events.body` (`''` for an intel-approved event) |
+| `magnitude` | `smallint` | `threat_events.severity` |
+| `tags` | `text[]` | `threat_events.tags` |
+| `is_global` | `boolean` | `threat_events.is_global` |
+| `starts_at` | `timestamp with time zone` | `threat_events.starts_at` |
+| `ends_at` | `timestamp with time zone` | `threat_events.expires_at` |
+
+Rows: `status = 'active' AND starts_at <= now() AND expires_at > now() AND cardinality(tags) > 0`. No person
+column. An event scoped by both domains and tags appears here and on `v_person_threat_context`; the backend dedupes by
+`event_id`. **Deploy:** services' 0042 first on the way up; the backend first on the way down. 0042's down refuses
+while an active or draft tag-only threat exists, so retract those first.
+
+**Notes for your step-3 build** (the services spec wins where the two specs differ):
+1. **Partial `values`.** Services spec §4.7 reads "`decided` is set to the operator's `values` if given", which
+   implies a complete set; backend §6.3 checks "the `values` tags when sent, otherwise `target.tags`", which implies a
+   partial one. Services merge (spec note 2026-09-30), so both readings work. The backend's tag check must use
+   exactly that merge: the effective tags are `values.tags` when present, else `target.tags`.
+2. **Tag refusals on a threat decision are `422 unknown_tag` / `422 tag_retired` with `error.slugs`** (services §3.1),
+   not `values_out_of_bounds`. Services §4.7's protection bullet says `values_out_of_bounds` for tags; that is step
+   4's to reconcile. Backend §6.3's inline resync on `unknown_tag` depends on the §3.1 answer, so they agree.
+3. **An approved threat answers `status: "applied"`**, not `"approved"`: event kinds skip `approved`. Take the event
+   id from `applied_ref` (backend §6.1 already does).
+4. **An intel-approved threat has `body = ''`.** Services §3.6's per-kind table gives a threat no body; §6.3's
+   "event `title` and `body`" names possible free-text leaves. The backend's per-event history line already falls
+   back to its generic reason for an empty body (`threatReason` in `src/score/reasons.ts`), so nothing breaks; the
+   title is the operator-approved user-facing copy.
+5. **`related_events` is defined here.** Neither spec pins its shape; the backend relays it verbatim.
+6. **`proposal_tags_unmapped` also answers an edit whose final tags are all unmapped.** Neither spec names that case;
+   services refuse it so no edit can create an event that reaches nobody.
+7. **The step-3 migration is `0042`.** Backend spec §8 says "diff services' real step-3 and step-4 migrations against
+   `CONTRACT_VIEW_COLUMNS` by hand": that file is `migrations/0042_intel_scoped_threats.up.sql`.
+8. **`matched_count` on create and retract excludes tag matches.** The backend's `score_effect.people` is its own
+   count across both bases, never this number.
+9. **Decision `values` fields are OMITTED, never null.** An explicit `null` (for example `{"tags": null}`) is refused
+   `422 values_out_of_bounds`; leave the key out to keep the proposal's own value.
+10. **A model-proposed threat's `body` is `''`** (flag 4), and on `v_active_scoped_events` too.
+11. **`applied_ref` is the new event's id as a canonical UUID string.**
+
+
 ---
 
 ## 5. Object storage — the proxy mints, we PUT and discard
@@ -823,10 +898,11 @@ built; we built `infringements` and `attestations` instead, with different names
 The grant named a schema that was never created. That was our mistake, not yours, and it is why
 `src/services/contract/readers.ts` was written against a contract nobody here had agreed to implement.
 
-### The nine `svc` views
+### The ten `svc` views
 
 The views your reader expects now exist, in an `svc` schema, owned by this repo (migration 0016;
-four more in 0023; one more in 0026; `keyed_on` appended to `v_person_hits` in 0027; a fifth
+four more in 0023; one more in 0026; one more in 0042, events rather than
+people; `keyed_on` appended to `v_person_hits` in 0027; a fifth
 feedback signal and a new `hit_status` value threaded through both `v_person_hits` and
 `v_person_report_summary` in 0028 — no new column, see below).
 
@@ -841,6 +917,7 @@ feedback signal and a new `hit_status` value threaded through both `v_person_hit
 | `svc.v_person_recommendations` *(0023)* | `rec_id`, `person_ref`, `kind`, `params`, `status`, `source_event_id`, `created_at`, `completed_at`, `expires_at` — **granted, no longer written (2026-09-24)** |
 | `svc.v_person_threat_context` *(0023)* | `person_ref`, `event_id`, `kind`, `title`, `body`, `severity`, `starts_at`, `expires_at` — pre-filtered to `status = 'active' AND expires_at > now()`; a `draft` or `retracted` event never appears here |
 | `svc.v_articles` *(0026)* | `article_id`, `title`, `summary`, `body`, `images`, `sources`, `published_at`, `updated_at` — published rows only; operator content for every user, no person column |
+| `svc.v_active_scoped_events` *(0042)* | `event_id`, `direction`, `kind`, `title`, `body`, `magnitude`, `tags`, `is_global`, `starts_at`, `ends_at` — **events, never people**: the threat half is active, started, unexpired threats carrying at least one tag; step 4 adds the protection half as a UNION. Required by our `/readyz`; optional on yours |
 
 **`v_person_score`, `v_person_score_events` and `v_person_recommendations` write no data since
 2026-09-24** (spec `2026-09-24-remove-protection-score-design.md`) — the protection score is
@@ -958,9 +1035,11 @@ GRANT SELECT ON svc.v_person_score, svc.v_person_score_events,
   TO imageshield_proxy_ro;
 -- 0026, same role, same idiom:
 GRANT SELECT ON svc.v_articles TO imageshield_proxy_ro;
+-- 0042, same role, same idiom:
+GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
 ```
 
-**`SELECT` on the nine views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
+**`SELECT` on the ten views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
 view's base-table reads are checked against the view *owner*, which is what lets exactly this
 projection through while `enrolments`, `attestations` and `attributed_faces` stay closed. Verify by
 attempting `SELECT * FROM public.enrolments` as that role: it must fail with a permission error, not be

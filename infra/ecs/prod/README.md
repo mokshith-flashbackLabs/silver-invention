@@ -108,7 +108,7 @@ role's `ClaudePlatformInvoke` grant lives in the backend repo
 
 ## Order
 
-Services migrates first: the backend reads nine `svc` views that live in this schema and fails its
+Services migrates first: the backend reads ten `svc` views that live in this schema and fails its
 readiness check without them.
 
 **Dated, 2026-09-24.** The same rule binds the protection-score removal specifically: services
