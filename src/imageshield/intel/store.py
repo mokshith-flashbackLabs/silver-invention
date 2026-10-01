@@ -21,7 +21,8 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.bounds import MAX_RUN_ATTEMPTS
-from imageshield.intel.models import Run, Source, SpendToday, Vocabulary
+from imageshield.intel.models import Run, Source, SourcePause, SpendToday, Vocabulary
+from imageshield.intel.vocabulary import parse_vocabulary
 from imageshield.providers.store import utc_spend_date
 from imageshield.search.urlhash import NORMALISATION_VERSION, canonicalise, url_hash
 
@@ -99,10 +100,15 @@ _PUT_VOCAB_SQL = """
     RETURNING 1
 """
 
+# An operator's own disable clears 'unmapped', so the pause pass never re-enables what an
+# operator turned off (spec §4.10).
 _PATCH_SOURCE_SQL = f"""
     UPDATE intel_sources SET
         enabled = coalesce(%(enabled)s::boolean, enabled),
-        disabled_reason = CASE WHEN %(enabled)s::boolean IS TRUE THEN NULL ELSE disabled_reason END,
+        disabled_reason = CASE
+            WHEN %(enabled)s::boolean IS TRUE THEN NULL
+            WHEN %(enabled)s::boolean IS FALSE AND disabled_reason = 'unmapped' THEN NULL
+            ELSE disabled_reason END,
         consecutive_failures = CASE WHEN %(enabled)s::boolean IS TRUE THEN 0
                                     ELSE consecutive_failures END,
         check_every_hours = coalesce(%(check_every_hours)s::int, check_every_hours),
@@ -112,6 +118,23 @@ _PATCH_SOURCE_SQL = f"""
         updated_at = now()
      WHERE source_id = %(source_id)s
     RETURNING {SOURCE_COLUMNS}
+"""
+
+# spec §4.9, §4.10: a source whose NON-EMPTY tags are all unmapped in the live vocabulary pauses;
+# one paused that way resumes when any of its tags is mapped again, or when its tags are cleared
+# (an untagged source never pauses). A source disabled for any other reason, or by an operator
+# (which leaves disabled_reason NULL), is never touched.
+_PAUSE_UNMAPPED_SQL = """
+    UPDATE intel_sources SET enabled = false, disabled_reason = 'unmapped', updated_at = now()
+     WHERE enabled AND cardinality(tags) > 0 AND NOT (tags && %(mapped)s::text[])
+    RETURNING source_id
+"""
+
+_RESUME_MAPPED_SQL = """
+    UPDATE intel_sources SET enabled = true, disabled_reason = NULL, updated_at = now()
+     WHERE NOT enabled AND disabled_reason = 'unmapped'
+       AND (cardinality(tags) = 0 OR tags && %(mapped)s::text[])
+    RETURNING source_id
 """
 
 
@@ -165,6 +188,7 @@ class IntelStore(Protocol):
         document: dict[str, Any],
     ) -> bool: ...
     async def load_vocabulary(self) -> Vocabulary | None: ...
+    async def pause_unmapped_sources(self) -> SourcePause: ...
     async def spend_today(self, now: datetime) -> SpendToday: ...
 
 
@@ -466,3 +490,46 @@ class PostgresIntelStore:
             spent_today_usd=cost or Decimal("0"),
             daily_budget_usd=budget,
         )
+
+    async def pause_unmapped_sources(self) -> SourcePause:
+        """spec §4.9's source row, STATE-BASED: run on every worker tick before scheduling, it
+        compares every source's tags with what the live quiz maps NOW, so a source registered or
+        re-tagged since the last push follows the quiz too. With no vocabulary, or one that cannot
+        be read, nothing moves: what is mapped is unknown then."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(
+                "SELECT release_no, map_version, scoring_version, quiz_version, document"
+                " FROM intel_vocabulary WHERE id = 1"
+            )
+            row = await cur.fetchone()
+            vocabulary = (
+                parse_vocabulary(Vocabulary.model_validate(row)) if row is not None else None
+            )
+            if vocabulary is None:
+                return SourcePause()
+            mapped = sorted(vocabulary.mapped_tags)
+            moved = await conn.execute(_PAUSE_UNMAPPED_SQL, {"mapped": mapped})
+            paused = tuple(r[0] for r in await moved.fetchall())
+            moved = await conn.execute(_RESUME_MAPPED_SQL, {"mapped": mapped})
+            resumed = tuple(r[0] for r in await moved.fetchall())
+            if paused or resumed:
+                await conn.execute(
+                    _AUDIT_SQL,
+                    {
+                        "actor_type": "service",
+                        "action": "intel.sources_followed_quiz",
+                        "resource_id": None,
+                        "metadata": Jsonb(
+                            {
+                                "release_no": vocabulary.release_no,
+                                "map_version": vocabulary.map_version,
+                                "paused": [str(i) for i in paused],
+                                "resumed": [str(i) for i in resumed],
+                            }
+                        ),
+                    },
+                )
+        if paused or resumed:
+            log.info("intel.sources_followed_quiz", paused=len(paused), resumed=len(resumed))
+        return SourcePause(paused=paused, resumed=resumed)

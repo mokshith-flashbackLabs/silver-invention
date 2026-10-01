@@ -51,6 +51,7 @@ from imageshield.intel.proposal_models import DecisionRefused
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, membership_problems
+from imageshield.intel.vocabulary import parse_vocabulary
 from imageshield.search.urlhash import url_hash
 
 log = structlog.get_logger("imageshield.intel")
@@ -116,6 +117,17 @@ async def _check_url(store: IntelStore, url: str | None) -> None:
         raise _refuse("known_hit_location", "this URL is a known hit location and is never read")
 
 
+async def _all_tags_unmapped(store: IntelStore, tags: tuple[str, ...]) -> bool:
+    """spec §4.10: a source whose non-empty tags are all unmapped cannot run -- the tick would
+    pause it again within one poll -- so enabling one is refused rather than silently undone.
+    With no readable vocabulary nothing counts as unmapped, exactly as the tick sees it."""
+    if not tags:
+        return False
+    row = await store.load_vocabulary()
+    vocabulary = parse_vocabulary(row) if row is not None else None
+    return vocabulary is not None and not set(tags) & vocabulary.mapped_tags
+
+
 @router.post("/sources", status_code=201)
 async def create_source(
     body: IntelSourceCreateRequest, store: IntelStore = Depends(get_intel_store)
@@ -162,6 +174,17 @@ async def patch_source(
     if body.tags is not None:
         added = tuple(tag for tag in body.tags if tag not in existing.tags)
         await _check_tags(store, added)
+    if body.enabled is True:
+        tags = body.tags if body.tags is not None else existing.tags
+        if await _all_tags_unmapped(store, tags):
+            raise ServiceError(
+                409,
+                "source_tags_unmapped",
+                "No option of the live quiz maps to any of this source's tags; map one, or clear"
+                " its tags, before enabling it.",
+                retryable=False,
+                extra={"slugs": list(tags)},
+            )
     source = await store.patch_source(
         source_id,
         operator=body.operator,

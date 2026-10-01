@@ -33,6 +33,7 @@ class FakeIntelStore:
         self.created: list[dict[str, Any]] = []
         self.known_hits: set[str] = set()
         self.vocab_applied = True
+        self.option_tags: list[dict[str, Any]] = []
         self.registry_tags = [
             {"slug": "instagram", "label": "Instagram", "description": "", "retired": False},
             {"slug": "vine", "label": "Vine", "description": "", "retired": True},
@@ -99,7 +100,7 @@ class FakeIntelStore:
             map_version=1,
             scoring_version="s",
             quiz_version="q",
-            document={"tags": self.registry_tags},
+            document={"tags": self.registry_tags, "option_tags": self.option_tags},
         )
 
     async def queue_source_check(self, source_id: UUID, *, operator: str) -> UUID | None:
@@ -559,3 +560,39 @@ def test_vocabulary_push_refuses_a_malformed_question(bad: dict[str, Any]) -> No
     client, _ = _client()
     r = client.put("/v1/admin/intel/vocabulary", headers=ADMIN, json=_push([bad]))
     assert r.status_code == 422 and r.json()["error"]["code"] == "validation_error"
+
+
+def test_enabling_a_source_whose_tags_are_all_unmapped_is_409() -> None:
+    """Review Focus 4: the tick would pause it again within one poll, so the enable is refused
+    rather than silently undone (spec §4.10)."""
+    client, store = _client()
+    created = client.post("/v1/admin/intel/sources", json=_source(), headers=ADMIN).json()
+    url = f"/v1/admin/intel/sources/{created['source_id']}"
+    r = client.patch(url, json={"enabled": True, "operator": "alice"}, headers=ADMIN)
+    assert r.status_code == 409 and r.json()["error"]["code"] == "source_tags_unmapped"
+    assert r.json()["error"]["slugs"] == ["instagram"]
+    store.option_tags = [{"question_key": "q", "option": "o", "tags": ["instagram"]}]
+    r = client.patch(url, json={"enabled": True, "operator": "alice"}, headers=ADMIN)
+    assert r.status_code == 200
+
+
+def test_enabling_an_untagged_source_or_clearing_its_tags_on_the_way_is_allowed() -> None:
+    client, _ = _client()
+    general = client.post("/v1/admin/intel/sources", json=_source(tags=[]), headers=ADMIN).json()
+    r = client.patch(
+        f"/v1/admin/intel/sources/{general['source_id']}",
+        json={"enabled": True, "operator": "alice"},
+        headers=ADMIN,
+    )
+    assert r.status_code == 200
+    tagged = client.post(
+        "/v1/admin/intel/sources",
+        json=_source(source_url="https://p.example/other"),
+        headers=ADMIN,
+    ).json()
+    r = client.patch(
+        f"/v1/admin/intel/sources/{tagged['source_id']}",
+        json={"enabled": True, "tags": [], "operator": "alice"},
+        headers=ADMIN,
+    )
+    assert r.status_code == 200

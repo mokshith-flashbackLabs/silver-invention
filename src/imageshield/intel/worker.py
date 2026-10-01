@@ -52,6 +52,9 @@ async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
     # spec §4.9: react to a new vocabulary within one poll, before any run loads it.
     await deps.reconciler.reconcile()
     await deps.store.expire_exhausted(now)
+    # spec §4.10: sources follow the quiz. State-based, and before scheduling, so a source whose
+    # tags all left the live quiz is paused before it can be queued.
+    await deps.store.pause_unmapped_sources()
     await deps.store.schedule_due(now)
     claimed = await deps.store.claim_next(now, lease_seconds=lease_seconds)
     if claimed is None:

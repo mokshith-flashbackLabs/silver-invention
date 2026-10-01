@@ -100,3 +100,13 @@ class SpendToday(BaseModel):
     call_count: int
     spent_today_usd: Decimal
     daily_budget_usd: Decimal | None
+
+
+class SourcePause(BaseModel):
+    """What one pause pass changed (spec §4.9, §4.10): sources paused because their tags all left
+    the live quiz, and sources resumed because one came back (or their tags were cleared)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    paused: tuple[UUID, ...] = ()
+    resumed: tuple[UUID, ...] = ()
