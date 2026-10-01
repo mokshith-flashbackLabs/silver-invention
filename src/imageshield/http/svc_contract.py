@@ -205,7 +205,8 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
     },
     # ── 0042: likeness intel — events, never people (spec 2026-09-27 §3.7) ─────────
     # REQUIRED here, where there is no optional tier; the backend reads it as optional,
-    # like v_articles. Step 4 re-creates it as a UNION and keeps these ten columns.
+    # like v_articles. 0044 (step 4) re-created it as a UNION with the protection half
+    # (strength as magnitude, review_by as ends_at) and kept these ten columns and types.
     "v_active_scoped_events": {
         "event_id": "uuid",
         "direction": "text",

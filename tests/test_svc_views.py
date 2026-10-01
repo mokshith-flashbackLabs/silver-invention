@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import json
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -396,6 +397,7 @@ def test_the_proxy_role_reads_the_views_and_nothing_else(migrated_db: str) -> No
             "public.subjects",
             "public.articles",
             "public.threat_events",
+            "public.protection_events",
         ):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute(f"SELECT * FROM {table}")
@@ -1280,3 +1282,71 @@ def test_active_scoped_events_carries_live_tag_scoped_threats_and_no_person(
     assert row["tags"] == ["linkedin"] and row["is_global"] is False and row["body"] == ""
     assert row["ends_at"] > row["starts_at"]
     assert not {"person_ref", "user_ref"} & set(row)
+
+
+_PROTECTION_PROPOSAL = (
+    "INSERT INTO intel_proposals (kind, status, target, suggested, rationale, model_id,"
+    " prompt_version) VALUES ('protection_event', 'pending', '{}', '{}', 'r', 'm', 'p')"
+    " RETURNING proposal_id"
+)
+
+_SCOPED_PROTECTION = (
+    "INSERT INTO protection_events (title, strength, tags, is_global, starts_at, review_by,"
+    " status, proposal_id, created_by, retracted_by, retracted_at, retract_reason)"
+    " VALUES (%s, 2, %s::text[], %s, now() + %s::interval, now() + %s::interval, %s, %s,"
+    " 'ops', %s, %s, %s) RETURNING event_id"
+)
+
+
+def test_active_scoped_events_carries_live_protections_beside_threats_and_no_person(
+    migrated_db: str,
+) -> None:
+    """spec §3.7, step 4 (0044): the UNION's protection half. A live credit is published with
+    direction and kind 'protection', its strength as magnitude and its review date as ends_at;
+    a global one carries no tags. A retracted, lapsed or not-yet-started credit is absent, and
+    the threat half is unchanged beside it."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+
+        def add(
+            title: str,
+            tags: list[str],
+            *,
+            is_global: bool = False,
+            status: str = "active",
+            starts: str = "0 days",
+            ends: str = "90 days",
+        ) -> UUID:
+            proposal = conn.execute(_PROTECTION_PROPOSAL).fetchone()
+            assert proposal is not None
+            named: tuple[Any, ...] = (
+                ("ops", datetime.now(UTC), "withdrawn")
+                if status == "retracted"
+                else (None, None, None)
+            )
+            row = conn.execute(
+                _SCOPED_PROTECTION,
+                (title, tags, is_global, starts, ends, status, proposal[0], *named),
+            ).fetchone()
+            assert row is not None
+            event_id: UUID = row[0]
+            return event_id
+
+        tagged = add("tagged", ["instagram"])
+        everyone = add("everyone", [], is_global=True)
+        add("retracted", ["instagram"], status="retracted")
+        add("lapsed", ["instagram"], starts="-100 days", ends="-1 days")
+        add("scheduled", ["instagram"], starts="30 days", ends="120 days")
+        conn.execute(_SCOPED_THREAT, ("threat", ["instagram"], [], "0 days", "7 days", "active"))
+    rows = _rows(migrated_db, "SELECT * FROM svc.v_active_scoped_events ORDER BY title")
+    assert [(r["title"], r["direction"]) for r in rows] == [
+        ("everyone", "protection"),
+        ("tagged", "protection"),
+        ("threat", "threat"),
+    ]
+    (credit,) = [r for r in rows if r["event_id"] == tagged]
+    assert credit["kind"] == "protection" and credit["magnitude"] == 2 and credit["body"] == ""
+    assert credit["tags"] == ["instagram"] and credit["is_global"] is False
+    assert credit["ends_at"] > credit["starts_at"]
+    (general,) = [r for r in rows if r["event_id"] == everyone]
+    assert general["tags"] == [] and general["is_global"] is True
+    assert not {"person_ref", "user_ref"} & set(credit)

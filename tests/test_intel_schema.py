@@ -7,7 +7,7 @@ import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -511,3 +511,178 @@ def test_0042_down_all_survives_a_retracted_tag_only_threat(migrated_db: str) ->
     down = run_migrate(migrated_db, "down", "--all")
     assert down.returncode == 0, down.stderr
     assert run_migrate(migrated_db, "up").returncode == 0
+
+
+_PROTECTION_PROPOSAL = (
+    "INSERT INTO intel_proposals (kind, status, target, suggested, rationale, model_id,"
+    " prompt_version) VALUES ('protection_event', 'pending',"
+    " '{\"tags\": [\"x\"], \"is_global\": false}', '{}', 'r', 'm', 'p') RETURNING proposal_id"
+)
+
+_PROTECTION = (
+    "INSERT INTO protection_events (title, strength, tags, is_global, starts_at, review_by,"
+    " status, proposal_id, renews_event_id, created_by, retracted_by, retracted_at,"
+    " retract_reason)"
+    " VALUES ('p', %(strength)s, %(tags)s::text[], %(is_global)s, now() + %(starts)s::interval,"
+    " now() + %(ends)s::interval, %(status)s, %(proposal_id)s, %(renews)s, 'op',"
+    " %(retracted_by)s, %(retracted_at)s, %(retract_reason)s) RETURNING event_id"
+)
+
+
+def _protection(conn: psycopg.Connection[Any], **overrides: Any) -> UUID:
+    """One protection_events row, on a fresh proposal unless ``proposal_id`` is given."""
+    params: dict[str, Any] = {
+        "strength": 3,
+        "tags": ["x"],
+        "is_global": False,
+        "starts": "0 days",
+        "ends": "90 days",
+        "status": "active",
+        "renews": None,
+        "retracted_by": None,
+        "retracted_at": None,
+        "retract_reason": None,
+        **overrides,
+    }
+    if "proposal_id" not in overrides:
+        proposal = conn.execute(_PROTECTION_PROPOSAL).fetchone()
+        assert proposal is not None
+        params["proposal_id"] = proposal[0]
+    row = conn.execute(_PROTECTION, params).fetchone()
+    assert row is not None
+    event_id: UUID = row[0]
+    return event_id
+
+
+def test_0044_protection_events_hold_their_shape(migrated_db: str) -> None:
+    """spec §3.7: strength 1-5, exactly one of tags or global, a review within 366 days of the
+    start, a retraction that names who and why, and a proposal behind every credit."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _protection(conn)  # a tag-scoped credit
+        _protection(conn, tags=[], is_global=True)  # a global one
+        for bad in (
+            {"strength": 0},
+            {"strength": 6},
+            {"tags": [], "is_global": False},  # reaches nobody
+            {"tags": ["x"], "is_global": True},  # both scopes at once
+            {"tags": ["X"]},  # a malformed slug
+            {"tags": ["x", "x"]},  # a repeated slug
+            {"ends": "0 days"},  # review_by == starts_at
+            {"ends": "367 days"},  # past a year and a day
+            {"status": "lapsed"},  # active or retracted only
+            {"status": "retracted"},  # retracted with no name on it
+            {"retracted_by": "op"},  # a name on an active credit
+        ):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                _protection(conn, **bad)
+        with pytest.raises(psycopg.errors.NotNullViolation):  # no hand-created credit
+            _protection(conn, proposal_id=None)
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            _protection(conn, proposal_id=uuid4())
+
+
+def test_0044_one_credit_per_proposal_and_one_renewal_per_credit(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        first = _protection(conn)
+        row = conn.execute(
+            "SELECT proposal_id FROM protection_events WHERE event_id = %s", (first,)
+        ).fetchone()
+        assert row is not None
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            _protection(conn, proposal_id=row[0])
+        _protection(conn, renews=first, starts="90 days", ends="180 days")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            _protection(conn, renews=first, starts="90 days", ends="180 days")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            _protection(conn, renews=uuid4())
+
+
+def test_0044_intel_rw_creates_locks_and_retracts_credits_and_never_deletes(
+    migrated_db: str,
+) -> None:
+    """Approving inserts a credit and locks the one a renewal continues; retracting updates
+    one; all as intel_rw (spec §3.7, §4.7). Asserted under SET ROLE: a superuser run hides a
+    missing grant (the 0035 trap)."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute("SET ROLE intel_rw")
+        event_id = _protection(conn)
+        conn.execute(
+            "SELECT event_id FROM protection_events WHERE event_id = %s FOR UPDATE", (event_id,)
+        )
+        conn.execute(
+            "UPDATE protection_events SET status = 'retracted', retracted_by = 'op',"
+            " retracted_at = now(), retract_reason = 'withdrawn' WHERE event_id = %s",
+            (event_id,),
+        )
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("DELETE FROM protection_events")
+        conn.execute("RESET ROLE")
+
+
+def test_0044_one_open_renewal_check_per_credit(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        event = str(uuid4())
+        insert = (
+            "INSERT INTO intel_runs (kind, request, requested_by, status)"
+            " VALUES ('renewal_check', jsonb_build_object('event_id', %s::text), 'schedule', %s)"
+        )
+        conn.execute(insert, (event, "queued"))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, (event, "queued"))
+        conn.execute(
+            "UPDATE intel_runs SET status = 'completed' WHERE request ->> 'event_id' = %s",
+            (event,),
+        )
+        conn.execute(insert, (event, "queued"))  # a finished check does not block the next
+
+
+def _threat_half(path: Path) -> str:
+    text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+    start = text.index("SELECT event_id,")
+    end = text.index("AND cardinality(tags) > 0", start) + len("AND cardinality(tags) > 0")
+    return text[start:end]
+
+
+def test_0044_keeps_the_threat_half_byte_identical_to_0042() -> None:
+    """spec §3.7 (step 4): the view gains a protection half; its threat half, and the one the
+    down restores, are 0042's exactly."""
+    migrations = Path(__file__).parent.parent / "migrations"
+    threat_half = _threat_half(migrations / "0042_intel_scoped_threats.up.sql")
+    for name in (
+        "0044_intel_protection_events.up.sql",
+        "0044_intel_protection_events.down.sql",
+    ):
+        assert _threat_half(migrations / name) == threat_half, name
+
+
+def test_0044_down_restores_the_threat_only_view_with_its_grant(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        _protection(conn)
+        conn.execute(
+            "INSERT INTO intel_runs (kind, request, requested_by)"
+            " VALUES ('renewal_check', jsonb_build_object('event_id', %s::text), 'schedule')",
+            (str(uuid4()),),
+        )
+    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0044_"))
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute("SELECT to_regclass('public.protection_events')").fetchone() == (
+            None,
+        )
+        assert conn.execute(
+            "SELECT to_regclass('public.intel_runs_one_open_renewal')"
+        ).fetchone() == (None,)
+        definition = conn.execute(
+            "SELECT definition FROM pg_views"
+            " WHERE schemaname = 'svc' AND viewname = 'v_active_scoped_events'"
+        ).fetchone()
+        assert definition is not None and "protection" not in definition[0]
+        assert conn.execute(
+            "SELECT has_table_privilege('imageshield_proxy_ro', 'svc.v_active_scoped_events',"
+            " 'SELECT')"
+        ).fetchone() == (True,)
+        assert conn.execute(
+            "SELECT status, error_code FROM intel_runs WHERE kind = 'renewal_check'"
+        ).fetchone() == ("failed", "migration_down")
+    up = run_migrate(migrated_db, "up")
+    assert up.returncode == 0, up.stderr
