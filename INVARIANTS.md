@@ -825,6 +825,12 @@ override lane) and `::test_a_subject_cannot_overturn_a_machine_confirm`.
 - There is no timeout, confidence level or source trust that auto-approves.
 - A known hit location is never fetched for it.
 - An operator query must not name an individual. That is policy, and the PII-shape refusal is its only enforcement.
+- *Step 5, 2026-09-30:* a model-proposed source is a candidate in its run's outcome and registers nothing. A source
+  enters `intel_sources` only through `POST /weight-suggestions`, naming an operator, after code alone found it ready
+  (stage 3), in one transaction with its audit row. A weight suggestion is advice born `delivered`: it decides
+  nothing, cannot be approved, and may cite no evidence. Check:
+  `tests/test_intel_question_runs.py::test_a_source_proposal_lists_existing_sources_first_and_registers_nothing` and
+  `tests/test_admin_intel_question_routes.py::test_a_source_that_is_not_validated_is_refused_and_nothing_registered`.
 
 Check: the boundary tests (§6.1), the shape CHECKs (§3.6), and a test that no code path moves a proposal to
 `approved` except the decision route: `tests/test_boundaries.py::test_only_the_decision_path_moves_a_proposal_to_approved`
