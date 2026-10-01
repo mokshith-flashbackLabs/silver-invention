@@ -14,6 +14,7 @@ from imageshield.intel.generation import (
     GeneratedBatch,
     duplicate_of,
     prompt_live_event,
+    prompt_live_protection,
     prompt_pending_event,
     prompt_quiz,
     prompt_registry,
@@ -31,6 +32,7 @@ from imageshield.intel.proposal_models import (
     Attachment,
     ContextSignal,
     LiveEvent,
+    LiveProtection,
     NewProposal,
     PendingEvent,
 )
@@ -38,6 +40,7 @@ from imageshield.intel.schemas import (
     ProposalOutput,
     ProposedAttach,
     ProposedCoverageGap,
+    ProposedProtectionEvent,
     ProposedTag,
     ProposedThreatEvent,
     ProposedWeightChange,
@@ -623,3 +626,133 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
     assert PROPOSE_PROMPT_VERSION == "propose-v3"
+
+
+def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
+    fields: dict[str, object] = {
+        "title": "Instagram lets people keep their photos out of AI training",
+        "strength": 2,
+        "review_in_days": 180,
+        "tags": ["instagram"],
+        "rationale": "The platform announced the opt-out on its own blog.",
+        "signal_ids": [str(s.signal_id) for s in signals],
+    }
+    fields.update(kw)
+    return ProposedProtectionEvent.model_validate(fields)
+
+
+def test_a_valid_protection_event_is_kept_with_its_title_masked() -> None:
+    s = _sig(tags=("instagram",))
+    out = ProposalOutput(protection_events=[_protection(s, title="Opt out; call +44 20 7946 0958")])
+    batch, counts = _validate(out, [s])
+    (proposal,) = batch.protection_events
+    assert proposal.kind == "protection_event"
+    assert proposal.target == {"tags": ["instagram"], "is_global": False}
+    assert proposal.suggested["strength"] == 2 and proposal.suggested["review_in_days"] == 180
+    assert "7946" not in proposal.suggested["title"] and counts["pii_masked_title"] == 1
+    assert proposal.signal_ids == (s.signal_id,) and batch.proposals == [proposal]
+
+
+@pytest.mark.parametrize(
+    ("kw", "reason"),
+    [
+        ({"is_global": True}, "global_not_proposable"),
+        ({"is_global": True, "tags": []}, "global_not_proposable"),
+        ({"tags": []}, "no_tags"),
+        ({"tags": ["Instagram"]}, "tag_malformed"),
+        ({"tags": ["instagram", "instagram"]}, "tag_malformed"),
+        ({"tags": ["tiktok"]}, "unknown_tag"),
+        ({"tags": ["instagram", "myspace"]}, "tag_retired"),
+        ({"strength": 0}, "strength_out_of_bounds"),
+        ({"strength": 6}, "strength_out_of_bounds"),
+        ({"review_in_days": 29}, "review_out_of_bounds"),
+        ({"review_in_days": 367}, "review_out_of_bounds"),
+        ({"title": "   "}, "empty_title"),
+        ({"title": "x" * 201}, "title_too_long"),
+        ({"signal_ids": []}, "no_signals"),
+    ],
+)
+def test_an_invalid_protection_event_is_never_written(kw: dict[str, object], reason: str) -> None:
+    s = _sig(tags=("instagram",))
+    batch, counts = _validate(ProposalOutput(protection_events=[_protection(s, **kw)]), [s])
+    assert batch.protection_events == []
+    assert counts[f"proposal_dropped_{reason}"] == 1
+
+
+def test_a_protection_on_registered_but_unmapped_tags_is_kept_to_wait() -> None:
+    """spec §4.5: written pending, never dropped. tags_unmapped is a read-time answer."""
+    s = _sig(tags=("linkedin",))
+    batch, _ = _validate(ProposalOutput(protection_events=[_protection(s, tags=["linkedin"])]), [s])
+    assert [p.target for p in batch.protection_events] == [
+        {"tags": ["linkedin"], "is_global": False}
+    ]
+
+
+def test_a_repeat_of_a_pending_protection_attaches_and_a_threat_is_no_duplicate_of_one() -> None:
+    """spec §4.3: same KIND, same tag set and a shared document. A pending threat on the same
+    tags and page is a different proposal."""
+    doc = "hash-of-the-page"
+    old, new = _sig(tags=("instagram",), document=doc), _sig(tags=("instagram",), document=doc)
+    pending_protection, pending_threat = uuid4(), uuid4()
+    pending = {
+        pending_threat: _pending(pending_threat, documents=frozenset({doc})),
+        pending_protection: PendingEvent(
+            pending_protection,
+            "protection_event",
+            ("instagram",),
+            "Opt-out",
+            None,
+            (),
+            frozenset({doc}),
+        ),
+    }
+    batch, counts = _validate(
+        ProposalOutput(protection_events=[_protection(old, new)]),
+        [old, new],
+        pending=pending,
+        new={new.signal_id},
+    )
+    assert batch.protection_events == []
+    assert batch.attachments == [Attachment(pending_protection, (new.signal_id,))]
+    assert counts["proposal_converted_to_attach"] == 1
+
+
+def test_two_copies_of_one_protection_in_one_batch_keep_the_first() -> None:
+    s = _sig(tags=("instagram",), document="hash-of-the-page")
+    out = ProposalOutput(
+        protection_events=[_protection(s), _protection(s, title="The same opt-out again")]
+    )
+    batch, counts = _validate(out, [s])
+    assert len(batch.protection_events) == 1
+    assert counts["proposal_dropped_duplicate_event"] == 1
+
+
+def test_a_threat_and_a_protection_on_one_page_are_both_kept() -> None:
+    s = _sig(tags=("instagram",), document="hash-of-the-page")
+    out = ProposalOutput(threat_events=[_threat(s)], protection_events=[_protection(s)])
+    batch, _ = _validate(out, [s])
+    assert len(batch.threat_events) == 1 and len(batch.protection_events) == 1
+    assert batch.proposals == [*batch.threat_events, *batch.protection_events]
+
+
+def test_a_regeneration_writes_protection_events_too() -> None:
+    s = _sig(tags=("instagram",))
+    out = ProposalOutput(weight_changes=[_change(s)], protection_events=[_protection(s)])
+    batch, counts = _validate(out, [s], events_only=True)
+    assert batch.weight_changes == [] and len(batch.protection_events) == 1
+    assert counts["proposal_dropped_not_an_event"] == 1
+
+
+def test_the_live_protection_prompt_item_carries_ids_as_strings() -> None:
+    eid, pid, sid = uuid4(), uuid4(), uuid4()
+    review = NOW + timedelta(days=90)
+    live = LiveProtection(eid, "Opt-out", 2, ("instagram",), False, NOW, review, pid, None, (sid,))
+    assert prompt_live_protection(live) == {
+        "event_id": str(eid),
+        "title": "Opt-out",
+        "strength": 2,
+        "tags": ["instagram"],
+        "is_global": False,
+        "review_by": review.isoformat(),
+        "signal_ids": [str(sid)],
+    }

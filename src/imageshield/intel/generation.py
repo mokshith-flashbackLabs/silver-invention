@@ -1,6 +1,6 @@
 """Proposal validation for every generated kind -- step 2's weight changes and coverage gaps,
-step 3's threat events and attachments -- (spec §4.3, §4.5, §6.3), and the payload builders for
-the generation prompt.
+step 3's threat events and attachments, step 4's protection events -- (spec §4.3, §4.5, §6.3),
+and the payload builders for the generation prompt.
 
 Code, never the model, decides what is written. The model's output is read against the
 vocabulary the run LOADED (never a row a push may have overwritten since) and against the
@@ -11,9 +11,13 @@ an unknown signal id is not skipped.
 A coverage gap's evidence is not the model's claim either. It is recomputed here from every
 active signal of the window that concerns the subject.
 
-A threat event that repeats a pending proposal is that proposal again, decided here by rule,
-never by the model: same kind, same tag set, a shared signal document (spec §4.3). It becomes an
-attachment of the run's own new evidence.
+An event proposal of either kind that repeats a pending proposal is that proposal again,
+decided here by rule, never by the model: same kind, same tag set, a shared signal document
+(spec §4.3). It becomes an attachment of the run's own new evidence.
+
+The model may not make a protection credit global: it cannot know that a protection applies
+wherever a person lives (spec §4.5). Such a proposal is dropped (global_not_proposable); a global
+credit exists only by an operator's edit on approval.
 """
 
 from __future__ import annotations
@@ -33,6 +37,10 @@ from imageshield.intel.bounds import (
     MAX_PROMPT_TAGS,
     MAX_RATIONALE_CHARS,
     MAX_SUGGESTED_QUESTION_CHARS,
+    PROTECTION_REVIEW_MAX_DAYS,
+    PROTECTION_REVIEW_MIN_DAYS,
+    PROTECTION_STRENGTH_MAX,
+    PROTECTION_STRENGTH_MIN,
     THREAT_EXPIRES_MAX_DAYS,
     THREAT_EXPIRES_MIN_DAYS,
     THREAT_SEVERITY_MAX,
@@ -42,6 +50,7 @@ from imageshield.intel.cells import cell_problem
 from imageshield.intel.pii import mask
 from imageshield.intel.prompts import (
     PromptLiveEvent,
+    PromptLiveProtection,
     PromptOption,
     PromptPendingEvent,
     PromptQuestion,
@@ -53,8 +62,11 @@ from imageshield.intel.proposal_models import (
     ContextSignal,
     CoverageGapTarget,
     LiveEvent,
+    LiveProtection,
     NewProposal,
     PendingEvent,
+    ProtectionEventSuggested,
+    ProtectionEventTarget,
     SuggestedTag,
     ThreatEventSuggested,
     ThreatEventTarget,
@@ -65,6 +77,7 @@ from imageshield.intel.schemas import (
     ProposalOutput,
     ProposedAttach,
     ProposedCoverageGap,
+    ProposedProtectionEvent,
     ProposedTag,
     ProposedThreatEvent,
     ProposedWeightChange,
@@ -79,11 +92,17 @@ class GeneratedBatch:
     weight_changes: list[NewProposal] = field(default_factory=list)
     coverage_gaps: list[NewProposal] = field(default_factory=list)
     threat_events: list[NewProposal] = field(default_factory=list)
+    protection_events: list[NewProposal] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
 
     @property
     def proposals(self) -> list[NewProposal]:
-        return [*self.weight_changes, *self.coverage_gaps, *self.threat_events]
+        return [
+            *self.weight_changes,
+            *self.coverage_gaps,
+            *self.threat_events,
+            *self.protection_events,
+        ]
 
 
 def validate_proposals(
@@ -98,10 +117,10 @@ def validate_proposals(
     new_signal_ids: Collection[UUID] = (),
     events_only: bool = False,
 ) -> GeneratedBatch:
-    """``pending_events`` are the pending event proposals the run loaded (those the prompt
-    showed): attach targets and duplicate candidates. ``new_signal_ids`` are the run's own new
-    evidence, the only signals an attachment may add. ``events_only`` is a gap_regenerate run,
-    which writes event proposals and attachments and nothing else (spec §4.9)."""
+    """``pending_events`` are the pending event proposals of both kinds the run loaded (those the
+    prompt showed): attach targets and duplicate candidates. ``new_signal_ids`` are the run's own
+    new evidence, the only signals an attachment may add. ``events_only`` is a gap_regenerate
+    run, which writes event proposals and attachments and nothing else (spec §4.9)."""
     batch = GeneratedBatch()
     if events_only:
         dropped = len(output.weight_changes) + len(output.coverage_gaps)
@@ -133,21 +152,12 @@ def validate_proposals(
     pending = pending_events or {}
     for event in output.threat_events:
         proposal = _threat_event(event, context, vocabulary, counts)
-        if proposal is None:
-            continue
-        duplicate = duplicate_of(proposal, pending.values())
-        if duplicate is not None:
-            fresh = tuple(i for i in proposal.signal_ids if i in new_signal_ids)
-            if fresh:
-                batch.attachments.append(Attachment(duplicate, fresh))
-                counts["proposal_converted_to_attach"] += 1
-            else:
-                counts["proposal_dropped_duplicate_event"] += 1
-            continue
-        if any(_same_event(proposal, earlier) for earlier in batch.threat_events):
-            counts["proposal_dropped_duplicate_event"] += 1
-            continue
-        batch.threat_events.append(proposal)
+        if proposal is not None:
+            _keep_event(proposal, batch.threat_events, batch, pending, new_signal_ids, counts)
+    for credit in output.protection_events:
+        proposal = _protection_event(credit, context, vocabulary, counts)
+        if proposal is not None:
+            _keep_event(proposal, batch.protection_events, batch, pending, new_signal_ids, counts)
     for attach in output.attach:
         attachment = _attachment(attach, pending, context, new_signal_ids, counts)
         if attachment is not None:
@@ -179,6 +189,33 @@ def _same_event(a: NewProposal, b: NewProposal) -> bool:
         and frozenset(a.target.get("tags", ())) == frozenset(b.target.get("tags", ()))
         and bool(set(a.document_keys) & set(b.document_keys))
     )
+
+
+def _keep_event(
+    proposal: NewProposal,
+    kept: list[NewProposal],
+    batch: GeneratedBatch,
+    pending: Mapping[UUID, PendingEvent],
+    new_signal_ids: Collection[UUID],
+    counts: Counter[str],
+) -> None:
+    """spec §4.3's duplicate rule for one validated event proposal of either kind. A repeat of a
+    pending proposal (same kind, same tag set, a shared document) becomes an attachment of the
+    run's own new evidence, or is dropped when it cites none; a repeat of one kept earlier in
+    this batch is dropped; anything else is kept."""
+    duplicate = duplicate_of(proposal, pending.values())
+    if duplicate is not None:
+        fresh = tuple(i for i in proposal.signal_ids if i in new_signal_ids)
+        if fresh:
+            batch.attachments.append(Attachment(duplicate, fresh))
+            counts["proposal_converted_to_attach"] += 1
+        else:
+            counts["proposal_dropped_duplicate_event"] += 1
+        return
+    if any(_same_event(proposal, earlier) for earlier in kept):
+        counts["proposal_dropped_duplicate_event"] += 1
+        return
+    kept.append(proposal)
 
 
 def concerns(
@@ -424,6 +461,65 @@ def _threat_event(
     )
 
 
+def _protection_event(
+    item: ProposedProtectionEvent,
+    context: Mapping[UUID, ContextSignal],
+    vocabulary: ScoringVocabulary,
+    counts: Counter[str],
+) -> NewProposal | None:
+    """§4.5 for protection_event. A global proposal is dropped first (global_not_proposable).
+    Then the threat rules: every tag a registered, non-retired slug, dropped never fixed up; a
+    proposal whose tags are all UNMAPPED is kept, pending, until a mapping gives it reach."""
+    if item.is_global:
+        counts["proposal_dropped_global_not_proposable"] += 1
+        return None
+    if not item.tags:
+        counts["proposal_dropped_no_tags"] += 1
+        return None
+    if any(not is_well_formed(t) for t in item.tags) or len(set(item.tags)) != len(item.tags):
+        counts["proposal_dropped_tag_malformed"] += 1
+        return None
+    unknown, retired = membership_problems(item.tags, vocabulary.registry())
+    if unknown:
+        counts["proposal_dropped_unknown_tag"] += 1
+        return None
+    if retired:
+        counts["proposal_dropped_tag_retired"] += 1
+        return None
+    if not PROTECTION_STRENGTH_MIN <= item.strength <= PROTECTION_STRENGTH_MAX:
+        counts["proposal_dropped_strength_out_of_bounds"] += 1
+        return None
+    if not PROTECTION_REVIEW_MIN_DAYS <= item.review_in_days <= PROTECTION_REVIEW_MAX_DAYS:
+        counts["proposal_dropped_review_out_of_bounds"] += 1
+        return None
+    signal_ids = _cited(item.signal_ids, context, counts)
+    if signal_ids is None:
+        return None
+    title = _free_text(item.title, field_name="title", limit=MAX_EVENT_TITLE_CHARS, counts=counts)
+    if title is None:
+        return None
+    rationale = _free_text(
+        item.rationale, field_name="rationale", limit=MAX_RATIONALE_CHARS, counts=counts
+    )
+    if rationale is None:
+        return None
+    documents = tuple(
+        dict.fromkeys(d for i in signal_ids if (d := context[i].document_key) is not None)
+    )
+    return NewProposal(
+        kind="protection_event",
+        target=ProtectionEventTarget(tags=tuple(item.tags)).model_dump(
+            mode="json", exclude_none=True
+        ),
+        suggested=ProtectionEventSuggested(
+            title=title, strength=item.strength, review_in_days=item.review_in_days
+        ).model_dump(mode="json"),
+        rationale=rationale,
+        signal_ids=signal_ids,
+        document_keys=documents,
+    )
+
+
 def _attachment(
     item: ProposedAttach,
     pending: Mapping[UUID, PendingEvent],
@@ -493,6 +589,18 @@ def prompt_live_event(event: LiveEvent) -> PromptLiveEvent:
         severity=event.severity,
         tags=list(event.tags),
         expires_at=event.expires_at.isoformat(),
+        signal_ids=[str(i) for i in event.signal_ids],
+    )
+
+
+def prompt_live_protection(event: LiveProtection) -> PromptLiveProtection:
+    return PromptLiveProtection(
+        event_id=str(event.event_id),
+        title=event.title,
+        strength=event.strength,
+        tags=list(event.tags),
+        is_global=event.is_global,
+        review_by=event.review_by.isoformat(),
         signal_ids=[str(i) for i in event.signal_ids],
     )
 
