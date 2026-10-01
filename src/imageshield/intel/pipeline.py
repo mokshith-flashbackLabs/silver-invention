@@ -94,10 +94,18 @@ from imageshield.intel.prompts import (
     extraction_request,
     proposal_request,
 )
-from imageshield.intel.proposal_models import GapRegenerateRequest
+from imageshield.intel.proposal_models import GapRegenerateRequest, RenewalRequest
 from imageshield.intel.proposal_store import ProposalStore
+from imageshield.intel.protection_store import (
+    RENEWAL_EVIDENCE_GONE,
+    RENEWAL_EVIDENCE_UNREACHABLE,
+    RENEWAL_NOT_DUE,
+    RENEWAL_PROPOSED,
+    ProtectionStore,
+)
 from imageshield.intel.publisher import publisher_domain
 from imageshield.intel.reconcile import Reconciler
+from imageshield.intel.renewal import RenewalPage, plan_renewal
 from imageshield.intel.schemas import ExtractedSignal
 from imageshield.intel.store import IntelStore
 from imageshield.intel.tags import TagRegistry, is_well_formed
@@ -141,6 +149,7 @@ class PipelineDeps:
     control: ProviderControlStore
     proposals: ProposalStore
     reconciler: Reconciler
+    protections: ProtectionStore  # credits and their renewal (step 4, intel/protection_store.py)
     clock: Callable[[], datetime]
     max_calls_per_run: int
     max_document_chars: int
@@ -239,7 +248,11 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
                 ctx.regenerate = GapRegenerateRequest.model_validate(claimed.request)
             except ValidationError:
                 return RunResult("failed", ctx.outcome(), "request_unreadable")
-        else:  # weight_suggestion (step 5) / renewal_check (step 4)
+        elif claimed.kind == "renewal_check":
+            # No model call at all (spec §4.8): the run returns its own result and never
+            # reaches generation below.
+            return await _renewal_check(ctx)
+        else:  # weight_suggestion (step 5)
             return RunResult("failed", ctx.outcome(), "kind_not_supported_yet")
     except _CallCap:
         ctx.counts["stopped_call_cap"] += 1
@@ -801,6 +814,90 @@ async def _generate(ctx: _Ctx) -> None:
         ctx.counts["proposals_attached"] += len(result.attached)
     if result.attach_dropped:
         ctx.counts["attach_dropped_not_pending"] += result.attach_dropped
+
+
+# ── protection renewal (step 4) ────────────────────────────────────────────────
+
+
+async def _renewal_check(ctx: _Ctx) -> RunResult:
+    """spec §4.8: fetch the pages behind a due credit's cited excerpts again, re-verify each
+    verbatim (#49), and write a pending renewal from what still verifies (intel/renewal.py).
+    NO model call, so no provider gate: the budget and the kill switch do not stop it, and it
+    costs nothing but fetches. A fetcher outage fails the run, and the worker queues it again."""
+    try:
+        request = RenewalRequest.model_validate(ctx.run.request)
+    except ValidationError:
+        return RunResult("failed", ctx.outcome(), "request_unreadable")
+    if await ctx.deps.proposals.proposals_written(ctx.run.run_id):
+        ctx.counts["proposals_already_written"] += 1  # a reclaimed run whose write committed
+        return RunResult("completed", ctx.outcome())
+    now = ctx.deps.clock()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    protections = ctx.deps.protections
+    evidence = await protections.renewal_evidence(request.event_id, now=now)
+    if evidence is None:  # retracted, renewed, lapsed or already given a renewal proposal
+        ctx.counts[RENEWAL_NOT_DUE] += 1
+        return RunResult("completed", ctx.outcome())
+    pages: dict[str, RenewalPage | str] = {}
+    by_final: dict[str, RenewalPage] = {}
+    try:
+        for signal in evidence.signals:
+            if signal.document_url_hash not in pages:
+                pages[signal.document_url_hash] = await _renewal_page(
+                    ctx, signal.document_url, by_final
+                )
+    except _Stop as stop:  # the fetcher itself is down: says nothing about the evidence
+        ctx.counts[f"stopped_{stop.reason}"] += 1
+        return RunResult("failed", ctx.outcome(), stop.reason)
+    plan = plan_renewal(evidence, pages)
+    ctx.counts["renewal_excerpts_checked"] += plan.excerpts_checked
+    ctx.counts["renewal_excerpts_verified"] += plan.excerpts_verified
+    for reason, count in plan.dropped.items():
+        ctx.counts[f"renewal_excerpt_dropped_{reason}"] += count
+    if not evidence.signals:
+        ctx.counts["renewal_no_active_signals"] += 1
+    if not plan.signals:
+        gone = RENEWAL_EVIDENCE_UNREACHABLE if plan.unreachable else RENEWAL_EVIDENCE_GONE
+        ctx.counts[gone] += 1
+        return RunResult("completed", ctx.outcome())
+    written = await protections.write_renewal(ctx.run.run_id, evidence, plan, now=now)
+    if written.status == "already_written":
+        ctx.counts["proposals_already_written"] += 1
+    elif written.status == "not_due":
+        ctx.counts[RENEWAL_NOT_DUE] += 1
+    else:
+        ctx.counts[RENEWAL_PROPOSED] += 1
+        ctx.counts["proposals_written"] += 1
+        ctx.counts["renewal_signals_reverified"] += len(plan.signals)
+    return RunResult("completed", ctx.outcome())
+
+
+async def _renewal_page(
+    ctx: _Ctx, url: str, by_final: dict[str, RenewalPage]
+) -> RenewalPage | str:
+    """One cited page fetched again under every guard extraction uses: https only, never a known
+    hit location (before the fetch, and again on the final URL), the document cap. A page two
+    cited URLs now reach is read once and shared. Returns the page, or why it was not read."""
+    if not _is_https(url):
+        ctx.counts["not_https"] += 1
+        return "not_https"
+    if await _known_hit(ctx, url):
+        return "known_hit_location"
+    fetched = await _fetch(ctx, url)  # a fetcher-side failure raises _Stop
+    if isinstance(fetched, FetchFailure):
+        return f"fetch_{fetched.code}"
+    if await _known_hit_after_redirect(ctx, url, fetched.final_url):
+        return "known_hit_location"
+    final_hash = url_hash(fetched.final_url)
+    if final_hash in by_final:
+        return by_final[final_hash]
+    text, truncated = _bounded(ctx, normalise(fetched.text), fetched.truncated)
+    page = RenewalPage(
+        requested_url=url, final_url=fetched.final_url, text=text, truncated=truncated
+    )
+    by_final[final_hash] = page
+    return page
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

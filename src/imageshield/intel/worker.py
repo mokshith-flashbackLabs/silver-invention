@@ -28,6 +28,7 @@ from imageshield.intel.fetch_client import HttpTextFetcher
 from imageshield.intel.model import ClaudeIntelModel, IntelModel
 from imageshield.intel.pipeline import PipelineDeps, run
 from imageshield.intel.proposal_store import PostgresProposalStore
+from imageshield.intel.protection_store import PostgresProtectionStore
 from imageshield.intel.reconcile import PostgresReconciler
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
@@ -56,6 +57,8 @@ async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
     await deps.reconciler.resolve_gaps(now)
     await deps.store.expire_exhausted(now)
     await deps.store.schedule_due(now)
+    # spec §4.8: one renewal check for each credit near its review date. No model call.
+    await deps.protections.schedule_renewals(now)
     claimed = await deps.store.claim_next(now, lease_seconds=lease_seconds)
     if claimed is None:
         return False
@@ -113,6 +116,7 @@ async def run_forever(config: IntelConfig) -> None:
         ),
         proposals=PostgresProposalStore(pool),
         reconciler=PostgresReconciler(pool),
+        protections=PostgresProtectionStore(pool),
         clock=lambda: datetime.now(UTC),
         # No default on PipelineDeps for either of these (task 10) -- a second
         # default beside IntelConfig's would be a second source of truth.

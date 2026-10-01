@@ -30,6 +30,7 @@ from imageshield.intel.models import Run, Vocabulary
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
 from imageshield.intel.pricing import Usage
 from imageshield.intel.proposal_store import PostgresProposalStore
+from imageshield.intel.protection_store import PostgresProtectionStore
 from imageshield.intel.reconcile import PostgresReconciler
 from imageshield.intel.schemas import (
     DiscoveryOutput,
@@ -214,6 +215,7 @@ def make_deps(
         control=control,
         proposals=PostgresProposalStore(pool),
         reconciler=PostgresReconciler(pool),
+        protections=PostgresProtectionStore(pool),
         clock=clock or (lambda: NOW),
         max_calls_per_run=max_calls_per_run,
         max_document_chars=max_document_chars,
