@@ -1,8 +1,9 @@
-"""Evidence store: one transaction per unit, snapshots, source bookkeeping, signals
-(spec §4.3-§4.4). ``record_unit`` is the one writer of ``intel_documents``,
-``intel_signals``, ``intel_excerpts``, ``intel_snapshots`` and the source's
-``last_content_sha256`` — together, in one transaction, or not at all. A reclaimed
-run's second attempt at a document it already recorded is absorbed by
+"""Evidence store: one transaction per unit, snapshots, source bookkeeping, signals (spec
+§4.3-§4.4). ``insert_unit`` is the one INSERT of ``intel_documents``, ``intel_signals`` and
+``intel_excerpts``, on its caller's connection and inside its caller's transaction:
+``record_unit`` wraps it with the snapshot and the source's ``last_content_sha256``, together or
+not at all, and the protection renewal (``intel/protection_store.py``) wraps it with its proposal.
+A reclaimed run's second attempt at a document it already recorded is absorbed by
 ``ON CONFLICT DO NOTHING`` (the ``(run_id, url_hash)`` unique constraint) rather than
 raising or double-writing signals: the caller sees ``None`` and moves on.
 
@@ -22,6 +23,7 @@ from typing import Any, Literal, Protocol
 from uuid import UUID
 
 import structlog
+from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
@@ -99,6 +101,64 @@ class SnapshotRecord:
     truncated: bool
 
 
+async def insert_unit(
+    conn: AsyncConnection[Any], document: DocumentRecord, signals: Sequence[SignalRecord]
+) -> tuple[UUID, tuple[UUID, ...]] | None:
+    """The document with its signals and their excerpts, on the caller's connection and inside
+    the caller's transaction. Returns the document id and the signal ids in order, or None when
+    this run already recorded the document: the ``(run_id, url_hash)`` unique constraint absorbs
+    a reclaimed run's repeat."""
+    params = {
+        **dataclasses.asdict(document),
+        "document_url_hash": document.document_url_hash or document.url_hash,
+        "nv": NORMALISATION_VERSION,
+    }
+    cur = await conn.execute(
+        """INSERT INTO intel_documents (run_id, source_id, document_url, final_url,
+               url_hash, document_url_hash, normalisation_version, publisher_domain,
+               trust, content_sha256, truncated, title, published_at)
+           VALUES (%(run_id)s, %(source_id)s, %(document_url)s, %(final_url)s,
+                   %(url_hash)s, %(document_url_hash)s, %(nv)s, %(publisher_domain)s,
+                   %(trust)s, %(content_sha256)s, %(truncated)s, %(title)s,
+                   %(published_at)s)
+           ON CONFLICT (run_id, url_hash) DO NOTHING
+           RETURNING document_id""",
+        params,
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    document_id: UUID = row[0]
+    signal_ids: list[UUID] = []
+    for signal in signals:
+        cur = await conn.execute(
+            """INSERT INTO intel_signals (document_id, category, direction, tags,
+                   unregistered_subjects, summary, model_id, prompt_version)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING signal_id""",
+            (
+                document_id,
+                signal.category,
+                signal.direction,
+                list(signal.tags),
+                list(signal.unregistered_subjects),
+                signal.summary,
+                signal.model_id,
+                signal.prompt_version,
+            ),
+        )
+        signal_row = await cur.fetchone()
+        assert signal_row is not None
+        signal_id: UUID = signal_row[0]
+        signal_ids.append(signal_id)
+        for quote in signal.quotes:
+            await conn.execute(
+                "INSERT INTO intel_excerpts (signal_id, quote_text, char_start,"
+                " char_end, quote_sha256) VALUES (%s, %s, %s, %s, %s)",
+                (signal_id, quote.text, quote.char_start, quote.char_end, quote.sha256),
+            )
+    return document_id, tuple(signal_ids)
+
+
 class EvidenceStore(Protocol):
     async def record_unit(
         self,
@@ -138,53 +198,10 @@ class PostgresEvidenceStore:
         source_hash: tuple[UUID, str] | None,
     ) -> UUID | None:
         async with self._pool.connection() as conn, conn.transaction():
-            params = {
-                **dataclasses.asdict(document),
-                "document_url_hash": document.document_url_hash or document.url_hash,
-                "nv": NORMALISATION_VERSION,
-            }
-            cur = await conn.execute(
-                """INSERT INTO intel_documents (run_id, source_id, document_url, final_url,
-                       url_hash, document_url_hash, normalisation_version, publisher_domain,
-                       trust, content_sha256, truncated, title, published_at)
-                   VALUES (%(run_id)s, %(source_id)s, %(document_url)s, %(final_url)s,
-                           %(url_hash)s, %(document_url_hash)s, %(nv)s, %(publisher_domain)s,
-                           %(trust)s, %(content_sha256)s, %(truncated)s, %(title)s,
-                           %(published_at)s)
-                   ON CONFLICT (run_id, url_hash) DO NOTHING
-                   RETURNING document_id""",
-                params,
-            )
-            row = await cur.fetchone()
-            if row is None:
+            inserted = await insert_unit(conn, document, signals)
+            if inserted is None:
                 return None  # a reclaimed run already recorded this unit
-            document_id: UUID = row[0]
-
-            for signal in signals:
-                cur = await conn.execute(
-                    """INSERT INTO intel_signals (document_id, category, direction, tags,
-                           unregistered_subjects, summary, model_id, prompt_version)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING signal_id""",
-                    (
-                        document_id,
-                        signal.category,
-                        signal.direction,
-                        list(signal.tags),
-                        list(signal.unregistered_subjects),
-                        signal.summary,
-                        signal.model_id,
-                        signal.prompt_version,
-                    ),
-                )
-                signal_row = await cur.fetchone()
-                assert signal_row is not None
-                signal_id = signal_row[0]
-                for quote in signal.quotes:
-                    await conn.execute(
-                        "INSERT INTO intel_excerpts (signal_id, quote_text, char_start,"
-                        " char_end, quote_sha256) VALUES (%s, %s, %s, %s, %s)",
-                        (signal_id, quote.text, quote.char_start, quote.char_end, quote.sha256),
-                    )
+            document_id = inserted[0]
 
             if snapshot is not None:
                 await conn.execute(

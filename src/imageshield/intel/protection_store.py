@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 import structlog
@@ -26,7 +26,24 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from imageshield.intel.bounds import PROTECTION_RENEWAL_WINDOW_DAYS
+from imageshield.intel.bounds import (
+    PROTECTION_RENEWAL_WINDOW_DAYS,
+    RENEWAL_MAX_RUNS,
+    RENEWAL_RETRY_HOURS,
+)
+from imageshield.intel.evidence_store import insert_unit
+from imageshield.intel.renewal import (
+    RENEWAL_VERSION,
+    RENEWAL_WRITER,
+    RenewalEvidence,
+    RenewalExcerpt,
+    RenewalPlan,
+    RenewalSignal,
+    renewal_rationale,
+    renewal_suggested,
+    renewal_target,
+    renewal_units,
+)
 
 log = structlog.get_logger("imageshield.intel")
 
@@ -134,6 +151,73 @@ _REJECT_PENDING_RENEWALS_SQL = """
     RETURNING proposal_id
 """
 
+# A credit is due while it is live, not renewed and never given a renewal proposal, whatever
+# became of that proposal: a rejected renewal lapses the credit (spec note 2026-09-30).
+_DUE_EVENT_SQL = """
+    SELECT e.event_id, e.title, e.strength, e.tags, e.is_global, e.starts_at, e.review_by,
+           e.proposal_id
+      FROM protection_events e
+     WHERE e.event_id = %(event_id)s AND e.status = 'active'
+       AND e.starts_at <= %(now)s AND e.review_by > %(now)s
+       AND NOT EXISTS (SELECT 1 FROM protection_events r WHERE r.renews_event_id = e.event_id)
+       AND NOT EXISTS (SELECT 1 FROM intel_proposals p
+                        WHERE p.kind = 'protection_event'
+                          AND p.target ->> 'renews_event_id' = e.event_id::text)
+"""
+
+# One statement, so an overlapping tick cannot queue twice (and intel_runs_one_open_renewal
+# makes a race a no-op). A credit within the window gets a check unless one is open, one ended
+# conclusively, one finished within RENEWAL_RETRY_HOURS, or RENEWAL_MAX_RUNS were already run.
+_SCHEDULE_RENEWALS_SQL = """
+    INSERT INTO intel_runs (kind, request, requested_by)
+    SELECT 'renewal_check', jsonb_build_object('event_id', e.event_id::text), 'schedule'
+      FROM protection_events e
+     WHERE e.status = 'active'
+       AND e.starts_at <= %(now)s AND e.review_by > %(now)s
+       AND e.review_by <= %(now)s + make_interval(days => %(window)s)
+       AND NOT EXISTS (SELECT 1 FROM protection_events r WHERE r.renews_event_id = e.event_id)
+       AND NOT EXISTS (SELECT 1 FROM intel_proposals p
+                        WHERE p.kind = 'protection_event'
+                          AND p.target ->> 'renews_event_id' = e.event_id::text)
+       AND NOT EXISTS (SELECT 1 FROM intel_runs x
+                        WHERE x.kind = 'renewal_check'
+                          AND x.request ->> 'event_id' = e.event_id::text
+                          AND (x.status IN ('queued', 'running')
+                               OR (x.status = 'completed'
+                                   AND x.outcome ?| %(conclusive)s::text[])
+                               OR x.completed_at > %(now)s - make_interval(hours => %(retry)s)))
+       AND (SELECT count(*) FROM intel_runs x
+             WHERE x.kind = 'renewal_check'
+               AND x.request ->> 'event_id' = e.event_id::text) < %(max_runs)s
+    ON CONFLICT DO NOTHING
+    RETURNING run_id
+"""
+
+_EVIDENCE_SIGNALS_SQL = """
+    SELECT s.signal_id, s.category, s.direction, s.tags, s.unregistered_subjects, s.summary,
+           s.model_id, s.prompt_version, d.document_url, d.document_url_hash, d.title,
+           d.published_at
+      FROM intel_proposal_signals ps
+      JOIN intel_signals s ON s.signal_id = ps.signal_id
+      JOIN intel_documents d ON d.document_id = s.document_id
+     WHERE ps.proposal_id = %s AND s.status = 'active'
+     ORDER BY s.created_at, s.signal_id
+"""
+
+_EVIDENCE_EXCERPTS_SQL = """
+    SELECT signal_id, excerpt_id, quote_text FROM intel_excerpts
+     WHERE signal_id = ANY(%s::uuid[])
+     ORDER BY char_start, excerpt_id
+"""
+
+_INSERT_RENEWAL_SQL = """
+    INSERT INTO intel_proposals (kind, status, target, suggested, rationale, run_id, model_id,
+        prompt_version)
+    VALUES ('protection_event', 'pending', %(target)s, %(suggested)s, %(rationale)s,
+            %(run_id)s, %(model_id)s, %(prompt_version)s)
+    RETURNING proposal_id
+"""
+
 
 def renewal_result(outcome: Mapping[str, Any]) -> str | None:
     """What a renewal check's outcome says, for the list read; None while it is undecided."""
@@ -188,6 +272,16 @@ def _event_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class RenewalWrite:
+    """What a renewal write did: ``not_due`` when the credit was retracted, renewed, lapsed or
+    already given a renewal proposal since the check began; ``already_written`` for a reclaimed
+    run whose write committed."""
+
+    status: Literal["written", "already_written", "not_due"]
+    proposal_id: UUID | None = None
+
+
 class ProtectionStore(Protocol):
     async def list_events(
         self,
@@ -199,6 +293,13 @@ class ProtectionStore(Protocol):
     async def retract(
         self, event_id: UUID, *, operator: str, reason: str
     ) -> ProtectionRetraction | None: ...
+    async def schedule_renewals(self, now: datetime) -> list[UUID]: ...
+    async def renewal_evidence(
+        self, event_id: UUID, *, now: datetime
+    ) -> RenewalEvidence | None: ...
+    async def write_renewal(
+        self, run_id: UUID, evidence: RenewalEvidence, plan: RenewalPlan, *, now: datetime
+    ) -> RenewalWrite: ...
 
 
 class PostgresProtectionStore:
@@ -289,3 +390,135 @@ class PostgresProtectionStore:
                 },
             )
         return ProtectionRetraction(event_id, also, rejected)
+
+    async def schedule_renewals(self, now: datetime) -> list[UUID]:
+        """One renewal_check for each credit within PROTECTION_RENEWAL_WINDOW_DAYS of its review
+        date that needs one (spec §4.8, note 2026-09-30). Machine bookkeeping: no audit row, as
+        for scheduled source checks."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                _SCHEDULE_RENEWALS_SQL,
+                {
+                    "now": now,
+                    "window": PROTECTION_RENEWAL_WINDOW_DAYS,
+                    "retry": RENEWAL_RETRY_HOURS,
+                    "max_runs": RENEWAL_MAX_RUNS,
+                    "conclusive": list(CONCLUSIVE_RENEWAL_RESULTS),
+                },
+            )
+            queued = [r[0] for r in await cur.fetchall()]
+        if queued:
+            log.info("intel.renewal_checks_queued", count=len(queued))
+        return queued
+
+    async def renewal_evidence(
+        self, event_id: UUID, *, now: datetime
+    ) -> RenewalEvidence | None:
+        """The due credit and every ACTIVE signal its approval rested on, with each excerpt and
+        the page it came from; None when the credit is not due (see _DUE_EVENT_SQL)."""
+        async with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(_DUE_EVENT_SQL, {"event_id": event_id, "now": now})
+            event = await cur.fetchone()
+            if event is None:
+                return None
+            await cur.execute(_EVIDENCE_SIGNALS_SQL, (event["proposal_id"],))
+            signal_rows = await cur.fetchall()
+            await cur.execute(_EVIDENCE_EXCERPTS_SQL, ([r["signal_id"] for r in signal_rows],))
+            excerpts: dict[UUID, list[RenewalExcerpt]] = {}
+            for row in await cur.fetchall():
+                excerpts.setdefault(row["signal_id"], []).append(
+                    RenewalExcerpt(row["excerpt_id"], row["quote_text"])
+                )
+        return RenewalEvidence(
+            event_id=event["event_id"],
+            title=event["title"],
+            strength=event["strength"],
+            tags=tuple(event["tags"]),
+            is_global=event["is_global"],
+            starts_at=event["starts_at"],
+            review_by=event["review_by"],
+            signals=tuple(
+                RenewalSignal(
+                    signal_id=r["signal_id"],
+                    category=r["category"],
+                    direction=r["direction"],
+                    tags=tuple(r["tags"]),
+                    unregistered_subjects=tuple(r["unregistered_subjects"]),
+                    summary=r["summary"],
+                    model_id=r["model_id"],
+                    prompt_version=r["prompt_version"],
+                    document_url=r["document_url"],
+                    document_url_hash=r["document_url_hash"],
+                    title=r["title"],
+                    published_at=r["published_at"],
+                    excerpts=tuple(excerpts.get(r["signal_id"], ())),
+                )
+                for r in signal_rows
+            ),
+        )
+
+    async def write_renewal(
+        self, run_id: UUID, evidence: RenewalEvidence, plan: RenewalPlan, *, now: datetime
+    ) -> RenewalWrite:
+        """The renewal in ONE transaction: the re-verified documents, signals and excerpts, the
+        pending protection_event proposal written by code, its links, the run's
+        proposals_written_at and the audit row. The credit is locked and re-checked first, so a
+        retraction that won the race leaves nothing behind, and one that loses it rejects the
+        proposal this commits (intel/protection_store.py's retract)."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                _DUE_EVENT_SQL + " FOR UPDATE OF e", {"event_id": evidence.event_id, "now": now}
+            )
+            if await cur.fetchone() is None:
+                return RenewalWrite("not_due")
+            cur = await conn.execute(
+                "UPDATE intel_runs SET proposals_written_at = now()"
+                " WHERE run_id = %s AND proposals_written_at IS NULL RETURNING 1",
+                (run_id,),
+            )
+            if await cur.fetchone() is None:
+                return RenewalWrite("already_written")
+            signal_ids: list[UUID] = []
+            for document, signals in renewal_units(run_id, plan):
+                inserted = await insert_unit(conn, document, signals)
+                if inserted is None:  # units are unique on their final URL: never
+                    raise RuntimeError("a renewal run recorded one page twice")
+                signal_ids.extend(inserted[1])
+            cur = await conn.execute(
+                _INSERT_RENEWAL_SQL,
+                {
+                    "target": Jsonb(renewal_target(evidence)),
+                    "suggested": Jsonb(renewal_suggested(evidence)),
+                    "rationale": renewal_rationale(plan),
+                    "run_id": run_id,
+                    "model_id": RENEWAL_WRITER,
+                    "prompt_version": RENEWAL_VERSION,
+                },
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            proposal_id: UUID = row[0]
+            await conn.execute(
+                "INSERT INTO intel_proposal_signals (proposal_id, signal_id)"
+                " SELECT %s, unnest(%s::uuid[])",
+                (proposal_id, signal_ids),
+            )
+            await conn.execute(
+                _AUDIT_SQL,
+                {
+                    "actor_type": "service",
+                    "action": "intel.renewal_proposed",
+                    "resource_id": proposal_id,
+                    "metadata": Jsonb(
+                        {
+                            "event_id": str(evidence.event_id),
+                            "run_id": str(run_id),
+                            "signals": len(signal_ids),
+                            "excerpts_verified": plan.excerpts_verified,
+                            "excerpts_checked": plan.excerpts_checked,
+                        }
+                    ),
+                },
+            )
+        return RenewalWrite("written", proposal_id)

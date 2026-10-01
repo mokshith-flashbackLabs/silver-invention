@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -13,14 +14,30 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.db.connection import make_async_pool
+from imageshield.intel.bounds import RENEWAL_MAX_RUNS, RENEWAL_RETRY_HOURS
 from imageshield.intel.decisions import PostgresDecisionStore
+from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.proposal_models import Decided, DecisionRefused
-from imageshield.intel.protection_store import PostgresProtectionStore, ProtectionRetraction
+from imageshield.intel.proposal_store import PostgresProposalStore
+from imageshield.intel.protection_store import (
+    PostgresProtectionStore,
+    ProtectionRetraction,
+    RenewalWrite,
+)
+from imageshield.intel.renewal import RenewalPage, plan_renewal
+from imageshield.intel.store import PostgresIntelStore
+from imageshield.search.urlhash import url_hash
 from tests.intel_fakes import (
+    NOW,
+    QUOTE,
+    protection_decided,
+    seed_cited_signal,
+    seed_due_credit,
     seed_protection_event,
     seed_protection_proposal,
     seed_quiz_vocabulary,
     seed_signal,
+    settle_runs,
 )
 
 
@@ -369,4 +386,176 @@ async def test_the_list_and_the_retraction_need_no_grant_intel_rw_lacks(
     )
     assert await store.retract(other, operator="ann", reason="withdrawn") == (
         ProtectionRetraction(other, (scheduled,), ())
+    )
+
+
+async def test_the_worker_queues_one_renewal_check_for_a_due_credit_and_no_other(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    due, _ = await seed_due_credit(intel_pool)
+    await seed_protection_event(intel_pool, title="later", starts_in_days=-10, ends_in_days=90)
+    await seed_protection_event(intel_pool, title="lapsed", starts_in_days=-100, ends_in_days=-1)
+    await seed_protection_event(
+        intel_pool, status="retracted", starts_in_days=-160, ends_in_days=20
+    )
+    renewed = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=10)
+    await seed_protection_event(intel_pool, renews=renewed, starts_in_days=10, ends_in_days=190)
+    awaiting = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=15)
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    await seed_protection_proposal(intel_pool, signal_ids=[sid], renews=awaiting)
+    await settle_runs(intel_pool)
+    store = PostgresProtectionStore(intel_pool)
+    (run_id,) = await store.schedule_renewals(NOW)
+    assert await _scalar(
+        intel_pool, "SELECT request FROM intel_runs WHERE run_id = %s", run_id
+    ) == {"event_id": str(due)}
+    assert await store.schedule_renewals(NOW) == []  # one open check per credit
+
+
+async def test_a_conclusive_check_is_never_repeated_and_an_undecided_one_is_retried_daily(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Review Focus 2, the queue."""
+    await seed_due_credit(intel_pool)
+    store, intel = PostgresProtectionStore(intel_pool), PostgresIntelStore(intel_pool)
+    step = timedelta(hours=RENEWAL_RETRY_HOURS + 1)
+    (first,) = await store.schedule_renewals(NOW)
+    await intel.finish_run(first, status="completed", outcome={"renewal_evidence_unreachable": 1})
+    assert await store.schedule_renewals(NOW) == []  # finished under a day ago
+    (second,) = await store.schedule_renewals(NOW + step)
+    await intel.finish_run(second, status="failed", outcome={}, error_code="fetcher_unreachable")
+    (third,) = await store.schedule_renewals(NOW + 2 * step)
+    await intel.finish_run(third, status="completed", outcome={"renewal_evidence_gone": 1})
+    assert await store.schedule_renewals(NOW + 3 * step) == []  # conclusive: it lapses
+
+
+async def test_the_checks_stop_at_the_cap(intel_pool: AsyncConnectionPool) -> None:
+    await seed_due_credit(intel_pool)
+    store, intel = PostgresProtectionStore(intel_pool), PostgresIntelStore(intel_pool)
+    at = NOW
+    for _ in range(RENEWAL_MAX_RUNS):
+        (run_id,) = await store.schedule_renewals(at)
+        await intel.finish_run(
+            run_id, status="failed", outcome={}, error_code="fetcher_unreachable"
+        )
+        at += timedelta(hours=RENEWAL_RETRY_HOURS + 1)
+    assert await store.schedule_renewals(at) == []
+
+
+async def test_the_evidence_is_the_credits_active_signals_with_their_excerpts_and_pages(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    url_a, url_b = "https://a.example.com/opt-out", "https://b.example.com/opt-out"
+    kept = await seed_cited_signal(intel_pool, url=url_a)
+    gone = await seed_cited_signal(intel_pool, url=url_b)
+    proposal = await seed_protection_proposal(
+        intel_pool, signal_ids=[kept, gone], status="applied", decided=protection_decided()
+    )
+    event = await seed_protection_event(
+        intel_pool, proposal_id=proposal, starts_in_days=-160, ends_in_days=20
+    )
+    await PostgresEvidenceStore(intel_pool).retract_signal(gone, operator="ann", reason="misread")
+    store = PostgresProtectionStore(intel_pool)
+    evidence = await store.renewal_evidence(event, now=NOW)
+    assert evidence is not None and evidence.event_id == event
+    (signal,) = evidence.signals
+    assert (signal.signal_id, signal.document_url) == (kept, url_a)
+    assert signal.document_url_hash == url_hash(url_a)
+    assert [e.quote_text for e in signal.excerpts] == [QUOTE]
+    assert (evidence.tags, evidence.is_global, evidence.strength, evidence.review_in_days) == (
+        ("instagram",),
+        False,
+        2,
+        180,
+    )
+    await store.retract(event, operator="ann", reason="withdrawn")
+    assert await store.renewal_evidence(event, now=NOW) is None
+
+
+async def test_the_renewal_write_is_one_transaction_and_happens_once(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    event, original = await seed_due_credit(intel_pool)  # the original was found by web search
+    store = PostgresProtectionStore(intel_pool)
+    (run_id,) = await store.schedule_renewals(NOW)
+    evidence = await store.renewal_evidence(event, now=NOW)
+    assert evidence is not None
+    (signal,) = evidence.signals
+    page = RenewalPage(
+        requested_url=signal.document_url,
+        final_url=signal.document_url,
+        text="Intro. " + QUOTE,
+        truncated=False,
+    )
+    plan = plan_renewal(evidence, {signal.document_url_hash: page})
+    written = await store.write_renewal(run_id, evidence, plan, now=NOW)
+    assert written.status == "written" and written.proposal_id is not None
+    assert await _row(
+        intel_pool,
+        "SELECT kind, status, target, suggested, model_id, prompt_version, run_id"
+        " FROM intel_proposals WHERE proposal_id = %s",
+        written.proposal_id,
+    ) == (
+        "protection_event",
+        "pending",
+        {"tags": ["instagram"], "is_global": False, "renews_event_id": str(event)},
+        {"title": "Seeded protection", "strength": 2, "review_in_days": 180},
+        "code:renewal",
+        "renewal-v1",
+        run_id,
+    )
+    linked = await _scalar(
+        intel_pool,
+        "SELECT array_agg(signal_id) FROM intel_proposal_signals WHERE proposal_id = %s",
+        written.proposal_id,
+    )
+    assert len(linked) == 1 and linked != [original]
+    assert await _row(
+        intel_pool,
+        "SELECT d.trust, d.run_id, e.quote_text, e.char_start FROM intel_signals s"
+        " JOIN intel_documents d USING (document_id) JOIN intel_excerpts e USING (signal_id)"
+        " WHERE s.signal_id = %s",
+        linked[0],
+    ) == ("listed", run_id, QUOTE, len("Intro. "))
+    assert await store.write_renewal(run_id, evidence, plan, now=NOW) == RenewalWrite(
+        "not_due"  # the credit now has a renewal proposal: never a second one
+    )
+    read = await PostgresProposalStore(intel_pool).get_proposal(written.proposal_id)
+    assert read is not None and read["approvable"] is True  # listed evidence corroborates alone
+    assert (
+        await _scalar(
+            intel_pool, "SELECT count(*) FROM audit_log WHERE action = 'intel.renewal_proposed'"
+        )
+        == 1
+    )
+
+
+async def test_a_credit_retracted_before_the_write_gets_no_renewal(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    event, _ = await seed_due_credit(intel_pool)
+    store = PostgresProtectionStore(intel_pool)
+    (run_id,) = await store.schedule_renewals(NOW)
+    evidence = await store.renewal_evidence(event, now=NOW)
+    assert evidence is not None
+    (signal,) = evidence.signals
+    page = RenewalPage(signal.document_url, signal.document_url, QUOTE, False)
+    plan = plan_renewal(evidence, {signal.document_url_hash: page})
+    await store.retract(event, operator="ann", reason="withdrawn")
+    assert await store.write_renewal(run_id, evidence, plan, now=NOW) == RenewalWrite("not_due")
+    assert (
+        await _scalar(
+            intel_pool,
+            "SELECT count(*) FROM intel_proposals WHERE target ? 'renews_event_id'",
+        )
+        == 0
+    )
+    assert (
+        await _scalar(
+            intel_pool,
+            "SELECT proposals_written_at IS NULL FROM intel_runs WHERE run_id = %s",
+            run_id,
+        )
+        is True
     )

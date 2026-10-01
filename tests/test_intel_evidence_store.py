@@ -14,6 +14,7 @@ from imageshield.intel.evidence_store import (
     PostgresEvidenceStore,
     SignalRecord,
     SnapshotRecord,
+    insert_unit,
 )
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.intel.verify import VerifiedQuote
@@ -232,3 +233,26 @@ async def test_retract_is_terminal(stores) -> None:
         == "not_active"
     )
     assert await evidence.retract_signal(uuid4(), operator="a", reason="x") == "not_found"
+
+
+async def test_insert_unit_writes_inside_the_callers_transaction(migrated_db: str) -> None:
+    """The one INSERT of a document with its evidence, shared by record_unit and the renewal
+    write: the caller's transaction decides whether it lands."""
+    pool: AsyncConnectionPool = make_async_pool(migrated_db, min_size=1, max_size=2)
+    await pool.open()
+    try:
+        run_id = await PostgresIntelStore(pool).queue_adhoc("https://p.example/t", operator="a")
+        with pytest.raises(RuntimeError):
+            async with pool.connection() as conn, conn.transaction():
+                inserted = await insert_unit(conn, _doc(run_id), [_signal()])
+                assert inserted is not None and len(inserted[1]) == 1
+                raise RuntimeError("the caller rolls back")
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT count(*) FROM intel_documents")
+            assert await cur.fetchone() == (0,)
+        async with pool.connection() as conn, conn.transaction():
+            first = await insert_unit(conn, _doc(run_id), [_signal()])
+            again = await insert_unit(conn, _doc(run_id), [_signal()])
+        assert first is not None and again is None  # (run_id, url_hash) absorbs a repeat
+    finally:
+        await pool.close()

@@ -656,3 +656,87 @@ async def seed_protection_event(
     assert row is not None
     event_id: UUID = row[0]
     return event_id
+
+
+async def seed_cited_signal(
+    pool: AsyncConnectionPool,
+    *,
+    url: str,
+    quote: str = QUOTE,
+    trust: str = "listed",
+    tags: tuple[str, ...] = ("instagram",),
+    publisher: str = "example.com",
+) -> UUID:
+    """One active signal citing ``quote`` from the page at ``url`` (canonical https), through the
+    real record_unit on its own adhoc run: a page a renewal fetches again (spec §4.8)."""
+    run_id = await PostgresIntelStore(pool).queue_adhoc(url, operator="seed")
+    document_id = await PostgresEvidenceStore(pool).record_unit(
+        DocumentRecord(
+            run_id=run_id,
+            document_url=url,
+            final_url=url,
+            url_hash=url_hash(url),
+            publisher_domain=publisher,
+            trust=trust,  # type: ignore[arg-type]
+            content_sha256="0" * 64,
+            truncated=False,
+            title="Seeded page",
+            published_at=None,
+        ),
+        [
+            SignalRecord(
+                category="protection",
+                direction="risk_down",
+                tags=tags,
+                unregistered_subjects=(),
+                summary="A platform added an opt-out.",
+                model_id="claude-sonnet-5",
+                prompt_version="extract-v1",
+                quotes=(VerifiedQuote(quote, 0, len(quote), "0" * 64),),
+            )
+        ],
+        snapshot=None,
+        source_hash=None,
+    )
+    assert document_id is not None
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT signal_id FROM intel_signals WHERE document_id = %s", (document_id,)
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    signal_id: UUID = row[0]
+    return signal_id
+
+
+async def seed_due_credit(
+    pool: AsyncConnectionPool,
+    *,
+    url: str = "https://newsroom.example.com/opt-out",
+    quote: str = QUOTE,
+    trust: str = "web",
+    tags: tuple[str, ...] = ("instagram",),
+    is_global: bool = False,
+) -> tuple[UUID, UUID]:
+    """A live protection credit twenty days from its review date, approved on ONE signal citing
+    ``quote`` from the page at ``url``: due for renewal (spec §4.8). Returns ``(event_id,
+    signal_id)``. Every seeded run is settled, so the next claim is the renewal's."""
+    signal_id = await seed_cited_signal(pool, url=url, quote=quote, trust=trust)
+    proposal_id = await seed_protection_proposal(
+        pool,
+        signal_ids=[signal_id],
+        tags=tags,
+        is_global=is_global,
+        status="applied",
+        decided=protection_decided(tags=tags, is_global=is_global),
+    )
+    event_id = await seed_protection_event(
+        pool,
+        proposal_id=proposal_id,
+        tags=tags,
+        is_global=is_global,
+        starts_in_days=-160,
+        ends_in_days=20,
+    )
+    await settle_runs(pool)
+    return event_id, signal_id
