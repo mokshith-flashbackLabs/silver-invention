@@ -34,6 +34,10 @@ the reconcile's gap pass queues it again later.
 PROTECTIONS (step 4). The generation call also sees the live protection credits on the evidence's
 tags (and every live global one), and may propose protection_events, never global ones. A
 ``renewal_check`` run is different in kind: it makes no model call (spec §4.8).
+
+QUESTIONS (steps 5 and 6). ``source_proposal``, ``source_validation`` and ``weight_suggestion`` are
+driven by a quiz question rather than a source; ``intel/question_runs.py`` executes them and
+returns its own result (spec §4.10).
 """
 
 from __future__ import annotations
@@ -46,7 +50,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -104,6 +108,7 @@ from imageshield.intel.protection_store import (
     ProtectionStore,
 )
 from imageshield.intel.publisher import publisher_domain
+from imageshield.intel.question_store import QuestionStore
 from imageshield.intel.reconcile import Reconciler
 from imageshield.intel.renewal import RenewalPage, plan_renewal
 from imageshield.intel.schemas import ExtractedSignal
@@ -131,6 +136,9 @@ _DIFF_CONTEXT_SENTENCES = 2
 _DIFF_MAX_SENTENCES = 10_000
 _HUNK_SEPARATOR = "\n[...]\n"
 _SENTENCE_END = re.compile(r"(?<=[.!?]) ")
+# The run kinds a quiz question drives rather than a source (spec §4.10): intel/question_runs.py
+# executes them. See run().
+_QUESTION_RUN_KINDS = frozenset({"source_proposal", "source_validation", "weight_suggestion"})
 
 
 @dataclass
@@ -140,7 +148,9 @@ class PipelineDeps:
     ``INTEL_MAX_CALLS_PER_RUN`` / ``INTEL_MAX_DOCUMENT_CHARS`` and have NO default
     here -- a second default beside IntelConfig's would be a second source of truth.
     ``reconciler`` is not part of a run: the worker's tick calls it before claiming
-    (spec §4.9)."""
+    (spec §4.9). ``questions`` is the question runs' store (step 5, ``intel/question_store.py``).
+    ``max_calls_per_suggestion_run`` is ``INTEL_MAX_CALLS_PER_SUGGESTION_RUN``, a weight
+    suggestion's reading cap (spec §4.10), with no default for the same reason."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -153,12 +163,16 @@ class PipelineDeps:
     clock: Callable[[], datetime]
     max_calls_per_run: int
     max_document_chars: int
+    questions: QuestionStore
+    max_calls_per_suggestion_run: int
 
 
 @dataclass(frozen=True)
 class RunResult:
     status: RunStatus
-    outcome: dict[str, int | str]
+    # Counts; a question run adds its results (spec §4.10: "their results live in the run's
+    # outcome").
+    outcome: dict[str, Any]
     error_code: str | None = None
 
 
@@ -189,6 +203,10 @@ class _Ctx:
     regenerate: GapRegenerateRequest | None = None
 
     def calls_left(self) -> bool:
+        """The reading cap: a weight suggestion's first read of the sources it registered has its
+        own, because it is legitimately larger than a weekly check (spec §4.10)."""
+        if self.run.kind == "weight_suggestion":
+            return self.model_calls < self.deps.max_calls_per_suggestion_run
         return self.model_calls < self.deps.max_calls_per_run
 
     def outcome(self) -> dict[str, int | str]:
@@ -233,6 +251,12 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
         vocabulary=vocabulary,
         registry=vocabulary.registry() if vocabulary is not None else None,
     )
+    if claimed.kind in _QUESTION_RUN_KINDS:
+        # A question run reads no source by itself and returns its own result (spec §4.10).
+        # Imported here: question_runs imports this module.
+        from imageshield.intel.question_runs import run_question
+
+        return await run_question(ctx)
     stop: _Stop | None = None
     try:
         if claimed.kind == "source_check":
@@ -252,7 +276,11 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
             # No model call at all (spec §4.8): the run returns its own result and never
             # reaches generation below.
             return await _renewal_check(ctx)
-        else:  # weight_suggestion (step 5)
+        else:
+            # Unreachable for every kind intel_runs' CHECK admits: the three question kinds
+            # (source_proposal, source_validation, weight_suggestion) returned above, and
+            # gap_regenerate (step 3) and renewal_check (step 4) are handled here. A defensive
+            # refusal for a kind this build does not know, never a silent no-op.
             return RunResult("failed", ctx.outcome(), "kind_not_supported_yet")
     except _CallCap:
         ctx.counts["stopped_call_cap"] += 1
@@ -283,12 +311,18 @@ async def _source_check(ctx: _Ctx) -> None:
     if source is None or source.source_url is None:
         ctx.counts["source_missing"] += 1
         return
+    await _check_listed(ctx, source, source.source_url)
+
+
+async def _check_listed(ctx: _Ctx, source: Source, url: str) -> None:
+    """One check of a listed source, recorded on the source. ``read_source`` reuses it for a
+    weight suggestion's immediate read."""
     # Before the fetch, not only after it: a listed URL that IS a known hit location
     # is never requested at all (spec §4.3, §6.1).
-    if await _known_hit(ctx, source.source_url):
+    if await _known_hit(ctx, url):
         await ctx.deps.evidence.record_check(source.source_id, ok=True, status="known_hit_location")
         return
-    fetched = await _fetch(ctx, source.source_url)  # a fetcher-side failure raises _Stop
+    fetched = await _fetch(ctx, url)  # a fetcher-side failure raises _Stop
     if isinstance(fetched, FetchFailure):
         await ctx.deps.evidence.record_check(source.source_id, ok=False, status=fetched.code)
         return
@@ -463,6 +497,11 @@ async def _discovery(ctx: _Ctx) -> None:
     if source is None or source.query_text is None:
         ctx.counts["source_missing"] += 1
         return
+    await _check_query(ctx, source)
+
+
+async def _check_query(ctx: _Ctx, source: Source) -> None:
+    """One check of a saved search query, recorded on the source. ``read_source`` reuses it."""
     try:
         await _discover(ctx, source)
     except _Stop as stop:
@@ -471,6 +510,21 @@ async def _discovery(ctx: _Ctx) -> None:
         )
         raise
     await ctx.deps.evidence.record_check(source.source_id, ok=True, status="checked")
+
+
+async def read_source(ctx: _Ctx, source: Source) -> None:
+    """Read one registered source now, exactly as its scheduled check would, whether or not it
+    is enabled: a weight suggestion's immediate read of the sources it registered (spec §4.10).
+    Raises _CallCap and _Stop as a check does."""
+    if source.kind == "search_query":
+        if source.query_text is None:
+            ctx.counts["source_missing"] += 1
+            return
+        await _check_query(ctx, source)
+    elif source.source_url is None:
+        ctx.counts["source_missing"] += 1
+    else:
+        await _check_listed(ctx, source, source.source_url)
 
 
 async def _discover(ctx: _Ctx, source: Source) -> None:
@@ -1015,4 +1069,4 @@ def changed_hunks(before: str, after: str, *, max_chars: int) -> str:
     return joined[:max_chars]
 
 
-__all__ = ["PipelineDeps", "RunResult", "changed_hunks", "run"]
+__all__ = ["PipelineDeps", "RunResult", "changed_hunks", "read_source", "run"]

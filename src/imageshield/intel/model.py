@@ -40,7 +40,13 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from imageshield.intel.config import IntelConfig
 from imageshield.intel.pricing import Usage, cost_of
-from imageshield.intel.schemas import DiscoveryOutput, ExtractionOutput, ProposalOutput
+from imageshield.intel.schemas import (
+    DiscoveryOutput,
+    ExtractionOutput,
+    ProposalOutput,
+    SourceProposalOutput,
+    SuggestionOutput,
+)
 
 T = TypeVar("T", bound=BaseModel)
 Outcome = Literal["ok", "refusal", "max_tokens", "unparseable"]
@@ -50,6 +56,8 @@ _MAX_TOKENS = 8000
 # _MAX_TOKENS: the 0.45 worst case in migration 0041 assumes 8 000 output tokens, and a
 # proposal call that stops there is consumed and counted (proposal_model_max_tokens).
 _PROPOSAL_EFFORT = "high"
+# spec §4.10 stage 3: a search_query candidate costs ONE web search.
+_VALIDATION_SEARCHES = 1
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,9 @@ class IntelModel(Protocol):
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]: ...
     async def discover(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
     async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]: ...
+    async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]: ...
+    async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
+    async def suggest_weights(self, system: str, user: str) -> ModelCall[SuggestionOutput]: ...
 
 
 def _usage(raw: Any) -> Usage:
@@ -211,12 +222,18 @@ class ClaudeIntelModel:
             messages=[{"role": "user", "content": user}],
         )
 
-    async def discover(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
+    async def _search(
+        self, output_format: type[T], *, system: str, user: str, max_uses: int
+    ) -> ModelCall[T]:
+        """One web-search call on the extraction model, its pause_turn continuations driven to
+        completion (spec §4.4), bounded by INTEL_MAX_CALLS_PER_RUN, usage summed across them.
+        Discovery, source proposal and the validation search differ only in their schema and
+        max_uses."""
         tools: list[dict[str, Any]] = [
             {
                 "type": self._config.intel_web_search_tool_type,
                 "name": "web_search",
-                "max_uses": self._config.intel_max_web_searches_per_run,
+                "max_uses": max_uses,
                 **(
                     {"blocked_domains": self._config.intel_blocked_domains}
                     if self._config.intel_blocked_domains
@@ -226,11 +243,11 @@ class ClaudeIntelModel:
         ]
         messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
         pause_turns = 0
-        total_calls = 0  # every actual API call this discover() makes, initial included
+        total_calls = 0  # every actual API call this search makes, initial included
         total = Usage(0, 0, 0, 0, 0)
         while True:
             call = await self._send(
-                DiscoveryOutput,
+                output_format,
                 model=self._config.intel_extraction_model,
                 system=system,
                 tools=tools,
@@ -245,11 +262,8 @@ class ClaudeIntelModel:
                 total.cache_read_input_tokens + u.cache_read_input_tokens,
                 total.web_search_requests + u.web_search_requests,
             )
-            # `total_calls`, not `pause_turns`: the cap bounds every call this
-            # method makes, not merely the resumes after the first. Checked
-            # before resuming again -- the off-by-one this replaces let one
-            # discover() make `max_calls_per_run + 1` calls (the initial call
-            # was never counted against its own cap).
+            # `total_calls`, not `pause_turns`: the cap bounds every call this method makes, the
+            # initial call included, checked before resuming again.
             if (
                 call.stop_reason != "pause_turn"
                 or total_calls >= self._config.intel_max_calls_per_run
@@ -265,14 +279,44 @@ class ClaudeIntelModel:
                     pause_turns=pause_turns,
                 )
             pause_turns += 1
-            # Resume per Anthropic's stop-reason handling guidance: resend the
-            # original user turn plus the paused assistant turn verbatim; the
-            # server resumes from the trailing server_tool_use block.
+            # Resume per Anthropic's stop-reason handling guidance: resend the original user turn
+            # plus the paused assistant turn verbatim; the server resumes from the trailing
+            # server_tool_use block.
             messages = [messages[0], {"role": "assistant", "content": call.content}]
+
+    async def discover(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
+        return await self._search(
+            DiscoveryOutput,
+            system=system,
+            user=user,
+            max_uses=self._config.intel_max_web_searches_per_run,
+        )
+
+    async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]:
+        return await self._search(
+            SourceProposalOutput,
+            system=system,
+            user=user,
+            max_uses=self._config.intel_max_source_proposal_searches,
+        )
+
+    async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
+        return await self._search(
+            DiscoveryOutput, system=system, user=user, max_uses=_VALIDATION_SEARCHES
+        )
 
     async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
         return await self._send(
             ProposalOutput,
+            model=self._config.intel_proposal_model,
+            effort=_PROPOSAL_EFFORT,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+
+    async def suggest_weights(self, system: str, user: str) -> ModelCall[SuggestionOutput]:
+        return await self._send(
+            SuggestionOutput,
             model=self._config.intel_proposal_model,
             effort=_PROPOSAL_EFFORT,
             system=system,

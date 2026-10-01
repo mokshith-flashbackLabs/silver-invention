@@ -29,6 +29,10 @@ from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractionOutput,
     ProposalOutput,
+    ProposedOptionSources,
+    ProposedSource,
+    SourceProposalOutput,
+    SuggestionOutput,
 )
 from imageshield.intel.stub import StubIntelModel
 from tests.test_intel_config import BASE
@@ -409,3 +413,107 @@ def test_the_protection_output_parses_out_of_range_numbers_for_code_to_drop() ->
     )
     (proposed,) = parsed.protection_events
     assert proposed.strength == 9 and proposed.is_global is True
+
+
+async def test_discover_still_searches_with_the_per_run_budget(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    response = SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(ws=1),
+        content=[_text_block(DiscoveryOutput(candidates=[]).model_dump_json())],
+    )
+    model, fake = _model([response], clean_env)
+    await model.discover("sys", "q")
+    (tool,) = fake.calls[0]["tools"]
+    assert tool["max_uses"] == 5 and tool["type"] == "web_search_20260209"
+
+
+async def test_propose_sources_searches_with_its_own_budget_on_the_extraction_model(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """spec §4.10 stage 1: one INTEL_EXTRACTION_MODEL call with web search, max_uses =
+    INTEL_MAX_SOURCE_PROPOSAL_SEARCHES."""
+    for k, v in BASE.items():
+        clean_env.setenv(k, v)
+    clean_env.setenv("INTEL_MAX_SOURCE_PROPOSAL_SEARCHES", "7")
+    from imageshield.intel.config import load_intel_config
+
+    output = SourceProposalOutput(
+        options=[
+            ProposedOptionSources(
+                option="Instagram",
+                candidates=[
+                    ProposedSource(
+                        kind="policy_page", source_url="https://p.example/terms", reason="terms"
+                    )
+                ],
+            )
+        ]
+    )
+    response = SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(ws=2),
+        content=[_text_block(output.model_dump_json())],
+    )
+    fake = FakeMessages([response])
+    model = ClaudeIntelModel(load_intel_config(), client=SimpleNamespace(messages=fake))
+    call = await model.propose_sources("sys", "question")
+    assert call.outcome == "ok" and call.output == output
+    sent = fake.calls[0]
+    assert sent["model"] == "claude-sonnet-5" and "effort" not in sent["output_config"]
+    assert sent["tools"][0]["max_uses"] == 7
+    assert call.cost_usd == cost_of("claude-sonnet-5", Usage(1000, 100, 0, 0, 2))
+
+
+async def test_search_once_allows_exactly_one_search(clean_env: pytest.MonkeyPatch) -> None:
+    """spec §4.10 stage 3: a search_query candidate costs ONE web search."""
+    output = DiscoveryOutput(candidates=[DiscoveryCandidate(url="https://n.example/a", reason="r")])
+    response = SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(ws=1),
+        content=[_text_block(output.model_dump_json())],
+    )
+    model, fake = _model([response], clean_env)
+    call = await model.search_once("sys", '{"query": "q"}')
+    assert call.output == output
+    assert fake.calls[0]["tools"][0]["max_uses"] == 1
+    assert fake.calls[0]["model"] == "claude-sonnet-5"
+
+
+async def test_suggest_weights_uses_the_proposal_model_with_explicit_effort(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    response = SimpleNamespace(
+        model="claude-opus-5-5",
+        stop_reason="end_turn",
+        usage=_usage(),
+        content=[_text_block(SuggestionOutput().model_dump_json())],
+    )
+    model, fake = _model([response], clean_env)
+    call = await model.suggest_weights("sys", "user")
+    assert call.outcome == "ok" and call.output == SuggestionOutput()
+    sent = fake.calls[0]
+    assert sent["model"] == "claude-opus-5-5" and sent["output_config"]["effort"] == "high"
+    assert "tools" not in sent
+
+
+def test_the_step5_schemas_carry_no_numeric_or_length_bounds() -> None:
+    """The §4.5 rule for step 5: one bad candidate or option must not make the whole response
+    unparseable. intel/source_choice.py and intel/suggestion.py bound them in code."""
+    for output_model in (SourceProposalOutput, SuggestionOutput):
+        schema = json.dumps(output_model.model_json_schema())
+        for keyword in ("minimum", "maximum", "maxLength", "minLength"):
+            assert keyword not in schema
+    parsed = SuggestionOutput.model_validate_json('{"options": [{"option": "o", "deduction": 14}]}')
+    assert parsed.options[0].deduction == 14
+
+
+async def test_the_stub_answers_the_step5_calls_with_nothing() -> None:
+    stub = StubIntelModel()
+    assert (await stub.propose_sources("s", "u")).output == SourceProposalOutput()
+    assert (await stub.search_once("s", "u")).output == DiscoveryOutput(candidates=[])
+    assert (await stub.suggest_weights("s", "u")).output == SuggestionOutput()

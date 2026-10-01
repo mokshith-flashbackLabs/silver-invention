@@ -346,6 +346,12 @@ review queue: `GET /proposals` omits the kind unless it is asked for explicitly.
 proposal_not_decidable`) and never dismissable, because a published config may already cite it. Provenance lives in
 the backend.
 
+*Clarified 2026-09-30 (step-5 plan):* a `weight_suggestion` may link **no** signal. "No evidence, operator's call" is
+an answer (§4.5), and a tag suggestion needs no evidence, so the rule that every proposal needs at least one signal
+when written holds for every other kind. A suggestion that cites nothing reads `evidence_retracted: false`. Each of its
+options carries its own `corroborated` and `why_not` (§4.6), and a newer one for the same `question_key` supersedes it
+with `newer_proposal`.
+
 **Publishers and corroboration.**
 - `publisher_domain` is the **registrable domain** (eTLD+1, ICANN section of the Public Suffix List only), computed by
   one function, `intel/publisher.py`, from the fetcher's **`final_url`** after redirects. That uses `publicsuffixlist`
@@ -596,6 +602,17 @@ one isolation boundary.
 guard, cached per host for 24 hours, and reported as `robots_disallowed`. It applies to validation, not to
 `/v1/page`.
 
+*Clarified 2026-09-30 (step-5 plan):* `/v1/text` takes `respect_robots: bool`, default false, and only validation
+sends true, so a scheduled check never asks. The check follows RFC 9309:
+- the rules are cached per **origin** (scheme, host and port, which is what one `robots.txt` covers) for 24 hours, in
+  memory per fetcher task, for at most 1024 origins;
+- the group naming the product token `ImageShield-Fetcher` applies, else the `*` group;
+- the longest matching path wins, and `Allow` wins a tie; `*` and `$` are honoured; at most 512 KiB is read;
+- a 4xx `robots.txt`, or one past the redirect cap, means no rules, so everything is allowed;
+- a 5xx, a 429, a timeout or any other failure to read it is `502 robots_unreachable`, never cached (RFC 9309 reads
+  that as a complete disallow), and a private address is refused exactly as the page would be;
+- a disallowed path is `403 robots_disallowed`.
+
 - **Content types:** `text/html`, `application/xhtml+xml`, `text/plain`, `application/rss+xml`,
   `application/atom+xml`, `application/xml`, `text/xml` and `application/json`. Anything else is `400
   unsupported_type`. PDF is out of v1 (§9).
@@ -783,6 +800,14 @@ consumer has not shipped (`409 proposal_not_decidable`). So no approval can crea
 - **Prompt builders** (`intel/prompts.py`) take typed public inputs only. No parameter may be a `UserRef`, a person or
   a phone. A test walks every builder's signature.
 
+*Clarified 2026-09-30 (step-5 plan):* step 5 adds two web-search calls to the seam, and both drive `pause_turn` to
+completion exactly as `discover()` does.
+- `propose_sources(...)` is stage 1 of §4.10, on `INTEL_EXTRACTION_MODEL`, with `max_uses =
+  INTEL_MAX_SOURCE_PROPOSAL_SEARCHES`.
+- `search_once(...)` is stage 3's test search for a `search_query` candidate, the same call with `max_uses: 1`.
+
+`suggest_weights(...)` runs on `INTEL_PROPOSAL_MODEL` with explicit effort and no tools, like `propose(...)`.
+
 ### 4.5 Validation, bounds and supersession — in code, on both sides
 
 These are safety limits, so they are **code constants in `intel/bounds.py`**, not env. Changing one costs a code
@@ -847,6 +872,21 @@ backend's tag routes, never through services.
 error_code | null, options: [{option, deduction | null, rationale, signal_ids, suggested_tags, new_tag, corroborated,
 why_not}] | null}`. `corroborated` comes from the one predicate (§3.6), computed per option from that option's own
 signals.
+
+*Clarified 2026-09-30 (step-5 plan):*
+- **Retrieval takes the chosen sources first.** Its first class is the signals read from the request's chosen sources
+  (those just read and any it reused). Then come by tag (the options' tags, plus any registered tag whose slug or label
+  an option names), by subject, and by category, deduplicated and bounded at 80.
+- **"Mentions" is exact on normalised words**: the option's whole text, or one of its words of at least four letters.
+  A shorter option must equal the text outright, so "No" and "X" never match a summary.
+- **A value that fails §4.5 is withheld, never clamped.** A deduction out of bounds, above the cap or with no
+  surviving evidence becomes `null`, and an unknown or retired tag or an invalid `new_tag` is removed. Each is counted
+  in the run's outcome, and the other options and the suggestion stand.
+- **A suggestion whose every option is `null` is still delivered.** "No evidence, operator's call" is an answer.
+- **The run's status is the suggestion's**: `completed` once one is written. The ordinary generation (§4.3) then runs
+  over what the run read, unless the gate refused.
+- `type` is required and may be `null`. `cap` may be omitted or `null`. The poll also carries `sources_deferred`
+  (§4.10).
 
 ### 4.7 Admin API — `/v1/admin/intel/*`
 
@@ -1134,6 +1174,41 @@ daily budget (§5), so a press that hits the budget waits and says so, like any 
 **Why the registry route stays.** `POST /sources` is still how an operator adds a general source that belongs to no
 option. Everything tied to an option arrives through this flow, so it carries the option's tags and pauses with them.
 
+*Clarified 2026-09-30 (step-5 plan):*
+- **"No model call" in stage 3** means no extraction, proposal or suggestion call, and nothing a model writes decides
+  a verdict. A URL candidate makes no model request at all. A `search_query` candidate's one test search is, on
+  Claude Platform on AWS, a Messages request carrying only the web search tool with `max_uses: 1` (§4.4). It is
+  metered through the gate like any call, and each URL it returns is judged by code exactly as a URL candidate is.
+  Once the gate refuses a search, every later `search_query` candidate in that run is blocked with the gate's reason
+  and no further search is asked for.
+- **A feed is judged by its items**: at least one, and no text floor. A search result page must reach
+  `MIN_SOURCE_TEXT_CHARS`.
+- **Stage 1's poll** is `{run_id, status, error_code, options}`. Each option also carries its `tags`, and a candidate
+  carries both locator keys, one of them null.
+- **Stage 3's poll is an object**, `{run_id, status, error_code, results, honoured_until}`, not a bare list.
+  - `results` answers the submitted candidates one for one and in order, each echoing its candidate.
+  - A blocked result's `reason` is one lowercase token from a closed set. Some of them are transient ("validate
+    again later"), such as the gate's own reasons.
+  - `honoured_until` is completion plus 24 hours.
+- **`422 source_not_validated`** carries `error.entries: [{index, reason}]`. `index` is the position in `sources`, and
+  `reason` is one of `unknown_run`, `expired` or `not_ready`. A chosen source matches a `ready` result by `kind` plus
+  canonical URL or normalised query text.
+- **A source's identity** for reuse is its canonical URL's `url_hash`, or its normalised, case-folded query text,
+  whatever its kind. A reused row is never rewritten. One source chosen for two options registers once, with both
+  options' tags.
+- **`origin` needs no body field.** It is `suggested` when one of the question's completed stage-1 runs of the last 7
+  days proposed that identity.
+- **A registered source's first scheduled check is `check_every_hours` away**, because the suggestion run reads it at
+  once. A source the run could not finish reading is made due at once.
+- **Registration re-runs the known-hit and PII checks.** Every tag of an option that has a chosen source must be
+  registered (`422 unknown_tag`), and a retired one is left off the new source.
+- **Pausing is state-based, on every worker tick, in `intel/store.py`**, not in the reconcile's transaction. A source
+  registered for a draft option after its vocabulary pair was reconciled must follow the quiz too.
+  - A PATCH `enabled: false` clears `unmapped`, so the tick never re-enables that source.
+  - A PATCH `enabled: true` on a source whose tags are all unmapped is `409 source_tags_unmapped`, never a success the
+    next tick undoes.
+  - The suggestion run's immediate read ignores `enabled`, so a draft option's source is read even while paused.
+
 ## 5. Cost and controls — the existing provider gate, with a new kind
 
 Every model call goes through `providers/gate.decide("claude_intel", ...)`: ENABLED → BREAKER → BUDGET, exactly as
@@ -1345,6 +1420,11 @@ services migration is `0041_intel_proposal_cost` (see the §3.9 note), and it ch
 
 **If `ap-south-1` is not served**, dev sets `INTEL_ANTHROPIC_REGION` to the nearest served region, and this spec's
 data note records that intel's public-document text is processed there. **Nothing proceeds on an unverified region.**
+
+*Clarified 2026-09-30 (step-5 plan):* step 5's services migration is `0043_intel_sources_per_question`. **Row 6 needs
+no new services code.** Step 2 already generates `coverage_gap` rows, lists them (`GET /proposals?kind=coverage_gap`),
+returns their evidence on the detail, and dismisses one (`rejected`, while approving one is `409
+proposal_not_decidable`). Step 3 adds `resolved_by_quiz`. The backend's display reads exactly that.
 
 ## 9. Out of scope, deliberately
 

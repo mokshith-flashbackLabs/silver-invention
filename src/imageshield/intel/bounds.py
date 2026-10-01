@@ -16,6 +16,31 @@ MAX_PROMPT_TAGS = 300
 DISCOVERY_DEDUP_DAYS = 30
 INTEL_STALE_GRACE_HOURS = 6
 
+# ── sources per question and weight suggestions (step 5, spec §4.6, §4.10) ───
+MIN_SOURCE_TEXT_CHARS = 200
+MAX_PROPOSED_SOURCES_PER_OPTION = 5
+# A validation result is honoured this long (§4.10 stage 4).
+VALIDATION_TTL_HOURS = 24
+# How far back stage 4 looks for the question's stage-1 runs, to record a chosen source they
+# proposed as origin 'suggested'. Provenance only: nothing is matched or scored by origin.
+PROPOSAL_ORIGIN_DAYS = 7
+# How many of a validation search's result pages are fetched before the search counts as empty.
+MAX_SEARCH_RESULTS_CHECKED = 5
+DEFAULT_SOURCE_CHECK_EVERY_HOURS = 168
+SUGGESTION_CONTEXT_DAYS = 365
+SUGGESTION_CONTEXT_MAX_SIGNALS = 80
+# How many recent candidate signals the subject and category classes read. A read bound, never
+# sent to the model.
+SUGGESTION_POOL_MAX = 2000
+# Request bounds. The backend enforces 50 options and 250 candidates or sources itself; these accept
+# at least that.
+MAX_QUESTION_OPTIONS = 50
+MAX_VALIDATION_CANDIDATES = 250
+MAX_SUGGESTION_SOURCES = 250
+MAX_QUERY_TEXT_CHARS = 300
+MAX_CANDIDATE_REASON_CHARS = 300
+MAX_TAG_LABEL_CHARS = 80
+
 # ── proposals (step 2, spec §4.5) ────────────────────────────────────────────
 WEIGHT_DELTA_MIN = -2
 WEIGHT_DELTA_MAX = 2

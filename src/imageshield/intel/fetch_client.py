@@ -16,6 +16,9 @@ Two failure families, kept apart because they mean different things to a source:
 ``unsupported_type`` is deliberately overloaded by the fetcher (a non-text type,
 a feed carrying a DTD, an unparseable feed or JSON body): none of the three needs
 a different remedy here.
+
+``robots_disallowed`` and ``robots_unreachable`` answer only a fetch that asked for
+``respect_robots`` (source validation, spec §4.10).
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ UPSTREAM_CODES = frozenset(
         "unsupported_type",
         "unfetchable",
         "too_large",
+        "robots_disallowed",
+        "robots_unreachable",
     }
 )
 FETCHER_SIDE_CODES = frozenset({"fetcher_unreachable", "fetcher_error"})
@@ -62,7 +67,9 @@ class FetchFailure(BaseModel):
 
 
 class TextFetcher(Protocol):
-    async def fetch_text(self, url: str) -> TextFetch | FetchFailure: ...
+    async def fetch_text(
+        self, url: str, *, respect_robots: bool = False
+    ) -> TextFetch | FetchFailure: ...
 
 
 def _error_code(response: httpx.Response) -> str | None:
@@ -92,11 +99,17 @@ class HttpTextFetcher:
         self._token = token
         self._timeout = timeout_seconds
 
-    async def fetch_text(self, url: str) -> TextFetch | FetchFailure:
+    async def fetch_text(
+        self, url: str, *, respect_robots: bool = False
+    ) -> TextFetch | FetchFailure:
+        # Only when asked, so every other call's body is exactly step 1's.
+        body: dict[str, Any] = {"url": url}
+        if respect_robots:
+            body["respect_robots"] = True
         try:
             response = await self._client.post(
                 f"{self._base_url}/v1/text",
-                json={"url": url},
+                json=body,
                 headers={"X-Fetcher-Token": self._token},
                 timeout=self._timeout,
             )

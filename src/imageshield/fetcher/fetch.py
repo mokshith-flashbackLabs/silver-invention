@@ -15,7 +15,18 @@ worker never fetches a third-party URL itself, so this is the only egress path
 for a page's terms, a news feed or a JSON API response, and it is the one
 caller that also refuses a plain-``http`` hop (``https_only=True``) — the
 other two render or relay bytes for one request, while this one's output can
-end up quoted as evidence.
+end up quoted as evidence. ``fetch_robots`` (2026-09-30) is a fourth thin wrapper over
+the same guard, for source validation's robots.txt check (spec §4.10,
+``fetcher/robots.py``): https on every hop, any content type, and the upstream's
+status kept on ``FetchRefused.status`` so a 4xx can be told from a 5xx.
+
+**One opt-in hook on the redirect walk.** ``_get_guarded`` takes ``before_redirect``, awaited
+with each redirect hop's absolute URL after that hop has passed the https and address checks and
+before it is requested; it raises ``FetchRefused`` to stop the walk. Only ``fetch_text`` exposes it
+(2026-09-30), for ``/v1/text`` with ``respect_robots``: a landing page or a middle hop that
+robots.txt disallows must never be requested, which is more than having its text thrown away
+afterwards. ``fetch_image`` and ``fetch_page`` -- the confirm pipeline's hit-image and page paths --
+do not pass it, so with the default ``None`` their walk is exactly what it was.
 
 Mirrors ``recheck/client.py``'s hand-rolled redirect walk (same
 ``_REDIRECT_STATUSES``, same "guard, then request, on every hop" shape) for
@@ -55,6 +66,7 @@ is discarded when that response is sent.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -64,18 +76,25 @@ from imageshield.recheck.ssrf import Resolver, address_refusal
 
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
+# A caller's own policy on a redirect hop: awaited with the hop's absolute URL, raising FetchRefused
+# to stop the walk. See ``_get_guarded``'s ``before_redirect``.
+HopCheck = Callable[[str], Awaitable[None]]
+
 
 class FetchRefused(Exception):
     """Why a fetch did not happen.
 
     ``code`` is the stable machine string ``fetcher/app.py`` maps to an HTTP
     status; ``detail`` is free text for logs, never echoed to a caller as-is.
+    ``status`` is the upstream's HTTP status when it answered with a non-2xx, so a
+    robots.txt read can tell a 4xx from a 5xx; it is None for every other refusal.
     """
 
-    def __init__(self, code: str, detail: str) -> None:
+    def __init__(self, code: str, detail: str, *, status: int | None = None) -> None:
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+        self.status = status
 
 
 class FetchedImage(BaseModel):
@@ -111,6 +130,7 @@ async def _get_guarded(
     max_redirects: int,
     resolver: Resolver | None,
     https_only: bool = False,
+    before_redirect: HopCheck | None = None,
 ) -> tuple[str, bytes, str]:
     """The guarded GET both public fetchers are built on.
 
@@ -123,12 +143,23 @@ async def _get_guarded(
     and a second copy of it is how one of the three ends up missing a hop
     check later.
 
+    ``before_redirect`` (None by default) is the one place a caller's own policy
+    can look at a URL it never named. It is awaited with the absolute URL of each
+    REDIRECT hop, never with ``url`` itself (the caller knows that URL and checks
+    it first), after the hop has passed the https and address checks and before
+    it is requested, so it only ever sees a hop this guard would have fetched and
+    a refusal means the hop is never contacted. It stops the walk by raising
+    :class:`FetchRefused`, which leaves here unchanged. The redirect that would
+    exceed ``max_redirects`` ends the walk without a call, because that URL is
+    never requested. With None the walk is exactly what it was before the hook
+    existed.
+
     Returns ``(content_type, body, final_url)`` — ``final_url`` is ``current``
     at the hop that actually answered, so a caller can tell a subject or an
     operator which URL the bytes really came from after any redirects.
     """
     current = url
-    for _hop in range(max_redirects + 1):
+    for hop in range(max_redirects + 1):
         if https_only and urlsplit(current).scheme != "https":
             # Checked on EVERY hop, not just the URL the caller supplied: a
             # https origin can still redirect to a plain-http location, and an
@@ -146,6 +177,13 @@ async def _get_guarded(
             # detail for logs, not a distinction the HTTP response makes.
             raise FetchRefused("refused_private_address", refusal)
 
+        if hop > 0 and before_redirect is not None:
+            # A URL nobody asked for, reached only through a Location header and about to be
+            # requested. Awaited AFTER the checks above, so the hook only sees a hop this guard
+            # would fetch, and BEFORE the request, so a refusal leaves the hop uncontacted. No
+            # response is open here: the previous hop's was closed by its ``finally``.
+            await before_redirect(current)
+
         try:
             request = client.build_request("GET", current, timeout=timeout_seconds)
             response = await client.send(request, stream=True)
@@ -161,7 +199,11 @@ async def _get_guarded(
                 continue
 
             if not 200 <= response.status_code < 300:
-                raise FetchRefused("unfetchable", f"upstream returned {response.status_code}")
+                raise FetchRefused(
+                    "unfetchable",
+                    f"upstream returned {response.status_code}",
+                    status=response.status_code,
+                )
 
             # Checked BEFORE the body is read: no point paying for bytes we
             # are about to refuse, and a hostile response can make the body
@@ -292,6 +334,7 @@ async def fetch_text(
     timeout_seconds: float,
     max_redirects: int,
     resolver: Resolver | None = None,
+    before_redirect: HopCheck | None = None,
 ) -> FetchedText:
     """GET ``url`` as one of ``TEXT_TYPES`` for likeness intel (spec §4.2).
 
@@ -299,6 +342,10 @@ async def fetch_text(
     the caller supplied — a redirect to plain ``http`` is refused exactly like
     a redirect to a private address, because this fetcher's callers use the
     result as evidence, not as a rendering convenience.
+
+    ``before_redirect`` is handed to the guarded GET unchanged (see
+    ``_get_guarded``): ``/v1/text`` with ``respect_robots`` reads each redirect
+    hop's robots.txt through it, so a hop the site disallows is never requested.
 
     Reading ``max_bytes + 1`` is what makes ``truncated`` honest: one byte past
     the cap proves more existed than what is returned.
@@ -314,6 +361,7 @@ async def fetch_text(
         max_redirects=max_redirects,
         resolver=resolver,
         https_only=True,
+        before_redirect=before_redirect,
     )
     truncated = len(body) > max_bytes
     return FetchedText(
@@ -322,3 +370,57 @@ async def fetch_text(
         raw=body[:max_bytes],
         truncated=truncated,
     )
+
+
+# RFC 9309 asks a crawler to parse at least 500 KiB of a robots.txt; past this the head is used.
+ROBOTS_MAX_BYTES = 512 * 1024
+
+
+class RobotsFile(BaseModel):
+    """A robots.txt, in memory for one request. ``text`` is None when there is no usable file (a
+    4xx other than 429, or a redirect chain past the cap): RFC 9309 then allows everything."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str | None
+
+
+async def fetch_robots(
+    client: httpx.AsyncClient,
+    origin: str,
+    *,
+    timeout_seconds: float,
+    max_redirects: int,
+    resolver: Resolver | None = None,
+) -> RobotsFile:
+    """GET ``{origin}/robots.txt`` for source validation (spec §4.10), under the same guard as
+    every fetch here: the SSRF check and https on every hop, a byte cap applied while reading.
+
+    Any content type is accepted: a robots.txt served as ``text/html`` still parses, to nothing if
+    it is a page. A 5xx, a 429, a timeout or a transport error is "unreachable", which RFC 9309
+    reads as a complete disallow: it raises ``robots_unreachable``. A private address raises
+    ``refused_private_address`` unchanged, because the page shares the host."""
+    try:
+        _content_type, body, _final_url = await _get_guarded(
+            client,
+            f"{origin}/robots.txt",
+            accept_prefixes=("",),
+            reject_code="unsupported_type",
+            truncate_over_cap=True,
+            max_bytes=ROBOTS_MAX_BYTES,
+            timeout_seconds=timeout_seconds,
+            max_redirects=max_redirects,
+            resolver=resolver,
+            https_only=True,
+        )
+    except FetchRefused as exc:
+        if exc.code == "refused_private_address":
+            raise
+        unavailable = exc.status is not None and 400 <= exc.status < 500 and exc.status != 429
+        if exc.code == "redirect_limit" or unavailable:
+            return RobotsFile(text=None)
+        raise FetchRefused("robots_unreachable", exc.detail) from exc
+    # utf-8-sig: a byte-order mark (Windows editors write one) is not part of the first line.
+    # Left in, ``User-agent`` would read as an unknown field and a blanket ``Disallow: /`` would
+    # bind nobody.
+    return RobotsFile(text=body.decode("utf-8-sig", errors="replace"))

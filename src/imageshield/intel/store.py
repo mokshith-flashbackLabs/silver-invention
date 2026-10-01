@@ -21,7 +21,8 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.bounds import MAX_RUN_ATTEMPTS
-from imageshield.intel.models import Run, Source, SpendToday, Vocabulary
+from imageshield.intel.models import Run, Source, SourcePause, SpendToday, Vocabulary
+from imageshield.intel.vocabulary import parse_vocabulary
 from imageshield.providers.store import utc_spend_date
 from imageshield.search.urlhash import NORMALISATION_VERSION, canonicalise, url_hash
 
@@ -29,10 +30,11 @@ log = structlog.get_logger("imageshield.intel")
 
 CLAUDE_INTEL = "claude_intel"
 
-_SOURCE_COLUMNS = """source_id, kind, source_url, url_hash, query_text, tags, check_every_hours,
+# Public: intel/question_store.py reads the same rows.
+SOURCE_COLUMNS = """source_id, kind, source_url, url_hash, query_text, tags, check_every_hours,
     next_check_at, enabled, terms_note, last_content_sha256, last_checked_at, last_run_status,
-    consecutive_failures, disabled_reason, created_by, created_at"""
-_RUN_COLUMNS = """run_id, kind, source_id, request, status, attempts, requested_by, outcome,
+    consecutive_failures, disabled_reason, created_by, created_at, origin, proposed_for"""
+RUN_COLUMNS = """run_id, kind, source_id, request, status, attempts, requested_by, outcome,
     error_code, created_at, completed_at"""
 
 _AUDIT_SQL = """
@@ -71,7 +73,7 @@ _CLAIM_SQL = f"""
          ORDER BY created_at
          FOR UPDATE SKIP LOCKED
          LIMIT 1)
-    RETURNING {_RUN_COLUMNS}
+    RETURNING {RUN_COLUMNS}
 """
 
 _EXPIRE_SQL = """
@@ -98,10 +100,15 @@ _PUT_VOCAB_SQL = """
     RETURNING 1
 """
 
+# An operator's own disable clears 'unmapped', so the pause pass never re-enables what an
+# operator turned off (spec §4.10).
 _PATCH_SOURCE_SQL = f"""
     UPDATE intel_sources SET
         enabled = coalesce(%(enabled)s::boolean, enabled),
-        disabled_reason = CASE WHEN %(enabled)s::boolean IS TRUE THEN NULL ELSE disabled_reason END,
+        disabled_reason = CASE
+            WHEN %(enabled)s::boolean IS TRUE THEN NULL
+            WHEN %(enabled)s::boolean IS FALSE AND disabled_reason = 'unmapped' THEN NULL
+            ELSE disabled_reason END,
         consecutive_failures = CASE WHEN %(enabled)s::boolean IS TRUE THEN 0
                                     ELSE consecutive_failures END,
         check_every_hours = coalesce(%(check_every_hours)s::int, check_every_hours),
@@ -110,7 +117,24 @@ _PATCH_SOURCE_SQL = f"""
         query_text = coalesce(%(query_text)s::text, query_text),
         updated_at = now()
      WHERE source_id = %(source_id)s
-    RETURNING {_SOURCE_COLUMNS}
+    RETURNING {SOURCE_COLUMNS}
+"""
+
+# spec §4.9, §4.10: a source whose NON-EMPTY tags are all unmapped in the live vocabulary pauses;
+# one paused that way resumes when any of its tags is mapped again, or when its tags are cleared
+# (an untagged source never pauses). A source disabled for any other reason, or by an operator
+# (which leaves disabled_reason NULL), is never touched.
+_PAUSE_UNMAPPED_SQL = """
+    UPDATE intel_sources SET enabled = false, disabled_reason = 'unmapped', updated_at = now()
+     WHERE enabled AND cardinality(tags) > 0 AND NOT (tags && %(mapped)s::text[])
+    RETURNING source_id
+"""
+
+_RESUME_MAPPED_SQL = """
+    UPDATE intel_sources SET enabled = true, disabled_reason = NULL, updated_at = now()
+     WHERE NOT enabled AND disabled_reason = 'unmapped'
+       AND (cardinality(tags) = 0 OR tags && %(mapped)s::text[])
+    RETURNING source_id
 """
 
 
@@ -164,6 +188,7 @@ class IntelStore(Protocol):
         document: dict[str, Any],
     ) -> bool: ...
     async def load_vocabulary(self) -> Vocabulary | None: ...
+    async def pause_unmapped_sources(self) -> SourcePause: ...
     async def spend_today(self, now: datetime) -> SpendToday: ...
 
 
@@ -190,7 +215,7 @@ class PostgresIntelStore:
                         query_text, tags, check_every_hours, terms_note, created_by)
                     VALUES (%(kind)s, %(url)s, %(hash)s, %(nv)s, %(query)s, %(tags)s, %(every)s,
                             %(terms)s, %(operator)s)
-                    RETURNING {_SOURCE_COLUMNS}""",
+                    RETURNING {SOURCE_COLUMNS}""",
                 {
                     "kind": kind,
                     "url": canonical,
@@ -223,13 +248,13 @@ class PostgresIntelStore:
             cur = conn.cursor(row_factory=dict_row)
             if cursor is None:
                 await cur.execute(
-                    f"SELECT {_SOURCE_COLUMNS} FROM intel_sources"
+                    f"SELECT {SOURCE_COLUMNS} FROM intel_sources"
                     " ORDER BY created_at DESC, source_id DESC LIMIT %s",
                     (limit,),
                 )
             else:
                 await cur.execute(
-                    f"SELECT {_SOURCE_COLUMNS} FROM intel_sources"
+                    f"SELECT {SOURCE_COLUMNS} FROM intel_sources"
                     " WHERE (created_at, source_id) < (%s, %s)"
                     " ORDER BY created_at DESC, source_id DESC LIMIT %s",
                     (cursor[0], cursor[1], limit),
@@ -241,7 +266,7 @@ class PostgresIntelStore:
         async with self._pool.connection() as conn:
             cur = conn.cursor(row_factory=dict_row)
             await cur.execute(
-                f"SELECT {_SOURCE_COLUMNS} FROM intel_sources WHERE source_id = %s", (source_id,)
+                f"SELECT {SOURCE_COLUMNS} FROM intel_sources WHERE source_id = %s", (source_id,)
             )
             row = await cur.fetchone()
         return Source.model_validate(row) if row is not None else None
@@ -384,13 +409,13 @@ class PostgresIntelStore:
             cur = conn.cursor(row_factory=dict_row)
             if cursor is None:
                 await cur.execute(
-                    f"SELECT {_RUN_COLUMNS} FROM intel_runs"
+                    f"SELECT {RUN_COLUMNS} FROM intel_runs"
                     " ORDER BY created_at DESC, run_id DESC LIMIT %s",
                     (limit,),
                 )
             else:
                 await cur.execute(
-                    f"SELECT {_RUN_COLUMNS} FROM intel_runs"
+                    f"SELECT {RUN_COLUMNS} FROM intel_runs"
                     " WHERE (created_at, run_id) < (%s, %s)"
                     " ORDER BY created_at DESC, run_id DESC LIMIT %s",
                     (cursor[0], cursor[1], limit),
@@ -465,3 +490,46 @@ class PostgresIntelStore:
             spent_today_usd=cost or Decimal("0"),
             daily_budget_usd=budget,
         )
+
+    async def pause_unmapped_sources(self) -> SourcePause:
+        """spec §4.9's source row, STATE-BASED: run on every worker tick before scheduling, it
+        compares every source's tags with what the live quiz maps NOW, so a source registered or
+        re-tagged since the last push follows the quiz too. With no vocabulary, or one that cannot
+        be read, nothing moves: what is mapped is unknown then."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(
+                "SELECT release_no, map_version, scoring_version, quiz_version, document"
+                " FROM intel_vocabulary WHERE id = 1"
+            )
+            row = await cur.fetchone()
+            vocabulary = (
+                parse_vocabulary(Vocabulary.model_validate(row)) if row is not None else None
+            )
+            if vocabulary is None:
+                return SourcePause()
+            mapped = sorted(vocabulary.mapped_tags)
+            moved = await conn.execute(_PAUSE_UNMAPPED_SQL, {"mapped": mapped})
+            paused = tuple(r[0] for r in await moved.fetchall())
+            moved = await conn.execute(_RESUME_MAPPED_SQL, {"mapped": mapped})
+            resumed = tuple(r[0] for r in await moved.fetchall())
+            if paused or resumed:
+                await conn.execute(
+                    _AUDIT_SQL,
+                    {
+                        "actor_type": "service",
+                        "action": "intel.sources_followed_quiz",
+                        "resource_id": None,
+                        "metadata": Jsonb(
+                            {
+                                "release_no": vocabulary.release_no,
+                                "map_version": vocabulary.map_version,
+                                "paused": [str(i) for i in paused],
+                                "resumed": [str(i) for i in resumed],
+                            }
+                        ),
+                    },
+                )
+        if paused or resumed:
+            log.info("intel.sources_followed_quiz", paused=len(paused), resumed=len(resumed))
+        return SourcePause(paused=paused, resumed=resumed)

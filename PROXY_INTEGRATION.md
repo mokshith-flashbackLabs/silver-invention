@@ -730,6 +730,9 @@ Nothing on this surface moves anyone's score.
 `POST /proposals/{id}/decision` and `POST /proposals/applied` (next subsection).
 `POST /weight-suggestions` and `GET /protection-events*` are still later steps.
 
+*Updated 2026-09-30 (step 5):* `POST /weight-suggestions` has shipped, with the source stages before it (the steps 5
+and 6 subsection below). `GET /protection-events*` is still step 4.
+
 ### Likeness intel admin surface (step 2 — proposals)
 
 **New 2026-09-30**, four routes. A proposal is model-written and reaches nothing until a named operator decides it.
@@ -939,6 +942,94 @@ The differences. Each D-row names who owes a fix. None changes a backend code pa
 | D7 | **A renewal whose credit was retracted or already renewed** | `409 proposal_not_pending` (message: "The protection this renews is no longer active." / "…has already been renewed.") | **None.** No new code. The panel's copy for that code may cover the case |
 | D8 | **Renewal proposals and renewal runs on the existing reads** | a renewal is an ordinary pending `protection_event` proposal with `target.renews_event_id`, `model_id: "code:renewal"`, `prompt_version: "renewal-v1"`. `GET /runs` lists `kind: "renewal_check"` runs (`requested_by: "schedule"`, `source_id: null`, `request: {event_id}`) with outcome keys `renewal_proposed`, `renewal_evidence_gone`, `renewal_evidence_unreachable`, `renewal_not_due`, `renewal_excerpts_checked`, `renewal_excerpts_verified`, `renewal_excerpt_dropped_<reason>` | **Backend (contract only)**: the control-room contract gives the panel words for the `renewal_check` kind and those keys, and labels a `code:renewal` proposal "Renewal" |
 
+### Likeness intel admin surface (steps 5 and 6 — sources per question, weight suggestions)
+
+**New 2026-09-30.** "Suggest points" in the quiz editor now starts by choosing sources.
+1. `POST /source-proposals` proposes sources per option. Existing registry sources come first, and nothing is
+   registered.
+2. The operator edits the list.
+3. `POST /source-validations` checks, by code alone, that each chosen source can be read.
+4. `POST /weight-suggestions` registers the chosen ones and queues the suggestion.
+
+The suggestion is a `weight_suggestion` proposal born `delivered`. It is advice for the editor and is never
+decidable. A source registered this way carries its option's tags, and pauses on its own (`disabled_reason:
+'unmapped'`) while none of those tags is mapped in the live quiz. Map every code below by name.
+
+| # | Route | Body | Success | Semantic errors |
+|---|---|---|---|---|
+| S1 | `POST /v1/admin/intel/source-proposals` | `{question_key: 1–128, prompt: 1–1000, options: 1–50 distinct strings of 1–200, tags?: {option: slug[]}, operator: 1–64}`. `tags` keys must be options, and slugs well-formed and distinct (**shape only**; when present, even `{}`, it replaces the vocabulary's map for this run) | `202 {run_id}` | none besides `422 validation_error` |
+| S2 | `GET /v1/admin/intel/source-proposals/{run_id}` | — | `200 {run_id, status, error_code, options: [{option, tags, existing: [Source], proposed: [{kind, source_url, query_text, reason}]}] \| null}`. `options` is null until the run finishes. A candidate carries both locator keys, one null. `existing` are full source rows, enabled first | `404 intel_run_not_found` (unknown id, or a run of another kind) |
+| S3 | `POST /v1/admin/intel/source-validations` | `{candidates: 1–250 × {option: 1–200, kind, source_url?, query_text?: 1–300}, operator}`. `search_query` ⟺ `query_text` and no `source_url`; every other kind an https `source_url` and no `query_text` | `202 {run_id}`. **A known hit location or a PII-shaped query is a per-candidate `blocked`, never a synchronous 422.** | none besides `422 validation_error` |
+| S4 | `GET /v1/admin/intel/source-validations/{run_id}` | — | `200 {run_id, status, error_code, results: [{candidate: {option, kind, source_url, query_text}, status: 'ready' \| 'blocked', reason: string \| null}] \| null, honoured_until: timestamptz \| null}`. `candidate` echoes the request's own values | `404 intel_run_not_found` |
+| S5 | `POST /v1/admin/intel/weight-suggestions` | `{question_key, prompt, type: string \| null (required), options, cap?: int 0–10 \| null, tags?, sources?: 0–250 × {option ∈ options, kind, source_url?, query_text?, validation_run_id: uuid, terms_note: 10–500, check_every_hours?: 6–720}, operator}` | `202 {run_id}` | `422 source_not_validated` with `error.entries: [{index, reason}]`, reason ∈ `unknown_run` · `expired` · `not_ready`; `422 known_hit_location`; `422 query_names_a_person`; `422 unknown_tag` with `error.slugs` (a tag of an option that has a chosen source, unknown to services' vocabulary; tags of options with no chosen source are never checked) |
+| S6 | `GET /v1/admin/intel/weight-suggestions/{run_id}` | — | `200 {run_id, status, proposal_id \| null, error_code \| null, options: [SuggestionOption] \| null, sources_deferred: int}` | `404 intel_run_not_found` |
+| S7 | `GET /v1/admin/intel/proposals/{proposal_id}` (step 2's route, a `weight_suggestion`) | — | step 2's body, whose `target.options[]` carry `deduction`, **plus `options: [SuggestionOption]`**. Proposal-level `approvable: false`, `why_not: 'not_decidable'` | `404 proposal_not_found` |
+| S8 | `PATCH /v1/admin/intel/sources/{source_id}` (step 1's route) | unchanged | unchanged | **new:** `409 source_tags_unmapped` with `error.slugs`, when the body sets `enabled: true` and every tag the source would carry is unmapped in services' vocabulary |
+| S9 | `GET /v1/admin/intel/sources` (step 1's route) | unchanged | each source gains `origin` (`suggested` · `operator`) and `proposed_for` (`{question_key, option}` or null). `disabled_reason` may now be `unmapped` | unchanged |
+| S10 | `GET /v1/admin/intel/proposals?kind=coverage_gap` and `POST /proposals/{id}/decision` on a gap (step 2, **step 6's whole services surface**) | unchanged | unchanged: a gap row carries `target: {subject, suggested_tag?, suggested_question?, regenerated_by_run_id?}`, `approvable: false`, `why_not: 'not_decidable'`. Dismissal (`rejected`) answers `200` | approving: `409 proposal_not_decidable` |
+
+**`SuggestionOption`** is `{option, deduction: int \| null, rationale, signal_ids: uuid[], suggested_tags: slug[],
+new_tag: {slug, label, kind} \| null, corroborated: bool, why_not: 'no_evidence' \| 'evidence_retracted' \|
+'uncorroborated' \| null}`. `corroborated` is `why_not IS NULL`, the one predicate over that option's own cited signals.
+
+**Stage-3 `reason` codes (S4), the closed set:**
+- verdicts about the source: `known_hit_location`, `not_https`, `unreachable`, `unsupported_type`,
+  `robots_disallowed`, `robots_unreachable`, `too_short`, `no_items`, `query_names_a_person`, `no_results`;
+- transient, so re-validate later: `search_unavailable`, `fetcher_unavailable`, `run_call_cap`, and the gate's own
+  `budget_exceeded`, `breaker_open`, `provider_disabled`, `budget_unset`.
+
+**Three details pinned for the backend's client (built at `image_backend` `c02d78c`):**
+1. **`422 source_not_validated` wire shape.** `{"error": {"code": "source_not_validated", "message": …, "retryable":
+   false, "request_id": …, "entries": [{"index": int, "reason": string}]}}`. `entries` sits beside the four usual
+   fields, inside `error`. `index` is the entry's 0-based position in the request's `sources`. Only failing entries are
+   listed, once each, in ascending `index`. The entries carry nothing the request sent (no URL, no query), per
+   `http/errors.py`'s rule for the envelope.
+2. **Every `reason` code matches `^[a-z][a-z0-9_]{0,39}$`.** `source_not_validated`'s closed set is `unknown_run` (no
+   completed `source_validation` run has that id), `expired` (that run completed more than 24 hours ago) and
+   `not_ready` (that run holds no `ready` result for this source). The stage-3 set above is the same shape. Tests
+   assert every code of both sets against that pattern: the stage-3 set in Task 6, `source_not_validated`'s in Task 8.
+3. **The validation poll (S4) answers an object, never a bare list:** `{run_id, status, error_code, results, honoured_until}`.
+   - `results` is null until the run completes, then holds exactly one result per submitted candidate, **in the
+     submitted order** (`results[i]` answers `candidates[i]` of the POST).
+   - Each result also **echoes its candidate verbatim** (`{option, kind, source_url, query_text}`, as submitted, the
+     absent locator null), so a client can match by position or by those four fields.
+   - At stage 4 (S5), services match a chosen source to a `ready` result of its `validation_run_id` by **`kind` plus
+     canonical URL** (its `url_hash`: scheme and host case, tracking parameters and fragments ignored) **or normalised
+     query text** (whitespace collapsed, case-folded). `option` is not part of that match. An entry the backend's
+     four-field match accepts is therefore always accepted here.
+
+**Run `error_code`s (S2, S4, S6):**
+- `request_unreadable`;
+- `source_proposal_<outcome>` or `suggestion_<outcome>`, where `<outcome>` ∈ `refusal` · `max_tokens` · `unparseable`;
+- `vocabulary_missing` (S6 only);
+- `timeout`, `error`, `rate_limited` (status `failed`);
+- the gate's reasons (status `refused`);
+- `migration_down`: a stage-1 or stage-3 run that a rollback of 0043 ended;
+- `attempts_exhausted`: step 1's, for any run kind the worker crashed on three times.
+
+A failed check in a validation run (S4) is that candidate's `blocked` result, never the run's error, so a validation
+run that the worker finishes always completes.
+
+**Rules the table does not show (pinned by the build):**
+- A validation run tests **at most 20 search queries** (`INTEL_MAX_CALLS_PER_RUN`) and answers `run_call_cap` for the
+  rest. Split a longer list into two validations.
+- A source URL must name a host. A bare `https://` is `422 validation_error` on every body that carries a candidate
+  (and on `POST /sources`), and stage 3 answers `not_https` for one that reaches it. A whitespace-only `option` on a
+  candidate is the same `422`.
+- A **reused** source keeps its enabled state. An operator-disabled source stays disabled when it is chosen again in
+  the Suggest flow, so re-enable it on the Sources screen. An `unmapped` pause still resumes by itself when one of its
+  tags is mapped.
+- A source with **no tags never auto-pauses**: pausing is tag-based, so an untagged source keeps being read until an
+  operator disables it.
+- Stage 3's test search for a `search_query` is **one metered request** through the provider gate. It counts toward the
+  $50/day cap and is judged by code only: no model judgement, only that the pages it returns pass the same checks.
+- `sources_read`, `sources_deferred` and `suggestion_evidence` are **absent** from a run's outcome when zero. Read them
+  with a default of 0 (`.get(..., 0)`), as the S6 poll does.
+
+**Step 6 needs nothing new from services.** Coverage gaps are step 2's rows:
+- `GET /proposals?kind=coverage_gap` lists them, and `GET /proposals/{id}` returns their evidence;
+- `rejected` on `POST /proposals/{id}/decision` dismisses one, and approving one is `409 proposal_not_decidable`;
+- step 3 adds `resolved_by_quiz` supersession.
 
 ---
 

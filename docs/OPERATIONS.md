@@ -376,6 +376,42 @@ at least a budget outage will not also relax everyone's cadence.
   proposal, in the retracting operator's name. One `intel.protection_retracted` audit row names all of them.
 - **Migration 0044's down drops every credit.** Retract them and roll the backend back first.
 
+**Sources per question and weight suggestions (steps 5 and 6, 2026-09-30).**
+- **Three new run kinds on `GET /runs`**, requested by an operator and with no `source_id`:
+  - `source_proposal`: one model call with web search;
+  - `source_validation`: no model call, except one metered test search per `search_query` candidate;
+  - `weight_suggestion`.
+- **A validation run tests at most 20 search queries** (`INTEL_MAX_CALLS_PER_RUN`) and answers `run_call_cap` for the
+  rest: split a longer list. Each test search is one metered request counted toward the $50/day cap and judged by
+  code only.
+- **A suggestion run's reading cap is `INTEL_MAX_CALLS_PER_SUGGESTION_RUN`** (default 60), not
+  `INTEL_MAX_CALLS_PER_RUN`. On top of it come one suggestion call and one generation call.
+- **Its outcome counts `sources_read` and `sources_deferred`.** A deferred source was made due, so its first scheduled
+  check runs on the next tick. The `suggestion_*` counters say what code withheld from the model's answer, and
+  `suggestion_evidence` says how many signals it saw. A counter that is zero is absent from the outcome, so read
+  one with a default of 0.
+- **Some validation reasons are transient**, meaning "validate again later", not "this source is bad":
+  `search_unavailable`, `fetcher_unavailable`, `run_call_cap`, and the gate's `budget_exceeded`, `breaker_open`,
+  `provider_disabled` and `budget_unset`.
+- **Sources follow the quiz.** Every tick, before scheduling, a source whose non-empty tags are all unmapped in the
+  live vocabulary is paused (`enabled = false`, `disabled_reason = 'unmapped'`). It resumes when any of its tags is
+  mapped again. One `intel.sources_followed_quiz` audit row is written per tick that moved something.
+  - A source with no tags never auto-pauses.
+  - A reused source keeps its enabled state: an operator-disabled source stays disabled when it is chosen again, so
+    re-enable it on the Sources screen.
+  - An operator's PATCH `enabled: false` clears `unmapped`, so the tick never re-enables that source.
+  - PATCH `enabled: true` on a source whose tags are all unmapped answers `409 source_tags_unmapped`. Map one of its
+    tags, or clear its tags.
+- **At deploy, hand-registered sources may pause.** A step-1 source whose tags are all unmapped pauses on the first
+  tick after this release. That is the rule working, not a fault: clear its tags to make it general, or map one.
+- **`robots.txt` is honoured by validation only.** The fetcher caches each origin's rules for 24 hours, in memory,
+  per fetcher task, for at most 1024 origins. A 5xx, a 429 or a timeout is `robots_unreachable` and is never cached.
+  Scheduled checks do not ask for the check. With `respect_robots`, each redirect hop's own robots.txt is read before
+  that hop is requested (at most 2 redirects), so a disallowed landing page or middle hop is never contacted. A hop
+  whose robots.txt cannot be read is `502 robots_unreachable` and is not cached.
+- **Deploy the fetcher with or before the worker.** An older fetcher refuses the worker's `respect_robots` field, and
+  validation then reads every URL as `fetcher_unavailable`.
+
 ---
 
 ## 5. A provider has returned zero successful calls for 24h

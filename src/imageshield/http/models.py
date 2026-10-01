@@ -24,6 +24,14 @@ from pydantic import (
 )
 
 from imageshield.enrolment.models import SENTINEL_CONSENT_REF
+from imageshield.intel.bounds import (
+    DEDUCTION_MAX,
+    DEDUCTION_MIN,
+    MAX_QUERY_TEXT_CHARS,
+    MAX_QUESTION_OPTIONS,
+    MAX_SUGGESTION_SOURCES,
+    MAX_VALIDATION_CANDIDATES,
+)
 from imageshield.intel.tags import TAG_SLUG_RE, is_well_formed
 from imageshield.search.feedback import FeedbackSignal
 from imageshield.types import UserRef
@@ -909,6 +917,25 @@ IntelSourceKind = Literal[
 ]
 
 
+def _source_shape_problem(kind: str, source_url: str | None, query_text: str | None) -> str | None:
+    """One rule for a source's locator, wherever a source is named: a ``search_query`` carries
+    ``query_text`` and no ``source_url``; every other kind an https ``source_url`` and no query."""
+    if (kind == "search_query") != (source_url is None):
+        return "search_query takes query_text and no source_url; every other kind a source_url"
+    if (kind == "search_query") != (query_text is not None):
+        return "query_text is for search_query only"
+    if source_url is not None and not source_url.startswith("https://"):
+        return "source_url must be https"
+    if source_url is not None:
+        try:
+            host = urlsplit(source_url).hostname
+        except ValueError:
+            host = None
+        if not host:
+            return "source_url must name a host"
+    return None
+
+
 class IntelSourceCreateRequest(ServiceModel):
     kind: IntelSourceKind
     source_url: str | None = None
@@ -920,14 +947,9 @@ class IntelSourceCreateRequest(ServiceModel):
 
     @model_validator(mode="after")
     def _shape(self) -> IntelSourceCreateRequest:
-        if (self.kind == "search_query") != (self.source_url is None):
-            raise ValueError(
-                "search_query takes query_text and no source_url; every other kind a source_url"
-            )
-        if (self.kind == "search_query") != (self.query_text is not None):
-            raise ValueError("query_text is for search_query only")
-        if self.source_url is not None and not self.source_url.startswith("https://"):
-            raise ValueError("source_url must be https")
+        problem = _source_shape_problem(self.kind, self.source_url, self.query_text)
+        if problem is not None:
+            raise ValueError(problem)
         if any(not is_well_formed(t) for t in self.tags) or len(set(self.tags)) != len(self.tags):
             raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
         return self
@@ -1075,3 +1097,119 @@ class IntelAppliedRequest(ServiceModel):
 
     scoring_version: str = Field(min_length=1, max_length=64)
     proposal_ids: tuple[UUID, ...] = Field(min_length=1, max_length=500)
+
+
+# ── likeness intel: sources per question and weight suggestions (step 5, spec §4.6, §4.10) ──
+
+
+class IntelQuestionBody(ServiceModel):
+    """The question a Suggest points press is about (spec §4.6, §4.10). ``tags`` is the backend's
+    option-to-tag rows for these options, keyed by option text, so it can hold rows for options
+    that exist only in a draft. Shape only here: services check membership only where a write
+    would give a new source a tag (POST /weight-suggestions)."""
+
+    question_key: str = Field(min_length=1, max_length=128)
+    prompt: str = Field(min_length=1, max_length=1000)
+    options: tuple[str, ...] = Field(min_length=1, max_length=MAX_QUESTION_OPTIONS)
+    tags: dict[str, tuple[str, ...]] | None = None
+    operator: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _question_shape(self) -> IntelQuestionBody:
+        if any(not option.strip() or len(option) > 200 for option in self.options):
+            raise ValueError("each option must be 1-200 characters and not blank")
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("options must be distinct")
+        for option, slugs in (self.tags or {}).items():
+            if option not in self.options:
+                raise ValueError("every tags key must be one of options")
+            if any(not is_well_formed(t) for t in slugs) or len(set(slugs)) != len(slugs):
+                raise ValueError("tags must be distinct slugs matching ^[a-z][a-z0-9_]{0,39}$")
+        return self
+
+    def question_request(self) -> dict[str, Any]:
+        """The run's stored request: the question, never the operator (``requested_by`` holds
+        that). An absent ``tags`` stays absent: it means "use the vocabulary's map"."""
+        stored: dict[str, Any] = {
+            "question_key": self.question_key,
+            "prompt": self.prompt,
+            "options": list(self.options),
+        }
+        if self.tags is not None:
+            stored["tags"] = {option: list(slugs) for option, slugs in self.tags.items()}
+        return stored
+
+
+class IntelSourceProposalRequest(IntelQuestionBody):
+    """POST /source-proposals: stage 1 of spec §4.10."""
+
+
+class IntelCandidate(ServiceModel):
+    """A source chosen or kept at stage 2 (spec §4.10): the option it is for, and a locator under
+    the one rule every source follows."""
+
+    option: str = Field(min_length=1, max_length=200)
+    kind: IntelSourceKind
+    source_url: str | None = None
+    query_text: str | None = Field(default=None, min_length=1, max_length=MAX_QUERY_TEXT_CHARS)
+
+    @model_validator(mode="after")
+    def _shape(self) -> IntelCandidate:
+        if not self.option.strip():
+            raise ValueError("option must not be blank")
+        problem = _source_shape_problem(self.kind, self.source_url, self.query_text)
+        if problem is not None:
+            raise ValueError(problem)
+        return self
+
+    def stored(self) -> dict[str, Any]:
+        """All four keys, the absent locator null: what a validation result echoes back."""
+        return {
+            "option": self.option,
+            "kind": self.kind,
+            "source_url": self.source_url,
+            "query_text": self.query_text,
+        }
+
+
+class IntelSourceValidationRequest(ServiceModel):
+    """POST /source-validations: stage 3 of spec §4.10. A known hit location or a PII-shaped
+    query is the run's per-candidate verdict, never a refusal of this body."""
+
+    candidates: tuple[IntelCandidate, ...] = Field(
+        min_length=1, max_length=MAX_VALIDATION_CANDIDATES
+    )
+    operator: str = Field(min_length=1, max_length=64)
+
+    def validation_request(self) -> dict[str, Any]:
+        return {"candidates": [c.stored() for c in self.candidates]}
+
+
+class IntelChosenSource(IntelCandidate):
+    """A source to register at stage 4 (spec §4.10): a stage-3 candidate, the validation run that
+    found it ready, the operator's terms note (§3.2), and an optional cadence (default 168
+    hours). A kept existing registry source is sent the same way, and is reused."""
+
+    validation_run_id: UUID
+    terms_note: str = Field(min_length=10, max_length=500)
+    check_every_hours: int | None = Field(default=None, ge=6, le=720)
+
+
+class IntelWeightSuggestionRequest(IntelQuestionBody):
+    """POST /weight-suggestions (spec §4.6; stage 4 of §4.10). ``type`` is the draft question's
+    scoring type as the vocabulary push spells it (``mutable`` · ``escrowed`` · ``decaying`` ·
+    ``recoverable``), or null for an unscored question: required, and nullable. ``cap`` may be
+    omitted or null."""
+
+    type: str | None = Field(max_length=32)
+    cap: StrictInt | None = Field(default=None, ge=DEDUCTION_MIN, le=DEDUCTION_MAX)
+    sources: tuple[IntelChosenSource, ...] = Field(default=(), max_length=MAX_SUGGESTION_SOURCES)
+
+    @model_validator(mode="after")
+    def _sources_name_options(self) -> IntelWeightSuggestionRequest:
+        if any(source.option not in self.options for source in self.sources):
+            raise ValueError("every source must name one of options")
+        return self
+
+    def question_request(self) -> dict[str, Any]:
+        return {**super().question_request(), "type": self.type, "cap": self.cap}

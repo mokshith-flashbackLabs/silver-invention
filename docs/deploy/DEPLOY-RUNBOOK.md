@@ -978,6 +978,23 @@ or draft threat event is scoped by tags alone; retract those first.
 Rolling back: clear the credit first (retract or let lapse every protection), then the backend, then services. 0044's
 down drops every protection credit.
 
+*Step 5 (2026-09-30):* `INTEL_MAX_SOURCE_PROPOSAL_SEARCHES=5` is required on the `intel-worker` container in both task
+definitions. It has no default, and without it the container crash-loops at boot. `INTEL_MAX_CALLS_PER_SUGGESTION_RUN`
+defaults to 60. Deploy order:
+1. services migration 0043;
+2. the fetcher service (`imageshield-dev-fetcher`, §9b) on the new image, with or before the worker, because only a
+   step-5 fetcher accepts the worker's `respect_robots` field;
+3. the services image and task definitions;
+4. only then the backend's step-5 build. Its source and suggestion relays call routes an older services build answers
+   with 404.
+
+Rolling back: the backend first, then services. 0043's down maps `unmapped` to NULL (those sources stay disabled),
+drops `origin` and `proposed_for`, and fails any queued or running stage-1 or stage-3 run (`migration_down`).
+
+*Steps 3–6 shipped as one release:* `migrate up` applies 0042, 0043 and 0044 in that order, so run it once, then
+the fetcher (step 5's item 2), then the services image and task definitions, then the backend's build that carries
+all four steps. Roll back in the reverse order; the per-step notes above say what each down refuses or drops.
+
 **As of 2026-09-30 dev ships `INTEL_ENABLED=true` and prod `INTEL_ENABLED=false`.** The workspace ids
 confirmed by the step-0 probe (2026-09-29) replaced the `pending-step0` placeholder in all **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
 (`infra/ecs/imageshield-dev-services-worker.json`), the prod container's (`infra/ecs/prod/services-worker.json`),

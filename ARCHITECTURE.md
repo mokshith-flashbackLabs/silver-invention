@@ -526,8 +526,8 @@ through one more metered call (`INTEL_PROPOSAL_MODEL`). A proposal is validated 
 - The backend acknowledges a published change on `POST /proposals/applied`.
 - The worker's reconcile keeps pending weight changes in step with every new vocabulary.
 
-The admin surface is fourteen routes (step 1's ten plus four). Quiz weight suggestions (step 5) are still to come; events
-(steps 3 and 4) are built, see below.
+The admin surface is fourteen routes (step 1's ten plus four). Events (steps 3 and 4) and quiz weight suggestions
+(steps 5 and 6) are built, see below.
 
 *Built 2026-09-30 (step 3):* threat events.
 - The generation call also proposes `threat_event`s aimed at exposure tags, and attaches new evidence to a pending
@@ -550,6 +550,21 @@ The admin surface is fourteen routes (step 1's ten plus four). Quiz weight sugge
   must approve; an approved renewal starts exactly where the old credit stops.
 - `GET /protection-events` and `POST /protection-events/{id}/retract` are the two new admin routes. A retraction also
   retracts the credit's unstarted renewal and rejects its pending one.
+
+*Built 2026-09-30 (steps 5 and 6):* sources chosen per question, and weight suggestions.
+- "Suggest points" first proposes sources per option (`source_proposal`, one metered call with web search).
+- It then checks each chosen source by code alone (`source_validation`): a known hit, https, the text floor,
+  `robots.txt` through the fetcher's new RFC 9309 check, feed items, and one metered test search for a query.
+- It registers the chosen ones in one transaction with the queued `weight_suggestion` run (migration 0043: `origin`,
+  `proposed_for`).
+- That run reads its new sources at once under `INTEL_MAX_CALLS_PER_SUGGESTION_RUN`, retrieves evidence in four
+  classes, and asks `INTEL_PROPOSAL_MODEL` for a deduction, tags and at most one new tag per option. What code keeps
+  is a `weight_suggestion` proposal born `delivered`. The ordinary generation then runs over what was read.
+- A source whose tags are all unmapped in the live quiz pauses (`disabled_reason = 'unmapped'`) on the next worker
+  tick, and resumes when one of them is mapped again. An operator's own disable is never undone.
+- Step 6 (coverage gaps surfaced) needed nothing new here: step 2's proposal surface already serves it.
+
+The admin surface is twenty-two routes (step 2's fourteen, step 4's two, and six for steps 5 and 6).
 
 **Disabled in both environments until an owner action.** `INTEL_ENABLED=false` on both dev and prod
 `intel-worker` containers, `claude_intel` seeded disabled with a NULL `daily_budget_usd`

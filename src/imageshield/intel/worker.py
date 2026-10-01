@@ -29,6 +29,7 @@ from imageshield.intel.model import ClaudeIntelModel, IntelModel
 from imageshield.intel.pipeline import PipelineDeps, run
 from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.protection_store import PostgresProtectionStore
+from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.reconcile import PostgresReconciler
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
@@ -56,6 +57,9 @@ async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
     await deps.reconciler.reconcile()
     await deps.reconciler.resolve_gaps(now)
     await deps.store.expire_exhausted(now)
+    # spec §4.10: sources follow the quiz. State-based, and before scheduling, so a source whose
+    # tags all left the live quiz is paused before it can be queued.
+    await deps.store.pause_unmapped_sources()
     await deps.store.schedule_due(now)
     # spec §4.8: one renewal check for each credit near its review date. No model call.
     await deps.protections.schedule_renewals(now)
@@ -122,6 +126,8 @@ async def run_forever(config: IntelConfig) -> None:
         # default beside IntelConfig's would be a second source of truth.
         max_calls_per_run=config.intel_max_calls_per_run,
         max_document_chars=config.intel_max_document_chars,
+        questions=PostgresQuestionStore(pool),
+        max_calls_per_suggestion_run=config.intel_max_calls_per_suggestion_run,
     )
     log.info("intel.started", enabled=config.intel_enabled, provider=config.intel_model_provider)
     try:

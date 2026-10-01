@@ -1257,9 +1257,40 @@ Coordinated deploy: services first on the way up, the backend first on the way d
 
 ---
 
-## 2h. Likeness intel — protection credits (migration 0044)
+## 2g. Likeness intel — sources per question (migration 0043)
 
-*§2g is steps 5–6's (`0043`, built on their branch); the letters follow the migrations.*
+`intel_sources` gains two columns (spec `2026-09-27-likeness-intel-design.md` §4.10):
+
+```sql
+origin       TEXT NOT NULL DEFAULT 'operator'  -- intel_sources_origin_valid: 'suggested' | 'operator'
+proposed_for JSONB                             -- intel_sources_proposed_for_shape: {question_key, option}
+```
+
+`origin` is `suggested` when a stage-1 source-proposal run proposed the source, and `operator` otherwise (every
+`POST /sources` source included). `proposed_for` names the question and option the source was registered for. Both
+are provenance only: matching still goes through `tags`. A `suggested` source always names its option
+(`intel_sources_suggested_names_its_option`).
+
+`disabled_reason` gains `unmapped` (`intel_sources_disabled_reason_valid`, replacing 0039's unnamed CHECK, which is
+found by its definition). The worker pauses a source whose non-empty tags are all unmapped in the live vocabulary,
+and resumes it when one is mapped again. An operator's PATCH clears `unmapped`, so an operator's disable is never
+undone.
+
+`intel_runs.kind` gains `source_proposal` and `source_validation` (`intel_runs_kind_valid`, replacing 0039's unnamed
+CHECK). Their results live in the run's `outcome`, with no new table. A `weight_suggestion` run's `request` holds the
+draft question plus `new_source_ids` (read first) and `source_ids` (every source it named).
+
+The down:
+- maps `unmapped` back to NULL, and those sources stay disabled;
+- drops the two columns;
+- fails any queued or running run of the two new kinds (`migration_down`);
+- restores the old kind CHECK `NOT VALID`, and validates it when no row of the new kinds remains.
+
+No `svc` view changes.
+
+---
+
+## 2h. Likeness intel — protection credits (migration 0044)
 
 `protection_events` (spec `2026-09-27-likeness-intel-design.md` §3.7, §4.8):
 

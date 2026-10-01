@@ -59,6 +59,42 @@ class ProposedTag(_Out):
     kind: Literal["platform", "service", "practice"]
 
 
+# ── sources per question and weight suggestions (step 5, spec §4.6, §4.10) ───
+# No numeric or length bounds, for the §4.5 reason: one bad candidate or option must not make the
+# whole response unparseable. intel/source_choice.py and intel/suggestion.py bound them in code.
+
+
+class ProposedSource(_Out):
+    kind: Literal[
+        "policy_page", "feed", "news", "breach_index", "regulator", "research", "search_query"
+    ]
+    source_url: str | None = None
+    query_text: str | None = None
+    reason: str = ""
+
+
+class ProposedOptionSources(_Out):
+    option: str
+    candidates: list[ProposedSource] = Field(default_factory=list)
+
+
+class SourceProposalOutput(_Out):
+    options: list[ProposedOptionSources] = Field(default_factory=list)
+
+
+class SuggestedOptionWeight(_Out):
+    option: str
+    deduction: int | None = None
+    rationale: str = ""
+    signal_ids: list[str] = Field(default_factory=list)
+    suggested_tags: list[str] = Field(default_factory=list)
+    new_tag: ProposedTag | None = None
+
+
+class SuggestionOutput(_Out):
+    options: list[SuggestedOptionWeight] = Field(default_factory=list)
+
+
 class ProposedCoverageGap(_Out):
     subject: str
     suggested_tag: ProposedTag | None = None
