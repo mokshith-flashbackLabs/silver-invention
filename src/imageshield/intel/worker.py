@@ -245,13 +245,14 @@ async def fill(
     *,
     concurrency: int,
     lease_seconds: int,
+    stopping: asyncio.Event | None = None,
 ) -> int:
     """One loop pass: housekeeping once, then claim runs while ``running`` holds fewer than
-    ``concurrency``, each executed in its own task (added to ``running``, removed when it ends).
-    Returns how many runs this pass claimed."""
+    ``concurrency``, each executed in its own task (added to ``running``, removed when it ends),
+    and never once ``stopping`` is set. Returns how many runs this pass claimed."""
     await housekeeping(deps)
     claimed_count = 0
-    while len(running) < concurrency:
+    while len(running) < concurrency and not (stopping is not None and stopping.is_set()):
         claimed = await deps.store.claim_next(deps.clock(), lease_seconds=lease_seconds)
         if claimed is None:
             break
@@ -294,7 +295,11 @@ async def serve(
             if enabled:
                 try:
                     await fill(
-                        deps, running, concurrency=run_concurrency, lease_seconds=lease_seconds
+                        deps,
+                        running,
+                        concurrency=run_concurrency,
+                        lease_seconds=lease_seconds,
+                        stopping=stopping,
                     )
                 except Exception:
                     # One bad pass must not kill the loop. Whatever it was working on is still

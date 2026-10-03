@@ -63,6 +63,10 @@ And one latent fault the fix depends on:
   their lease lapses — the same outcome a deploy had before, when the container was killed mid-run.
 - `tick()` stays: housekeeping, one claim, `execute()`. Scripts and tests use it; the deployed loop
   is `serve`.
+- **Accepted edge:** a suggestion's inline read of a page source and that source's own scheduled
+  check can now run at the same time in one worker (two prod tasks could already overlap them).
+  Both read the page and may both be billed for it; every write they share is an upsert
+  (`record_unit`'s snapshot and hash), so neither run fails.
 
 ## 4. The run log under concurrency
 
