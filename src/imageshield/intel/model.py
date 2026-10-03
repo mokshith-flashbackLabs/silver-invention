@@ -338,12 +338,18 @@ class ClaudeIntelModel:
         )
 
     async def _search(
-        self, output_format: type[T], *, system: str, user: str, max_uses: int
+        self,
+        output_format: type[T],
+        *,
+        system: str,
+        user: str,
+        max_uses: int,
+        effort: str | None = None,
     ) -> ModelCall[T]:
         """One web-search call on the extraction model, its pause_turn continuations driven to
         completion (spec §4.4), bounded by INTEL_MAX_CALLS_PER_RUN, usage summed across them.
-        Discovery, source proposal and the validation search differ only in their schema and
-        max_uses."""
+        Discovery, source proposal and the validation search differ only in their schema,
+        max_uses and ``effort`` (sent on the call and on every continuation of it)."""
         tools: list[dict[str, Any]] = [
             {
                 "type": self._config.intel_web_search_tool_type,
@@ -364,6 +370,7 @@ class ClaudeIntelModel:
             call = await self._send(
                 output_format,
                 model=self._config.intel_extraction_model,
+                effort=effort,
                 announce=pause_turns == 0,
                 system=system,
                 tools=tools,
@@ -401,12 +408,17 @@ class ClaudeIntelModel:
             # server_tool_use block.
             messages = [messages[0], {"role": "assistant", "content": call.content}]
 
+    # INTEL_SEARCH_READ_EFFORT (spec 2026-10-03-intel-throughput §7) is sent on the two search
+    # calls that READ or CHECK -- a saved search's read and stage 3's validation search -- and on
+    # no other: not stage 1's source proposal, not extraction, proposal or suggestion.
+
     async def discover(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
         return await self._search(
             DiscoveryOutput,
             system=system,
             user=user,
             max_uses=self._config.intel_max_web_searches_per_run,
+            effort=self._config.intel_search_read_effort,
         )
 
     async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]:
@@ -419,7 +431,11 @@ class ClaudeIntelModel:
 
     async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
         return await self._search(
-            DiscoveryOutput, system=system, user=user, max_uses=_VALIDATION_SEARCHES
+            DiscoveryOutput,
+            system=system,
+            user=user,
+            max_uses=_VALIDATION_SEARCHES,
+            effort=self._config.intel_search_read_effort,
         )
 
     async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:

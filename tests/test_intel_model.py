@@ -971,3 +971,77 @@ async def test_an_unreadable_event_is_skipped_never_raised() -> None:
     await translator.feed(SimpleNamespace(type="content_block_stop", content_block=object()))
     await translator.feed(object())
     assert store.rows == {}
+
+
+# ── Claude's effort on search READS (spec 2026-10-03-intel-throughput §7) ─────────────────────
+
+
+def _model_at_effort(
+    responses: list[Any], clean_env: pytest.MonkeyPatch, effort: str
+) -> tuple[ClaudeIntelModel, FakeMessages]:
+    """``_model`` with INTEL_SEARCH_READ_EFFORT set over BASE's."""
+    for k, v in BASE.items():
+        clean_env.setenv(k, v)
+    clean_env.setenv("INTEL_SEARCH_READ_EFFORT", effort)
+    from imageshield.intel.config import load_intel_config
+
+    fake = FakeMessages(responses)
+    return ClaudeIntelModel(load_intel_config(), client=SimpleNamespace(messages=fake)), fake
+
+
+def _discovered(ws: int = 1) -> SimpleNamespace:
+    return SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(ws=ws),
+        content=[_text_block(DiscoveryOutput(candidates=[]).model_dump_json())],
+    )
+
+
+async def test_a_saved_searchs_read_sends_the_search_read_effort_on_every_call(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """BASE sets INTEL_SEARCH_READ_EFFORT=medium. A pause_turn resume is the same search, so it
+    carries the same effort."""
+    model, fake = _model([_paused(), _discovered()], clean_env)
+    call = await model.discover("sys", "q")
+    assert call.pause_turns == 1 and len(fake.calls) == 2
+    assert [sent["output_config"]["effort"] for sent in fake.calls] == ["medium", "medium"]
+
+
+async def test_a_validation_search_sends_the_search_read_effort(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    model, fake = _model_at_effort([_discovered()], clean_env, "low")
+    await model.search_once("sys", '{"query": "q"}')
+    assert fake.calls[0]["output_config"]["effort"] == "low"
+
+
+async def test_no_other_call_carries_the_search_read_effort(clean_env: pytest.MonkeyPatch) -> None:
+    """Stage 1's source proposal searches too, but it PROPOSES, so it keeps the model's own
+    default; extraction sends none; proposal and suggestion keep their explicit 'high'."""
+
+    def answer(output: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            model="claude-sonnet-5",
+            stop_reason="end_turn",
+            usage=_usage(),
+            content=[_text_block(output.model_dump_json())],
+        )
+
+    model, fake = _model_at_effort(
+        [
+            answer(SourceProposalOutput()),
+            answer(ExtractionOutput(signals=[])),
+            answer(ProposalOutput()),
+            answer(SuggestionOutput()),
+        ],
+        clean_env,
+        "low",
+    )
+    await model.propose_sources("sys", "question")
+    await model.extract("sys", "user")
+    await model.propose("sys", "user")
+    await model.suggest_weights("sys", "user")
+    efforts = [sent["output_config"].get("effort") for sent in fake.calls]
+    assert efforts == [None, None, "high", "high"]
