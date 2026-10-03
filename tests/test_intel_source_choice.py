@@ -169,6 +169,8 @@ def _new(option: str, tags: tuple[str, ...], url: str = "https://p.example/terms
         origin="operator",
         question_key="platforms",
         option=option,
+        validation_run_id=None,
+        validated_at=None,
     )
 
 

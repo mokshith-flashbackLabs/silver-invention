@@ -24,7 +24,12 @@ class Source(BaseModel):
     ``search_query`` source carries ``query_text`` instead — the DB's own CHECKs enforce
     which, this model only carries whatever the row has. ``origin`` is ``suggested`` when a
     stage-1 source-proposal run proposed the source, else ``operator``; ``proposed_for`` is
-    ``{question_key, option}`` provenance, never used for matching (0043)."""
+    ``{question_key, option}`` provenance, never used for matching (0043).
+
+    ``terms_note`` is optional since 0047 (2026-10-03). ``validation_run_id`` and
+    ``validated_at`` are the automatic evidence instead: the source_validation run that found the
+    source ready, and when that run completed, set together when stage 4 registers a source and
+    null for one created on the Sources screen (``POST /sources``, never validated)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -37,7 +42,7 @@ class Source(BaseModel):
     check_every_hours: int
     next_check_at: datetime
     enabled: bool
-    terms_note: str
+    terms_note: str | None
     last_content_sha256: str | None
     last_checked_at: datetime | None
     last_run_status: str | None
@@ -48,6 +53,9 @@ class Source(BaseModel):
     # Migration 0043 (spec §4.10). Defaults, so a row or a fake without them still reads.
     origin: str = "operator"
     proposed_for: dict[str, Any] | None = None
+    # Migration 0047. Defaults for the same reason.
+    validation_run_id: UUID | None = None
+    validated_at: datetime | None = None
 
 
 class Run(BaseModel):

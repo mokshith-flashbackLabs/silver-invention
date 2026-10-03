@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -30,6 +31,7 @@ from imageshield.intel.bounds import (
     MAX_QUERY_TEXT_CHARS,
     MAX_QUESTION_OPTIONS,
     MAX_SUGGESTION_SOURCES,
+    MAX_TERMS_NOTE_CHARS,
     MAX_VALIDATION_CANDIDATES,
 )
 from imageshield.intel.tags import TAG_SLUG_RE, is_well_formed
@@ -936,13 +938,33 @@ def _source_shape_problem(kind: str, source_url: str | None, query_text: str | N
     return None
 
 
+def _optional_terms_note(value: str | None) -> str | None:
+    """A source's terms note, the operator's free text on why reading the site automatically is
+    allowed. OPTIONAL since 2026-10-03 (owner decision, migration 0047): it was required and at
+    least 10 characters, and in practice was typed as filler on every source. Null, or blank once
+    trimmed, is no note at all; a given note is trimmed and at most MAX_TERMS_NOTE_CHARS. A source
+    registered by stage 4 records its automatic evidence instead (``validation_run_id``,
+    ``validated_at``)."""
+    if value is None:
+        return None
+    note = value.strip()
+    if not note:
+        return None
+    if len(note) > MAX_TERMS_NOTE_CHARS:
+        raise ValueError(f"terms_note must be at most {MAX_TERMS_NOTE_CHARS} characters")
+    return note
+
+
+TermsNote = Annotated[str | None, AfterValidator(_optional_terms_note)]
+
+
 class IntelSourceCreateRequest(ServiceModel):
     kind: IntelSourceKind
     source_url: str | None = None
     query_text: str | None = Field(default=None, max_length=300)
     tags: tuple[str, ...] = ()
     check_every_hours: int = Field(ge=6, le=720)
-    terms_note: str = Field(min_length=10, max_length=500)
+    terms_note: TermsNote = None
     operator: str = Field(min_length=1, max_length=64)
 
     @model_validator(mode="after")
@@ -959,12 +981,16 @@ class IntelSourcePatchRequest(ServiceModel):
     """Shape-only validation lives here. Whether ``query_text`` may be set at all
     depends on the STORED source's own ``kind`` — a PATCH body never carries
     ``kind`` — so that check runs in the route, against the row the store returns
-    (controller ruling 1)."""
+    (controller ruling 1).
+
+    ``terms_note`` may SET a note, never clear one (2026-10-03): omitted, null and blank all
+    leave the stored note as it is, the store's ``coalesce`` reading, so no distinct "clear"
+    signal exists."""
 
     enabled: bool | None = None
     check_every_hours: int | None = Field(default=None, ge=6, le=720)
     tags: tuple[str, ...] | None = None
-    terms_note: str | None = Field(default=None, min_length=10, max_length=500)
+    terms_note: TermsNote = None
     query_text: str | None = Field(default=None, max_length=300)
     operator: str = Field(min_length=1, max_length=64)
 
@@ -1204,11 +1230,13 @@ class IntelSourceValidationRequest(ServiceModel):
 
 class IntelChosenSource(IntelCandidate):
     """A source to register at stage 4 (spec §4.10): a stage-3 candidate, the validation run that
-    found it ready, the operator's terms note (§3.2), and an optional cadence (default 168
-    hours). A kept existing registry source is sent the same way, and is reused."""
+    found it ready, the operator's optional terms note (§3.2, optional since 2026-10-03), and an
+    optional cadence (default 168 hours). A newly registered source records the validation run and
+    its completion time as its evidence. A kept existing registry source is sent the same way, and
+    is reused unchanged: its own note and evidence stand."""
 
     validation_run_id: UUID
-    terms_note: str = Field(min_length=10, max_length=500)
+    terms_note: TermsNote = None
     check_every_hours: int | None = Field(default=None, ge=6, le=720)
 
 

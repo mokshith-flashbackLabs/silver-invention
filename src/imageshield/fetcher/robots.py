@@ -14,7 +14,9 @@ RFC 9309, the parts a validator needs:
 
 A definite answer is cached per origin for ``ROBOTS_CACHE_SECONDS`` (24 hours), bounded at
 ``ROBOTS_CACHE_MAX_ORIGINS``, in this process only: the fetcher holds no database. Robots is a
-floor, not a permission, and the operator's ``terms_note`` is still required (§3.2).
+floor, not a permission. The operator's ``terms_note`` (§3.2) is OPTIONAL since 2026-10-03
+(migration 0047): a source registered from a validation records that run, the one this check
+passed in, and its completion time instead.
 """
 
 from __future__ import annotations

@@ -191,7 +191,14 @@ def test_the_source_proposal_poll_is_404_for_an_unknown_run_or_another_kind() ->
 
 def test_the_source_proposal_poll_renders_existing_sources_and_candidates() -> None:
     client, questions = _client()
-    source = _source_row()
+    validation_run_id, validated_at = uuid4(), _now()
+    source = _source_row().model_copy(
+        update={
+            "terms_note": None,
+            "validation_run_id": validation_run_id,
+            "validated_at": validated_at,
+        }
+    )
     questions.sources[source.source_id] = source
     candidate = {
         "kind": "search_query",
@@ -214,6 +221,10 @@ def test_the_source_proposal_poll_renders_existing_sources_and_candidates() -> N
     (option,) = body["options"]
     assert option["existing"][0]["source_id"] == str(source.source_id)
     assert option["existing"][0]["origin"] == "operator"
+    # 0047: an existing row shows its optional note and its validation evidence.
+    assert option["existing"][0]["terms_note"] is None
+    assert option["existing"][0]["validation_run_id"] == str(validation_run_id)
+    assert datetime.fromisoformat(option["existing"][0]["validated_at"]) == validated_at
     assert option["proposed"] == [candidate]
 
 
@@ -425,7 +436,8 @@ def _ready(
 
 def test_a_suggestion_registers_its_validated_sources_and_queues_the_run() -> None:
     client, questions, _ = _suggest_client()
-    _ready(questions, TERMS_KEY)
+    validated_at = _now() - timedelta(hours=2)
+    _ready(questions, TERMS_KEY, completed_at=validated_at)
     body = _suggest([_chosen(source_url=f"{TERMS}?utm_source=x")])  # the same canonical URL
     r = _post(client, "weight-suggestions", body)
     assert r.status_code == 202 and UUID(r.json()["run_id"])
@@ -450,8 +462,37 @@ def test_a_suggestion_registers_its_validated_sources_and_queues_the_run() -> No
             origin="operator",
             question_key="platforms",
             option="Instagram",
+            # The automatic evidence (0047): the run that found it ready, and when it completed.
+            validation_run_id=VALIDATION_RUN,
+            validated_at=validated_at,
         )
     ]
+
+
+@pytest.mark.parametrize("note", ["omitted", None, "  "])
+def test_a_chosen_source_needs_no_terms_note_and_records_its_validation(note: Any) -> None:
+    """2026-10-03: an entry with no terms note (omitted, null or blank) still registers, carrying
+    the validation run named in the entry and that run's completion time as its evidence."""
+    client, questions, _ = _suggest_client()
+    validated_at = _now() - timedelta(hours=3)
+    _ready(questions, TERMS_KEY, completed_at=validated_at)
+    chosen = _chosen()
+    if note == "omitted":
+        del chosen["terms_note"]
+    else:
+        chosen["terms_note"] = note
+    assert _post(client, "weight-suggestions", _suggest([chosen])).status_code == 202
+    (source,) = questions.registrations[-1][1]
+    assert source.terms_note is None
+    assert (source.validation_run_id, source.validated_at) == (VALIDATION_RUN, validated_at)
+
+
+def test_a_chosen_sources_one_character_note_is_kept_trimmed() -> None:
+    client, questions, _ = _suggest_client()
+    _ready(questions, TERMS_KEY)
+    body = _suggest([_chosen(terms_note=" k ")])
+    assert _post(client, "weight-suggestions", body).status_code == 202
+    assert questions.registrations[-1][1][0].terms_note == "k"
 
 
 @pytest.mark.parametrize(
@@ -566,7 +607,9 @@ def test_a_suggestion_without_sources_needs_no_validation() -> None:
     [
         {"sources": [_chosen(option="Tinder")]},  # not one of the options
         {"cap": 11},
-        {"sources": [_chosen(terms_note="short")]},
+        # A note is optional and has no minimum since 2026-10-03; past 500 characters it is
+        # still refused.
+        {"sources": [_chosen(terms_note="n" * 501)]},
         {"sources": [_chosen(check_every_hours=5)]},
         {"sources": [_chosen(validation_run_id="not-a-uuid")]},
         {"sources": [_chosen(source_url="http://p.example/terms")]},

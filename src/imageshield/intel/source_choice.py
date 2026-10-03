@@ -435,17 +435,22 @@ def validation_problems(
 @dataclass(frozen=True)
 class NewSource:
     """One chosen source, ready to register, or to reuse the registry row with its identity.
-    ``source_url`` is canonical and ``query_text`` normalised."""
+    ``source_url`` is canonical and ``query_text`` normalised. ``terms_note`` is optional (0047,
+    2026-10-03); ``validation_run_id`` and ``validated_at`` are the automatic evidence a NEW row
+    records instead: the validation run that found the source ready and when it completed. Stage
+    4 always sets both. A reused row keeps its own note and evidence."""
 
     kind: str
     source_url: str | None
     query_text: str | None
     tags: tuple[str, ...]
     check_every_hours: int
-    terms_note: str
+    terms_note: str | None
     origin: str
     question_key: str
     option: str
+    validation_run_id: UUID | None
+    validated_at: datetime | None
 
     @property
     def identity(self) -> str:

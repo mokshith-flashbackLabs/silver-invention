@@ -29,6 +29,8 @@ def _new(
     option: str = "Instagram",
     origin: str = "operator",
     tags: tuple[str, ...] = ("instagram",),
+    note: str | None = "public terms page; automated reads allowed",
+    validation: tuple[UUID, datetime] | None = None,
 ) -> NewSource:
     return NewSource(
         kind=kind,
@@ -36,11 +38,25 @@ def _new(
         query_text=query,
         tags=tags,
         check_every_hours=168,
-        terms_note="public terms page; automated reads allowed",
+        terms_note=note,
         origin=origin,
         question_key="platforms",
         option=option,
+        validation_run_id=validation[0] if validation is not None else None,
+        validated_at=validation[1] if validation is not None else None,
     )
+
+
+async def _validation_run(pool: AsyncConnectionPool) -> tuple[UUID, datetime]:
+    """A completed source_validation run: its id and completion time, the evidence stage 4
+    records on a source it registers (0047)."""
+    ((run_id, completed_at),) = await _rows(
+        pool,
+        "INSERT INTO intel_runs (kind, status, requested_by, completed_at)"
+        " VALUES ('source_validation', 'completed', 'ann', now() - interval '1 hour')"
+        " RETURNING run_id, completed_at",
+    )
+    return run_id, completed_at
 
 
 async def _rows(pool: AsyncConnectionPool, query: str, *params: Any) -> list[tuple[Any, ...]]:
@@ -140,6 +156,65 @@ async def test_a_source_already_registered_is_reused_not_duplicated(
         intel_pool, "SELECT request FROM intel_runs WHERE kind = 'weight_suggestion'"
     )
     assert request["new_source_ids"] == [] and len(request["source_ids"]) == 2
+
+
+async def test_a_registered_source_records_its_validation_and_needs_no_terms_note(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """0047 (2026-10-03): the terms note is optional, and a source stage 4 registers records the
+    validation run that found it ready and when that run completed, as the evidence instead."""
+    validation = await _validation_run(intel_pool)
+    query = _new(
+        kind="search_query",
+        url=None,
+        query="Bumble privacy news",
+        option="Bumble",
+        tags=(),
+        note="a",  # one character is a note
+        validation=validation,
+    )
+    registered = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        REQUEST, [_new(note=None, validation=validation), query], operator="ann"
+    )
+    assert len(registered.registered) == 2
+    sources = {
+        s.kind: s
+        for s in await PostgresQuestionStore(intel_pool).sources_by_ids(registered.registered)
+    }
+    policy, search = sources["policy_page"], sources["search_query"]
+    assert (policy.terms_note, search.terms_note) == (None, "a")
+    for source in (policy, search):
+        assert (source.validation_run_id, source.validated_at) == validation
+
+
+async def test_a_reused_source_keeps_its_own_note_and_evidence(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """A source created on the Sources screen carries no evidence (never validated). Chosen again
+    at stage 4 it is reused, and neither its note nor its null evidence is rewritten."""
+    registry = PostgresIntelStore(intel_pool)
+    existing = await registry.create_source(
+        kind="policy_page",
+        source_url="https://p.example/terms",
+        query_text=None,
+        tags=("instagram",),
+        check_every_hours=24,
+        terms_note="the operator's own note",
+        operator="alice",
+    )
+    assert (existing.validation_run_id, existing.validated_at) == (None, None)
+    validation = await _validation_run(intel_pool)
+    registered = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        REQUEST, [_new(note=None, validation=validation)], operator="ann"
+    )
+    assert registered.reused == (existing.source_id,) and registered.registered == ()
+    after = await registry.get_source(existing.source_id)
+    assert after is not None
+    assert (after.terms_note, after.validation_run_id, after.validated_at) == (
+        "the operator's own note",
+        None,
+        None,
+    )
 
 
 async def test_the_same_source_twice_in_one_request_registers_once(

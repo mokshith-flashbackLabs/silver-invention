@@ -38,6 +38,9 @@ MAX_QUESTION_OPTIONS = 50
 MAX_VALIDATION_CANDIDATES = 250
 MAX_SUGGESTION_SOURCES = 250
 MAX_QUERY_TEXT_CHARS = 300
+# A source's optional terms note, after trimming (0047; amended 2026-10-03, the note was required
+# and at least 10 characters until then). Migration 0047's CHECK is the database's own ceiling.
+MAX_TERMS_NOTE_CHARS = 500
 MAX_CANDIDATE_REASON_CHARS = 300
 MAX_TAG_LABEL_CHARS = 80
 

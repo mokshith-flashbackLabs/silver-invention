@@ -54,10 +54,11 @@ _AUDIT_SQL = """
 
 _REGISTER_SQL = """
     INSERT INTO intel_sources (kind, source_url, url_hash, normalisation_version, query_text, tags,
-        check_every_hours, next_check_at, terms_note, created_by, origin, proposed_for)
+        check_every_hours, next_check_at, terms_note, created_by, origin, proposed_for,
+        validation_run_id, validated_at)
     VALUES (%(kind)s, %(url)s, %(hash)s, %(nv)s, %(query)s, %(tags)s, %(every)s,
             now() + make_interval(hours => %(every)s), %(terms)s, %(operator)s, %(origin)s,
-            %(proposed_for)s)
+            %(proposed_for)s, %(validation_run_id)s, %(validated_at)s)
     ON CONFLICT (url_hash) WHERE url_hash IS NOT NULL DO NOTHING
     RETURNING source_id
 """
@@ -242,8 +243,10 @@ class PostgresQuestionStore:
     async def register_and_queue_suggestion(
         self, request: dict[str, Any], sources: Sequence[NewSource], *, operator: str
     ) -> Registered:
-        """spec §4.10 stage 4, in ONE transaction: register each chosen source, or reuse the row
-        with the same url_hash or normalised query (never rewriting it), then queue the
+        """spec §4.10 stage 4, in ONE transaction: register each chosen source, with its
+        validation run and that run's completion time as evidence (0047), or reuse the row with
+        the same url_hash or normalised query (never rewriting it, so its own terms note and
+        evidence stand), then queue the
         weight_suggestion run naming the sources it must read first (``new_source_ids``) and
         every source the request named (``source_ids``). A new source's first scheduled check
         is a full interval away, because the run reads it now. The advisory lock serialises two
@@ -330,6 +333,8 @@ class PostgresQuestionStore:
                 "proposed_for": Jsonb(
                     {"question_key": source.question_key, "option": source.option}
                 ),
+                "validation_run_id": source.validation_run_id,
+                "validated_at": source.validated_at,
             },
         )
         row = await cur.fetchone()

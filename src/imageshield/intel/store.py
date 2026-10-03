@@ -43,7 +43,8 @@ CLAUDE_INTEL = "claude_intel"
 # Public: intel/question_store.py reads the same rows.
 SOURCE_COLUMNS = """source_id, kind, source_url, url_hash, query_text, tags, check_every_hours,
     next_check_at, enabled, terms_note, last_content_sha256, last_checked_at, last_run_status,
-    consecutive_failures, disabled_reason, created_by, created_at, origin, proposed_for"""
+    consecutive_failures, disabled_reason, created_by, created_at, origin, proposed_for,
+    validation_run_id, validated_at"""
 RUN_COLUMNS = """run_id, kind, source_id, request, status, attempts, requested_by, outcome,
     error_code, created_at, completed_at"""
 
@@ -111,7 +112,8 @@ _PUT_VOCAB_SQL = """
 """
 
 # An operator's own disable clears 'unmapped', so the pause pass never re-enables what an
-# operator turned off (spec §4.10).
+# operator turned off (spec §4.10). Every field is coalesced, so a PATCH may set a terms note but
+# never clear one (optional since 0047, 2026-10-03): null leaves the stored note as it is.
 _PATCH_SOURCE_SQL = f"""
     UPDATE intel_sources SET
         enabled = coalesce(%(enabled)s::boolean, enabled),
@@ -157,7 +159,7 @@ class IntelStore(Protocol):
         query_text: str | None,
         tags: tuple[str, ...],
         check_every_hours: int,
-        terms_note: str,
+        terms_note: str | None,
         operator: str,
     ) -> Source: ...
     async def list_sources(
@@ -230,9 +232,11 @@ class PostgresIntelStore:
         query_text: str | None,
         tags: tuple[str, ...],
         check_every_hours: int,
-        terms_note: str,
+        terms_note: str | None,
         operator: str,
     ) -> Source:
+        """A source registered on the Sources screen: never validated, so its 0047 evidence
+        (``validation_run_id``, ``validated_at``) stays null, and its terms note may be null."""
         canonical = canonicalise(source_url) if source_url is not None else None
         async with self._pool.connection() as conn, conn.transaction():
             cur = conn.cursor(row_factory=dict_row)

@@ -52,6 +52,29 @@ async def test_create_source_canonicalises_and_hashes(store: PostgresIntelStore)
     assert source.url_hash is not None and len(source.url_hash) == 64
 
 
+async def test_a_source_needs_no_terms_note_and_a_patch_sets_but_never_clears_one(
+    store: PostgresIntelStore,
+) -> None:
+    """0047 (2026-10-03): the note is optional. A source from the Sources screen was never
+    validated, so its evidence is null. PATCH coalesces: null leaves the note as it is."""
+    source = await store.create_source(
+        kind="policy_page",
+        source_url="https://p.example/terms",
+        query_text=None,
+        tags=(),
+        check_every_hours=24,
+        terms_note=None,
+        operator="alice",
+    )
+    assert (source.terms_note, source.validation_run_id, source.validated_at) == (None, None, None)
+    (listed,) = await store.list_sources(cursor=None, limit=5)
+    assert (listed.terms_note, listed.validation_run_id, listed.validated_at) == (None, None, None)
+    noted = await store.patch_source(source.source_id, operator="bob", terms_note="ok")
+    assert noted is not None and noted.terms_note == "ok"
+    kept = await store.patch_source(source.source_id, operator="bob", terms_note=None)
+    assert kept is not None and kept.terms_note == "ok"
+
+
 async def test_queue_check_returns_the_open_run(store: PostgresIntelStore) -> None:
     source = await _policy(store)
     first = await store.queue_source_check(source.source_id, operator="alice")

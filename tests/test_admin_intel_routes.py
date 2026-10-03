@@ -391,6 +391,66 @@ def test_patch_source_updates_and_returns_the_source() -> None:
     assert r.json()["enabled"] is False
 
 
+# ── the optional terms note (0047, owner decision 2026-10-03) ─────────────────
+
+
+@pytest.mark.parametrize("note", ["omitted", None, "", "   \n\t "])
+def test_a_source_needs_no_terms_note(note: Any) -> None:
+    """Omitted, null and blank are all no note: stored NULL and answered null, beside the two
+    evidence fields, which a source created here never has (it was never validated)."""
+    client, store = _client()
+    body = _source()
+    if note == "omitted":
+        del body["terms_note"]
+    else:
+        body["terms_note"] = note
+    r = client.post("/v1/admin/intel/sources", json=body, headers=ADMIN)
+    assert r.status_code == 201, r.json()
+    assert store.created[-1]["terms_note"] is None
+    created = r.json()
+    assert (created["terms_note"], created["validation_run_id"], created["validated_at"]) == (
+        None,
+        None,
+        None,
+    )
+    (listed,) = client.get("/v1/admin/intel/sources", headers=ADMIN).json()["sources"]
+    assert {"terms_note", "validation_run_id", "validated_at"} <= set(listed)
+    assert listed["terms_note"] is None
+
+
+def test_a_terms_note_is_trimmed_and_one_to_five_hundred_characters() -> None:
+    client, store = _client()
+    r = client.post("/v1/admin/intel/sources", json=_source(terms_note="x"), headers=ADMIN)
+    assert r.status_code == 201 and r.json()["terms_note"] == "x"  # no 10-character minimum
+    padded = "  " + "y" * 500 + "\n"
+    r = client.post(
+        "/v1/admin/intel/sources",
+        json=_source(source_url="https://p.example/other", terms_note=padded),
+        headers=ADMIN,
+    )
+    assert r.status_code == 201 and r.json()["terms_note"] == "y" * 500  # counted once trimmed
+    r = client.post("/v1/admin/intel/sources", json=_source(terms_note="z" * 501), headers=ADMIN)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "validation_error"
+    assert len(store.created) == 2
+
+
+def test_a_patch_sets_a_terms_note_but_never_clears_one() -> None:
+    """The store coalesces every PATCH field, so null, blank and omitted all leave the stored note
+    as it is; there is no "clear" signal."""
+    client, _ = _client()
+    created = client.post(
+        "/v1/admin/intel/sources", json=_source(terms_note=None), headers=ADMIN
+    ).json()
+    url = f"/v1/admin/intel/sources/{created['source_id']}"
+    r = client.patch(url, json={"terms_note": " a short note ", "operator": "bob"}, headers=ADMIN)
+    assert r.status_code == 200 and r.json()["terms_note"] == "a short note"
+    for keeps in ({"terms_note": None}, {"terms_note": "   "}, {"enabled": True}):
+        r = client.patch(url, json={**keeps, "operator": "bob"}, headers=ADMIN)
+        assert r.status_code == 200 and r.json()["terms_note"] == "a short note"
+    r = client.patch(url, json={"terms_note": "n" * 501, "operator": "bob"}, headers=ADMIN)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "validation_error"
+
+
 def test_list_sources_reports_a_next_cursor_only_at_the_page_limit() -> None:
     client, _ = _client()
     client.post("/v1/admin/intel/sources", json=_source(), headers=ADMIN)

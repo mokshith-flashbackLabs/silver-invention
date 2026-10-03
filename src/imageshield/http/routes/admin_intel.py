@@ -631,7 +631,8 @@ async def suggest_weights(
     within 24 hours. The known-hit and PII checks run again, because registration is one of the
     places §6.1 names. A tag a chosen source would carry must be registered (§3.1), and a retired
     one is left off the new source. Then ONE transaction registers or reuses the sources and
-    queues the run. Nothing is registered when any check refuses."""
+    queues the run. Nothing is registered when any check refuses. A terms note is optional
+    (2026-10-03): a new source records its validation run and that run's completion time instead."""
     now = datetime.now(UTC)
     validations = await questions.validations(sorted({s.validation_run_id for s in body.sources}))
     problems = validation_problems(body.sources, validations, now=now)
@@ -686,6 +687,10 @@ async def suggest_weights(
                 origin="suggested" if was_proposed else "operator",
                 question_key=body.question_key,
                 option=s.option,
+                # The automatic evidence a new row records (0047): validation_problems has
+                # refused every entry whose run is missing, so the read above holds it.
+                validation_run_id=s.validation_run_id,
+                validated_at=validations[s.validation_run_id].completed_at,
             )
         )
     queued = await questions.register_and_queue_suggestion(

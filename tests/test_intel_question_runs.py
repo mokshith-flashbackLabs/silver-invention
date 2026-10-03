@@ -389,6 +389,8 @@ def _chosen(
         origin="suggested",
         question_key="platforms",
         option=option,
+        validation_run_id=None,
+        validated_at=None,
     )
 
 
