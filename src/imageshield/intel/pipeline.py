@@ -47,10 +47,11 @@ import difflib
 import re
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -151,7 +152,9 @@ class PipelineDeps:
     ``reconciler`` is not part of a run: the worker's tick calls it before claiming
     (spec §4.9). ``questions`` is the question runs' store (step 5, ``intel/question_store.py``).
     ``max_calls_per_suggestion_run`` is ``INTEL_MAX_CALLS_PER_SUGGESTION_RUN``, a weight
-    suggestion's reading cap (spec §4.10), with no default for the same reason."""
+    suggestion's reading cap (spec §4.10), with no default for the same reason.
+    ``source_read_concurrency`` is ``INTEL_SOURCE_READ_CONCURRENCY`` (spec
+    2026-10-03-intel-throughput §5): how many sources or pages one run reads at once."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -166,6 +169,7 @@ class PipelineDeps:
     max_document_chars: int
     questions: QuestionStore
     max_calls_per_suggestion_run: int
+    source_read_concurrency: int
 
 
 @dataclass(frozen=True)
@@ -202,6 +206,9 @@ class _Ctx:
     model_calls: int = 0
     cost_usd: Decimal = Decimal("0")
     regenerate: GapRegenerateRequest | None = None
+    # Sources a feed or a saved search read only in part (the call cap left items for its next
+    # check). Keyed by source, so reads running side by side cannot mistake one another's.
+    partly_read: set[UUID] = field(default_factory=set)
 
     def calls_left(self) -> bool:
         """The reading cap: a weight suggestion's first read of the sources it registered has its
@@ -473,23 +480,23 @@ async def _feed(ctx: _Ctx, source: Source, fetched: TextFetch) -> None:
     take = unseen[:FEED_MAX_ITEMS_PER_RUN]
     if len(unseen) > len(take):
         ctx.counts["feed_backlog"] += len(unseen) - len(take)
-    for position, entry in enumerate(take):
-        try:
-            await _read_url(
-                ctx,
-                entry.link,
-                trust="listed",
-                source_id=source.source_id,
-                tag_hints=source.tags,
-                source_kind="feed_item",
-                title=entry.title,
-                published_at=entry.published,
-                recent_days=DISCOVERY_DEDUP_DAYS,
-            )
-        except _CallCap:
-            ctx.counts["call_cap_deferred"] += len(take) - position
-            ctx.counts["stopped_call_cap"] += 1
-            return
+
+    async def read_item(entry: _FeedItem) -> None:
+        await _read_url(
+            ctx,
+            entry.link,
+            trust="listed",
+            source_id=source.source_id,
+            tag_hints=source.tags,
+            source_kind="feed_item",
+            title=entry.title,
+            published_at=entry.published,
+            recent_days=DISCOVERY_DEDUP_DAYS,
+        )
+
+    # Several items at once (spec 2026-10-03-intel-throughput §5); the accounting is the
+    # sequential loop's: items the call cap left are counted and wait for the next check.
+    _settle_reads(ctx, source, await read_each(ctx, take, read_item))
 
 
 async def _discovery(ctx: _Ctx) -> None:
@@ -556,21 +563,21 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
     )
     todo = [u for u in urls if url_hash(u) not in recent]
     ctx.counts["recently_read"] += len(urls) - len(todo)
-    for position, url in enumerate(todo):
-        try:
-            await _read_url(
-                ctx,
-                url,
-                trust="web",
-                source_id=source.source_id,
-                tag_hints=source.tags,
-                source_kind="web_search_result",
-                recent_days=DISCOVERY_DEDUP_DAYS,
-            )
-        except _CallCap:
-            ctx.counts["call_cap_deferred"] += len(todo) - position
-            ctx.counts["stopped_call_cap"] += 1
-            return
+
+    async def read_result(url: str) -> None:
+        await _read_url(
+            ctx,
+            url,
+            trust="web",
+            source_id=source.source_id,
+            tag_hints=source.tags,
+            source_kind="web_search_result",
+            recent_days=DISCOVERY_DEDUP_DAYS,
+        )
+
+    # The search is one call; the pages it found are read several at once (spec
+    # 2026-10-03-intel-throughput §5).
+    _settle_reads(ctx, source, await read_each(ctx, todo, read_result))
 
 
 async def _adhoc(ctx: _Ctx) -> None:
@@ -911,6 +918,9 @@ async def _renewal_check(ctx: _Ctx) -> RunResult:
         return RunResult("completed", ctx.outcome())
     pages: dict[str, RenewalPage | str] = {}
     by_final: dict[str, RenewalPage] = {}
+    # One page after another, on purpose (spec 2026-10-03-intel-throughput §5): a renewal makes no
+    # model call, so its pages are seconds of fetching, and by_final shares a page two cited
+    # URLs reach, which reads in parallel would fetch twice.
     try:
         for signal in evidence.signals:
             if signal.document_url_hash not in pages:
@@ -979,20 +989,130 @@ async def _call_model(
     """One call through the provider gate. A gate refusal or an unavailable model stops the
     run with the current unit unconsumed; every returned answer -- including a refusal or
     unparseable output -- is handed back to be consumed. ``capped=False`` is the generation
-    call: one per run, on top of INTEL_MAX_CALLS_PER_RUN."""
-    if capped and not ctx.calls_left():
-        raise _CallCap
-    outcome, result, reason = await metered(
-        ctx.deps.control, run_id=ctx.run.run_id, now=ctx.deps.clock(), call=call
-    )
+    call: one per run, on top of INTEL_MAX_CALLS_PER_RUN.
+
+    *Amended 2026-10-03 (throughput, spec 2026-10-03-intel-throughput §5):* a capped call
+    RESERVES its slot before it is sent -- the check and the count happen with no ``await``
+    between them -- so reads running side by side can never send more calls than the cap
+    between them. A call the gate does not send gives its slot back; one sent and failed keeps
+    it, as before. A web search's ``pause_turn`` continuations are counted when it returns."""
+    reserved = False
+    if capped:
+        if not ctx.calls_left():
+            raise _CallCap
+        ctx.model_calls += 1
+        reserved = True
+    try:
+        outcome, result, reason = await metered(
+            ctx.deps.control, run_id=ctx.run.run_id, now=ctx.deps.clock(), call=call
+        )
+    except BaseException:
+        if reserved:
+            ctx.model_calls -= 1
+        raise
     if outcome != "called":  # "skipped" (the gate) or "budget_unset"
+        if reserved:
+            ctx.model_calls -= 1  # nothing was sent
         raise _Stop(reason or outcome, gate=True)
-    ctx.model_calls += 1
+    if not reserved:
+        ctx.model_calls += 1
     if result is None:  # ModelUnavailable: timeout / error / rate_limited
         raise _Stop(reason or "error", gate=False)
     ctx.model_calls += result.pause_turns  # web-search continuations are calls too
     ctx.cost_usd += result.cost_usd
     return result
+
+
+# ── several reads at once (spec 2026-10-03-intel-throughput §5) ────────────────
+
+_X = TypeVar("_X")
+# Set inside each lane of read_each: a read_each nested in one (a feed's items, read as one of a
+# weight suggestion's sources) runs its items one after another in that lane, so one run never
+# has more than INTEL_SOURCE_READ_CONCURRENCY reads in flight however the reads nest.
+_in_read_lane: ContextVar[bool] = ContextVar("_in_read_lane", default=False)
+
+
+@dataclass(frozen=True)
+class ReadEach(Generic[_X]):
+    """What ``read_each`` did with each item, in the items' order. ``raised[i]`` is the exception
+    item ``i``'s read raised (None when it finished); ``started[i]`` is False for an item that
+    never started, because a read stopped the run or the call cap was reached first."""
+
+    items: tuple[_X, ...]
+    started: tuple[bool, ...]
+    raised: tuple[Exception | None, ...]
+
+    def first_stop(self) -> _Stop | None:
+        return next((e for e in self.raised if isinstance(e, _Stop)), None)
+
+    def first_bug(self) -> Exception | None:
+        """An exception that is no outcome of reading at all: the run crashes on it, as it did
+        when reads ran one after another."""
+        return next(
+            (e for e in self.raised if e is not None and not isinstance(e, _Stop | _CallCap)),
+            None,
+        )
+
+
+async def read_each(
+    ctx: _Ctx,
+    items: Sequence[_X],
+    read: Callable[[_X], Awaitable[None]],
+    *,
+    while_calls_left: bool = True,
+) -> ReadEach[_X]:
+    """``read`` every item, at most ``INTEL_SOURCE_READ_CONCURRENCY`` at once, started in the
+    items' order. An item starts only while the run has calls left (``calls_left``) and no read
+    has raised -- a stop (``_Stop``), the call cap (``_CallCap``) or a bug; after that, nothing
+    new starts and the reads already in flight finish. A read that fails never cancels another:
+    every exception is kept in its item's slot for the caller to account for. One item, or a
+    concurrency of one, reads exactly as the sequential loop did. ``while_calls_left=False`` is
+    stage 3's validation: every candidate gets a verdict, the cap's included, so the cap stops
+    nothing from starting there."""
+    limit = 1 if _in_read_lane.get() else max(1, ctx.deps.source_read_concurrency)
+    started = [False] * len(items)
+    raised: list[Exception | None] = [None] * len(items)
+    cursor = 0
+    halted = False
+
+    async def lane() -> None:
+        nonlocal cursor, halted
+        _in_read_lane.set(True)  # this lane's own context: gather runs each lane in a copy
+        while not halted and cursor < len(items):
+            if while_calls_left and not ctx.calls_left():
+                halted = True
+                return
+            index = cursor
+            cursor += 1
+            started[index] = True
+            try:
+                await read(items[index])
+            except Exception as exc:
+                raised[index] = exc
+                halted = True  # a stop, the cap or a bug: nothing new starts after it
+
+    await asyncio.gather(*(lane() for _ in range(min(limit, len(items)))))
+    return ReadEach(tuple(items), tuple(started), tuple(raised))
+
+
+def _settle_reads(ctx: _Ctx, source: Source, each: ReadEach[Any]) -> None:
+    """The sequential loop's accounting for one source's pages read side by side: a bug is
+    raised, items the call cap left (refused by it, or never started under it) are
+    ``call_cap_deferred`` and mark the source ``partly_read``, and a stop is raised once every
+    read in flight has finished. Items left unstarted by a stop are not counted, as before."""
+    bug = each.first_bug()
+    if bug is not None:
+        raise bug
+    stop = each.first_stop()
+    left = sum(isinstance(e, _CallCap) for e in each.raised)
+    if stop is None:
+        left += each.started.count(False)
+    if left:
+        ctx.counts["call_cap_deferred"] += left
+        ctx.counts["stopped_call_cap"] += 1
+        ctx.partly_read.add(source.source_id)
+    if stop is not None:
+        raise stop
 
 
 async def _fetch(ctx: _Ctx, url: str) -> TextFetch | FetchFailure:
@@ -1085,4 +1205,12 @@ def changed_hunks(before: str, after: str, *, max_chars: int) -> str:
     return joined[:max_chars]
 
 
-__all__ = ["PipelineDeps", "RunResult", "changed_hunks", "read_source", "run"]
+__all__ = [
+    "PipelineDeps",
+    "ReadEach",
+    "RunResult",
+    "changed_hunks",
+    "read_each",
+    "read_source",
+    "run",
+]

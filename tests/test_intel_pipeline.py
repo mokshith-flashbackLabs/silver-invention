@@ -9,6 +9,7 @@ are shared with the worker tests (``tests/intel_fakes.py``, ``conftest.py``).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import timedelta
 from typing import Any
@@ -37,6 +38,7 @@ from tests.intel_fakes import (
     QUOTE,
     FakeFetcher,
     FakeModel,
+    GatedFetcher,
     claim,
     make_deps,
     make_page,
@@ -690,3 +692,92 @@ async def test_the_call_cap_stops_taking_units_and_leaves_the_rest(
     assert result.status == "completed" and result.outcome["model_calls"] == 3
     assert result.outcome["call_cap_deferred"] == 2 and result.outcome["stopped_call_cap"] == 1
     assert model.extract_calls == 1 and fetcher.fetched == urls[:1]
+
+
+# ── reads side by side (spec 2026-10-03-intel-throughput §5) ─────────────────────────────────
+
+
+async def _held_then_released(
+    fetcher: GatedFetcher, running: asyncio.Task[Any], *, expected: int
+) -> None:
+    """Wait until ``expected`` fetches are held at once, give any further read the chance to
+    start (none may), then let them all go and wait for the run."""
+    await fetcher.until_waiting(expected)
+    await asyncio.sleep(0.3)
+    assert fetcher.waiting == expected  # the bound: nothing beyond it started
+    fetcher.release.set()
+    await asyncio.wait_for(running, 30)
+
+
+async def test_discovery_reads_its_pages_several_at_once_within_the_bound(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await _source(intel_pool, kind="search_query", url=None, query="platform AI training")
+    urls = [f"https://n.example/{i}" for i in range(6)]
+    discovery = DiscoveryOutput(candidates=[DiscoveryCandidate(url=u, reason="r") for u in urls])
+    fetcher = GatedFetcher({u: make_page(POLICY, u) for u in urls})
+    model = FakeModel(ExtractionOutput(signals=[]), discovery=discovery)
+    deps = make_deps(intel_pool, fetcher, model, source_read_concurrency=4)
+    running = asyncio.create_task(run(await claim(intel_pool), deps))
+    await _held_then_released(fetcher, running, expected=4)
+    result = running.result()
+    assert result.status == "completed" and result.outcome["documents_recorded"] == 6
+    assert fetcher.peak == 4 and model.extract_calls == 6
+    assert sorted(fetcher.fetched) == sorted(urls)
+
+
+async def test_a_feeds_items_are_read_several_at_once_within_the_bound(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await _source(intel_pool, kind="feed", url=FEED)
+    links = [f"https://n.example/{i}" for i in range(5)]
+    pages: dict[str, Any] = {FEED: make_page("feed", FEED, items=_feed_items(links))}
+    pages.update({link: make_page(POLICY, link) for link in links})
+    fetcher = GatedFetcher(pages, hold=set(links))
+    model = FakeModel(ExtractionOutput(signals=[]))
+    deps = make_deps(intel_pool, fetcher, model, source_read_concurrency=3)
+    running = asyncio.create_task(run(await claim(intel_pool), deps))
+    await _held_then_released(fetcher, running, expected=3)
+    result = running.result()
+    assert result.status == "completed" and model.extract_calls == 5
+    assert fetcher.peak == 3 and result.outcome["documents_recorded"] == 5
+
+
+async def test_the_call_cap_is_exact_when_pages_are_read_at_once(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Four lanes, slow extractions, three calls left after the search: exactly three are sent,
+    side by side, and the other three pages wait for the next check -- never a fourth call."""
+    await _source(intel_pool, kind="search_query", url=None, query="platform AI training")
+    urls = [f"https://n.example/{i}" for i in range(6)]
+    discovery = DiscoveryOutput(candidates=[DiscoveryCandidate(url=u, reason="r") for u in urls])
+    fetcher = FakeFetcher({u: make_page(POLICY, u) for u in urls})
+    model = FakeModel(ExtractionOutput(signals=[]), discovery=discovery, extract_delay=0.3)
+    deps = make_deps(intel_pool, fetcher, model, max_calls_per_run=4, source_read_concurrency=4)
+    result = await run(await claim(intel_pool), deps)
+    assert model.extract_calls == 3 and model.extract_peak >= 2
+    assert result.outcome["call_cap_deferred"] == 3 and result.outcome["stopped_call_cap"] == 1
+    assert result.outcome["documents_recorded"] == 3
+    # The search and three extractions; they kept no signal, so there is no generation call.
+    assert result.outcome["model_calls"] == 4
+
+
+async def test_a_stop_in_one_read_lets_the_reads_in_flight_finish(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The fetcher goes down for one page while three others are mid-read: those three are
+    still read and recorded, nothing new starts, and the run ends failed on the outage."""
+    await _source(intel_pool, kind="search_query", url=None, query="platform AI training")
+    urls = [f"https://n.example/{i}" for i in range(6)]
+    discovery = DiscoveryOutput(candidates=[DiscoveryCandidate(url=u, reason="r") for u in urls])
+    pages: dict[str, Any] = {u: make_page(POLICY, u) for u in urls}
+    pages[urls[0]] = FetchFailure(code="fetcher_unreachable")
+    fetcher = GatedFetcher(pages)
+    model = FakeModel(ExtractionOutput(signals=[]), discovery=discovery)
+    deps = make_deps(intel_pool, fetcher, model, source_read_concurrency=4)
+    running = asyncio.create_task(run(await claim(intel_pool), deps))
+    await _held_then_released(fetcher, running, expected=4)
+    result = running.result()
+    assert (result.status, result.error_code) == ("failed", "fetcher_unreachable")
+    assert result.outcome["documents_recorded"] == 3 and model.extract_calls == 3
+    assert sorted(fetcher.fetched) == sorted(urls[:4])  # the last two never started

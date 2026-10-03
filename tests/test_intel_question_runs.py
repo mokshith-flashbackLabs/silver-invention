@@ -4,6 +4,7 @@ weight suggestion."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any
@@ -31,6 +32,7 @@ from tests.intel_fakes import (
     NOW,
     POLICY,
     FakeFetcher,
+    GatedFetcher,
     make_deps,
     make_page,
     make_signal,
@@ -632,3 +634,101 @@ async def test_a_retried_press_reads_the_named_sources_a_refused_one_left_unread
     assert fetcher.fetched == [NEW_TERMS, NEW_SAFETY] and result.outcome["sources_read"] == 2
     assert await _scalar(intel_pool, status, terms) == "checked"
     assert await _scalar(intel_pool, status, help_page) is None
+
+
+# ── reading side by side (spec 2026-10-03-intel-throughput §5) ───────────────────────────────
+
+PAGES = [f"https://p.example/instagram-page-{n}" for n in range(6)]
+
+
+async def _suggest_in_background(
+    pool: AsyncConnectionPool, deps: Any, urls: list[str]
+) -> asyncio.Task[RunResult]:
+    await seed_quiz_vocabulary(pool)
+    await PostgresQuestionStore(pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [_chosen(url) for url in urls], operator="ann"
+    )
+    return asyncio.create_task(run_once(pool, deps))
+
+
+async def test_a_suggestion_reads_its_sources_several_at_once_within_the_bound(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    fetcher = GatedFetcher({url: make_page(POLICY, url) for url in PAGES})
+    model = FakeQuestionModel(make_signal(tags=["instagram"]), suggest_with=_cite_everything())
+    deps = make_deps(intel_pool, fetcher, model, source_read_concurrency=4)
+    running = await _suggest_in_background(intel_pool, deps, PAGES)
+    await fetcher.until_waiting(4)
+    await asyncio.sleep(0.3)
+    assert fetcher.waiting == 4  # the fifth and sixth wait for a free lane
+    fetcher.release.set()
+    result = await asyncio.wait_for(running, 30)
+    assert result.status == "completed", result
+    assert fetcher.peak == 4 and sorted(fetcher.fetched) == sorted(PAGES)
+    assert (result.outcome["sources_read"], result.outcome.get("sources_deferred", 0)) == (6, 0)
+    assert model.extract_calls == 6 and model.suggest_calls == 1
+
+
+async def test_the_suggestion_cap_is_exact_when_sources_are_read_at_once(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Four lanes, slow extractions, a cap of three: three calls, side by side, never a fourth;
+    the three sources left wait for their own check and are made due for it."""
+    fetcher = FakeFetcher({url: make_page(POLICY, url) for url in PAGES})
+    model = FakeQuestionModel(
+        make_signal(tags=["instagram"]), suggest_with=_cite_everything(), extract_delay=0.3
+    )
+    deps = make_deps(
+        intel_pool, fetcher, model, max_calls_per_suggestion_run=3, source_read_concurrency=4
+    )
+    running = await _suggest_in_background(intel_pool, deps, PAGES)
+    result = await asyncio.wait_for(running, 30)
+    assert result.status == "completed", result
+    assert model.extract_calls == 3 and model.extract_peak >= 2
+    assert (result.outcome["sources_read"], result.outcome["sources_deferred"]) == (3, 3)
+    due = "SELECT count(*) FROM intel_sources WHERE next_check_at <= %s"
+    assert await _scalar(intel_pool, due, NOW) == 3
+    assert model.suggest_calls == 1  # the suggestion is outside the reading cap
+
+
+async def test_one_sources_outage_never_cancels_the_reads_beside_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The fetcher fails for one source while two others are mid-read: those two are read, the
+    failed one waits for its own check, and the suggestion goes ahead with what was read."""
+    urls = PAGES[:3]
+    pages: dict[str, Any] = {url: make_page(POLICY, url) for url in urls}
+    pages[urls[1]] = FetchFailure(code="fetcher_unreachable")
+    fetcher = GatedFetcher(pages)
+    model = FakeQuestionModel(make_signal(tags=["instagram"]), suggest_with=_cite_everything())
+    deps = make_deps(intel_pool, fetcher, model, source_read_concurrency=4)
+    running = await _suggest_in_background(intel_pool, deps, urls)
+    await fetcher.until_waiting(3)
+    fetcher.release.set()
+    result = await asyncio.wait_for(running, 30)
+    assert result.status == "completed", result
+    assert (result.outcome["sources_read"], result.outcome["sources_deferred"]) == (2, 1)
+    assert result.outcome["stopped_fetcher_unreachable"] == 1
+    assert model.extract_calls == 2 and model.suggest_calls == 1
+
+
+async def test_validation_judges_candidates_at_once_and_keeps_their_order(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    pages: dict[str, Any] = {url: make_page(POLICY, url) for url in PAGES[:4]}
+    pages[PAGES[4]] = make_page("Loading...", PAGES[4])
+    fetcher = GatedFetcher(pages)
+    candidates = [_candidate("policy_page", url) for url in PAGES[:5]]
+    await PostgresQuestionStore(intel_pool).queue_source_validation(
+        {"candidates": candidates}, operator="ann"
+    )
+    deps = make_deps(intel_pool, fetcher, FakeQuestionModel(), source_read_concurrency=4)
+    running = asyncio.create_task(run_once(intel_pool, deps))
+    await fetcher.until_waiting(4)
+    await asyncio.sleep(0.3)
+    assert fetcher.waiting == 4
+    fetcher.release.set()
+    result = await asyncio.wait_for(running, 30)
+    assert result.status == "completed" and fetcher.peak == 4
+    assert [r["candidate"] for r in result.outcome["results"]] == candidates
+    assert [r["reason"] for r in result.outcome["results"]] == [None, None, None, None, "too_short"]

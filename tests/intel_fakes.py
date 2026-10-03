@@ -143,8 +143,14 @@ class FakeModel:
         propose_with: Callable[[dict[str, Any]], ProposalOutput] | None = None,
         proposal_outcome: str = "ok",
         propose_unavailable: ModelUnavailable | None = None,
+        extract_delay: float = 0.0,
     ) -> None:
         self.extraction = extraction
+        # A slow extraction: each call waits this long, so calls from reads running side by side
+        # overlap; `extracting` is how many are in flight now, `extract_peak` the most at once.
+        self.extract_delay = extract_delay
+        self.extracting = 0
+        self.extract_peak = 0
         self.outcome = outcome
         self.discovery = discovery
         self.unavailable = unavailable
@@ -161,6 +167,13 @@ class FakeModel:
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]:
         self.extract_calls += 1
         self.users.append(user)
+        if self.extract_delay:
+            self.extracting += 1
+            self.extract_peak = max(self.extract_peak, self.extracting)
+            try:
+                await asyncio.sleep(self.extract_delay)
+            finally:
+                self.extracting -= 1
         if self.unavailable is not None:
             raise self.unavailable
         output = self.extraction if self.outcome == "ok" else None
@@ -258,6 +271,7 @@ def make_deps(
     max_calls_per_suggestion_run: int = 60,
     max_document_chars: int = 200_000,
     clock: Callable[[], datetime] | None = None,
+    source_read_concurrency: int = 1,
 ) -> PipelineDeps:
     control = PostgresProviderControlStore(
         pool,
@@ -280,6 +294,9 @@ def make_deps(
         max_document_chars=max_document_chars,
         questions=PostgresQuestionStore(pool),
         max_calls_per_suggestion_run=max_calls_per_suggestion_run,
+        # One at a time unless a test asks for more: the tests written before reads ran side by
+        # side pin the order pages are fetched in, which concurrency makes a race.
+        source_read_concurrency=source_read_concurrency,
     )
 
 

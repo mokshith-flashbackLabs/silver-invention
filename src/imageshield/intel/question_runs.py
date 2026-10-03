@@ -20,6 +20,7 @@ the pipeline's internals and why the pipeline imports this module lazily.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, timedelta
 from typing import Any
 from uuid import UUID
@@ -45,6 +46,7 @@ from imageshield.intel.pipeline import (
     _Ctx,
     _generate,
     _Stop,
+    read_each,
     read_source,
 )
 from imageshield.intel.prompts import (
@@ -188,13 +190,25 @@ async def _source_validation(ctx: _Ctx) -> RunResult:
         request = ValidationRequest.model_validate(ctx.run.request)
     except ValidationError:
         return RunResult("failed", ctx.outcome(), "request_unreadable")
-    results: list[dict[str, Any]] = []
-    refused: str | None = None
-    for candidate in request.candidates:
+    candidates = list(request.candidates)
+    reasons: list[str | None] = [None] * len(candidates)
+    refused = _Refused()
+
+    async def judge(index: int) -> None:
+        candidate = candidates[index]
         if candidate.kind == "search_query":
-            reason, refused = await _validate_search(ctx, candidate.query_text or "", refused)
+            reasons[index] = await _validate_search(ctx, candidate.query_text or "", refused)
         else:
-            reason = await _validate_url(ctx, candidate.kind, candidate.source_url or "")
+            reasons[index] = await _validate_url(ctx, candidate.kind, candidate.source_url or "")
+
+    # Several candidates at once (spec 2026-10-03-intel-throughput §5), every one judged: the
+    # verdicts are kept by position, so the results stay in the submitted order.
+    each = await read_each(ctx, range(len(candidates)), judge, while_calls_left=False)
+    bug = each.first_bug()
+    if bug is not None:
+        raise bug
+    results: list[dict[str, Any]] = []
+    for candidate, reason in zip(candidates, reasons, strict=True):
         ctx.counts["candidate_ready" if reason is None else f"candidate_blocked_{reason}"] += 1
         results.append(
             {
@@ -226,29 +240,38 @@ async def _validate_url(ctx: _Ctx, kind: str, url: str) -> str | None:
     return url_verdict(kind, normalise(fetched.text), fetched.items)
 
 
-async def _validate_search(
-    ctx: _Ctx, query: str, refused: str | None
-) -> tuple[str | None, str | None]:
-    """One search_query candidate, as ``(reason, refused)``. ``refused`` carries a gate refusal
-    (or the run's call cap) forward, so no later candidate asks again (Review Focus 2). The
-    route refuses a person-shaped query before it is stored (final review I1); this check is
-    the second line, for a run queued any other way, and still searches nothing."""
+@dataclass
+class _Refused:
+    """A gate refusal (or the run's call cap) met by one validation search, shared by all of
+    them so no candidate that starts after it asks again (Review Focus 2). Candidates judged side
+    by side (spec 2026-10-03-intel-throughput §5) that were already asking keep their own answer;
+    the first refusal is the one kept."""
+
+    reason: str | None = None
+
+
+async def _validate_search(ctx: _Ctx, query: str, refused: _Refused) -> str | None:
+    """One search_query candidate's reason (None: ready). The route refuses a person-shaped
+    query before it is stored (final review I1); this check is the second line, for a run queued
+    any other way, and still searches nothing."""
     if contains_pii(query):
-        return "query_names_a_person", refused
-    if refused is not None:
-        return refused, refused
+        return "query_names_a_person"
+    if refused.reason is not None:
+        return refused.reason
     system, user = validation_search_request(query)
     try:
         call = await _call_model(ctx, lambda: ctx.deps.model.search_once(system, user))
     except _Stop as stop:
         if stop.gate:
-            return stop.reason, stop.reason
-        return "search_unavailable", refused
+            refused.reason = refused.reason or stop.reason
+            return stop.reason
+        return "search_unavailable"
     except _CallCap:
-        return "run_call_cap", "run_call_cap"
+        refused.reason = refused.reason or "run_call_cap"
+        return "run_call_cap"
     if call.output is None:
         ctx.counts[f"model_{call.outcome}"] += 1
-        return "no_results", refused
+        return "no_results"
     urls: list[str] = []
     seen: set[str] = set()
     for found in call.output.candidates:
@@ -258,10 +281,10 @@ async def _validate_search(
     for url in urls[:MAX_SEARCH_RESULTS_CHECKED]:
         reason = await _validate_url(ctx, "search_result", url)
         if reason is None:
-            return None, refused
+            return None
         if reason == "fetcher_unavailable":
-            return reason, refused
-    return "no_results", refused
+            return reason
+    return "no_results"
 
 
 # ── the weight suggestion (spec §4.10 stage 4's run, §4.6) ───────────────────
@@ -308,7 +331,12 @@ async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop |
     """Each newly registered source in the request's order, then each other named source no check
     has read yet (``_unread``), until the cap, a gate refusal or an outage ends reading. Every
     source left unread or part-read is made due, so its first scheduled check comes at once
-    rather than a full interval later. Returns the stop."""
+    rather than a full interval later. Returns the stop.
+
+    *Amended 2026-10-03 (throughput, spec 2026-10-03-intel-throughput §5):* up to
+    ``INTEL_SOURCE_READ_CONCURRENCY`` sources are read at once, started in that same order. The
+    cap is exact (a call reserves its slot before it is sent); a source whose read fails never
+    cancels another's, and once one stops or meets the cap, no further source starts."""
     listed = await ctx.deps.questions.sources_by_ids(
         list(dict.fromkeys([*request.new_source_ids, *request.source_ids]))
     )
@@ -318,29 +346,26 @@ async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop |
         source = by_id.get(named)
         if named not in to_read and source is not None and _unread(source):
             to_read.append(named)
-    deferred: list[UUID] = []
-    stop: _Stop | None = None
+    sources: list[Source] = []
     for source_id in to_read:
         source = by_id.get(source_id)
         if source is None:
             ctx.counts["source_missing"] += 1
-            continue
-        if stop is not None or not ctx.calls_left():
-            deferred.append(source_id)
-            continue
-        before = ctx.counts["call_cap_deferred"]
-        try:
-            await read_source(ctx, source)
-        except _CallCap:
-            deferred.append(source_id)
-            continue
-        except _Stop as reading:
-            ctx.counts[f"stopped_{reading.reason}"] += 1
-            stop = reading
-            deferred.append(source_id)
-            continue
-        if ctx.counts["call_cap_deferred"] > before:
-            deferred.append(source_id)  # a feed or a search left items for its next check
+        else:
+            sources.append(source)
+    each = await read_each(ctx, sources, lambda source: read_source(ctx, source))
+    bug = each.first_bug()
+    if bug is not None:
+        raise bug
+    stop = each.first_stop()
+    if stop is not None:
+        ctx.counts[f"stopped_{stop.reason}"] += 1
+    deferred: list[UUID] = []
+    for source, started, raised in zip(each.items, each.started, each.raised, strict=True):
+        if not started or raised is not None or source.source_id in ctx.partly_read:
+            # Never started (a stop or the cap came first), refused by the cap, stopped, or a
+            # feed or search that left items for its next check.
+            deferred.append(source.source_id)
         else:
             ctx.counts["sources_read"] += 1
     if deferred:
