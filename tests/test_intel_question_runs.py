@@ -732,3 +732,139 @@ async def test_validation_judges_candidates_at_once_and_keeps_their_order(
     assert result.status == "completed" and fetcher.peak == 4
     assert [r["candidate"] for r in result.outcome["results"]] == candidates
     assert [r["reason"] for r in result.outcome["results"]] == [None, None, None, None, "too_short"]
+
+
+# ── a saved search is read in its own run (spec 2026-10-03-intel-throughput §6) ───────────────
+
+SAVED_SEARCH = "Instagram AI training news"
+
+
+def _chosen_search(
+    query: str = SAVED_SEARCH, *, tags: tuple[str, ...] = ("instagram",), option: str = "Instagram"
+) -> NewSource:
+    return NewSource(
+        kind="search_query",
+        source_url=None,
+        query_text=query,
+        tags=tags,
+        check_every_hours=168,
+        terms_note=None,
+        origin="suggested",
+        question_key="platforms",
+        option=option,
+        validation_run_id=None,
+        validated_at=None,
+    )
+
+
+async def _open_runs(pool: AsyncConnectionPool, source_id: UUID) -> list[tuple[Any, ...]]:
+    return await _rows(
+        pool,
+        "SELECT kind, status, requested_by FROM intel_runs"
+        " WHERE source_id = %s AND status IN ('queued', 'running')",
+        source_id,
+    )
+
+
+def _found_article() -> DiscoveryOutput:
+    return DiscoveryOutput(candidates=[DiscoveryCandidate(url=ARTICLE, reason="r")])
+
+
+async def test_a_suggestion_hands_its_saved_searches_to_their_own_runs(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The page is read inside the run; the saved search is not read there at all. It is queued
+    as its own discovery run, counted as deferred, and a later press includes what it found."""
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresQuestionStore(intel_pool)
+    chosen = [_chosen(), _chosen_search()]
+    queued = await store.register_and_queue_suggestion(SUGGEST_REQUEST, chosen, operator="ann")
+    page_id, search_id = queued.registered
+    fetcher = FakeFetcher(
+        {NEW_TERMS: make_page(POLICY, NEW_TERMS), ARTICLE: make_page(POLICY, ARTICLE)}
+    )
+    model = FakeQuestionModel(
+        make_signal(tags=["instagram"]),
+        discovery=_found_article(),
+        suggest_with=_cite_everything(),
+    )
+    deps = make_deps(intel_pool, fetcher, model, source_read_concurrency=4)
+    result = await run_once(intel_pool, deps)
+    assert result.status == "completed", result
+    assert model.discover_calls == 0 and fetcher.fetched == [NEW_TERMS]  # no search inside
+    assert result.outcome["sources_read"] == 1
+    assert result.outcome["sources_deferred"] == 1
+    assert result.outcome["search_sources_deferred"] == 1
+    assert model.suggest_calls == 1  # written from the page and the evidence already held
+    assert await _open_runs(intel_pool, search_id) == [("discovery", "queued", "schedule")]
+    assert await _open_runs(intel_pool, page_id) == []
+    # The search's own run, claimed by the next free slot: one search, its page read.
+    searched = await run_once(intel_pool, deps)
+    assert searched.status == "completed" and model.discover_calls == 1
+    ((found,),) = await _rows(
+        intel_pool,
+        "SELECT s.signal_id FROM intel_signals s JOIN intel_documents d"
+        " ON d.document_id = s.document_id WHERE d.source_id = %s",
+        search_id,
+    )
+    # Asked again: the search has been read, so nothing is deferred and its evidence is shown.
+    again = await store.register_and_queue_suggestion(SUGGEST_REQUEST, chosen, operator="ann")
+    assert again.registered == ()
+    asked = await run_once(intel_pool, deps)
+    assert asked.status == "completed", asked
+    assert asked.outcome.get("sources_deferred", 0) == 0 and model.discover_calls == 1
+    payload = json.loads(model.suggestion_users[-1])
+    assert str(found) in {e["signal_id"] for e in payload["evidence"]}
+
+
+async def test_a_draft_options_saved_search_is_still_read_in_its_own_run(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """A draft option's search is paused as unmapped, so the scheduler would never queue it
+    before the draft publishes. The suggestion queues its read anyway, as it used to read it
+    inline, and the source stays paused."""
+    await seed_quiz_vocabulary(intel_pool)
+    request = {**SUGGEST_REQUEST, "tags": {"Instagram": ["instagram"], "Bumble": ["linkedin"]}}
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        request, [_chosen_search(tags=("linkedin",), option="Bumble")], operator="ann"
+    )
+    (search_id,) = queued.registered
+    await PostgresIntelStore(intel_pool).pause_unmapped_sources()  # the tick, before the claim
+    fetcher = FakeFetcher({ARTICLE: make_page(POLICY, ARTICLE)})
+    model = FakeQuestionModel(
+        make_signal(tags=["linkedin"]), discovery=_found_article(), suggest_with=_cite_everything()
+    )
+    deps = make_deps(intel_pool, fetcher, model)
+    result = await run_once(intel_pool, deps)
+    assert result.status == "completed" and model.discover_calls == 0
+    assert await _open_runs(intel_pool, search_id) == [("discovery", "queued", "schedule")]
+    searched = await run_once(intel_pool, deps)
+    assert searched.status == "completed" and model.discover_calls == 1
+    ((enabled, reason),) = await _rows(
+        intel_pool,
+        "SELECT enabled, disabled_reason FROM intel_sources WHERE source_id = %s",
+        search_id,
+    )
+    assert (enabled, reason) == (False, "unmapped")
+
+
+async def test_a_saved_search_with_a_read_already_open_gets_no_second(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [_chosen_search()], operator="ann"
+    )
+    (search_id,) = queued.registered
+    already = await PostgresIntelStore(intel_pool).queue_source_check(search_id, operator="ann")
+    model = FakeQuestionModel(suggest_with=_cite_everything())
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert result.status == "completed" and model.discover_calls == 0
+    assert result.outcome["sources_deferred"] == 1
+    assert result.outcome["search_sources_deferred"] == 1
+    ((run_id,),) = await _rows(
+        intel_pool,
+        "SELECT run_id FROM intel_runs WHERE source_id = %s AND status IN ('queued', 'running')",
+        search_id,
+    )
+    assert run_id == already

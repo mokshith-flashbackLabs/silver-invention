@@ -10,7 +10,9 @@
   named source no check has read yet, so a retried press reads what a refused one left), under
   INTEL_MAX_CALLS_PER_SUGGESTION_RUN and through ``read_source`` (the scheduled check's own code),
   then retrieval and ONE suggestion call (intel/suggestion.py decides what is kept), then the
-  ordinary generation over what was read.
+  ordinary generation over what was read. *Amended 2026-10-03 (throughput):* the pages are read
+  several at once (INTEL_SOURCE_READ_CONCURRENCY), and a saved search is not read inline at all:
+  it is queued as its own discovery run (spec 2026-10-03-intel-throughput §5, §6).
 
 ``pipeline.run()`` dispatches here after loading the vocabulary, and each kind returns its own
 RunResult, because its status must say what the operator is waiting for. The pipeline's run
@@ -333,10 +335,17 @@ async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop |
     source left unread or part-read is made due, so its first scheduled check comes at once
     rather than a full interval later. Returns the stop.
 
-    *Amended 2026-10-03 (throughput, spec 2026-10-03-intel-throughput §5):* up to
+    *Amended 2026-10-03 (throughput, spec 2026-10-03-intel-throughput §5, §6):* up to
     ``INTEL_SOURCE_READ_CONCURRENCY`` sources are read at once, started in that same order. The
     cap is exact (a call reserves its slot before it is sent); a source whose read fails never
-    cancels another's, and once one stops or meets the cap, no further source starts."""
+    cancels another's, and once one stops or meets the cap, no further source starts.
+
+    A SAVED SEARCH is not read here at all. Its read is a Claude research call of several
+    minutes, which held the suggestion (and, one run at a time, the queue) for as long; it is
+    queued as its own ``discovery`` run instead, which a free worker slot runs beside this one,
+    and counted in ``sources_deferred`` (and ``search_sources_deferred``). The suggestion is
+    written from the pages read here plus the evidence already collected; asking again once the
+    search has been read includes what it found."""
     listed = await ctx.deps.questions.sources_by_ids(
         list(dict.fromkeys([*request.new_source_ids, *request.source_ids]))
     )
@@ -347,12 +356,20 @@ async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop |
         if named not in to_read and source is not None and _unread(source):
             to_read.append(named)
     sources: list[Source] = []
+    searches: list[UUID] = []
     for source_id in to_read:
         source = by_id.get(source_id)
         if source is None:
             ctx.counts["source_missing"] += 1
+        elif source.kind == "search_query":
+            searches.append(source_id)
         else:
             sources.append(source)
+    if searches:
+        # Queued before this run reads anything, so the searches start as soon as a slot frees,
+        # not after this run. A search with a run already open keeps that one.
+        await ctx.deps.questions.queue_source_reads(searches, now=ctx.deps.clock())
+        ctx.counts["search_sources_deferred"] += len(searches)
     each = await read_each(ctx, sources, lambda source: read_source(ctx, source))
     bug = each.first_bug()
     if bug is not None:
@@ -370,7 +387,8 @@ async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop |
             ctx.counts["sources_read"] += 1
     if deferred:
         await ctx.deps.questions.mark_sources_due(deferred, now=ctx.deps.clock())
-        ctx.counts["sources_deferred"] += len(deferred)
+    if deferred or searches:
+        ctx.counts["sources_deferred"] += len(deferred) + len(searches)
     return stop
 
 

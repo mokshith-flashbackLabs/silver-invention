@@ -52,6 +52,25 @@ _AUDIT_SQL = """
     VALUES (%(actor_type)s, %(action)s, %(resource_id)s, %(metadata)s)
 """
 
+# store.py's _SCHEDULE_SQL for the named sources, enabled or not (queue_source_reads).
+_QUEUE_READS_SQL = """
+    WITH due AS (
+        UPDATE intel_sources s
+           SET next_check_at = %(now)s + make_interval(hours => s.check_every_hours),
+               updated_at = now()
+         WHERE s.source_id = ANY(%(ids)s::uuid[])
+           AND NOT EXISTS (SELECT 1 FROM intel_runs r WHERE r.source_id = s.source_id
+                            AND r.status IN ('queued', 'running'))
+        RETURNING s.source_id, s.kind
+    )
+    INSERT INTO intel_runs (kind, source_id, requested_by)
+    SELECT CASE WHEN kind = 'search_query' THEN 'discovery' ELSE 'source_check' END,
+           source_id, 'schedule'
+      FROM due
+    ON CONFLICT DO NOTHING
+    RETURNING run_id
+"""
+
 _REGISTER_SQL = """
     INSERT INTO intel_sources (kind, source_url, url_hash, normalisation_version, query_text, tags,
         check_every_hours, next_check_at, terms_note, created_by, origin, proposed_for,
@@ -104,6 +123,9 @@ class QuestionStore(Protocol):
         self, request: dict[str, Any], sources: Sequence[NewSource], *, operator: str
     ) -> Registered: ...
     async def mark_sources_due(self, source_ids: Sequence[UUID], *, now: datetime) -> None: ...
+    async def queue_source_reads(
+        self, source_ids: Sequence[UUID], *, now: datetime
+    ) -> list[UUID]: ...
     async def suggestion_candidates(
         self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int
     ) -> SuggestionCandidates: ...
@@ -382,6 +404,23 @@ class PostgresQuestionStore:
                 " WHERE source_id = ANY(%s::uuid[]) AND next_check_at > %s",
                 (now, list(source_ids), now),
             )
+
+    async def queue_source_reads(self, source_ids: Sequence[UUID], *, now: datetime) -> list[UUID]:
+        """Queue each source's own read NOW, as the scheduler would when it falls due: a
+        ``discovery`` run for a saved search, a ``source_check`` for anything else, advancing its
+        ``next_check_at`` by one interval (spec 2026-10-03-intel-throughput §6). A weight
+        suggestion hands its saved searches over this way instead of reading them inline.
+
+        Unlike ``schedule_due`` it does not ask ``enabled``: a source of a draft option is paused
+        as ``unmapped`` until the draft publishes (spec §4.10), and the suggestion reads it all the
+        same (``_unread``). A source that already has a run open gets no second one: the
+        ``NOT EXISTS`` skips it, and ``intel_runs_one_open_per_source`` makes a race a no-op.
+        Returns the runs queued."""
+        if not source_ids:
+            return []
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(_QUEUE_READS_SQL, {"ids": list(source_ids), "now": now})
+            return [row[0] for row in await cur.fetchall()]
 
     async def suggestion_candidates(
         self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int
