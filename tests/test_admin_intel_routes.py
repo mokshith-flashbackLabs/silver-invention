@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from imageshield.http.app import create_app
-from imageshield.intel.models import Run, Source, SpendToday, Vocabulary
+from imageshield.intel.models import Run, RunEvent, RunEvents, Source, SpendToday, Vocabulary
 from tests.conftest import ADMIN_SERVICE_TOKEN, SERVICE_TOKEN, make_config
 
 ADMIN = {"X-Service-Token": SERVICE_TOKEN, "X-Admin-Service-Token": ADMIN_SERVICE_TOKEN}
@@ -44,6 +44,8 @@ class FakeIntelStore:
         ]
         self.sources: dict[UUID, Source] = {}
         self.runs: list[Run] = []
+        self.list_calls: list[dict[str, Any]] = []
+        self.events: dict[UUID, tuple[RunEvent, ...]] = {}
         self.checked: list[UUID] = []
         self.adhoc: list[str] = []
         self.spend_call_count = 0
@@ -118,8 +120,33 @@ class FakeIntelStore:
         self.adhoc.append(url)
         return uuid4()
 
-    async def list_runs(self, *, cursor: tuple[datetime, UUID] | None, limit: int) -> list[Run]:
-        return self.runs[:limit]
+    async def list_runs(
+        self,
+        *,
+        cursor: tuple[datetime, UUID] | None,
+        limit: int,
+        kinds: list[str] | None = None,
+        statuses: list[str] | None = None,
+        question_key: str | None = None,
+    ) -> list[Run]:
+        self.list_calls.append(
+            {"kinds": kinds, "statuses": statuses, "question_key": question_key}
+        )
+        return [
+            run
+            for run in self.runs
+            if (not kinds or run.kind in kinds)
+            and (not statuses or run.status in statuses)
+            and (question_key is None or run.request.get("question_key") == question_key)
+        ][:limit]
+
+    async def run_events(self, run_id: UUID) -> RunEvents | None:
+        run = next((r for r in self.runs if r.run_id == run_id), None)
+        if run is None:
+            return None
+        return RunEvents(
+            run_id=run_id, kind=run.kind, status=run.status, events=self.events.get(run_id, ())
+        )
 
     async def put_vocabulary(self, **kwargs: Any) -> bool:
         return self.vocab_applied
@@ -618,3 +645,168 @@ def test_enabling_an_untagged_source_or_clearing_its_tags_on_the_way_is_allowed(
         headers=ADMIN,
     )
     assert r.status_code == 200
+
+
+# ── the runs list's filters and a run's step log (spec 2026-10-03 §3.6) ────────────────────
+
+
+def _seed_run(
+    store: FakeIntelStore,
+    kind: str,
+    *,
+    status: str = "completed",
+    question_key: str | None = None,
+) -> Run:
+    run = Run(
+        run_id=uuid4(),
+        kind=kind,
+        source_id=None,
+        request={"question_key": question_key} if question_key else {},
+        status=status,
+        attempts=1,
+        requested_by="ann",
+        outcome={},
+        error_code=None,
+        created_at=_now(),
+        completed_at=None,
+    )
+    store.runs.insert(0, run)
+    return run
+
+
+def _run_ids(response: Any) -> list[str]:
+    assert response.status_code == 200, response.text
+    return [run["run_id"] for run in response.json()["runs"]]
+
+
+def test_list_runs_filters_by_kind_status_and_question_alone_and_combined() -> None:
+    client, store = _client()
+    proposal = _seed_run(store, "source_proposal", question_key="platforms")
+    failed = _seed_run(store, "source_proposal", status="failed", question_key="platforms")
+    suggestion = _seed_run(store, "weight_suggestion", question_key="dating")
+    adhoc = _seed_run(store, "adhoc_url", status="queued")
+    url = "/v1/admin/intel/runs"
+
+    assert _run_ids(client.get(url, params={"kind": "source_proposal"}, headers=ADMIN)) == [
+        str(failed.run_id),
+        str(proposal.run_id),
+    ]
+    assert _run_ids(client.get(url, params={"status": "queued"}, headers=ADMIN)) == [
+        str(adhoc.run_id)
+    ]
+    assert _run_ids(client.get(url, params={"question_key": "dating"}, headers=ADMIN)) == [
+        str(suggestion.run_id)
+    ]
+    combined = client.get(
+        url,
+        params={"kind": "source_proposal", "status": "completed", "question_key": "platforms"},
+        headers=ADMIN,
+    )
+    assert _run_ids(combined) == [str(proposal.run_id)]
+    assert store.list_calls[-1] == {
+        "kinds": ["source_proposal"],
+        "statuses": ["completed"],
+        "question_key": "platforms",
+    }
+    # Repeated parameters are lists, OR within a filter and AND across them.
+    repeated = client.get(
+        url,
+        params=[("kind", "adhoc_url"), ("kind", "weight_suggestion"), ("status", "completed")],
+        headers=ADMIN,
+    )
+    assert _run_ids(repeated) == [str(suggestion.run_id)]
+    assert store.list_calls[-1]["kinds"] == ["adhoc_url", "weight_suggestion"]
+    # No filter forwards none, and the spend block is unchanged by filtering.
+    everything = client.get(url, headers=ADMIN)
+    assert len(_run_ids(everything)) == 4
+    assert store.list_calls[-1] == {"kinds": None, "statuses": None, "question_key": None}
+    assert set(combined.json()["spend"]) == set(everything.json()["spend"])
+
+
+def test_a_question_key_that_matches_nothing_is_an_empty_page() -> None:
+    client, store = _client()
+    _seed_run(store, "source_proposal", question_key="platforms")
+    r = client.get(
+        "/v1/admin/intel/runs",
+        params={"kind": "source_proposal", "question_key": "never_asked"},
+        headers=ADMIN,
+    )
+    assert r.status_code == 200 and r.json()["runs"] == [] and r.json()["next_cursor"] is None
+
+
+@pytest.mark.parametrize(
+    ("params", "loc"),
+    [
+        ({"kind": "everything"}, "query.kind.0"),
+        ([("kind", "discovery"), ("kind", "Discovery")], "query.kind.1"),
+        ({"status": "done"}, "query.status.0"),
+        ({"question_key": "Platforms"}, "query.question_key"),
+        ({"question_key": "p"}, "query.question_key"),
+        ({"question_key": "a" * 41}, "query.question_key"),
+    ],
+)
+def test_an_unknown_filter_value_is_a_422(params: Any, loc: str) -> None:
+    client, store = _client()
+    r = client.get("/v1/admin/intel/runs", params=params, headers=ADMIN)
+    assert r.status_code == 422
+    error = r.json()["error"]
+    assert error["code"] == "validation_error" and error["retryable"] is False
+    assert [d["loc"] for d in error["details"]] == [loc]
+    assert store.list_calls == []  # refused before the store is asked
+
+
+def _event(seq: int, kind: str, text: str, detail: dict[str, Any] | None = None) -> RunEvent:
+    now = _now()
+    return RunEvent(seq=seq, kind=kind, text=text, detail=detail or {}, at=now, updated_at=now)
+
+
+def test_a_runs_events_are_its_whole_log_in_order() -> None:
+    client, store = _client()
+    run = _seed_run(store, "source_proposal", status="running", question_key="platforms")
+    store.events[run.run_id] = (
+        _event(1, "run_started", "Started: find sources for 'platforms'", {"attempt": 1}),
+        _event(2, "model_call_started", "Asked claude-sonnet-5 (up to 5 web searches)"),
+        _event(3, "thinking", "Looking at dating apps first.", {"chars": 29}),
+        _event(4, "search", "Searched: bumble data breach", {"query": "bumble data breach"}),
+    )
+    r = client.get(f"/v1/admin/intel/runs/{run.run_id}/events", headers=ADMIN)
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"run_id", "kind", "status", "events", "truncated"}
+    assert (body["run_id"], body["kind"], body["status"]) == (
+        str(run.run_id),
+        "source_proposal",
+        "running",
+    )
+    assert body["truncated"] is False
+    assert [e["seq"] for e in body["events"]] == [1, 2, 3, 4]
+    assert set(body["events"][0]) == {"seq", "kind", "text", "detail", "at", "updated_at"}
+    assert body["events"][3]["detail"] == {"query": "bumble data breach"}
+
+
+def test_a_truncated_log_says_so() -> None:
+    client, store = _client()
+    run = _seed_run(store, "weight_suggestion", question_key="dating")
+    store.events[run.run_id] = (
+        _event(1, "run_started", "Started"),
+        _event(2, "truncated", "Log limit reached; later steps were not recorded"),
+    )
+    body = client.get(f"/v1/admin/intel/runs/{run.run_id}/events", headers=ADMIN).json()
+    assert body["truncated"] is True
+
+
+def test_a_run_with_no_steps_yet_is_an_empty_log() -> None:
+    client, store = _client()
+    run = _seed_run(store, "source_proposal", status="queued", question_key="platforms")
+    r = client.get(f"/v1/admin/intel/runs/{run.run_id}/events", headers=ADMIN)
+    assert r.status_code == 200
+    assert r.json()["events"] == [] and r.json()["truncated"] is False
+    assert r.json()["status"] == "queued"
+
+
+def test_an_unknown_runs_events_are_a_404() -> None:
+    client, _ = _client()
+    r = client.get(f"/v1/admin/intel/runs/{uuid4()}/events", headers=ADMIN)
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "intel_run_not_found"
+    assert client.get("/v1/admin/intel/runs/not-a-uuid/events", headers=ADMIN).status_code == 422

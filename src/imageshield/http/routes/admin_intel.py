@@ -37,6 +37,7 @@ from imageshield.http.deps import (
 )
 from imageshield.http.errors import ServiceError
 from imageshield.http.models import (
+    INTEL_QUESTION_KEY_PATTERN,
     IntelAppliedRequest,
     IntelDecisionRequest,
     IntelDocumentRequest,
@@ -45,6 +46,8 @@ from imageshield.http.models import (
     IntelProposalStatus,
     IntelProtectionStatus,
     IntelRetractRequest,
+    IntelRunKind,
+    IntelRunStatus,
     IntelSourceCreateRequest,
     IntelSourcePatchRequest,
     IntelSourceProposalRequest,
@@ -273,11 +276,25 @@ async def paste_document(
 
 @router.get("/runs")
 async def list_runs(
+    kinds: list[IntelRunKind] | None = Query(default=None, alias="kind"),
+    statuses: list[IntelRunStatus] | None = Query(default=None, alias="status"),
+    question_key: str | None = Query(default=None, pattern=INTEL_QUESTION_KEY_PATTERN),
     cursor: str | None = Query(default=None),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
     store: IntelStore = Depends(get_intel_store),
 ) -> dict[str, Any]:
-    runs = await store.list_runs(cursor=_decode_cursor(cursor), limit=limit)
+    """Run history, newest first. ``kind`` and ``status`` repeat, ``question_key`` matches the
+    run request's own key exactly, and the three combine with AND (spec 2026-10-03 §3.6): the
+    console reopens a question's last Suggest-points run with
+    ``?kind=source_proposal&question_key=<key>&limit=1``. An unknown value is a 422; ``spend``
+    is today's whatever the filters."""
+    runs = await store.list_runs(
+        cursor=_decode_cursor(cursor),
+        limit=limit,
+        kinds=kinds,
+        statuses=statuses,
+        question_key=question_key,
+    )
     spend = await store.spend_today(datetime.now(UTC))
     headroom = (
         (spend.daily_budget_usd - spend.spent_today_usd)
@@ -299,6 +316,23 @@ async def list_runs(
             ),
             "budget_headroom_usd": str(headroom) if headroom is not None else None,
         },
+    }
+
+
+@router.get("/runs/{run_id}/events")
+async def run_events(run_id: UUID, store: IntelStore = Depends(get_intel_store)) -> dict[str, Any]:
+    """A run's whole step log, ``seq`` ascending (at most 300 rows, the last ``truncated`` when
+    the cap was reached), for the console to poll while the run is open (spec 2026-10-03 §3.6).
+    A run with no rows yet is ``events: []``; an unknown run is a 404."""
+    found = await store.run_events(run_id)
+    if found is None:
+        raise ServiceError(404, "intel_run_not_found", "No run with this id.", retryable=False)
+    return {
+        "run_id": found.run_id,
+        "kind": found.kind,
+        "status": found.status,
+        "events": list(found.events),
+        "truncated": any(event.kind == "truncated" for event in found.events),
     }
 
 
