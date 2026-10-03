@@ -703,7 +703,7 @@ release rather than asking anyone. (The design spec's §4.7 also names a second 
 | `GET /v1/admin/intel/sources?cursor=&limit=` | — | `200 {sources, next_cursor}` | `422 invalid_cursor` |
 | `POST /v1/admin/intel/sources/{id}/check` | `operator` | `200 {run_id}` | `404 intel_source_not_found` |
 | `POST /v1/admin/intel/documents` | `url` (https only), `operator` | `202 {run_id}` — queues an `adhoc_url` run | `422 known_hit_location` |
-| `GET /v1/admin/intel/runs?cursor=&limit=` | — | `200 {runs, next_cursor, spend}` — `spend` is `{spend_date, call_count, spent_today_usd, daily_budget_usd, budget_headroom_usd}` for `claude_intel`, read off the same pre-aggregated `provider_spend` row the budget guard enforces, money as decimal **strings**, `daily_budget_usd`/`budget_headroom_usd` null while unset | `422 invalid_cursor` |
+| `GET /v1/admin/intel/runs?cursor=&limit=` | — | `200 {runs, next_cursor, spend}` — `spend` is `{spend_date, call_count, spent_today_usd, daily_budget_usd, budget_headroom_usd}` for `claude_intel`, read off the same pre-aggregated `provider_spend` row the budget guard enforces, money as decimal **strings**, `daily_budget_usd`/`budget_headroom_usd` null while unset. *Amended 2026-10-03:* gains optional `kind`, `status` and `question_key` filters, and a run's step log is `GET /runs/{run_id}/events` (the run-log subsection below) | `422 invalid_cursor` |
 | `GET /v1/admin/intel/signals?cursor=&limit=` | — | `200 {signals, next_cursor}`, each with its excerpts and document provenance | `422 invalid_cursor` |
 | `GET /v1/admin/intel/signals/{id}` | — | `200` the signal | `404 signal_not_found` |
 | `POST /v1/admin/intel/signals/{id}/retract` | `reason` (≥3 chars), `operator` | `200 {status: retracted}` | `404 signal_not_found`, `409 signal_not_active` |
@@ -1052,6 +1052,59 @@ run that the worker finishes always completes.
 - `GET /proposals?kind=coverage_gap` lists them, and `GET /proposals/{id}` returns their evidence;
 - `rejected` on `POST /proposals/{id}/decision` dismisses one, and approving one is `409 proposal_not_decidable`;
 - step 3 adds `resolved_by_quiz` supersession.
+
+### Likeness intel admin surface — the run log and run filters (2026-10-03)
+
+**New 2026-10-03** (spec `docs/superpowers/specs/2026-10-03-intel-run-log-design.md`). A Suggest-points question is
+one Claude call of 2–9 minutes. Every Claude call is now **streamed**, and the worker writes one row per step AS THE
+STREAM ARRIVES (migration 0046, `intel_run_events`), so the control room can show it live by polling. One route is new
+and one gains three filters. Both are admin routes like the rest of this surface: both tokens, the error envelope, and
+nothing person-shaped anywhere in them.
+
+| # | Route | Success | Errors |
+|---|---|---|---|
+| L1 | `GET /v1/admin/intel/runs?kind=&status=&question_key=&cursor=&limit=` | unchanged: `200 {runs, next_cursor, spend}`. The three filters are optional and combine with **AND**. `kind` and `status` **repeat** (`?kind=source_proposal&kind=weight_suggestion` is either kind). `question_key` matches the run request's own `question_key` exactly. Keyset paging composes with the filters, and `spend` is today's whatever they are | `422 validation_error`, `details[].loc` naming the value (`query.kind.0`, `query.status.1`, `query.question_key`), for a `kind` outside `source_check` · `discovery` · `adhoc_url` · `weight_suggestion` · `renewal_check` · `gap_regenerate` · `source_proposal` · `source_validation`, a `status` outside `queued` · `running` · `completed` · `failed` · `refused`, or a `question_key` not matching `^[a-z][a-z0-9_]{1,39}$` (your `questionParams` regex). A key that matches nothing is an empty page, never an error. `422 invalid_cursor` as before |
+| L2 | `GET /v1/admin/intel/runs/{run_id}/events` | `200 {run_id, kind, status, events: [{seq, kind, text, detail, at, updated_at}], truncated: bool}`: the run's **whole** log, `seq` ascending from 1, at most 300 rows. `truncated` is true when the last row is `truncated`. A run with no rows yet (still `queued`) is `events: []` | `404 intel_run_not_found` (any kind of run; `422 validation_error` for an id that is not a UUID) |
+
+**Render on `kind` and `detail`, never on `text`.** `text` is server-authored English for display and may change
+wording. The vocabulary is closed (0046's CHECK):
+
+| `kind` | `text`, e.g. | `detail` |
+|---|---|---|
+| `run_started` | "Started: find sources for 'platforms'", " (attempt 2)" on a reclaimed run | `{run_kind, attempt}` |
+| `model_call_started` | "Asked claude-sonnet-5 (up to 5 web searches)" / "Asked claude-opus-5-5" | `{model, max_searches}` (`null` without the search tool) |
+| `thinking` | Claude's reasoning SUMMARY for one thinking block. ONE row per block, rewritten at most every 2 s while it streams (`updated_at` moves) and finalised when the block ends | `{chars}` (the summary's full length) |
+| `search` | "Searched: bumble data breach 2026" | `{query}` |
+| `search_results` | "8 results: bumble.com, techcrunch.com, theverge.com" (first 3 domains) / "No results" / "Search failed: max_uses_exceeded" | `{count, results: [{title, url}] (at most 10), error_code}` (`error_code` null on success; on a failure `count` 0 and `results` []) |
+| `writing` | "Writing the answer", once per API call, at its first text block | `{}` |
+| `continuing` | "Continuing — Claude paused after its searches" (a `pause_turn` resume) | `{pause_turns}` |
+| `model_call_finished` | "Answered in 3m 12s · $0.23 · 2 searches", plus a note when the answer was a refusal, cut off or unreadable | `{model, stop_reason, input_tokens, output_tokens, web_search_requests, cost_usd, latency_ms}`. `model` is the model that answered; `cost_usd` a decimal string; `latency_ms` the wall time of the whole call, `pause_turn` continuations included |
+| `model_call_failed` | "Claude call failed: permission denied (403) — <the API's own message, at most 500 chars>" | `{status, error_type, http_status, message}`: `status` is `error` · `timeout` · `rate_limited`, `error_type` the exception class (`PermissionDeniedError`), `http_status` null for a timeout or a dropped connection |
+| `model_call_skipped` | "Not sent: the provider is switched off" / "…the breaker is open" / "…today's budget is spent" / "…no daily budget is set" | `{reason}`: `provider_disabled` · `breaker_open` · `budget_exceeded` · `budget_unset` |
+| `run_finished` | "Finished in 3m 40s · $0.23" / "Failed: <error_code>" / "Refused: <error_code>" | `{status, error_code, cost_usd, duration_ms}` |
+| `truncated` | "Log limit reached; later steps were not recorded" | `{}` |
+
+**What the log promises, and what it does not:**
+- **Poll it every 2 s while the run is `queued` or `running`, and once more when it ends.** `run_finished` is written
+  BEFORE the run's terminal status, and the route reads the status before the rows, so a response whose `status` is
+  terminal always carries the whole log.
+- **A run that crashed has no `run_finished`.** Its lease expires and the worker reclaims it; the reclaim's rows
+  continue the same `seq` ("Started: … (attempt 2)"). A run past its attempts ends `failed`/`attempts_exhausted` with
+  no `run_finished` row.
+- **The log is capped and never fails a run.** 300 rows per run, the 300th `truncated` and nothing after it (the
+  run's own `run_finished` included). A row's `text` is at most 2000 characters (4000 for `thinking`) and its `detail`
+  at most 8 KB serialised (`results` is dropped first, then the detail is `{"oversize": true}`). A write that fails is
+  a warning in services' logs; the run carries on with a gap in its log.
+- **Every run kind that calls Claude gets a log**: Suggest points stages 1, 3 and 4, source checks, discovery and gap
+  regeneration. A renewal check calls no model, so its log is `run_started` and `run_finished`.
+- **No transcript and no person.** A row holds Claude's search queries, public result titles and URLs, a reasoning
+  SUMMARY, counts, costs, model ids and API error text, never a prompt or the model's answer. Intel prompts carry no
+  personal data (design spec §6.1). Rows are kept with their run and never pruned.
+- **`provider_calls.error_detail` is unchanged** (`PermissionDeniedError:403`). The API's message reaches the run log
+  only.
+
+**Deploy order:** services first (migration 0046, then services and services-worker), then the backend. On the way
+down the backend goes first; 0046's down drops every run's log and nothing else.
 
 ---
 

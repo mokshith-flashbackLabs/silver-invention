@@ -506,6 +506,13 @@ a new kind, `llm`, and a new row, `claude_intel` (migration 0039) — see
 `docs/OPERATIONS.md` §4 for the operational shape (`budget_unset`, `intel_stale`, and why
 `no_successful_calls_24h` does not apply to this kind).
 
+*Amended 2026-10-03, the run log:* every call is **streamed** (`messages.stream`, same arguments,
+same final `Message`), and the worker writes one `intel_run_events` row per step as it arrives —
+the call asked, Claude's reasoning summary, each search and its results, writing, a `pause_turn`
+resume, and how the call ended (migration 0046, `intel/run_log.py`). The control room polls
+`GET /runs/{run_id}/events`; a log write that fails never fails a run. Spec
+`docs/superpowers/specs/2026-10-03-intel-run-log-design.md`.
+
 **Admin surface — the step-1 set, ten routes under `/v1/admin/intel/*`**: the source registry
 (`GET`/`POST /sources`, `PATCH /sources/{id}`, `POST /sources/{id}/check`), pasting a one-off URL
 (`POST /documents`), run history with today's spend (`GET /runs`), the signal list and single-signal

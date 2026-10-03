@@ -1336,6 +1336,47 @@ reads, so one index serves that and the equality probes (`tests/test_intel_schem
 for the store's own SQL). `intel_runs_one_open_renewal` (0044) covers only queued and running checks. The down drops
 both; no grant or data changes either way.
 
+## 2j. Likeness intel — the run log (migration 0046)
+
+`intel_run_events` (spec `2026-10-03-intel-run-log-design.md` §3.1): one row per step of an intel run, written by the
+worker as the model stream arrives (`intel/run_log.py`) and polled by the control room through
+`GET /v1/admin/intel/runs/{run_id}/events`.
+
+```sql
+run_id     UUID NOT NULL REFERENCES intel_runs(run_id)
+seq        INTEGER NOT NULL CHECK (seq >= 1)        -- intel_run_events_seq_positive; PRIMARY KEY (run_id, seq)
+kind       TEXT NOT NULL                            -- intel_run_events_kind_valid: run_started | model_call_started |
+                                                    --   thinking | search | search_results | writing | continuing |
+                                                    --   model_call_finished | model_call_failed | model_call_skipped |
+                                                    --   run_finished | truncated
+text       TEXT NOT NULL CHECK (char_length(text) <= 4000)  -- intel_run_events_text_length
+detail     JSONB NOT NULL DEFAULT '{}'
+at         TIMESTAMPTZ NOT NULL DEFAULT now()       -- first written
+updated_at TIMESTAMPTZ NOT NULL DEFAULT now()       -- moves only on a thinking row while its block streams
+```
+
+`seq` continues from the run's `max(seq) + 1`, so a run reclaimed after a crash appends rather than collides. The
+recorder caps a run at 300 rows (the 300th `truncated`, nothing after it), `text` at 2000 characters (4000 for
+`thinking`, the CHECK's ceiling) and `detail` at 8 KB serialised. Every write is its own short autocommit statement,
+never inside a run's transaction. A row is server-authored English plus counts, search queries, public result titles
+and URLs, a reasoning summary and API error text: never a prompt, an answer or a person. Rows are kept with their run
+and never pruned.
+
+`intel_rw` holds `SELECT, INSERT, UPDATE` (no `DELETE`), 0039's rule: `app_services` holds `intel_rw` for the worker
+that writes the log and for the admin routes that read it.
+
+Two indexes on `intel_runs` serve `GET /runs`' new filters in its keyset order:
+
+```sql
+CREATE INDEX intel_runs_kind_created_idx ON intel_runs (kind, created_at DESC, run_id DESC);
+CREATE INDEX intel_runs_question_idx ON intel_runs ((request->>'question_key'), created_at DESC)
+  WHERE request ? 'question_key';
+```
+
+The store's question filter states `request ? 'question_key'` itself, so the planner can prove the partial index
+applies (`tests/test_intel_run_log.py` asserts both indexes are chosen for the store's own predicates). The down
+drops the table (every run's log, and its grant) and both indexes; the runs are untouched. No `svc` view changes.
+
 ---
 
 ## 3. Adjudication service

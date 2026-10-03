@@ -200,3 +200,33 @@ notes if affected, and this spec.
 Services first (migration 0046, then services + services-worker); then backend api. Dev now;
 `release/prod-sep15` is pushed, prod deploys when the owner asks. Rolling back: backend first, then
 services; 0046's down drops the log.
+
+## 7. As built — services (2026-10-03)
+
+§3 is built as written (`PROXY_INTEGRATION.md` "the run log and run filters" is the contract the
+backend relays). Where the build had to choose, it chose this:
+
+- **0046's three CHECKs are named** (`intel_run_events_seq_positive`, `_kind_valid`, `_text_length`)
+  so a later migration finds them by name, not by definition as 0042 and 0043 had to. Same rules.
+- **`model_call_started` is the first leg only.** A `pause_turn` resume is announced by its
+  `continuing` row, not a second "Asked". **`writing` is once per API call**, so a resumed leg may
+  write its own.
+- **`thinking` is written at block start with empty text** (the summary arrives only as deltas),
+  rewritten at most every 2 s, finalised at the block's stop with the full summary.
+- **Two failure shapes only a stream has.** An `error` event inside an open stream arrives as an
+  `APIStatusError` carrying the stream's own 200 (e.g. `overloaded_error`): it is retried like a
+  5xx, where the literal "same mapping" would have made it a final `error`. A transport error
+  mid-body is raised by the SDK unwrapped (`httpx2`): a timeout maps to `timeout`, anything else to
+  a retried connection failure, as the SDK maps the same errors before a body. Without this a
+  dropped stream would crash the run instead of metering it.
+- **`model_call_finished.latency_ms` is the wall time of the whole metered call**, `pause_turn`
+  continuations included; `ModelCall.latency_ms` (the last leg's) and `provider_calls` are
+  unchanged. The text adds a note when the answer was a refusal, cut off, or unreadable.
+- **`search_results`:** an empty list reads "No results"; an oversize detail drops the `results`
+  KEY (absent, not `[]`), then becomes `{"oversize": true}`.
+- **`run_finished` is written BEFORE `finish_run`**, and the events route reads the run's status
+  before its rows, so a response whose status is terminal always carries the whole log. A crashed
+  run gets no `run_finished` (it is not finished; its reclaim appends "(attempt N)"), nor does a
+  run whose log already hit the cap.
+- **The 404 is `intel_run_not_found`** with the message "No run with this id." (any run kind; the
+  question polls keep their own "No run of this kind with this id.").
