@@ -9,11 +9,13 @@ rows in ``test_intel_metering.py``, the worker's ``run_started``/``run_finished`
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, get_args
 from uuid import UUID, uuid4
 
@@ -35,6 +37,7 @@ from imageshield.intel.run_log import (
     RUN_EVENT_KINDS,
     TRUNCATED_TEXT,
     RunLog,
+    StreamTranslator,
     capped_detail,
     current_run_log,
     duration_words,
@@ -131,6 +134,68 @@ async def test_a_write_that_raises_is_a_warning_naming_only_the_run_and_the_kind
     # The database comes back: the next write re-reads the run's last seq and carries on.
     store.fail = False
     assert await run_log.append("search", "Searched: q") == 1
+
+
+class _YieldingRunEvents(MemoryRunEvents):
+    """Every read and write yields to the event loop first, the way a database round trip does,
+    so appends from concurrent reads interleave exactly where they would in production."""
+
+    async def last_run_event_seq(self, run_id: UUID) -> int:
+        await asyncio.sleep(0)
+        return await super().last_run_event_seq(run_id)
+
+    async def insert_run_event(
+        self, run_id: UUID, *, seq: int, kind: str, text: str, detail: Any
+    ) -> None:
+        await asyncio.sleep(0)
+        await super().insert_run_event(run_id, seq=seq, kind=kind, text=text, detail=detail)
+
+    async def update_run_event(self, run_id: UUID, *, seq: int, text: str, detail: Any) -> None:
+        await asyncio.sleep(0)
+        await super().update_run_event(run_id, seq=seq, text=text, detail=detail)
+
+
+async def test_concurrent_appends_take_unique_contiguous_seqs() -> None:
+    """Spec 2026-10-03-intel-throughput §4: a run's parallel reads append to ONE log at once.
+    Every append gets its own seq, none fails, and nothing is lost."""
+    store = _YieldingRunEvents()
+    run_log = RunLog(uuid4(), store)
+    with structlog.testing.capture_logs() as logs:
+        seqs = await asyncio.gather(
+            *(run_log.append("search", f"Searched: q{n}", {"query": "q"}) for n in range(40))
+        )
+    assert sorted(s for s in seqs if s is not None) == list(range(1, 41))
+    assert len(store.events(run_log.run_id)) == 40
+    assert logs == []  # no write failed
+
+
+async def test_concurrent_thinking_rows_are_each_rewritten_by_their_own_seq() -> None:
+    """Two calls streaming at once into one log: each translator's thinking row is opened,
+    rewritten and finalised by its own seq, whatever the other wrote in between."""
+    store = _YieldingRunEvents()
+    run_log = RunLog(uuid4(), store)
+    now = [0.0]
+    first = StreamTranslator(run_log, clock=lambda: now[0])
+    second = StreamTranslator(run_log, clock=lambda: now[0])
+
+    def start() -> SimpleNamespace:
+        block = SimpleNamespace(type="thinking", thinking="", signature="")
+        return SimpleNamespace(type="content_block_start", index=0, content_block=block)
+
+    def stop(text: str) -> SimpleNamespace:
+        block = SimpleNamespace(type="thinking", thinking=text, signature="s")
+        return SimpleNamespace(type="content_block_stop", index=0, content_block=block)
+
+    await asyncio.gather(first.feed(start()), second.feed(start()))
+    now[0] = 3.0
+    await asyncio.gather(
+        first.feed(SimpleNamespace(type="thinking", thinking="x", snapshot="first, so far")),
+        second.feed(SimpleNamespace(type="thinking", thinking="x", snapshot="second, so far")),
+    )
+    await asyncio.gather(second.feed(stop("second, final")), first.feed(stop("first, final")))
+    rows = store.events(run_log.run_id)
+    assert [r["seq"] for r in rows] == [1, 2]
+    assert {r["text"] for r in rows} == {"first, final", "second, final"}
 
 
 async def test_with_no_log_bound_every_note_is_a_no_op() -> None:

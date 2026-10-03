@@ -21,6 +21,7 @@ personal data (spec §6.1), and nothing here ever reads a prompt or the model's 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping
@@ -87,7 +88,13 @@ class RunEventStore(Protocol):
 class RunLog:
     """One run's log. ``seq`` continues from the run's ``max(seq) + 1``, read before this log's
     first write, so a run reclaimed after a crash appends rather than collides. The
-    ``MAX_EVENTS_PER_RUN``-th row is ``truncated`` and nothing is appended after it."""
+    ``MAX_EVENTS_PER_RUN``-th row is ``truncated`` and nothing is appended after it.
+
+    *Amended 2026-10-03 (throughput, spec 2026-10-03-intel-throughput §4):* a run reads several
+    sources at once, and every one of them appends to this one log. Allocating a ``seq`` and
+    writing its row happen under one lock, so two appends never take the same number; the
+    table's primary key stays the backstop. Rows of parallel reads interleave in ``seq`` order,
+    which is expected. ``update`` takes no lock: it rewrites a row by its own ``seq``."""
 
     def __init__(self, run_id: UUID, store: RunEventStore) -> None:
         self.run_id = run_id
@@ -95,11 +102,18 @@ class RunLog:
         self._last: int | None = None  # the highest seq known written; None reads it again
         self._full = False
         self._kinds: dict[int, str] = {}
+        self._lock = asyncio.Lock()
 
     async def append(
         self, kind: RunEventKind, text: str, detail: Mapping[str, Any] | None = None
     ) -> int | None:
         """Write one row; its ``seq``, or None when nothing (or only ``truncated``) was written."""
+        async with self._lock:
+            return await self._append(kind, text, detail)
+
+    async def _append(
+        self, kind: RunEventKind, text: str, detail: Mapping[str, Any] | None
+    ) -> int | None:
         if self._full:
             return None
         try:
