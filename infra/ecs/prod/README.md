@@ -92,8 +92,8 @@ ECS places against `memoryReservation` where set, otherwise `memory`:
 | `fetcher` | 128 |
 | **services side total** | **1440** |
 
-`intel-worker` (+128 MiB, likeness-intel task 5) ships with `INTEL_ENABLED=false`, so it adds
-placement weight before it adds any traffic — the arithmetic below already assumes it is running.
+`intel-worker` (+128 MiB, likeness-intel task 5) shipped with `INTEL_ENABLED=false`, so it added
+placement weight before it added any traffic — the arithmetic below already assumes it is running.
 
 With the backend's `api` (512), `worker` (512) and `image-worker` (1024) that is 3488 MiB of the
 3835 MiB a `t4g.medium` offers — 347 MiB free, still enough for the 256 MiB migration task to run
@@ -105,6 +105,12 @@ alongside everything else, but only 91 MiB to spare. If any of these grow, redo 
 role's `ClaudePlatformInvoke` grant lives in the backend repo
 (`deploy/iam/prod/services-task-role.json` on `release/prod-sep15`) and must be APPLIED before
 `INTEL_ENABLED` is flipped to `true` here, together with a `claude_intel` daily budget.
+
+**Applied 2026-10-03, and `INTEL_ENABLED` is `true` here from the same day.** The grant went onto
+`imageshield-prod-services` as its existing inline policy `boundary` (the backend repo's file adds
+exactly `ClaudePlatformInvoke` to it). The budget is USD 50/day (migration 0040). The worker
+spends nothing until an operator enables the `claude_intel` provider in the control room's
+Providers screen; disabling it there is the kill switch.
 
 ## Order
 

@@ -1,6 +1,6 @@
 {
   "family": "imageshield-prod-services-worker",
-  "x-notes": "PRODUCTION. Three containers, one task: the relay, the search worker and (as of the likeness-intel work) the intel worker are all small, stateless and die with the instance; splitting them would double the placement bookkeeping for no isolation. Generated from infra/ecs/imageshield-dev-services-worker.json by applying only the environment-specific values. Dev already carried ENVIRONMENT=production and SEARCH_PROVIDER=hive here, which reads like an inconsistency and is not one: config.py refuses development+hive, and these two containers must hold a live adapter to do anything at all, so dev's search worker really does run in the production configuration and really does spend Hive money. Production changes the region, the queues, the collections, the log group and the roles; it changes nothing about that pair. LOG_LEVEL was already info. See services.json notes on the two ATTRIBUTION_ values, which are unset here as in dev. intel-worker ships with INTEL_ENABLED=false; the prod workspace id and us-east-1 were confirmed by the step-0 probe on 2026-09-29, and INTEL_ENABLED flips only after the backend's prod IAM grant is applied and the claude_intel budget exists -- see infra/ecs/prod/README.md.",
+  "x-notes": "PRODUCTION. Three containers, one task: the relay, the search worker and (as of the likeness-intel work) the intel worker are all small, stateless and die with the instance; splitting them would double the placement bookkeeping for no isolation. Generated from infra/ecs/imageshield-dev-services-worker.json by applying only the environment-specific values. Dev already carried ENVIRONMENT=production and SEARCH_PROVIDER=hive here, which reads like an inconsistency and is not one: config.py refuses development+hive, and these two containers must hold a live adapter to do anything at all, so dev's search worker really does run in the production configuration and really does spend Hive money. Production changes the region, the queues, the collections, the log group and the roles; it changes nothing about that pair. LOG_LEVEL was already info. See services.json notes on the two ATTRIBUTION_ values, which are unset here as in dev. intel-worker runs with INTEL_ENABLED=true as of 2026-10-03, after the backend's prod IAM grant was applied (the claude_intel budget is USD 50/day, migration 0040); the prod workspace id and us-east-1 were confirmed by the step-0 probe on 2026-09-29. Spend still starts only once an operator enables the claude_intel provider -- see infra/ecs/prod/README.md.",
   "networkMode": "host",
   "requiresCompatibilities": ["EC2"],
   "executionRoleArn": "arn:aws:iam::225989356895:role/imageshield-prod-exec",
@@ -125,7 +125,7 @@
         { "name": "LOG_LEVEL", "value": "info" },
         { "name": "DB_SSLMODE", "value": "require" },
         { "name": "DB_POOL_MAX_SIZE", "value": "2" },
-        { "name": "INTEL_ENABLED", "value": "false" },
+        { "name": "INTEL_ENABLED", "value": "true" },
         { "name": "INTEL_MODEL_PROVIDER", "value": "claude" },
         { "name": "INTEL_ANTHROPIC_REGION", "value": "us-east-1" },
         { "name": "ANTHROPIC_AWS_WORKSPACE_ID", "value": "wrkspc_01Pyst4AzZBMDsgNsTHDSWuV" },
