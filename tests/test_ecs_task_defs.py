@@ -547,3 +547,28 @@ def test_the_task_role_grants_the_claude_platform_invoke_actions_scoped_to_the_w
     resources = statements[0]["Resource"]
     resource_list = resources if isinstance(resources, list) else [resources]
     assert resources != "*" and "*" not in resource_list
+
+
+def test_the_task_role_may_mint_the_web_identity_token_claude_platform_forwards() -> None:
+    """The Claude Platform gateway calls ``sts:GetWebIdentityToken`` AS THE CALLER to mint
+    the JWT it forwards to Anthropic, so ``CreateInference`` alone is refused with a 403
+    naming that action. Found 2026-10-03: the step-0 probe passed only because it ran as an
+    administrator. Scoped exactly as AWS's own ``Anthropic*Access`` managed policies scope it:
+    Anthropic's two audiences, and only when the gateway is the caller."""
+    by_action: dict[str, dict[str, Any]] = {}
+    for s in _statements(TASK_ROLE):
+        actions = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+        for a in actions:
+            if a.lower().startswith("sts:"):
+                by_action[a] = s
+    assert set(by_action) == {"sts:GetWebIdentityToken", "sts:TagGetWebIdentityToken"}
+    token = by_action["sts:GetWebIdentityToken"]
+    assert token["Effect"] == "Allow"
+    condition = token["Condition"]
+    assert condition["StringEquals"] == {
+        "aws:CalledViaLast": "aws-external-anthropic.amazonaws.com"
+    }
+    assert sorted(condition["ForAnyValue:StringEquals"]["sts:IdentityTokenAudience"]) == [
+        "https://api.anthropic.com",
+        "https://platform.claude.com",
+    ]
