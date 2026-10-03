@@ -1377,6 +1377,31 @@ The store's question filter states `request ? 'question_key'` itself, so the pla
 applies (`tests/test_intel_run_log.py` asserts both indexes are chosen for the store's own predicates). The down
 drops the table (every run's log, and its grant) and both indexes; the runs are untouched. No `svc` view changes.
 
+## 2k. Likeness intel — the terms note is optional (migration 0047)
+
+Owner decision 2026-10-03 (spec `2026-09-27-likeness-intel-design.md` §3.2, amended). `intel_sources.terms_note` was
+`TEXT NOT NULL CHECK (length(terms_note) >= 10)` (0039, unnamed, so Postgres named it
+`intel_sources_terms_note_check`). It is now:
+
+```sql
+terms_note        TEXT                                 -- intel_sources_terms_note_length:
+                                                       --   terms_note IS NULL OR length(terms_note) BETWEEN 1 AND 500
+validation_run_id UUID REFERENCES intel_runs(run_id)   -- the source_validation run that found the source ready
+validated_at      TIMESTAMPTZ                          -- that run's completed_at
+-- intel_sources_validation_evidence_paired: (validation_run_id IS NULL) = (validated_at IS NULL)
+```
+
+The API trims a note and stores a blank one as NULL, so the CHECK's lower bound is only a floor. The evidence pair is
+written by stage 4 (`POST /weight-suggestions`) on a source it registers, from the validation read it already makes
+to check readiness. A source created with `POST /sources` (never validated), a reused source (never rewritten) and
+every source that existed before 0047 carry neither. The up finds 0039's CHECK by its definition (0043's precedent).
+0039's table-level grants to `intel_rw` cover the new columns; no grant changes.
+
+The down drops both columns (their FK and the paired CHECK with them), gives a NULL note the placeholder
+`recorded while terms notes were optional`, appends ` (recorded while terms notes were optional)` to a note shorter
+than 10 characters so the operator's text is kept, and restores `NOT NULL` and `intel_sources_terms_note_check`. No
+`svc` view changes.
+
 ---
 
 ## 3. Adjudication service

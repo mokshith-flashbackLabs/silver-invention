@@ -698,8 +698,8 @@ release rather than asking anyone. (The design spec's §4.7 also names a second 
 
 | Route | Request body | Success | Error codes |
 |---|---|---|---|
-| `POST /v1/admin/intel/sources` | `kind` (`policy_page`\|`feed`\|`news`\|`breach_index`\|`regulator`\|`research`\|`search_query`), `source_url?`, `query_text?`, `tags[]`, `check_every_hours` (6–720), `terms_note` (≥10 chars — why automated access is permitted), `operator` | `201` the created source | `422 known_hit_location`, `422 query_names_a_person`, `422 unknown_tag`, `422 tag_retired`, `422 validation_error`; `409 source_tags_unmapped` with `error.slugs` when the source's non-empty tags are all unmapped in the live quiz (*amended 2026-10-01, final review M5*: the tick would pause it within one poll, so a create is refused exactly as an enable is) |
-| `PATCH /v1/admin/intel/sources/{id}` | Any of `enabled`, `check_every_hours`, `tags`, `terms_note`, `query_text` (all optional), `operator` | `200` the updated source | `404 intel_source_not_found`, `422 query_text_wrong_kind` (only a `search_query` source may carry one), `422 query_names_a_person`, `422 unknown_tag`, `422 tag_retired`, `422 validation_error` |
+| `POST /v1/admin/intel/sources` | `kind` (`policy_page`\|`feed`\|`news`\|`breach_index`\|`regulator`\|`research`\|`search_query`), `source_url?`, `query_text?`, `tags[]`, `check_every_hours` (6–720), `terms_note?` (why automated access is permitted; *amended 2026-10-03*: optional, omitted/null/blank is stored null, a given note is trimmed and 1–500 chars; it was required and ≥10 chars), `operator` | `201` the created source | `422 known_hit_location`, `422 query_names_a_person`, `422 unknown_tag`, `422 tag_retired`, `422 validation_error`; `409 source_tags_unmapped` with `error.slugs` when the source's non-empty tags are all unmapped in the live quiz (*amended 2026-10-01, final review M5*: the tick would pause it within one poll, so a create is refused exactly as an enable is) |
+| `PATCH /v1/admin/intel/sources/{id}` | Any of `enabled`, `check_every_hours`, `tags`, `terms_note`, `query_text` (all optional), `operator`. *Amended 2026-10-03:* `terms_note` is trimmed and 1–500 chars; a PATCH sets a note but never clears one (null, blank and omitted all leave it as it is) | `200` the updated source | `404 intel_source_not_found`, `422 query_text_wrong_kind` (only a `search_query` source may carry one), `422 query_names_a_person`, `422 unknown_tag`, `422 tag_retired`, `422 validation_error` |
 | `GET /v1/admin/intel/sources?cursor=&limit=` | — | `200 {sources, next_cursor}` | `422 invalid_cursor` |
 | `POST /v1/admin/intel/sources/{id}/check` | `operator` | `200 {run_id}` | `404 intel_source_not_found` |
 | `POST /v1/admin/intel/documents` | `url` (https only), `operator` | `202 {run_id}` — queues an `adhoc_url` run | `422 known_hit_location` |
@@ -969,11 +969,11 @@ cap ($50/day), until an operator disables it on the Sources screen. Services cha
 | S2 | `GET /v1/admin/intel/source-proposals/{run_id}` | — | `200 {run_id, status, error_code, options: [{option, tags, existing: [Source], proposed: [{kind, source_url, query_text, reason}]}] \| null}`. `options` is null until the run finishes. A candidate carries both locator keys, one null. `existing` are full source rows, enabled first | `404 intel_run_not_found` (unknown id, or a run of another kind) |
 | S3 | `POST /v1/admin/intel/source-validations` | `{candidates: 1–250 × {option: 1–200, kind, source_url?, query_text?: 1–300}, operator}`. `search_query` ⟺ `query_text` and no `source_url`; every other kind an https `source_url` and no `query_text` | `202 {run_id}`. **A known hit location is a per-candidate `blocked`, never a synchronous 422.** | `422 query_names_a_person` (*amended 2026-10-01, final review I1*): any candidate's `query_text` holding a phone- or email-shaped run refuses the whole body, with the same envelope as `POST /sources` and S5 and no `entries`. It was a per-candidate `blocked`, and the run then stored the string forever in its request and results, served it on this poll and on `GET /runs`, and logged it |
 | S4 | `GET /v1/admin/intel/source-validations/{run_id}` | — | `200 {run_id, status, error_code, results: [{candidate: {option, kind, source_url, query_text}, status: 'ready' \| 'blocked', reason: string \| null}] \| null, honoured_until: timestamptz \| null}`. `candidate` echoes the request's own values | `404 intel_run_not_found` |
-| S5 | `POST /v1/admin/intel/weight-suggestions` | `{question_key, prompt, type: string \| null (required), options, cap?: int 0–10 \| null, tags?, sources?: 0–250 × {option ∈ options, kind, source_url?, query_text?, validation_run_id: uuid, terms_note: 10–500, check_every_hours?: 6–720}, operator}` | `202 {run_id}` | `422 source_not_validated` with `error.entries: [{index, reason}]`, reason ∈ `unknown_run` · `expired` · `not_ready`; `422 known_hit_location`; `422 query_names_a_person`; `422 unknown_tag` with `error.slugs` (a tag of an option that has a chosen source, unknown to services' vocabulary; tags of options with no chosen source are never checked) |
+| S5 | `POST /v1/admin/intel/weight-suggestions` | `{question_key, prompt, type: string \| null (required), options, cap?: int 0–10 \| null, tags?, sources?: 0–250 × {option ∈ options, kind, source_url?, query_text?, validation_run_id: uuid, terms_note?: 1–500 \| null, check_every_hours?: 6–720}, operator}`. *Amended 2026-10-03:* `terms_note` is optional (it was required, 10–500); a newly registered source records `validation_run_id` and that run's completion time as `validated_at` instead | `202 {run_id}` | `422 source_not_validated` with `error.entries: [{index, reason}]`, reason ∈ `unknown_run` · `expired` · `not_ready`; `422 known_hit_location`; `422 query_names_a_person`; `422 unknown_tag` with `error.slugs` (a tag of an option that has a chosen source, unknown to services' vocabulary; tags of options with no chosen source are never checked) |
 | S6 | `GET /v1/admin/intel/weight-suggestions/{run_id}` | — | `200 {run_id, status, proposal_id \| null, error_code \| null, options: [SuggestionOption] \| null, sources_deferred: int}` | `404 intel_run_not_found` |
 | S7 | `GET /v1/admin/intel/proposals/{proposal_id}` (step 2's route, a `weight_suggestion`) | — | step 2's body, whose `target.options[]` carry `deduction`, **plus `options: [SuggestionOption]`**. Proposal-level `approvable: false`, `why_not: 'not_decidable'` | `404 proposal_not_found` |
 | S8 | `PATCH /v1/admin/intel/sources/{source_id}` (step 1's route) | unchanged | unchanged | **new:** `409 source_tags_unmapped` with `error.slugs`, when the body sets `enabled: true` and every tag the source would carry is unmapped in services' vocabulary |
-| S9 | `GET /v1/admin/intel/sources` (step 1's route) | unchanged | each source gains `origin` (`suggested` · `operator`) and `proposed_for` (`{question_key, option}` or null). `disabled_reason` may now be `unmapped` | unchanged |
+| S9 | `GET /v1/admin/intel/sources` (step 1's route) | unchanged | each source gains `origin` (`suggested` · `operator`) and `proposed_for` (`{question_key, option}` or null). `disabled_reason` may now be `unmapped`. *Amended 2026-10-03:* `terms_note` may be null, and each source gains `validation_run_id` (uuid or null) and `validated_at` (timestamptz or null) | unchanged |
 | S10 | `GET /v1/admin/intel/proposals?kind=coverage_gap` and `POST /proposals/{id}/decision` on a gap (step 2, **step 6's whole services surface**) | unchanged | unchanged: a gap row carries `target: {subject, suggested_tag?, suggested_question?, regenerated_by_run_id?}`, `approvable: false`, `why_not: 'not_decidable'`. Dismissal (`rejected`) answers `200` | approving: `409 proposal_not_decidable` |
 
 **`SuggestionOption`** is `{option, deduction: int \| null, rationale, signal_ids: uuid[], suggested_tags: slug[],
@@ -1105,6 +1105,41 @@ wording. The vocabulary is closed (0046's CHECK):
 
 **Deploy order:** services first (migration 0046, then services and services-worker), then the backend. On the way
 down the backend goes first; 0046's down drops every run's log and nothing else.
+
+### Likeness intel admin surface — the terms note is optional (2026-10-03)
+
+**Owner decision 2026-10-03.** A source's `terms_note` (the operator's free text on why reading the site
+automatically is allowed) was required, at least 10 characters, on every source. On a Suggest-points question that
+is one note per chosen source, often 17 or more, and in practice it was typed as filler. It is now **optional**, and a
+source registered from a validation records the **automatic evidence** instead: the validation run that found it
+`ready` (where the fetch, https and `robots.txt` checks passed) and when that run completed. Migration 0047. No route
+is new, none is removed, and no `svc` view changes.
+
+**Request rules, the same on every body that carries a note:**
+- omitted, `null`, or blank once trimmed: **no note**, stored and answered as `null`;
+- otherwise the note is **trimmed** and must be **1–500 characters** after trimming (`422 validation_error` past 500).
+  The 10-character minimum is gone: `"x"` is a note.
+
+| Body | Rule |
+|---|---|
+| `POST /v1/admin/intel/sources` | `terms_note?` as above. The source carries no evidence: it was never validated |
+| `POST /v1/admin/intel/weight-suggestions` (S5), each `sources[]` entry | `terms_note?` as above. A source this call **registers** stores the entry's `validation_run_id` and that run's `completed_at` as `validated_at`. A source it **reuses** is never rewritten: its own note and evidence stand, whatever the entry sends |
+| `PATCH /v1/admin/intel/sources/{id}` | `terms_note?` sets a note. **A PATCH never clears one**: `null`, blank and omitted all leave the stored note as it is, because the store coalesces every field and there is no separate "clear" signal |
+
+**Every Source the admin routes return gains two fields** (`GET /sources`, `POST /sources`, `PATCH /sources/{id}`,
+and each `existing` row of the stage-1 poll, S2):
+- `terms_note`: `string | null`;
+- `validation_run_id`: `uuid | null`, the `source_validation` run that found the source ready;
+- `validated_at`: `timestamptz | null`, when that run completed.
+
+The two evidence fields are set together or not at all (a CHECK). They are set on a source registered by S5 and null
+on one created with `POST /sources` and on every source that existed before 0047.
+
+**Deploy order:** services first (migration 0047, then services and services-worker), then the backend, whose own
+schemas still require a note of at least 10 characters until it relaxes them. On the way down, roll back services and
+services-worker and **run 0047's down at once**: the old code cannot read a source with no note, and the down gives
+each one a placeholder (`recorded while terms notes were optional`; a note shorter than 10 characters keeps its text
+with the same words appended in brackets) and drops the two evidence columns.
 
 ---
 

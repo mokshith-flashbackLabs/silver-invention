@@ -187,7 +187,8 @@ pending `coverage_gap` about LinkedIn closes itself (§4.9). Nothing in services
 | `tags` | A hint for the extractor. May be empty. Well-formed by CHECK; membership checked on write. |
 | `check_every_hours` | `CHECK BETWEEN 6 AND 720` |
 | `next_check_at`, `enabled`, `created_by`, `created_at`, `updated_at` | |
-| `terms_note` | TEXT NOT NULL, `CHECK (length(terms_note) >= 10)`. §7.7: whoever adds a source records that automated access to it is permitted. |
+| `terms_note` | TEXT NOT NULL, `CHECK (length(terms_note) >= 10)`. §7.7: whoever adds a source records that automated access to it is permitted. *Amended 2026-10-03 (owner decision, migration 0047):* optional. NULL when none is given, else 1–500 characters after trimming (`intel_sources_terms_note_length`). |
+| `validation_run_id`, `validated_at` | *Added 2026-10-03 (0047).* The automatic evidence in place of a required note: the `source_validation` run that found the source ready (§4.10 stage 3), and when it completed. Set together or not at all; set when stage 4 registers a source, NULL for a `POST /sources` source. |
 | `last_content_sha256` | The normalised hash from the last *consumed* check (§4.3). Not used for `policy_page` (its snapshot holds it) or `feed` (unseen items gate it instead). |
 | `last_checked_at`, `last_run_status`, `consecutive_failures` | `consecutive_failures SMALLINT NOT NULL DEFAULT 0`, reset on success |
 | `disabled_reason` | `CHECK (disabled_reason IN ('too_short','unreachable'))`, `CHECK (disabled_reason IS NULL OR NOT enabled)`. An operator's `PATCH enabled=true` clears it. |
@@ -198,6 +199,15 @@ pending `coverage_gap` about LinkedIn closes itself (§4.9). Nothing in services
 *Amended 2026-09-30 (decision 11):* sources tied to a quiz option now arrive through the Suggest points flow (§4.10),
 which adds `origin` and `proposed_for` and a third `disabled_reason`, `unmapped`, for a source paused because none of
 its tags maps to a live option. `POST /sources` stays for general sources.
+
+*Amended 2026-10-03 (owner decision, migration 0047):* `terms_note` is **optional** everywhere it is accepted. It was
+required and at least 10 characters, which on a Suggest-points question meant one note per chosen source, and in
+practice it was typed as filler. Omitted, null or blank is no note (NULL); a given note is trimmed and 1–500
+characters. In its place a source registered at stage 4 (§4.10) records **automatic evidence**:
+`validation_run_id`, the stage-3 run that found it ready (fetched over https, `robots.txt` honoured, the text floor
+met), and `validated_at`, when that run completed. A source added with `POST /sources` was never validated and carries
+neither. Robots stays a floor, not a permission (§4.10); what changed is only that an operator no longer has to type a
+sentence to say so.
 
 ### 3.3 Snapshots — only for `policy_page`
 
@@ -924,7 +934,7 @@ signals.
 
 | Route | Does |
 |---|---|
-| `GET /sources` · `POST /sources` · `PATCH /sources/{id}` | Registry. PATCH changes `enabled`, `check_every_hours`, `tags`, `terms_note` and `query_text`. `POST` refuses a known hit location (`422 known_hit_location`) and a PII-shaped `query_text` (`422 query_names_a_person`). |
+| `GET /sources` · `POST /sources` · `PATCH /sources/{id}` | Registry. PATCH changes `enabled`, `check_every_hours`, `tags`, `terms_note` and `query_text`. `POST` refuses a known hit location (`422 known_hit_location`) and a PII-shaped `query_text` (`422 query_names_a_person`). *Amended 2026-10-03:* `terms_note` is optional on `POST` (§3.2); a PATCH may set a note but never clear one (null, blank and omitted leave it). Every source returned carries `validation_run_id` and `validated_at`. |
 | `POST /sources/{id}/check` | Queues a `source_check`, or returns the open one (§3.4) |
 | `POST /documents` | Pastes a URL and queues an `adhoc_url` run. `422 known_hit_location` is checked synchronously. |
 | `GET /runs` | Recent runs with outcomes, plus a top-level `spend` block: `{spend_date, call_count, spent_today_usd, daily_budget_usd, budget_headroom_usd}` for `claude_intel`. It is read from the same UTC-day `provider_spend` row the budget guard enforces, **never summed from runs**. Money crosses as decimal strings. `daily_budget_usd` is null while unset. |
@@ -1155,7 +1165,8 @@ afterwards; nothing about how a registered source is checked changes.
      `intel/bounds.py`) otherwise. This catches app shells before they cost a scheduled check;
    - **robots:** the host's `robots.txt` must not disallow the path for our user agent (`robots_disallowed`). The
      fetcher gains this check (§4.2, amended): it fetches `robots.txt` under the same SSRF guard and caches it per host
-     for 24 hours. Robots is a floor, not a permission: the operator's `terms_note` (§3.2) is still required;
+     for 24 hours. Robots is a floor, not a permission: the operator's `terms_note` (§3.2) is still required
+     (*amended 2026-10-03*: no longer; the note is optional, and stage 4 records this run as the source's evidence);
    - a `feed` must parse as RSS or Atom with at least one item;
    - a `search_query` passes the PII check, then **one** web search, metered through the gate like any call, must
      return at least one https URL that passes the checks above.
@@ -1169,6 +1180,11 @@ afterwards; nothing about how a registered source is checked changes.
      (`suggested` when it came from stage 1, `operator` otherwise), `proposed_for = {question_key, option}`, the
      option's tags from the request's `tags` map or the vocabulary, and `check_every_hours` defaulting to 168;
    - queues the `weight_suggestion` run.
+
+   *Amended 2026-10-03 (owner decision, migration 0047):* each entry's `terms_note` is optional (`terms_note?`). A
+   source this call **registers** stores the entry's `validation_run_id` and that run's completion time as
+   `validated_at`, read from the same validation lookup that checks readiness. A **reused** source is never rewritten,
+   so its own note and evidence stand.
 
    That run first performs an **immediate check of every newly registered source**, inside the run rather than as
    separate queued runs, then retrieval (§4.6) and the suggestion. **Its call cap is
