@@ -6,14 +6,15 @@ Claude Platform on AWS via AnthropicAWS: SigV4 with the task role, no API key.
 it. Server-side fallbacks are OFF: a declined document is recorded, never
 rescued by another model (#4 for intel).
 
-**Why this calls ``messages.create`` and never ``messages.parse``.** In
+**Why this never calls ``messages.parse``.** In
 ``anthropic==1.8.0``, ``.parse()`` validates the response's text block with
 ``TypeAdapter.validate_json`` INSIDE the call and raises ``pydantic.ValidationError``
 straight out of it on bad/truncated/non-JSON output -- before returning anything,
 including ``usage``. A billed call that fails to parse would then vanish with no
 usage and no cost recorded, and the caller (task 9's ``metered`` wrapper) only
-catches ``ModelUnavailable``. So every call here goes through ``messages.create``
-with the same structured-output ``output_config`` ``.parse()`` builds internally
+catches ``ModelUnavailable``. So every call here went through ``messages.create``
+(``messages.stream`` since 2026-10-03, below) with the same structured-output
+``output_config`` ``.parse()`` builds internally
 (``_output_config`` below, verified against ``anthropic.lib._parse._transform
 .transform_schema`` and ``anthropic.resources.messages.Messages.parse``'s own
 source in the installed package -- there is no public helper that builds this
@@ -23,6 +24,27 @@ neutral, no parse attempted), only then does a caught ``model_validate_json`` on
 the final text block. Usage, cost and latency are attached on every one of those
 paths -- only a genuine transport/status failure (which never returns a
 ``Message`` at all) raises, for the metering layer to classify as unavailable.
+
+**Every call is STREAMED (the run log, spec 2026-10-03 §3.4).**
+``messages.stream`` takes the same arguments ``create`` took, and the request it
+sends is the same apart from ``stream: true``. Passing ``output_config`` and never
+``output_format`` keeps the stream from parsing anything itself either
+(``AsyncMessageStreamManager``'s ``output_format`` stays omitted, so
+``accumulate_event`` never calls ``parse_text`` at a ``content_block_stop``), and
+``get_final_message()`` hands back the accumulated ``Message`` this module has
+always classified: same ``ModelCall``, same usage, same pricing, same outcome.
+The events are fed to ``run_log.StreamTranslator`` on the way through, so an
+operator can watch a call of several minutes as it happens. Thinking is
+``{"type": "adaptive", "display": "summarized"}``: a readable summary for that
+log (``display`` does not change billing).
+
+Failures are classified as before, now raised from entering OR iterating the
+stream, plus two shapes only a stream has: an ``error`` event inside an open
+stream (an ``APIStatusError`` carrying the stream's own 200, a server-side
+failure such as ``overloaded_error``, retried like a 5xx), and a transport error
+mid-body, which the SDK does not wrap (``httpx2``'s, mapped exactly as the SDK
+maps the same error before a body: a timeout is ``timeout``, anything else a
+retried connection failure).
 """
 
 from __future__ import annotations
@@ -35,11 +57,19 @@ from decimal import Decimal
 from typing import Any, Generic, Literal, Protocol, TypeVar
 
 import anthropic
+import httpx2
 from anthropic.lib._parse._transform import transform_schema
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from imageshield.intel.config import IntelConfig
 from imageshield.intel.pricing import Usage, cost_of
+from imageshield.intel.run_log import (
+    MAX_FAILURE_MESSAGE_CHARS,
+    StreamTranslator,
+    current_run_log,
+    note_continuing,
+    note_model_call_started,
+)
 from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractionOutput,
@@ -58,6 +88,9 @@ _MAX_TOKENS = 8000
 _PROPOSAL_EFFORT = "high"
 # spec §4.10 stage 3: a search_query candidate costs ONE web search.
 _VALIDATION_SEARCHES = 1
+# The run log shows Claude's reasoning summary (spec 2026-10-03 §2): on Claude 5 models the
+# default display is "omitted", an empty text. Billing does not depend on `display`.
+_THINKING = {"type": "adaptive", "display": "summarized"}
 
 
 @dataclass(frozen=True)
@@ -79,12 +112,69 @@ class ModelCall(Generic[T]):
 class ModelUnavailable(Exception):
     """A call never came back as a ``Message`` at all -- timeout, a 5xx/429
     status, or a connection failure. Distinct from every ``ModelCall`` outcome,
-    which all describe an answer the model DID return."""
+    which all describe an answer the model DID return.
 
-    def __init__(self, status: Literal["timeout", "error", "rate_limited"], detail: str) -> None:
+    ``detail`` is what ``provider_calls.error_detail`` records (``PermissionDeniedError:403``),
+    unchanged. ``message`` (the API's own words, at most ``MAX_FAILURE_MESSAGE_CHARS``),
+    ``error_type`` and ``http_status`` are for the run log's ``model_call_failed`` row ONLY
+    (spec 2026-10-03 §3.4): the reason a call was refused used to be recoverable only by a
+    one-off probe."""
+
+    def __init__(
+        self,
+        status: Literal["timeout", "error", "rate_limited"],
+        detail: str,
+        *,
+        message: str | None = None,
+        error_type: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
         super().__init__(f"{status}: {detail}")
         self.status = status
         self.detail = detail
+        self.message = message
+        self.error_type = error_type or detail.split(":", 1)[0]
+        self.http_status = http_status
+
+
+def _error_message(exc: Exception) -> str | None:
+    """The API's own explanation, whitespace collapsed, at most ``MAX_FAILURE_MESSAGE_CHARS``:
+    ``error.message`` of an Anthropic error body, else an AWS-style top-level ``message``, else
+    the exception's own message."""
+    message: object = None
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+        if not isinstance(message, str) or not message.strip():
+            message = body.get("message", body.get("Message"))
+    if not isinstance(message, str) or not message.strip():
+        message = getattr(exc, "message", None) or str(exc)
+    text = " ".join(str(message).split())
+    return text[:MAX_FAILURE_MESSAGE_CHARS] or None
+
+
+def _unavailable(
+    status: Literal["timeout", "error", "rate_limited"], detail: str, exc: Exception
+) -> ModelUnavailable:
+    http_status = getattr(exc, "status_code", None)
+    return ModelUnavailable(
+        status,
+        detail,
+        message=_error_message(exc),
+        error_type=type(exc).__name__,
+        http_status=http_status if isinstance(http_status, int) else None,
+    )
+
+
+def _max_searches(tools: object) -> int | None:
+    """The web-search tool's ``max_uses``, or None for a call without the tool."""
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and isinstance(tool.get("max_uses"), int):
+                return int(tool["max_uses"])
+    return None
 
 
 class IntelModel(Protocol):
@@ -131,7 +221,7 @@ class ClaudeIntelModel:
             cost_of(model_id, Usage(0, 0, 0, 0, 0))
         self._config = config
         # Explicitly `Any`: an injected test double (SimpleNamespace) is not an
-        # AsyncAnthropicAWS, and `self._client.messages.create(**kwargs)` below
+        # AsyncAnthropicAWS, and `self._client.messages.stream(**kwargs)` below
         # must not be checked against the real client's narrow model Literal.
         self._client: Any = client or anthropic.AsyncAnthropicAWS(
             aws_region=config.intel_anthropic_region,
@@ -140,36 +230,61 @@ class ClaudeIntelModel:
         )
 
     async def _send(
-        self, output_format: type[T], *, model: str, effort: str | None = None, **kwargs: Any
+        self,
+        output_format: type[T],
+        *,
+        model: str,
+        effort: str | None = None,
+        announce: bool = True,
+        **kwargs: Any,
     ) -> ModelCall[T]:
+        """One streamed API call, retried within ``_RETRIES``. ``announce`` writes the run log's
+        ``model_call_started``; ``_search`` turns it off on a ``pause_turn`` resume, which its own
+        ``continuing`` row announces instead."""
         started = time.monotonic()
         output_config = _output_config(output_format)
         if effort is not None:
             output_config["effort"] = effort
+        run_log = current_run_log.get()
+        if announce:
+            await note_model_call_started(model, _max_searches(kwargs.get("tools")))
         response: Any = None
         for attempt in range(1, _RETRIES + 1):
+            translator = StreamTranslator(run_log) if run_log is not None else None
             try:
-                response = await self._client.messages.create(
+                async with self._client.messages.stream(
                     model=model,
                     max_tokens=_MAX_TOKENS,
-                    thinking={"type": "adaptive"},
+                    thinking=_THINKING,
                     output_config=output_config,
                     **kwargs,
-                )
+                ) as stream:
+                    async for event in stream:
+                        if translator is not None:
+                            await translator.feed(event)
+                    response = await stream.get_final_message()
                 break
             except anthropic.RateLimitError as exc:
                 if attempt == _RETRIES:
-                    raise ModelUnavailable("rate_limited", type(exc).__name__) from exc
+                    raise _unavailable("rate_limited", type(exc).__name__, exc) from exc
             except anthropic.APITimeoutError as exc:
-                raise ModelUnavailable("timeout", type(exc).__name__) from exc
+                raise _unavailable("timeout", type(exc).__name__, exc) from exc
             except anthropic.APIStatusError as exc:
-                if exc.status_code < 500 or attempt == _RETRIES:
-                    raise ModelUnavailable(
-                        "error", f"{type(exc).__name__}:{exc.status_code}"
+                # A 4xx is final. A 5xx, or an `error` event inside an open stream (the stream's
+                # own 200), is a server-side failure and retried.
+                if 400 <= exc.status_code < 500 or attempt == _RETRIES:
+                    raise _unavailable(
+                        "error", f"{type(exc).__name__}:{exc.status_code}", exc
                     ) from exc
             except anthropic.APIConnectionError as exc:
                 if attempt == _RETRIES:
-                    raise ModelUnavailable("error", type(exc).__name__) from exc
+                    raise _unavailable("error", type(exc).__name__, exc) from exc
+            except httpx2.TimeoutException as exc:
+                # Mid-body: the SDK wraps transport errors only before a response arrives.
+                raise _unavailable("timeout", type(exc).__name__, exc) from exc
+            except httpx2.TransportError as exc:
+                if attempt == _RETRIES:
+                    raise _unavailable("error", type(exc).__name__, exc) from exc
             await asyncio.sleep(min(8.0, 0.5 * 2**attempt) * (0.5 + random.random()))
         assert response is not None
 
@@ -249,6 +364,7 @@ class ClaudeIntelModel:
             call = await self._send(
                 output_format,
                 model=self._config.intel_extraction_model,
+                announce=pause_turns == 0,
                 system=system,
                 tools=tools,
                 messages=messages,
@@ -279,6 +395,7 @@ class ClaudeIntelModel:
                     pause_turns=pause_turns,
                 )
             pause_turns += 1
+            await note_continuing(pause_turns)
             # Resume per Anthropic's stop-reason handling guidance: resend the original user turn
             # plus the paused assistant turn verbatim; the server resumes from the trailing
             # server_tool_use block.

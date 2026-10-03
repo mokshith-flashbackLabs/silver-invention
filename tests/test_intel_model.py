@@ -1,7 +1,11 @@
 """The model seam (task 8, spec §4.4/§5): schemas, prompts, pricing,
 ``ClaudeIntelModel`` and the stub. No network call, ever -- ``ClaudeIntelModel``
-takes an injected client double whose ``messages.create`` is the only thing it
-calls, matching ``anthropic.AsyncAnthropicAWS``'s shape.
+takes an injected client double whose ``messages.stream`` is the only thing it
+calls, matching ``anthropic.AsyncAnthropicAWS``'s shape: an async context manager
+whose stream yields events and then hands back the final message (every call is
+streamed since 2026-10-03, the run log). The run-log tests at the end drive the
+installed SDK's own ``AsyncMessageStream`` over scripted raw events, so the event
+and block shapes the translator reads are anthropic 1.8.0's, not a guess.
 
 Isolated from any developer ``.env.local`` the same way ``test_intel_config.py``
 is: ``clean_env`` chdirs to a fresh ``tmp_path`` and deletes every key first.
@@ -12,18 +16,26 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
+import anthropic
+import httpx2
 import pytest
+from anthropic._models import construct_type
+from anthropic.lib.streaming import AsyncMessageStreamManager
+from anthropic.types import RawMessageStreamEvent
 
 from imageshield.intel import prompts
 from imageshield.intel.config import IntelConfig
 from imageshield.intel.model import ClaudeIntelModel, ModelUnavailable
 from imageshield.intel.pricing import UnknownModelPrice, Usage, cost_of
 from imageshield.intel.prompts import extraction_request
+from imageshield.intel.run_log import RunLog, StreamTranslator, current_run_log
 from imageshield.intel.schemas import (
     DiscoveryCandidate,
     DiscoveryOutput,
@@ -35,6 +47,7 @@ from imageshield.intel.schemas import (
     SuggestionOutput,
 )
 from imageshield.intel.stub import StubIntelModel
+from tests.intel_fakes import MemoryRunEvents
 from tests.test_intel_config import BASE
 
 # Not imported from test_intel_config: a `clean_env` parameter here would
@@ -74,20 +87,57 @@ def _text_block(text: str) -> SimpleNamespace:
     return SimpleNamespace(type="text", text=text)
 
 
+class _FakeStream:
+    """What ``async with client.messages.stream(...)`` yields: events, then the final message.
+    ``error`` is raised after the events, the way a stream breaks mid-body."""
+
+    def __init__(self, events: list[Any], final: Any, error: Exception | None) -> None:
+        self._events = events
+        self._final = final
+        self._error = error
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for event in self._events:
+            yield event
+        if self._error is not None:
+            raise self._error
+
+    async def get_final_message(self) -> Any:
+        return self._final
+
+
+class _FakeStreamManager:
+    """``messages.stream(...)``'s return: an exception item is raised on entering, as a refused
+    request is; anything else is the final message of a stream with no events."""
+
+    def __init__(self, item: Any) -> None:
+        self._item = item
+
+    async def __aenter__(self) -> Any:
+        if isinstance(self._item, Exception):
+            raise self._item
+        if isinstance(self._item, AsyncMessageStreamManager):
+            return await self._item.__aenter__()
+        return _FakeStream([], self._item, None)
+
+    async def __aexit__(self, *exc: object) -> None:
+        if isinstance(self._item, AsyncMessageStreamManager):
+            await self._item.__aexit__(None, None, None)
+
+
 class FakeMessages:
-    """Stands in for ``client.messages`` -- only ``.create`` is exercised,
-    never ``.parse`` (see model.py's module docstring for why)."""
+    """Stands in for ``client.messages`` -- only ``.stream`` is exercised, never ``.create`` or
+    ``.parse`` (see model.py's module docstring for why). Each item is the final message of a
+    call, an exception the call raises, or ``sdk_stream(...)``: the real SDK stream over
+    scripted raw events."""
 
     def __init__(self, responses: list[Any]) -> None:
         self._responses = responses
         self.calls: list[dict[str, Any]] = []
 
-    async def create(self, **kwargs: Any) -> Any:
+    def stream(self, **kwargs: Any) -> _FakeStreamManager:
         self.calls.append(kwargs)
-        item = self._responses.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
+        return _FakeStreamManager(self._responses.pop(0))
 
 
 def _model(
@@ -335,7 +385,8 @@ async def test_propose_uses_the_proposal_model_with_explicit_effort(
     sent = fake.calls[0]
     assert sent["model"] == "claude-opus-5-5"
     assert sent["output_config"]["effort"] == "high"
-    assert sent["thinking"] == {"type": "adaptive"}
+    # The run log shows Claude's reasoning summary (spec 2026-10-03 §2).
+    assert sent["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert call.cost_usd == cost_of("claude-opus-5-5", Usage(1000, 100, 0, 0, 0))
 
 
@@ -517,3 +568,406 @@ async def test_the_stub_answers_the_step5_calls_with_nothing() -> None:
     assert (await stub.propose_sources("s", "u")).output == SourceProposalOutput()
     assert (await stub.search_once("s", "u")).output == DiscoveryOutput(candidates=[])
     assert (await stub.suggest_weights("s", "u")).output == SuggestionOutput()
+
+
+# ── the run log: streaming translation (spec 2026-10-03 §3.4) ─────────────────────────────────
+
+
+class _RawStream:
+    """Stands in for the SDK's ``AsyncStream[RawMessageStreamEvent]``: the raw events the API
+    sends, as the SDK's own models, so ``AsyncMessageStream`` accumulates and fires its events
+    exactly as it does against the wire."""
+
+    def __init__(self, raw: list[dict[str, Any]], error: Exception | None) -> None:
+        self._events = [construct_type(type_=RawMessageStreamEvent, value=event) for event in raw]
+        self._error = error
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for event in self._events:
+            yield event
+        if self._error is not None:
+            raise self._error
+
+    async def close(self) -> None:
+        return None
+
+
+def sdk_stream(
+    raw: list[dict[str, Any]], error: Exception | None = None
+) -> AsyncMessageStreamManager[Any]:
+    async def request() -> Any:
+        return _RawStream(raw, error)
+
+    return AsyncMessageStreamManager(request())
+
+
+def _message_start(model: str = "claude-sonnet-5", i: int = 1000) -> dict[str, Any]:
+    return {
+        "type": "message_start",
+        "message": {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": i, "output_tokens": 1},
+        },
+    }
+
+
+def _block(index: int, block: dict[str, Any], *deltas: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"type": "content_block_start", "index": index, "content_block": block},
+        *({"type": "content_block_delta", "index": index, "delta": d} for d in deltas),
+        {"type": "content_block_stop", "index": index},
+    ]
+
+
+def _message_end(
+    stop: str = "end_turn", *, i: int = 1000, o: int = 100, ws: int = 0
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {
+                "input_tokens": i,
+                "output_tokens": o,
+                "server_tool_use": {"web_search_requests": ws},
+            },
+        },
+        {"type": "message_stop"},
+    ]
+
+
+def _thinking(index: int, *parts: str) -> list[dict[str, Any]]:
+    return _block(
+        index,
+        {"type": "thinking", "thinking": "", "signature": ""},
+        *({"type": "thinking_delta", "thinking": part} for part in parts),
+        {"type": "signature_delta", "signature": "sig"},
+    )
+
+
+def _search(index: int, query: str) -> list[dict[str, Any]]:
+    encoded = json.dumps({"query": query})
+    half = len(encoded) // 2
+    return _block(
+        index,
+        {"type": "server_tool_use", "id": f"srvtoolu_{index}", "name": "web_search", "input": {}},
+        {"type": "input_json_delta", "partial_json": encoded[:half]},
+        {"type": "input_json_delta", "partial_json": encoded[half:]},
+    )
+
+
+def _results(index: int, *urls: str) -> list[dict[str, Any]]:
+    content = [
+        {
+            "type": "web_search_result",
+            "title": f"Result {n}",
+            "url": url,
+            "encrypted_content": "opaque",
+            "page_age": None,
+        }
+        for n, url in enumerate(urls)
+    ]
+    block = {
+        "type": "web_search_tool_result",
+        "tool_use_id": f"srvtoolu_{index - 1}",
+        "content": content,
+    }
+    return _block(index, block)
+
+
+def _search_error(index: int, code: str) -> list[dict[str, Any]]:
+    return _block(
+        index,
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": f"srvtoolu_{index - 1}",
+            "content": {"type": "web_search_tool_result_error", "error_code": code},
+        },
+    )
+
+
+def _text(index: int, text: str) -> list[dict[str, Any]]:
+    return _block(index, {"type": "text", "text": ""}, {"type": "text_delta", "text": text})
+
+
+@pytest.fixture
+def bound_log() -> Iterator[tuple[RunLog, MemoryRunEvents]]:
+    store = MemoryRunEvents()
+    run_log = RunLog(uuid4(), store)
+    token = current_run_log.set(run_log)
+    try:
+        yield run_log, store
+    finally:
+        current_run_log.reset(token)
+
+
+_FOUND = DiscoveryOutput(candidates=[DiscoveryCandidate(url="https://n.example/a", reason="r")])
+
+
+async def test_a_streamed_search_becomes_its_steps(
+    clean_env: pytest.MonkeyPatch, bound_log: tuple[RunLog, MemoryRunEvents]
+) -> None:
+    """One call, read off the installed SDK's own stream: ONE thinking row grown to the whole
+    summary, each search with its query (complete only at its block's stop), each result list
+    with titles and URLs, a search error by its code, and `writing` once, at the FIRST text
+    block."""
+    run_log, store = bound_log
+    raw = [
+        _message_start(),
+        *_thinking(0, "Looking for ", "recent breaches ", "on dating apps."),
+        *_text(1, "Let me search."),
+        *_search(2, "bumble data breach 2026"),
+        *_results(
+            3,
+            "https://www.bumble.com/en/news",
+            "https://techcrunch.com/a",
+            "https://www.theverge.com/b",
+            "https://techcrunch.com/c",
+        ),
+        *_search(4, "bumble leak"),
+        *_search_error(5, "max_uses_exceeded"),
+        *_text(6, _FOUND.model_dump_json()),
+        *_message_end(ws=2),
+    ]
+    model, _ = _model([sdk_stream(raw)], clean_env)
+    call = await model.discover("sys", "find things")
+    assert call.outcome == "ok" and call.output == _FOUND
+
+    events = store.events(run_log.run_id)
+    assert [e["kind"] for e in events] == [
+        "model_call_started",
+        "thinking",
+        "writing",
+        "search",
+        "search_results",
+        "search",
+        "search_results",
+    ]
+    started, thinking, writing, search, results, _, failed = events
+    assert started["text"] == "Asked claude-sonnet-5 (up to 5 web searches)"
+    assert started["detail"] == {"model": "claude-sonnet-5", "max_searches": 5}
+    summary = "Looking for recent breaches on dating apps."
+    assert thinking["text"] == summary and thinking["detail"] == {"chars": len(summary)}
+    assert writing["text"] == "Writing the answer" and writing["detail"] == {}
+    assert search["text"] == "Searched: bumble data breach 2026"
+    assert search["detail"] == {"query": "bumble data breach 2026"}
+    assert results["text"] == "4 results: bumble.com, techcrunch.com, theverge.com"
+    assert results["detail"]["count"] == 4 and results["detail"]["error_code"] is None
+    assert results["detail"]["results"][0] == {
+        "title": "Result 0",
+        "url": "https://www.bumble.com/en/news",
+    }
+    assert failed["text"] == "Search failed: max_uses_exceeded"
+    assert failed["detail"] == {"count": 0, "results": [], "error_code": "max_uses_exceeded"}
+
+
+async def test_a_call_without_the_search_tool_is_announced_without_a_limit(
+    clean_env: pytest.MonkeyPatch, bound_log: tuple[RunLog, MemoryRunEvents]
+) -> None:
+    run_log, store = bound_log
+    raw = [
+        _message_start("claude-opus-5-5"),
+        *_text(0, ProposalOutput().model_dump_json()),
+        *_message_end(),
+    ]
+    model, fake = _model([sdk_stream(raw)], clean_env)
+    await model.propose("sys", "user")
+    (started, writing) = store.events(run_log.run_id)
+    assert started["text"] == "Asked claude-opus-5-5"
+    assert started["detail"] == {"model": "claude-opus-5-5", "max_searches": None}
+    assert writing["kind"] == "writing"
+    assert fake.calls[0]["thinking"] == {"type": "adaptive", "display": "summarized"}
+
+
+async def test_a_pause_turn_resume_is_continuing_not_a_second_question(
+    clean_env: pytest.MonkeyPatch, bound_log: tuple[RunLog, MemoryRunEvents]
+) -> None:
+    """The resume is announced as `continuing`; the call itself was announced once."""
+    run_log, store = bound_log
+    paused = [
+        _message_start(i=100),
+        *_search(0, "first query"),
+        *_results(1, "https://a.example/x"),
+        *_message_end("pause_turn", i=100, o=10, ws=1),
+    ]
+    final = [
+        _message_start(i=200),
+        *_search(0, "second query"),
+        *_results(1, "https://b.example/y"),
+        *_text(2, _FOUND.model_dump_json()),
+        *_message_end(i=200, o=20, ws=1),
+    ]
+    model, fake = _model([sdk_stream(paused), sdk_stream(final)], clean_env)
+    call = await model.discover("sys", "find things")
+    assert call.pause_turns == 1 and call.output == _FOUND
+    assert call.usage == Usage(300, 30, 0, 0, 2)
+    assert store.kinds(run_log.run_id) == [
+        "model_call_started",
+        "search",
+        "search_results",
+        "continuing",
+        "search",
+        "search_results",
+        "writing",
+    ]
+    (continuing,) = [e for e in store.events(run_log.run_id) if e["kind"] == "continuing"]
+    assert continuing["text"] == "Continuing — Claude paused after its searches"
+    assert continuing["detail"] == {"pause_turns": 1}
+    # The paused turn is resent as the SDK accumulated it.
+    resent = fake.calls[1]["messages"][1]["content"]
+    assert [block.type for block in resent] == ["server_tool_use", "web_search_tool_result"]
+
+
+async def test_the_streamed_call_equals_the_call_today_for_the_same_message(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """Same final message, same ModelCall: what `create` returned and what the stream
+    accumulates are classified, priced and counted identically."""
+    text = _FOUND.model_dump_json()
+    raw = [_message_start(), *_text(0, text), *_message_end(o=100, ws=1)]
+    created = SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(i=1000, o=100, ws=1),
+        content=[_text_block(text)],
+    )
+    streamed_model, _ = _model([sdk_stream(raw)], clean_env)
+    created_model, _ = _model([created], clean_env)
+    streamed = await streamed_model.search_once("sys", "q")
+    today = await created_model.search_once("sys", "q")
+    for name in ("output", "outcome", "answered_by", "stop_reason", "usage", "cost_usd"):
+        assert getattr(streamed, name) == getattr(today, name), name
+    assert streamed.pause_turns == today.pause_turns == 0
+
+
+def _status_error(cls: type[anthropic.APIStatusError], status: int, body: Any) -> Any:
+    request = httpx2.Request("POST", "https://anthropic.aws.example/v1/messages")
+    return cls("Error code", response=httpx2.Response(status, request=request), body=body)
+
+
+async def test_a_403_from_the_stream_is_unavailable_exactly_as_before_and_names_the_reason(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """`detail` is what provider_calls.error_detail records, unchanged; the API's own message
+    rides on the exception for the run log only."""
+    reason = "User is not authorized to perform: sts:GetWebIdentityToken"
+    refused = _status_error(
+        anthropic.PermissionDeniedError,
+        403,
+        {"type": "error", "error": {"type": "permission_error", "message": reason}},
+    )
+    model, fake = _model([refused], clean_env)
+    with pytest.raises(ModelUnavailable) as caught:
+        await model.propose("sys", "user")
+    assert (caught.value.status, caught.value.detail) == ("error", "PermissionDeniedError:403")
+    assert caught.value.message == reason
+    assert caught.value.http_status == 403 and caught.value.error_type == "PermissionDeniedError"
+    assert len(fake.calls) == 1  # a 4xx is never retried
+
+
+async def test_an_aws_style_body_and_a_long_message_are_read_and_bounded(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    long = "not authorized " * 100
+    refused = _status_error(anthropic.PermissionDeniedError, 403, {"Message": long})
+    model, _ = _model([refused], clean_env)
+    with pytest.raises(ModelUnavailable) as caught:
+        await model.extract("sys", "user")
+    assert caught.value.message is not None and len(caught.value.message) == 500
+    assert caught.value.message.startswith("not authorized not authorized")
+
+
+async def test_an_error_event_inside_an_open_stream_is_retried_like_a_5xx(
+    clean_env: pytest.MonkeyPatch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An `error` event mid-stream arrives as an APIStatusError carrying the stream's own 200:
+    a server-side failure (overloaded_error), so the next attempt runs."""
+    import imageshield.intel.model as model_module
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(model_module, "asyncio", SimpleNamespace(sleep=_no_sleep))
+    overloaded = _status_error(
+        anthropic.APIStatusError,
+        200,
+        {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}},
+    )
+    good = [_message_start(), *_text(0, ExtractionOutput(signals=[]).model_dump_json())]
+    model, fake = _model(
+        [sdk_stream([_message_start()], overloaded), sdk_stream([*good, *_message_end()])],
+        clean_env,
+    )
+    call = await model.extract("sys", "user")
+    assert call.outcome == "ok" and len(fake.calls) == 2
+
+
+async def test_a_transport_timeout_mid_body_is_a_timeout(clean_env: pytest.MonkeyPatch) -> None:
+    """The SDK wraps transport errors only before a response arrives; one mid-body is mapped
+    the way the SDK maps the same error before one."""
+    request = httpx2.Request("POST", "https://anthropic.aws.example/v1/messages")
+    model, _ = _model(
+        [sdk_stream([_message_start()], httpx2.ReadTimeout("read timed out", request=request))],
+        clean_env,
+    )
+    with pytest.raises(ModelUnavailable) as caught:
+        await model.extract("sys", "user")
+    assert (caught.value.status, caught.value.detail) == ("timeout", "ReadTimeout")
+
+
+async def test_a_log_that_cannot_be_written_changes_nothing_about_the_call(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    raw = [
+        _message_start(),
+        *_thinking(0, "Thinking it through."),
+        *_search(1, "q"),
+        *_results(2, "https://a.example/x"),
+        *_text(3, _FOUND.model_dump_json()),
+        *_message_end(ws=1),
+    ]
+    unbound_model, _ = _model([sdk_stream(raw)], clean_env)
+    unbound = await unbound_model.discover("sys", "find things")
+    broken = MemoryRunEvents(fail=True)
+    token = current_run_log.set(RunLog(uuid4(), broken))
+    try:
+        logged_model, _ = _model([sdk_stream(raw)], clean_env)
+        logged = await logged_model.discover("sys", "find things")
+    finally:
+        current_run_log.reset(token)
+    for name in ("output", "outcome", "answered_by", "stop_reason", "usage", "cost_usd"):
+        assert getattr(logged, name) == getattr(unbound, name), name
+    assert broken.rows == {}
+
+
+async def test_thinking_is_rewritten_at_most_every_two_seconds() -> None:
+    """One row per thinking block: written at its start, rewritten while deltas arrive no more
+    often than THINKING_UPDATE_SECONDS, and finalised at its stop."""
+    store = MemoryRunEvents()
+    run_log = RunLog(uuid4(), store)
+    now = [0.0]
+    translator = StreamTranslator(run_log, clock=lambda: now[0])
+    block = SimpleNamespace(type="thinking", thinking="", signature="")
+    await translator.feed(SimpleNamespace(type="content_block_start", index=0, content_block=block))
+    for at, snapshot in ((0.5, "a"), (1.9, "ab"), (2.1, "abc"), (3.0, "abcd"), (4.2, "abcde")):
+        now[0] = at
+        await translator.feed(SimpleNamespace(type="thinking", thinking="x", snapshot=snapshot))
+    assert store.updates == 2  # at 2.1s and at 4.2s
+    final = SimpleNamespace(type="thinking", thinking="abcdef", signature="s")
+    await translator.feed(SimpleNamespace(type="content_block_stop", index=0, content_block=final))
+    (row,) = store.events(run_log.run_id)
+    assert row["kind"] == "thinking" and row["text"] == "abcdef" and row["detail"] == {"chars": 6}
+
+
+async def test_an_unreadable_event_is_skipped_never_raised() -> None:
+    store = MemoryRunEvents()
+    translator = StreamTranslator(RunLog(uuid4(), store))
+    await translator.feed(SimpleNamespace(type="content_block_stop", content_block=object()))
+    await translator.feed(object())
+    assert store.rows == {}

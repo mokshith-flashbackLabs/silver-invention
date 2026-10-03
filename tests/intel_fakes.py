@@ -761,3 +761,40 @@ async def seed_due_credit(
     )
     await settle_runs(pool)
     return event_id, signal_id
+
+
+class MemoryRunEvents:
+    """An in-memory ``RunEventStore`` (``intel/run_log.py``): what a recorder wrote, in order.
+    ``fail`` makes every write raise, the way a database blip would; a duplicate ``(run, seq)``
+    raises like the primary key does."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.rows: dict[tuple[UUID, int], dict[str, Any]] = {}
+        self.fail = fail
+        self.updates = 0
+
+    async def last_run_event_seq(self, run_id: UUID) -> int:
+        if self.fail:
+            raise RuntimeError("database unavailable")
+        return max((seq for (run, seq) in self.rows if run == run_id), default=0)
+
+    async def insert_run_event(
+        self, run_id: UUID, *, seq: int, kind: str, text: str, detail: Any
+    ) -> None:
+        if self.fail:
+            raise RuntimeError("database unavailable")
+        if (run_id, seq) in self.rows:
+            raise RuntimeError("duplicate key")
+        self.rows[(run_id, seq)] = {"seq": seq, "kind": kind, "text": text, "detail": dict(detail)}
+
+    async def update_run_event(self, run_id: UUID, *, seq: int, text: str, detail: Any) -> None:
+        if self.fail:
+            raise RuntimeError("database unavailable")
+        self.rows[(run_id, seq)].update(text=text, detail=dict(detail))
+        self.updates += 1
+
+    def events(self, run_id: UUID) -> list[dict[str, Any]]:
+        return [self.rows[key] for key in sorted(k for k in self.rows if k[0] == run_id)]
+
+    def kinds(self, run_id: UUID) -> list[str]:
+        return [row["kind"] for row in self.events(run_id)]

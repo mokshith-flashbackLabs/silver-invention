@@ -1,5 +1,6 @@
 """The intel registry and run queue (spec §3.2, §3.4, §3.8). The one writer of
-intel_sources, intel_runs and intel_vocabulary.
+intel_sources, intel_runs and intel_vocabulary, and of the run log's intel_run_events (migration
+0046, spec 2026-10-03 §3.3: written through ``intel/run_log.py``'s ``RunLog``).
 
 Every write that is an operator act writes its ``audit_log`` row in the same transaction
 (``actor_type 'operator'``, ``metadata.operator``); a machine write (the vocabulary push)
@@ -10,6 +11,7 @@ the database rather than merely at review.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -21,7 +23,15 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.bounds import MAX_RUN_ATTEMPTS
-from imageshield.intel.models import Run, Source, SourcePause, SpendToday, Vocabulary
+from imageshield.intel.models import (
+    Run,
+    RunEvent,
+    RunEvents,
+    Source,
+    SourcePause,
+    SpendToday,
+    Vocabulary,
+)
 from imageshield.intel.vocabulary import parse_vocabulary
 from imageshield.providers.store import utc_spend_date
 from imageshield.search.urlhash import NORMALISATION_VERSION, canonicalise, url_hash
@@ -176,7 +186,23 @@ class IntelStore(Protocol):
     async def set_run_vocabulary(
         self, run_id: UUID, *, release_no: int, map_version: int
     ) -> None: ...
-    async def list_runs(self, *, cursor: tuple[datetime, UUID] | None, limit: int) -> list[Run]: ...
+    async def list_runs(
+        self,
+        *,
+        cursor: tuple[datetime, UUID] | None,
+        limit: int,
+        kinds: Sequence[str] | None = None,
+        statuses: Sequence[str] | None = None,
+        question_key: str | None = None,
+    ) -> list[Run]: ...
+    async def run_events(self, run_id: UUID) -> RunEvents | None: ...
+    async def last_run_event_seq(self, run_id: UUID) -> int: ...
+    async def insert_run_event(
+        self, run_id: UUID, *, seq: int, kind: str, text: str, detail: Mapping[str, Any]
+    ) -> None: ...
+    async def update_run_event(
+        self, run_id: UUID, *, seq: int, text: str, detail: Mapping[str, Any]
+    ) -> None: ...
     async def is_known_hit(self, url_hash_value: str) -> bool: ...
     async def put_vocabulary(
         self,
@@ -404,24 +430,99 @@ class PostgresIntelStore:
                 (release_no, map_version, run_id),
             )
 
-    async def list_runs(self, *, cursor: tuple[datetime, UUID] | None, limit: int) -> list[Run]:
+    async def list_runs(
+        self,
+        *,
+        cursor: tuple[datetime, UUID] | None,
+        limit: int,
+        kinds: Sequence[str] | None = None,
+        statuses: Sequence[str] | None = None,
+        question_key: str | None = None,
+    ) -> list[Run]:
+        """Newest first, keyset-paged on ``(created_at, run_id)``. The filters combine with AND;
+        an empty or absent one filters nothing (spec 2026-10-03 §3.6)."""
+        where: list[str] = []
+        params: dict[str, Any] = {"limit": limit}
+        if kinds:
+            where.append("kind = ANY(%(kinds)s)")
+            params["kinds"] = list(kinds)
+        if statuses:
+            where.append("status = ANY(%(statuses)s)")
+            params["statuses"] = list(statuses)
+        if question_key is not None:
+            # `request ? 'question_key'` is intel_runs_question_idx's own predicate (0046), stated
+            # so the planner can prove the partial index applies.
+            where.append(
+                "request ? 'question_key' AND request ->> 'question_key' = %(question_key)s"
+            )
+            params["question_key"] = question_key
+        if cursor is not None:
+            where.append("(created_at, run_id) < (%(cursor_at)s, %(cursor_id)s)")
+            params["cursor_at"], params["cursor_id"] = cursor
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
         async with self._pool.connection() as conn:
             cur = conn.cursor(row_factory=dict_row)
-            if cursor is None:
-                await cur.execute(
-                    f"SELECT {RUN_COLUMNS} FROM intel_runs"
-                    " ORDER BY created_at DESC, run_id DESC LIMIT %s",
-                    (limit,),
-                )
-            else:
-                await cur.execute(
-                    f"SELECT {RUN_COLUMNS} FROM intel_runs"
-                    " WHERE (created_at, run_id) < (%s, %s)"
-                    " ORDER BY created_at DESC, run_id DESC LIMIT %s",
-                    (cursor[0], cursor[1], limit),
-                )
+            await cur.execute(
+                f"SELECT {RUN_COLUMNS} FROM intel_runs{clause}"
+                " ORDER BY created_at DESC, run_id DESC LIMIT %(limit)s",
+                params,
+            )
             rows = await cur.fetchall()
         return [Run.model_validate(row) for row in rows]
+
+    # -- the run log (migration 0046, intel/run_log.py) --------------------------------------
+
+    async def run_events(self, run_id: UUID) -> RunEvents | None:
+        """The run's kind and status, THEN its rows: ``run_finished`` is written before the run's
+        terminal status, so a read that sees a terminal status always sees the complete log."""
+        async with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(
+                "SELECT run_id, kind, status FROM intel_runs WHERE run_id = %s", (run_id,)
+            )
+            run = await cur.fetchone()
+            if run is None:
+                return None
+            await cur.execute(
+                "SELECT seq, kind, text, detail, at, updated_at FROM intel_run_events"
+                " WHERE run_id = %s ORDER BY seq",
+                (run_id,),
+            )
+            rows = await cur.fetchall()
+        return RunEvents(
+            run_id=run["run_id"],
+            kind=run["kind"],
+            status=run["status"],
+            events=tuple(RunEvent.model_validate(row) for row in rows),
+        )
+
+    async def last_run_event_seq(self, run_id: UUID) -> int:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT coalesce(max(seq), 0) FROM intel_run_events WHERE run_id = %s", (run_id,)
+            )
+            row = await cur.fetchone()
+        return int(row[0]) if row is not None else 0
+
+    async def insert_run_event(
+        self, run_id: UUID, *, seq: int, kind: str, text: str, detail: Mapping[str, Any]
+    ) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "INSERT INTO intel_run_events (run_id, seq, kind, text, detail)"
+                " VALUES (%s, %s, %s, %s, %s)",
+                (run_id, seq, kind, text, Jsonb(dict(detail))),
+            )
+
+    async def update_run_event(
+        self, run_id: UUID, *, seq: int, text: str, detail: Mapping[str, Any]
+    ) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "UPDATE intel_run_events SET text = %s, detail = %s, updated_at = now()"
+                " WHERE run_id = %s AND seq = %s",
+                (text, Jsonb(dict(detail)), run_id, seq),
+            )
 
     async def put_vocabulary(
         self,

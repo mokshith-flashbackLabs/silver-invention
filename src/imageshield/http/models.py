@@ -1066,6 +1066,22 @@ IntelProposalStatus = Literal[
     "pending", "approved", "rejected", "superseded", "applied", "delivered"
 ]
 IntelProtectionStatus = Literal["active", "retracted"]
+# GET /runs filters (spec 2026-10-03 §3.6): exactly intel_runs' kind CHECK (0043's
+# intel_runs_kind_valid) and its status CHECK (0039). tests/test_intel_run_log.py holds the two
+# Literals to the database's own CHECKs.
+IntelRunKind = Literal[
+    "source_check",
+    "discovery",
+    "adhoc_url",
+    "weight_suggestion",
+    "renewal_check",
+    "gap_regenerate",
+    "source_proposal",
+    "source_validation",
+]
+IntelRunStatus = Literal["queued", "running", "completed", "failed", "refused"]
+# The backend's questionParams regex: a quiz question key as the backend names it.
+INTEL_QUESTION_KEY_PATTERN = r"^[a-z][a-z0-9_]{1,39}$"
 
 
 class IntelDecisionRequest(ServiceModel):

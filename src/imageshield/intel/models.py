@@ -1,7 +1,8 @@
 """Row and value types shared by the intel store, the pipeline and the admin routes.
 
 Frozen pydantic models over ``intel_sources`` / ``intel_runs`` / ``intel_vocabulary`` rows
-(migration 0039, task-3-report.md's column list is binding for the store's SQL) plus one
+(migration 0039, task-3-report.md's column list is binding for the store's SQL), the run log's
+``intel_run_events`` rows (migration 0046), plus one
 non-persisted read (``SpendToday``, a projection over ``providers``/``provider_spend``).
 """
 
@@ -66,6 +67,33 @@ class Run(BaseModel):
     error_code: str | None
     created_at: datetime
     completed_at: datetime | None
+
+
+class RunEvent(BaseModel):
+    """One ``intel_run_events`` row (migration 0046, spec 2026-10-03 §3.2). ``kind`` and the
+    ``detail`` keys are the contract; ``text`` is server-authored English for display only."""
+
+    model_config = ConfigDict(frozen=True)
+
+    seq: int
+    kind: str
+    text: str
+    detail: dict[str, Any]
+    at: datetime
+    updated_at: datetime
+
+
+class RunEvents(BaseModel):
+    """A run's whole log, ``seq`` ascending, with the run's kind and status read BEFORE the rows:
+    a run's terminal status is written after its ``run_finished`` row, so a read that sees the
+    terminal status also sees the complete log."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: UUID
+    kind: str
+    status: str
+    events: tuple[RunEvent, ...]
 
 
 class Vocabulary(BaseModel):

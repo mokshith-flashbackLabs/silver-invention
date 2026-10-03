@@ -5,10 +5,17 @@ providers, deliberately: a model that can loop on web search must not run uncapp
 raw_response holds metadata only, never content, quotes or search results (spec §5).
 A refusal, max_tokens or unparseable output is status 'ok': the call worked, the
 verdict lives in intel tables, and #40 forbids opening a breaker on an ordinary result.
+
+Each call also ends one step of the run log (spec 2026-10-03 §3.5), when the worker has bound
+one: a refusal before the call is ``model_call_skipped``, an unavailable model
+``model_call_failed`` (with the API's own message, which ``provider_calls.error_detail`` never
+carries), an answer ``model_call_finished``. Written AFTER the metering row, and never able to
+fail the call.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Literal, TypeVar
@@ -17,6 +24,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from imageshield.intel.model import ModelCall, ModelUnavailable
+from imageshield.intel.run_log import note_failed, note_finished, note_skipped
 from imageshield.providers.gate import decide
 from imageshield.providers.models import Skip
 from imageshield.providers.store import ProviderControlStore, utc_spend_date
@@ -61,6 +69,7 @@ async def metered(
     runtimes = await control.runtimes()
     runtime = runtimes.get(CLAUDE_INTEL)
     if runtime is not None and runtime.enabled and runtime.daily_budget_usd is None:
+        await note_skipped("budget_unset")
         return "budget_unset", None, "budget_unset"
 
     decision = await decide(CLAUDE_INTEL, runtime=runtime, store=control, now=now)
@@ -68,8 +77,10 @@ async def metered(
         await control.record_skip(
             None, CLAUDE_INTEL, decision.reason, decision.detail, intel_run_id=run_id
         )
+        await note_skipped(decision.reason)
         return "skipped", None, decision.reason
 
+    started = time.monotonic()
     try:
         result = await call()
     except ModelUnavailable as exc:
@@ -89,6 +100,7 @@ async def metered(
             probe=decision.probe,
             intel_run_id=run_id,
         )
+        await note_failed(exc)
         return "called", None, exc.status
 
     await control.record_outcome(
@@ -118,4 +130,5 @@ async def metered(
         probe=decision.probe,
         intel_run_id=run_id,
     )
+    await note_finished(result, int((time.monotonic() - started) * 1000))
     return "called", result, None
