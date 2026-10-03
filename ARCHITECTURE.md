@@ -513,6 +513,15 @@ resume, and how the call ended (migration 0046, `intel/run_log.py`). The control
 `GET /runs/{run_id}/events`; a log write that fails never fails a run. Spec
 `docs/superpowers/specs/2026-10-03-intel-run-log-design.md`.
 
+*Amended 2026-10-03, throughput:* the worker keeps `INTEL_RUN_CONCURRENCY` runs in flight (each in its
+own asyncio task with its own run log; a run's lease is renewed while it executes and its finish is
+guarded on the claim, so a long run is never claimed twice), and one run reads up to
+`INTEL_SOURCE_READ_CONCURRENCY` sources or pages at once — so "one call at a time" above now holds
+per read, not per worker. The call cap stays exact (a capped call reserves its slot before it is
+sent). A weight suggestion hands its saved searches to their own `discovery` runs rather than reading
+them inline, and those search reads (and stage 3's validation search) run at
+`INTEL_SEARCH_READ_EFFORT`. Spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`.
+
 **Admin surface — the step-1 set, ten routes under `/v1/admin/intel/*`**: the source registry
 (`GET`/`POST /sources`, `PATCH /sources/{id}`, `POST /sources/{id}/check`), pasting a one-off URL
 (`POST /documents`), run history with today's spend (`GET /runs`), the signal list and single-signal

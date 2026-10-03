@@ -250,6 +250,11 @@ sentence to say so.
   against a crashed worker, not against two live ones, and no heartbeat is needed under that assumption. The
   scheduler step still advances `next_check_at` with one atomic `UPDATE … RETURNING`, so an overlapping task during a
   rolling deploy cannot create duplicate runs for one source.
+  *Amended 2026-10-03 (throughput, spec `2026-10-03-intel-throughput-design.md` §2, §3):* the assumption no longer
+  holds and is no longer needed. Prod runs two services-worker tasks, and one worker keeps `INTEL_RUN_CONCURRENCY`
+  runs in flight. A running run's lease IS renewed now (every third of `INTEL_LEASE_SECONDS`, guarded on the claim's
+  `attempts`), so a run longer than its lease is never claimed twice, and `finish_run` is guarded the same way.
+  `claim_next`'s `FOR UPDATE SKIP LOCKED` is what keeps two claimers off one run.
 
 ### 3.5 Documents, signals, excerpts
 
@@ -568,6 +573,10 @@ weights release, bootstrap), **after every tag or mapping change**, once at work
   1. creates `source_check`, `discovery` or `renewal_check` runs that are due, advancing `next_check_at` atomically;
   2. claims **one** queued run under a lease and executes it.
 
+  *Amended 2026-10-03 (throughput, spec `2026-10-03-intel-throughput-design.md` §3):* step 2 now claims runs while
+  one of `INTEL_RUN_CONCURRENCY` slots is free, each executed in its own task, and a pass runs again as soon as a
+  run ends as well as every `INTEL_POLL_SECONDS`. Step 1 still runs once per pass.
+
   The API queues a run by inserting a `queued` row. It never calls the model, which matters because the backend's
   admin calls time out at 3 seconds.
 - **Who schedules.** Intel cadence is intel's own fact, owned by the registry here. Migration 0032's objection was to
@@ -588,6 +597,7 @@ weights release, bootstrap), **after every tag or mapping change**, once at work
 | Limits | `INTEL_MAX_CALLS_PER_RUN` (default 20); `INTEL_MAX_DOCUMENT_CHARS` (default 200 000) |
 | Provider control | The four `PostgresProviderControlStore` settings with `Config`'s defaults: `PROVIDER_CONFIG_CACHE_SECONDS`, `PROVIDER_FAILURE_THRESHOLD`, `BREAKER_COOLDOWN_SECONDS`, `BREAKER_COOLDOWN_MAX_SECONDS`. The store is built from `providers.store` directly, never through `search.worker`. |
 | Plumbing | `FETCHER_BASE_URL`, `FETCHER_TOKEN`, `INTEL_POLL_SECONDS` (default 30), `INTEL_LEASE_SECONDS` (default 900) |
+| Throughput (*added 2026-10-03*, spec `2026-10-03-intel-throughput-design.md` §8) | `INTEL_RUN_CONCURRENCY`, `INTEL_SOURCE_READ_CONCURRENCY` (ints ≥ 1) and `INTEL_SEARCH_READ_EFFORT` (`low` · `medium` · `high` · `xhigh` · `max`), all **required**; the intel worker's `DB_POOL_MAX_SIZE` should be at least `RUN × (READ + 1) + 1` |
 
 **Safety constants live in `intel/bounds.py`, not env** (§4.5). A value that guards a promise costs a code change, a
 review and a `git blame` to move.
@@ -1295,6 +1305,10 @@ search providers do (#37). The chain's step 1 (subject eligibility) does not app
   - This amends models.py's "the recording path charges what the guard checked" for `llm` only, and the docstring says
     so. The overshoot bound becomes *concurrent calls × (actual − estimate)*. With one worker claiming one run at a
     time, that is one call.
+    *Amended 2026-10-03 (throughput, spec `2026-10-03-intel-throughput-design.md` §9):* it is no longer one call.
+    Calls in flight together each pass the gate before any is recorded, so the daily cap can be overshot by at most
+    the calls in flight: `INTEL_RUN_CONCURRENCY × INTEL_SOURCE_READ_CONCURRENCY` per worker, times the number of
+    services-worker tasks. No reservation is made; the bound is the design.
 - **`raw_response` for kind `llm` is metadata only:** `{model, stop_reason, usage, web_search_requests,
   pause_turns}`. It never holds content, thinking, quotes or web-search result blocks, so a PII-bearing quote that
   verification drops never lands in a column. `error_detail` is a stable class name plus HTTP status, never

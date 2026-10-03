@@ -328,6 +328,18 @@ at least a budget outage will not also relax everyone's cadence.
   not alarm on that, so **`no_successful_calls_24h` is suppressed for kind
   `llm`** — `intel_stale` is what actually watches this provider for silence.
 
+**Throughput (2026-10-03, spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`).**
+- **Several runs at once.** Each `intel-worker` keeps up to `INTEL_RUN_CONCURRENCY` (3) runs in flight, and one run
+  reads up to `INTEL_SOURCE_READ_CONCURRENCY` (4) sources or pages at once. The `claude_intel` daily budget can
+  therefore be overshot by at most the calls in flight: 12 per services-worker task. That is the design, not a fault.
+- **Leases are renewed** while a run executes. `intel.run_lease_lost` / `intel.run_result_dropped` in the worker log
+  mean a second claimer took a run over mid-flight: the newer attempt's result is the one written. Expect none; a
+  steady stream means the database is refusing the renewal (`intel.run_lease_renewal_failed` beside it).
+- **A deploy** gives in-flight runs 20 s to finish (`intel.draining`), then leaves the rest leased
+  (`intel.runs_left_leased`) for the next worker to reclaim once the lease lapses (up to `INTEL_LEASE_SECONDS`).
+- **`intel.pool_below_concurrency`** at boot means `DB_POOL_MAX_SIZE` is under `RUN × (READ + 1) + 1`; reads then
+  queue for connections instead of running. The task definitions set 16.
+
 **Proposals (step 2, 2026-09-30).**
 - **Cost.** `cost_per_call_usd` is 0.45 from migration 0041, the worst case once the proposal model (Opus 5.5)
   runs. The guard checks that estimate, and the actual cost is recorded. A run makes at most

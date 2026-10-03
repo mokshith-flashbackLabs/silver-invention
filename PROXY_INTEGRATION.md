@@ -1047,6 +1047,9 @@ run that the worker finishes always completes.
   $50/day cap and is judged by code only: no model judgement, only that the pages it returns pass the same checks.
 - `sources_read`, `sources_deferred` and `suggestion_evidence` are **absent** from a run's outcome when zero. Read them
   with a default of 0 (`.get(..., 0)`), as the S6 poll does.
+  *Amended 2026-10-03 (throughput):* `sources_deferred` now also counts every saved search the suggestion handed to
+  its own `discovery` run instead of reading it, and `search_sources_deferred` (absent when zero) says how many of
+  them those are. See "Likeness intel — throughput" below.
 
 **Step 6 needs nothing new from services.** Coverage gaps are step 2's rows:
 - `GET /proposals?kind=coverage_gap` lists them, and `GET /proposals/{id}` returns their evidence;
@@ -1140,6 +1143,48 @@ schemas still require a note of at least 10 characters until it relaxes them. On
 services-worker and **run 0047's down at once**: the old code cannot read a source with no note, and the down gives
 each one a placeholder (`recorded while terms notes were optional`; a note shorter than 10 characters keeps its text
 with the same words appended in brackets) and drops the two evidence columns.
+
+### Likeness intel — throughput: several runs at once, searches in the background (2026-10-03)
+
+**Owner decision 2026-10-03** (spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`). A Suggest-points
+"Ask for points" for the platforms question took over fifteen minutes on dev, and every other run waited behind it:
+the worker ran one run at a time, a stage-4 run read its sources one after another, and a saved search's read is a
+Claude research call of five to eight minutes. **No route, body, status or error code changes, and no `svc` view
+changes.** What the backend and the console will see:
+
+- **Several runs at once.** Each services-worker task keeps up to 3 runs executing together (`INTEL_RUN_CONCURRENCY`),
+  claimed oldest first. A run may start before an older one finishes, so the Runs screen can show several `running`
+  rows at once. A running run's lease is renewed while it executes, so a long run is never picked up twice. (If a
+  worker ever loses a run's lease to another anyway, that attempt's log stops without `run_finished`, exactly like a
+  crash, and the newer attempt's result is the one written.)
+- **Stage 4 (S5/S6) hands its saved searches to their own runs.** A `search_query` source a suggestion registers, or
+  reuses unread, is no longer read inside the `weight_suggestion` run. It is queued as its own `discovery` run
+  (`requested_by: "schedule"`, `source_id` set) that runs beside the suggestion. Page and feed sources are still read
+  inside the run, up to 4 at once (`INTEL_SOURCE_READ_CONCURRENCY`).
+  - **`sources_deferred` on S6 now includes those searches**, so a first press can answer "N deferred" with the call
+    cap nowhere near. The run's outcome on `GET /runs` also carries `search_sources_deferred` (absent when zero, like
+    `sources_deferred`): of the deferred, how many are searches being read in their own runs.
+  - The suggestion is written from the pages read and the evidence already held. **Asking again once those discovery
+    runs have completed includes what the searches found**, and does not defer them again. The panel can say so:
+    "N saved searches are being read in the background; ask again once they finish for a suggestion that includes
+    them." Their progress is on the Runs screen (`kind=discovery`).
+  - A draft option's search (paused `unmapped`) is still read this way, as it was read inline before.
+- **Interleaved run logs.** A run reading several sources at once writes their steps into ONE log (L2) as they happen,
+  so `model_call_started`/`search`/`model_call_finished` rows of different sources interleave. `seq` stays unique and
+  gap-free; render on `kind` as before.
+- **Stage 3 (S3/S4) judges candidates side by side.** Results stay one per candidate in the submitted order. A gate
+  refusal still blocks every search that starts after it; with several searches in flight the gate may be asked more
+  than once.
+- **Claude's effort on search reads is `medium`** (`INTEL_SEARCH_READ_EFFORT`): a saved search's read and stage 3's
+  validation search only. Stage 1's source proposal, extraction, generation and the suggestion are unchanged.
+- **The budget bound.** Every call still passes the gate (kill switch, breaker, `daily_budget_usd`) before it is sent,
+  but calls in flight together each pass it before any is recorded, so the `claude_intel` daily cap ($50/day) can be
+  overshot by at most the calls in flight: 3 runs × 4 reads = 12 per services-worker task, so up to 24 calls across
+  prod's two tasks. No reservation is made; that bound is the design.
+
+**Deploy order:** services only (image and task definitions, which add the three required keys and raise the
+intel-worker's `DB_POOL_MAX_SIZE` to 16). No migration; the backend changes nothing. Rolling back is the previous image
+and task definitions.
 
 ---
 
