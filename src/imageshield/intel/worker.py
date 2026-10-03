@@ -6,6 +6,11 @@ under a lease, execute it, finish it. One worker (``services-worker`` runs
 desired count 1); the lease protects against a crash, not against two live
 workers -- ``claim_next``'s ``FOR UPDATE SKIP LOCKED`` is what would make a
 second one safe if that ever changed.
+
+Each executed run gets a run log (spec 2026-10-03 §3.3): ``run_started`` before it,
+``run_finished`` after it and BEFORE ``finish_run``, so a poll that sees the run's terminal
+status always sees its whole log. ``current_run_log`` is bound for the duration of
+``run(claimed, deps)``, which is how the model seam and ``metered()`` reach it.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ import asyncio
 import contextlib
 import signal
 import sys
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -32,6 +38,12 @@ from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.protection_store import PostgresProtectionStore
 from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.reconcile import PostgresReconciler
+from imageshield.intel.run_log import (
+    RunLog,
+    current_run_log,
+    run_finished_event,
+    run_started_event,
+)
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
 
@@ -79,6 +91,10 @@ async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
     claimed = await deps.store.claim_next(now, lease_seconds=lease_seconds)
     if claimed is None:
         return False
+    run_log = RunLog(claimed.run_id, deps.store)
+    started = time.monotonic()
+    await run_log.append("run_started", *run_started_event(claimed))
+    bound = current_run_log.set(run_log)
     try:
         result = await run(claimed, deps)
     except Exception:
@@ -86,9 +102,20 @@ async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
         # always turns into a RunResult instead of raising. Leave the run
         # leased: it is reclaimed once the lease expires, capped at
         # MAX_RUN_ATTEMPTS (`expire_exhausted` then fails it for good rather
-        # than retrying forever).
+        # than retrying forever). Its log stops here; a reclaim appends to it.
         log.exception("intel.run_crashed", run_id=str(claimed.run_id), kind=claimed.kind)
         return True
+    finally:
+        current_run_log.reset(bound)
+    await run_log.append(
+        "run_finished",
+        *run_finished_event(
+            result.status,
+            result.error_code,
+            result.outcome.get("cost_usd"),
+            int((time.monotonic() - started) * 1000),
+        ),
+    )
     await deps.store.finish_run(
         claimed.run_id, status=result.status, outcome=result.outcome, error_code=result.error_code
     )
