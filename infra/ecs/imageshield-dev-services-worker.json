@@ -123,7 +123,7 @@
         { "name": "ENVIRONMENT", "value": "production" },
         { "name": "LOG_LEVEL", "value": "info" },
         { "name": "DB_SSLMODE", "value": "require" },
-        { "name": "DB_POOL_MAX_SIZE", "value": "2" },
+        { "name": "DB_POOL_MAX_SIZE", "value": "16" },
         { "name": "INTEL_ENABLED", "value": "true" },
         { "name": "INTEL_MODEL_PROVIDER", "value": "claude" },
         { "name": "INTEL_ANTHROPIC_REGION", "value": "ap-south-1" },
@@ -132,6 +132,9 @@
         { "name": "INTEL_PROPOSAL_MODEL", "value": "claude-opus-5-5" },
         { "name": "INTEL_WEB_SEARCH_TOOL_TYPE", "value": "web_search_20260209" },
         { "name": "INTEL_MAX_SOURCE_PROPOSAL_SEARCHES", "value": "10" },
+        { "name": "INTEL_RUN_CONCURRENCY", "value": "3" },
+        { "name": "INTEL_SOURCE_READ_CONCURRENCY", "value": "4" },
+        { "name": "INTEL_SEARCH_READ_EFFORT", "value": "medium" },
         { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" }
       ],
       "secrets": [

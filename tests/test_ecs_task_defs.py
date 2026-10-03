@@ -514,6 +514,18 @@ def test_prod_intel_worker_supplies_every_required_intel_field() -> None:
     assert required - _container_supplied_names(containers["intel-worker"]) == set()
 
 
+@pytest.mark.parametrize("path", [WORKER_TASK, PROD_WORKER_TASK], ids=["dev", "prod"])
+def test_intel_worker_runs_concurrently_with_a_pool_that_covers_it(path: Path) -> None:
+    """Spec 2026-10-03-intel-throughput §8: three runs at once, four reads per run, Claude at
+    medium effort on search reads -- and a pool sized for RUN x (READ + 1) + 1, the same formula
+    the worker warns on at boot (IntelConfig.pool_size_needed)."""
+    containers = {c["name"]: c for c in _load(path)["containerDefinitions"]}
+    env = {e["name"]: e["value"] for e in containers["intel-worker"]["environment"]}
+    run, read = int(env["INTEL_RUN_CONCURRENCY"]), int(env["INTEL_SOURCE_READ_CONCURRENCY"])
+    assert (run, read, env["INTEL_SEARCH_READ_EFFORT"]) == (3, 4, "medium")
+    assert int(env["DB_POOL_MAX_SIZE"]) >= run * (read + 1) + 1
+
+
 def test_intel_worker_sets_nothing_intel_config_does_not_read() -> None:
     known = {n.upper() for n in IntelConfig.model_fields}
     container = _worker_containers()["intel-worker"]

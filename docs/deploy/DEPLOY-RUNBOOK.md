@@ -995,6 +995,16 @@ drops `origin` and `proposed_for`, and fails any queued or running stage-1 or st
 the fetcher (step 5's item 2), then the services image and task definitions, then the backend's build that carries
 all four steps. Roll back in the reverse order; the per-step notes above say what each down refuses or drops.
 
+*Throughput (2026-10-03, spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`):* three keys are
+required on the `intel-worker` container in both task definitions, with no default, so a task definition without
+them crash-loops at boot: `INTEL_RUN_CONCURRENCY=3`, `INTEL_SOURCE_READ_CONCURRENCY=4`,
+`INTEL_SEARCH_READ_EFFORT=medium`. The same change raises that container's `DB_POOL_MAX_SIZE` from 2 to 16, the
+`RUN x (READ + 1) + 1` ceiling (`tests/test_ecs_task_defs.py` holds both task definitions to it). No migration and no
+backend change: deploy the services image with the new task definitions. Rolling back is the previous image with the
+previous task definitions. Two services-worker tasks (prod) can hold up to 32 intel connections between them at the
+ceiling, against the shared cluster's `max_connections` (about 225 on `db.t4g.small`); the ceiling is reached only
+when every slot is mid-statement at once, and idle connections close after ten minutes.
+
 **As of 2026-09-30 dev ships `INTEL_ENABLED=true` and prod `INTEL_ENABLED=false`.** The workspace ids
 confirmed by the step-0 probe (2026-09-29) replaced the `pending-step0` placeholder in all **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
 (`infra/ecs/imageshield-dev-services-worker.json`), the prod container's (`infra/ecs/prod/services-worker.json`),

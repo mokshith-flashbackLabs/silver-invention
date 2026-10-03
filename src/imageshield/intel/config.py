@@ -55,6 +55,22 @@ class IntelConfig(BaseSettings):
     # A weight suggestion's first read of the sources it registered is legitimately larger than a
     # weekly check (§4.10), so it has its own call cap.
     intel_max_calls_per_suggestion_run: int = 60
+    # Throughput (spec 2026-10-03-intel-throughput §8). Required with no default, like every key
+    # its spec gives none: each environment says how much it runs at once.
+    # - INTEL_RUN_CONCURRENCY: runs one worker process executes at the same time.
+    # - INTEL_SOURCE_READ_CONCURRENCY: sources (or pages) one run reads at the same time.
+    # - INTEL_SEARCH_READ_EFFORT: Claude's effort on the web-search calls that READ or CHECK (a
+    #   saved search's read, stage 3's validation search) and on no other call.
+    # Every call still passes the provider gate (budget, breaker, kill switch) before it is sent,
+    # but concurrent calls each pass it before any of them is recorded, so the daily cap can be
+    # overshot by at most the calls in flight: RUN x SOURCE_READ for one worker, times the
+    # number of services-worker tasks. No reservation is made; the bound is the design.
+    # DB_POOL_MAX_SIZE must cover RUN x (SOURCE_READ + 1) + 1 (one connection per read in flight
+    # and per run's lease heartbeat, plus the loop's own); the worker warns at boot when it does
+    # not, and test_ecs_task_defs holds every deployed task to it.
+    intel_run_concurrency: int
+    intel_source_read_concurrency: int
+    intel_search_read_effort: Literal["low", "medium", "high", "xhigh", "max"]
 
     provider_config_cache_seconds: float = 10.0
     provider_failure_threshold: int = 5
@@ -86,6 +102,8 @@ class IntelConfig(BaseSettings):
         "intel_max_document_chars",
         "intel_max_source_proposal_searches",
         "intel_max_calls_per_suggestion_run",
+        "intel_run_concurrency",
+        "intel_source_read_concurrency",
         "intel_lease_seconds",
         "db_pool_max_size",
         "provider_failure_threshold",
@@ -104,6 +122,13 @@ class IntelConfig(BaseSettings):
         if value <= 0:
             raise ValueError("must be a positive number")
         return value
+
+    def pool_size_needed(self) -> int:
+        """The connections the worker can want at once: one per source read in flight and one per
+        run's lease heartbeat, for every run in flight, plus the loop's own (housekeeping and
+        claims). Statements are short and hold no connection across a model call, so this is a
+        ceiling rather than a typical load."""
+        return self.intel_run_concurrency * (self.intel_source_read_concurrency + 1) + 1
 
     @model_validator(mode="after")
     def _resolve_database_url(self) -> IntelConfig:

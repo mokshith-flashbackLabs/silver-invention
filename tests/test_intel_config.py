@@ -25,6 +25,9 @@ BASE = {
     "INTEL_PROPOSAL_MODEL": "claude-opus-5-5",
     "INTEL_WEB_SEARCH_TOOL_TYPE": "web_search_20260209",
     "INTEL_MAX_SOURCE_PROPOSAL_SEARCHES": "5",
+    "INTEL_RUN_CONCURRENCY": "3",
+    "INTEL_SOURCE_READ_CONCURRENCY": "4",
+    "INTEL_SEARCH_READ_EFFORT": "medium",
     "FETCHER_BASE_URL": "http://localhost:8083",
     "FETCHER_TOKEN": "fetcher-token-for-tests-0003",
 }
@@ -124,4 +127,50 @@ def test_the_suggestion_call_cap_defaults_to_sixty_and_must_be_positive(
     assert load_intel_config().intel_max_calls_per_suggestion_run == 60
     clean_env.setenv("INTEL_MAX_CALLS_PER_SUGGESTION_RUN", "0")
     with pytest.raises(ConfigError, match="INTEL_MAX_CALLS_PER_SUGGESTION_RUN"):
+        load_intel_config()
+
+
+# ── throughput (spec 2026-10-03-intel-throughput §8) ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "key", ["INTEL_RUN_CONCURRENCY", "INTEL_SOURCE_READ_CONCURRENCY", "INTEL_SEARCH_READ_EFFORT"]
+)
+def test_the_throughput_keys_are_required(clean_env: pytest.MonkeyPatch, key: str) -> None:
+    _env(clean_env)
+    clean_env.delenv(key)
+    with pytest.raises(ConfigError, match=key):
+        load_intel_config()
+
+
+def test_the_throughput_keys_load(clean_env: pytest.MonkeyPatch) -> None:
+    _env(clean_env)
+    cfg = load_intel_config()
+    assert (cfg.intel_run_concurrency, cfg.intel_source_read_concurrency) == (3, 4)
+    assert cfg.intel_search_read_effort == "medium"
+    assert cfg.pool_size_needed() == 3 * (4 + 1) + 1
+
+
+@pytest.mark.parametrize("key", ["INTEL_RUN_CONCURRENCY", "INTEL_SOURCE_READ_CONCURRENCY"])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_a_concurrency_must_be_at_least_one(
+    clean_env: pytest.MonkeyPatch, key: str, value: str
+) -> None:
+    _env(clean_env, **{key: value})
+    with pytest.raises(ConfigError, match=key):
+        load_intel_config()
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_every_effort_level_is_accepted(clean_env: pytest.MonkeyPatch, effort: str) -> None:
+    _env(clean_env, INTEL_SEARCH_READ_EFFORT=effort)
+    assert load_intel_config().intel_search_read_effort == effort
+
+
+@pytest.mark.parametrize("effort", ["none", "MEDIUM", "", "minimal"])
+def test_an_effort_outside_the_five_levels_is_refused(
+    clean_env: pytest.MonkeyPatch, effort: str
+) -> None:
+    _env(clean_env, INTEL_SEARCH_READ_EFFORT=effort)
+    with pytest.raises(ConfigError, match="INTEL_SEARCH_READ_EFFORT"):
         load_intel_config()
