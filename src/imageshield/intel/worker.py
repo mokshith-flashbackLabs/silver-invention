@@ -33,6 +33,7 @@ from imageshield.intel.config import IntelConfig, load_intel_config
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import HttpTextFetcher
 from imageshield.intel.model import ClaudeIntelModel, IntelModel
+from imageshield.intel.models import Run
 from imageshield.intel.pipeline import PipelineDeps, run
 from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.protection_store import PostgresProtectionStore
@@ -70,11 +71,10 @@ def _build_model(config: IntelConfig) -> IntelModel:
     return ClaudeIntelModel(config)
 
 
-async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
-    """One pass: reconcile a new vocabulary, resolve newly mapped gaps, expire exhausted runs,
-    schedule due sources, claim at most one run, execute it, finish it. Returns whether a run
-    was executed, so the caller can poll again immediately while there is work and back off
-    once the queue is empty."""
+async def housekeeping(deps: PipelineDeps) -> None:
+    """Everything a loop pass does before it claims: reconcile a new vocabulary, resolve newly
+    mapped gaps, expire exhausted runs, pause sources whose tags left the quiz, schedule due
+    sources and due renewals. Once per pass, however many runs the pass then claims."""
     now = deps.clock()
     # spec §4.9: react to a new vocabulary within one poll, before any run loads it; then
     # resolve every pending gap the live quiz now maps (state-based), so its regeneration run
@@ -88,45 +88,133 @@ async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
     await deps.store.schedule_due(now)
     # spec §4.8: one renewal check for each credit near its review date. No model call.
     await deps.protections.schedule_renewals(now)
-    claimed = await deps.store.claim_next(now, lease_seconds=lease_seconds)
+
+
+async def tick(deps: PipelineDeps, *, lease_seconds: int) -> bool:
+    """One pass with one slot: housekeeping, then claim at most one run, execute it, finish it.
+    Returns whether a run was claimed. The deployed loop is ``serve``, which keeps several runs
+    in flight; this is the same pass for exactly one, kept for scripts and tests."""
+    await housekeeping(deps)
+    claimed = await deps.store.claim_next(deps.clock(), lease_seconds=lease_seconds)
     if claimed is None:
         return False
-    run_log = RunLog(claimed.run_id, deps.store)
-    started = time.monotonic()
-    await run_log.append("run_started", *run_started_event(claimed))
-    bound = current_run_log.set(run_log)
-    try:
-        result = await run(claimed, deps)
-    except Exception:
-        # A bug or a DB error -- never a page/feed/model outcome, which `run()`
-        # always turns into a RunResult instead of raising. Leave the run
-        # leased: it is reclaimed once the lease expires, capped at
-        # MAX_RUN_ATTEMPTS (`expire_exhausted` then fails it for good rather
-        # than retrying forever). Its log stops here; a reclaim appends to it.
-        log.exception("intel.run_crashed", run_id=str(claimed.run_id), kind=claimed.kind)
-        return True
-    finally:
-        current_run_log.reset(bound)
-    await run_log.append(
-        "run_finished",
-        *run_finished_event(
-            result.status,
-            result.error_code,
-            result.outcome.get("cost_usd"),
-            int((time.monotonic() - started) * 1000),
-        ),
-    )
-    await deps.store.finish_run(
-        claimed.run_id, status=result.status, outcome=result.outcome, error_code=result.error_code
-    )
-    log.info(
-        "intel.run_finished",
-        run_id=str(claimed.run_id),
-        kind=claimed.kind,
-        status=result.status,
-        outcome=loggable_outcome(result.outcome),
-    )
+    await execute(claimed, deps, lease_seconds=lease_seconds)
     return True
+
+
+class _Lease:
+    """A claimed run's heartbeat (spec 2026-10-03-intel-throughput §2): while the run executes,
+    its lease is renewed every third of ``lease_seconds``, so a run longer than its lease is never
+    claimed a second time while it is still running. Only the claim that holds the run renews it
+    (``renew_lease`` is guarded on ``attempts``). A renewal that finds the run taken over sets
+    ``lost``, is logged, and stops; one that errors is logged and tried again next beat."""
+
+    def __init__(self, claimed: Run, deps: PipelineDeps, *, lease_seconds: int) -> None:
+        self._claimed = claimed
+        self._deps = deps
+        self._lease_seconds = lease_seconds
+        self.lost = False
+        self._task = asyncio.create_task(self._beat(), name=f"intel-lease-{claimed.run_id}")
+
+    async def _beat(self) -> None:
+        interval = self._lease_seconds / 3
+        run_id = str(self._claimed.run_id)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                held = await self._deps.store.renew_lease(
+                    self._claimed.run_id,
+                    attempts=self._claimed.attempts,
+                    now=self._deps.clock(),
+                    lease_seconds=self._lease_seconds,
+                )
+            except Exception:
+                log.warning("intel.run_lease_renewal_failed", run_id=run_id)
+                continue
+            if not held:
+                self.lost = True
+                log.warning(
+                    "intel.run_lease_lost",
+                    run_id=run_id,
+                    kind=self._claimed.kind,
+                    attempt=self._claimed.attempts,
+                )
+                return
+
+    async def stop(self) -> None:
+        """Stop renewing. Idempotent. Waits for the beat to end without ever raising its
+        cancellation into the caller (``asyncio.wait`` returns rather than raising)."""
+        self._task.cancel()
+        await asyncio.wait({self._task})
+
+
+async def execute(claimed: Run, deps: PipelineDeps, *, lease_seconds: int) -> None:
+    """Execute ONE claimed run: its run log, its lease heartbeat, ``run()``, its finish.
+
+    Each run's log is bound for the duration of ``run(claimed, deps)`` (spec 2026-10-03 §3.3):
+    in its own task under ``serve`` (a task runs in a copy of the context, so concurrent runs
+    never see each other's log), inline under ``tick``. ``run_started`` comes before the run,
+    ``run_finished`` after it and BEFORE ``finish_run``, so a poll that sees the run's terminal
+    status always sees its whole log. The heartbeat stops before the finish write; the finish
+    is guarded on this claim, so a holder that lost its lease writes nothing over the newer
+    holder's result."""
+    lease = _Lease(claimed, deps, lease_seconds=lease_seconds)
+    run_id = str(claimed.run_id)
+    try:
+        run_log = RunLog(claimed.run_id, deps.store)
+        started = time.monotonic()
+        await run_log.append("run_started", *run_started_event(claimed))
+        bound = current_run_log.set(run_log)
+        try:
+            result = await run(claimed, deps)
+        except Exception:
+            # A bug or a DB error -- never a page/feed/model outcome, which `run()`
+            # always turns into a RunResult instead of raising. Leave the run
+            # leased: it is reclaimed once the lease expires, capped at
+            # MAX_RUN_ATTEMPTS (`expire_exhausted` then fails it for good rather
+            # than retrying forever). Its log stops here; a reclaim appends to it.
+            log.exception("intel.run_crashed", run_id=run_id, kind=claimed.kind)
+            return
+        finally:
+            current_run_log.reset(bound)
+        await lease.stop()
+        if lease.lost:
+            # Another claimer holds the run now (or expire_exhausted ended it): its result is
+            # the one that stands. This attempt's log stops without run_finished, like a crash.
+            log.warning(
+                "intel.run_result_dropped", run_id=run_id, kind=claimed.kind, status=result.status
+            )
+            return
+        await run_log.append(
+            "run_finished",
+            *run_finished_event(
+                result.status,
+                result.error_code,
+                result.outcome.get("cost_usd"),
+                int((time.monotonic() - started) * 1000),
+            ),
+        )
+        finished = await deps.store.finish_run(
+            claimed.run_id,
+            status=result.status,
+            outcome=result.outcome,
+            error_code=result.error_code,
+            attempts=claimed.attempts,
+        )
+        if not finished:
+            log.warning(
+                "intel.run_result_dropped", run_id=run_id, kind=claimed.kind, status=result.status
+            )
+            return
+        log.info(
+            "intel.run_finished",
+            run_id=run_id,
+            kind=claimed.kind,
+            status=result.status,
+            outcome=loggable_outcome(result.outcome),
+        )
+    finally:
+        await lease.stop()
 
 
 async def run_forever(config: IntelConfig) -> None:

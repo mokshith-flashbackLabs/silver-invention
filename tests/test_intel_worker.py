@@ -5,7 +5,8 @@ pipeline tests (``tests/conftest.py``'s ``intel_pool``, ``tests/intel_fakes.py``
 
 from __future__ import annotations
 
-from datetime import timedelta
+import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -17,7 +18,16 @@ from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.run_log import RunLog, current_run_log
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.intel.worker import tick
-from tests.intel_fakes import NOW, POLICY, FakeFetcher, FakeModel, make_deps, make_page, make_signal
+from tests.intel_fakes import (
+    NOW,
+    POLICY,
+    FakeFetcher,
+    FakeModel,
+    GatedFetcher,
+    make_deps,
+    make_page,
+    make_signal,
+)
 
 URL = "https://n.example/a"
 
@@ -225,3 +235,145 @@ async def test_a_crashed_run_is_left_without_run_finished(
     read = await store.run_events(run_id)
     assert read is not None and read.status == "running"
     assert [e.kind for e in read.events] == ["run_started"]
+
+
+# ── the lease heartbeat (spec 2026-10-03-intel-throughput §2) ─────────────────────────────────
+
+
+def _real_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+def _counting_renewals(deps: Any) -> list[bool]:
+    """Wrap the store's renew_lease so a test can count the heartbeat's beats and their answers."""
+    beats: list[bool] = []
+    renew = deps.store.renew_lease
+
+    async def counted(*args: Any, **kwargs: Any) -> bool:
+        held: bool = await renew(*args, **kwargs)
+        beats.append(held)
+        return held
+
+    deps.store.renew_lease = counted
+    return beats
+
+
+async def test_a_run_longer_than_its_lease_is_renewed_and_never_claimed_twice(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """A one-second lease on a run held for two and a half seconds: the heartbeat keeps it, so a
+    second claimer finds nothing, and the run finishes on its first attempt."""
+    store = PostgresIntelStore(intel_pool)
+    await store.queue_adhoc(URL, operator="a")
+    fetcher = GatedFetcher({URL: make_page(POLICY, URL)})
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()), clock=_real_clock)
+    beats = _counting_renewals(deps)
+    worker = asyncio.create_task(tick(deps, lease_seconds=1))
+    await fetcher.until_waiting(1)
+    await asyncio.sleep(2.5)
+    assert await store.claim_next(_real_clock(), lease_seconds=1) is None  # still held
+    fetcher.release.set()
+    assert await worker is True
+    assert len(beats) >= 2 and all(beats)
+    (run,) = await store.list_runs(cursor=None, limit=1)
+    assert (run.status, run.attempts) == ("completed", 1)
+    assert await _scalar(intel_pool, "SELECT lease_expires_at FROM intel_runs") is None
+
+
+async def test_the_heartbeat_stops_when_the_run_finishes(intel_pool: AsyncConnectionPool) -> None:
+    store = PostgresIntelStore(intel_pool)
+    await store.queue_adhoc(URL, operator="a")
+    fetcher = GatedFetcher({URL: make_page(POLICY, URL)})
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()), clock=_real_clock)
+    beats = _counting_renewals(deps)
+    worker = asyncio.create_task(tick(deps, lease_seconds=1))
+    await fetcher.until_waiting(1)
+    await asyncio.sleep(0.8)
+    fetcher.release.set()
+    assert await worker is True
+    counted = len(beats)
+    assert counted >= 1
+    await asyncio.sleep(1.0)  # three beats' worth
+    assert len(beats) == counted
+
+
+async def test_the_heartbeat_stops_when_the_run_crashes(intel_pool: AsyncConnectionPool) -> None:
+    """A crash leaves the run leased for a reclaim, exactly as before; the lease is simply no
+    longer renewed, so it expires and the run can be reclaimed."""
+    store = PostgresIntelStore(intel_pool)
+    await store.queue_adhoc(URL, operator="a")
+    deps = make_deps(intel_pool, FakeFetcher({}), FakeModel(), clock=_real_clock)
+    beats = _counting_renewals(deps)
+
+    async def broken(_: Any, **__: Any) -> Any:
+        await asyncio.sleep(0.6)  # long enough for one beat
+        raise RuntimeError("bug")
+
+    deps.fetcher.fetch_text = broken  # type: ignore[method-assign,assignment]
+    assert await tick(deps, lease_seconds=1) is True
+    counted = len(beats)
+    assert counted >= 1
+    await asyncio.sleep(1.0)
+    assert len(beats) == counted
+    (run,) = await store.list_runs(cursor=None, limit=1)
+    assert run.status == "running"
+    reclaimed = await store.claim_next(_real_clock(), lease_seconds=900)
+    assert reclaimed is not None and reclaimed.attempts == 2
+
+
+async def test_a_lost_lease_is_logged_and_never_overwrites_the_new_holder(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Another claimer takes the run over while it is still executing (its lease looked lapsed
+    to that claimer). The first holder's next beat finds the run no longer its own and logs it;
+    the run still finishes, but its result is dropped and the newer holder's row is untouched."""
+    store = PostgresIntelStore(intel_pool)
+    run_id = await store.queue_adhoc(URL, operator="a")
+    fetcher = GatedFetcher({URL: make_page(POLICY, URL)})
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()), clock=_real_clock)
+    with structlog.testing.capture_logs() as logs:
+        worker = asyncio.create_task(tick(deps, lease_seconds=1))
+        await fetcher.until_waiting(1)
+        taken = await store.claim_next(_real_clock() + timedelta(hours=1), lease_seconds=900)
+        assert taken is not None and taken.attempts == 2
+        await asyncio.sleep(0.8)  # at least one beat after the takeover
+        fetcher.release.set()
+        assert await worker is True
+    lost = [e for e in logs if e["event"] == "intel.run_lease_lost"]
+    assert len(lost) == 1 and lost[0]["run_id"] == str(run_id) and lost[0]["attempt"] == 1
+    assert [e["event"] for e in logs if e["event"] == "intel.run_result_dropped"] == [
+        "intel.run_result_dropped"
+    ]
+    assert "intel.run_finished" not in {e["event"] for e in logs}
+    (run,) = await store.list_runs(cursor=None, limit=1)
+    assert (run.status, run.attempts, run.outcome) == ("running", 2, {})
+    read = await store.run_events(run_id)
+    assert read is not None and "run_finished" not in {e.kind for e in read.events}
+
+
+async def test_a_finish_is_refused_once_another_claim_holds_the_run(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The guard on the write itself, for a takeover the heartbeat had not seen yet."""
+    store = PostgresIntelStore(intel_pool)
+    await store.queue_adhoc(URL, operator="a")
+    first = await store.claim_next(NOW, lease_seconds=60)
+    assert first is not None
+    second = await store.claim_next(NOW + timedelta(seconds=61), lease_seconds=60)
+    assert second is not None and second.attempts == 2
+    stale = await store.finish_run(
+        first.run_id, status="completed", outcome={"x": 1}, attempts=first.attempts
+    )
+    assert stale is False
+    assert (
+        await store.renew_lease(first.run_id, attempts=first.attempts, now=NOW, lease_seconds=60)
+        is False
+    )
+    assert (
+        await store.finish_run(
+            second.run_id, status="completed", outcome={"x": 2}, attempts=second.attempts
+        )
+        is True
+    )
+    (run,) = await store.list_runs(cursor=None, limit=1)
+    assert (run.status, run.outcome) == ("completed", {"x": 2})

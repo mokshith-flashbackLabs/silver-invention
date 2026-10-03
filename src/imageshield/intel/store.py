@@ -93,6 +93,16 @@ _EXPIRE_SQL = """
      WHERE status = 'running' AND lease_expires_at <= %(now)s AND attempts >= %(max_attempts)s
 """
 
+# The holder's heartbeat (spec 2026-10-03-intel-throughput §2). Guarded on the claim that is
+# renewing: a run another claimer has since taken (attempts moved on) or that expire_exhausted
+# ended (status moved on) is not this holder's to extend. An expired lease nobody took yet IS
+# still this holder's, so it is extended rather than lost.
+_RENEW_LEASE_SQL = """
+    UPDATE intel_runs SET lease_expires_at = %(now)s + make_interval(secs => %(lease)s)
+     WHERE run_id = %(run_id)s AND status = 'running' AND attempts = %(attempts)s
+    RETURNING 1
+"""
+
 # ``<=`` on both halves of the pair, not ``<``: an equal pair is a legitimate re-push
 # (e.g. the same release republished with a corrected document) and must overwrite
 # rather than be silently dropped as "no-op". A strictly-older pair on either half of
@@ -181,10 +191,19 @@ class IntelStore(Protocol):
     async def queue_adhoc(self, url: str, *, operator: str) -> UUID: ...
     async def schedule_due(self, now: datetime) -> list[UUID]: ...
     async def claim_next(self, now: datetime, *, lease_seconds: int) -> Run | None: ...
+    async def renew_lease(
+        self, run_id: UUID, *, attempts: int, now: datetime, lease_seconds: int
+    ) -> bool: ...
     async def expire_exhausted(self, now: datetime) -> int: ...
     async def finish_run(
-        self, run_id: UUID, *, status: str, outcome: dict[str, Any], error_code: str | None = None
-    ) -> None: ...
+        self,
+        run_id: UUID,
+        *,
+        status: str,
+        outcome: dict[str, Any],
+        error_code: str | None = None,
+        attempts: int | None = None,
+    ) -> bool: ...
     async def set_run_vocabulary(
         self, run_id: UUID, *, release_no: int, map_version: int
     ) -> None: ...
@@ -408,6 +427,18 @@ class PostgresIntelStore:
             row = await cur.fetchone()
         return Run.model_validate(row) if row is not None else None
 
+    async def renew_lease(
+        self, run_id: UUID, *, attempts: int, now: datetime, lease_seconds: int
+    ) -> bool:
+        """Extend a running run's lease to ``now + lease_seconds``, only for the claim that
+        holds it (``attempts`` is that claim's). False: the run is no longer this holder's."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _RENEW_LEASE_SQL,
+                {"run_id": run_id, "attempts": attempts, "now": now, "lease": lease_seconds},
+            )
+            return await cur.fetchone() is not None
+
     async def expire_exhausted(self, now: datetime) -> int:
         async with self._pool.connection() as conn, conn.transaction():
             cur = await conn.execute(_EXPIRE_SQL, {"now": now, "max_attempts": MAX_RUN_ATTEMPTS})
@@ -417,14 +448,35 @@ class PostgresIntelStore:
         return count
 
     async def finish_run(
-        self, run_id: UUID, *, status: str, outcome: dict[str, Any], error_code: str | None = None
-    ) -> None:
+        self,
+        run_id: UUID,
+        *,
+        status: str,
+        outcome: dict[str, Any],
+        error_code: str | None = None,
+        attempts: int | None = None,
+    ) -> bool:
+        """Write a run's result. With ``attempts`` (the worker always passes its claim's), only
+        while that claim still holds the run, so a holder whose lease was taken over never writes
+        over the newer holder's result. Returns whether the row was written."""
+        guard = ""
+        params: dict[str, Any] = {
+            "status": status,
+            "outcome": Jsonb(outcome),
+            "error_code": error_code,
+            "run_id": run_id,
+        }
+        if attempts is not None:
+            guard = " AND status = 'running' AND attempts = %(attempts)s"
+            params["attempts"] = attempts
         async with self._pool.connection() as conn:
-            await conn.execute(
-                "UPDATE intel_runs SET status = %s, outcome = %s, error_code = %s,"
-                " completed_at = now(), lease_expires_at = NULL WHERE run_id = %s",
-                (status, Jsonb(outcome), error_code, run_id),
+            cur = await conn.execute(
+                "UPDATE intel_runs SET status = %(status)s, outcome = %(outcome)s,"
+                " error_code = %(error_code)s, completed_at = now(), lease_expires_at = NULL"
+                f" WHERE run_id = %(run_id)s{guard}",
+                params,
             )
+            return cur.rowcount > 0
 
     async def set_run_vocabulary(self, run_id: UUID, *, release_no: int, map_version: int) -> None:
         async with self._pool.connection() as conn:

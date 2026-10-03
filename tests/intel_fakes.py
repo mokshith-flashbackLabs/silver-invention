@@ -12,6 +12,7 @@ page.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from collections.abc import Callable
@@ -85,6 +86,47 @@ class FakeFetcher:
             if url in self.robots_disallowed:
                 return FetchFailure(code="robots_disallowed")
         return self.pages.get(url, FetchFailure(code="unfetchable"))
+
+
+class GatedFetcher(FakeFetcher):
+    """A FakeFetcher whose fetches are HELD until ``release`` is set: ``hold`` names the URLs
+    held (None holds every one). ``waiting`` is how many fetches are held right now and ``peak``
+    the most ever held at once, so a test can see reads overlap and runs stay in flight."""
+
+    def __init__(
+        self,
+        pages: dict[str, TextFetch | FetchFailure],
+        *,
+        hold: frozenset[str] | set[str] | None = None,
+    ) -> None:
+        super().__init__(pages)
+        self.release = asyncio.Event()
+        self.hold = None if hold is None else frozenset(hold)
+        self.waiting = 0
+        self.peak = 0
+        self._changed = asyncio.Condition()
+
+    async def fetch_text(
+        self, url: str, *, respect_robots: bool = False
+    ) -> TextFetch | FetchFailure:
+        if self.hold is None or url in self.hold:
+            async with self._changed:
+                self.waiting += 1
+                self.peak = max(self.peak, self.waiting)
+                self._changed.notify_all()
+            await self.release.wait()
+            async with self._changed:
+                self.waiting -= 1
+        return await super().fetch_text(url, respect_robots=respect_robots)
+
+    async def until_waiting(self, count: int, *, timeout: float = 10.0) -> None:
+        """Return once ``count`` fetches are held at the same time."""
+
+        async def held() -> None:
+            async with self._changed:
+                await self._changed.wait_for(lambda: self.waiting >= count)
+
+        await asyncio.wait_for(held(), timeout)
 
 
 class FakeModel:
