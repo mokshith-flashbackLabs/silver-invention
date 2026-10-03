@@ -1,11 +1,24 @@
 """The intel worker (spec §4.1). ``python -m imageshield.intel.worker`` -- a third
 container in services-worker; a polled loop like ``recheck/worker.py``, no queue.
 
-Each tick: expire runs at the attempt cap, schedule due sources, claim ONE run
-under a lease, execute it, finish it. One worker (``services-worker`` runs
-desired count 1); the lease protects against a crash, not against two live
-workers -- ``claim_next``'s ``FOR UPDATE SKIP LOCKED`` is what would make a
-second one safe if that ever changed.
+*Amended 2026-10-03 (throughput, spec 2026-10-03-intel-throughput):* it used to claim ONE run
+per tick and execute it before the next tick, so a fifteen-minute Suggest-points run held the
+whole queue. Now each loop pass (``serve``) does housekeeping ONCE -- reconcile, resolve gaps,
+expire exhausted runs, pause unmapped sources, schedule due sources and renewals -- then claims
+runs while one of ``INTEL_RUN_CONCURRENCY`` slots is free, each executed in its own task. A pass
+runs again as soon as a run ends (a slot frees), and at least every ``INTEL_POLL_SECONDS``.
+
+- **Claims.** ``claim_next``'s ``FOR UPDATE SKIP LOCKED`` keeps any two claimers -- two slots
+  here, or two services-worker tasks (prod runs two) -- off one run. Each claimed run's lease is
+  RENEWED while it executes (``_Lease``), so a run longer than ``INTEL_LEASE_SECONDS`` is never
+  claimed a second time while still running; a lease does lapse when its worker dies, and a
+  reclaim follows as before. The finish write is guarded on the claim (``attempts``).
+- **Runs are independent.** Each run's task binds its OWN ``current_run_log`` (a task runs in a
+  copy of the context), writes its own ``run_started`` and ``run_finished``, and crashes alone:
+  a crash is logged and leaves that run leased, and the loop and the other runs carry on.
+- **Shutdown.** SIGTERM stops claiming. In-flight runs get ``_DRAIN_SECONDS`` to finish (inside
+  ECS's default 30 s stop timeout); any still running are cancelled and left leased, to be
+  reclaimed by the next worker once their lease lapses.
 
 Each executed run gets a run log (spec 2026-10-03 §3.3): ``run_started`` before it,
 ``run_finished`` after it and BEFORE ``finish_run``, so a poll that sees the run's terminal
@@ -217,6 +230,98 @@ async def execute(claimed: Run, deps: PipelineDeps, *, lease_seconds: int) -> No
         await lease.stop()
 
 
+async def _execute_alone(claimed: Run, deps: PipelineDeps, *, lease_seconds: int) -> None:
+    """``execute`` in its own task: whatever escapes it (a DB error writing the finish, say) is
+    logged here and ends this run's task only. The run stays leased and is reclaimed."""
+    try:
+        await execute(claimed, deps, lease_seconds=lease_seconds)
+    except Exception:
+        log.exception("intel.run_task_failed", run_id=str(claimed.run_id), kind=claimed.kind)
+
+
+async def fill(
+    deps: PipelineDeps,
+    running: set[asyncio.Task[None]],
+    *,
+    concurrency: int,
+    lease_seconds: int,
+) -> int:
+    """One loop pass: housekeeping once, then claim runs while ``running`` holds fewer than
+    ``concurrency``, each executed in its own task (added to ``running``, removed when it ends).
+    Returns how many runs this pass claimed."""
+    await housekeeping(deps)
+    claimed_count = 0
+    while len(running) < concurrency:
+        claimed = await deps.store.claim_next(deps.clock(), lease_seconds=lease_seconds)
+        if claimed is None:
+            break
+        # A task runs in a COPY of this context, where no run log is bound; execute() binds
+        # this run's own inside it, so concurrent runs never write to each other's log.
+        task = asyncio.create_task(
+            _execute_alone(claimed, deps, lease_seconds=lease_seconds),
+            name=f"intel-run-{claimed.run_id}",
+        )
+        running.add(task)
+        task.add_done_callback(running.discard)
+        claimed_count += 1
+    return claimed_count
+
+
+# How long SIGTERM waits for in-flight runs before cancelling them, leaving them leased. Inside
+# ECS's default 30 s stop timeout (the task definitions set none), so the pool and the HTTP client
+# still close cleanly before the container is killed.
+_DRAIN_SECONDS = 20.0
+
+
+async def serve(
+    deps: PipelineDeps,
+    *,
+    stopping: asyncio.Event,
+    enabled: bool,
+    run_concurrency: int,
+    lease_seconds: int,
+    poll_seconds: float,
+    drain_seconds: float = _DRAIN_SECONDS,
+) -> None:
+    """The loop: a pass (``fill``), then sleep until a run ends, ``stopping`` is set, or
+    ``poll_seconds`` pass, whichever is first -- so a freed slot is refilled at once and
+    housekeeping still runs every poll while every slot is busy. On ``stopping``: claim nothing
+    more, give in-flight runs ``drain_seconds``, then cancel what is left (it stays leased)."""
+    running: set[asyncio.Task[None]] = set()
+    stop = asyncio.ensure_future(stopping.wait())
+    try:
+        while not stopping.is_set():
+            if enabled:
+                try:
+                    await fill(
+                        deps, running, concurrency=run_concurrency, lease_seconds=lease_seconds
+                    )
+                except Exception:
+                    # One bad pass must not kill the loop. Whatever it was working on is still
+                    # queued/leased and picked up later; in-flight runs are untouched.
+                    log.exception("intel.tick_failed")
+            await asyncio.wait(
+                {stop, *running}, timeout=poll_seconds, return_when=asyncio.FIRST_COMPLETED
+            )
+        await _drain(running, drain_seconds)
+    finally:
+        stop.cancel()
+
+
+async def _drain(running: set[asyncio.Task[None]], drain_seconds: float) -> None:
+    if not running:
+        return
+    log.info("intel.draining", runs=len(running))
+    _, pending = await asyncio.wait(set(running), timeout=drain_seconds)
+    if pending:
+        # Cancelled mid-run: each one's lease heartbeat stops with it, and the run is reclaimed
+        # by the next worker once its lease lapses, exactly as after a crash.
+        log.warning("intel.runs_left_leased", runs=len(pending))
+        for task in pending:
+            task.cancel()
+        await asyncio.wait(pending)
+
+
 async def run_forever(config: IntelConfig) -> None:
     stopping = asyncio.Event()
 
@@ -257,22 +362,30 @@ async def run_forever(config: IntelConfig) -> None:
         questions=PostgresQuestionStore(pool),
         max_calls_per_suggestion_run=config.intel_max_calls_per_suggestion_run,
     )
-    log.info("intel.started", enabled=config.intel_enabled, provider=config.intel_model_provider)
+    log.info(
+        "intel.started",
+        enabled=config.intel_enabled,
+        provider=config.intel_model_provider,
+        run_concurrency=config.intel_run_concurrency,
+        source_read_concurrency=config.intel_source_read_concurrency,
+    )
+    if config.db_pool_max_size < config.pool_size_needed():
+        # Not a refusal: statements are short, so a smaller pool queues rather than fails. But a
+        # read waiting on a connection is a read not running, so say so where it can be seen.
+        log.warning(
+            "intel.pool_below_concurrency",
+            db_pool_max_size=config.db_pool_max_size,
+            needed=config.pool_size_needed(),
+        )
     try:
-        while not stopping.is_set():
-            worked = False
-            if config.intel_enabled:
-                try:
-                    worked = await tick(deps, lease_seconds=config.intel_lease_seconds)
-                except Exception:
-                    # One bad tick must not kill the loop. Whatever it was
-                    # working on is still queued/leased and picked up later.
-                    log.exception("intel.tick_failed")
-            if not worked:
-                # Sleep, but wake immediately on SIGTERM rather than finishing
-                # the interval -- a deploy should not wait for a poll to elapse.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stopping.wait(), timeout=config.intel_poll_seconds)
+        await serve(
+            deps,
+            stopping=stopping,
+            enabled=config.intel_enabled,
+            run_concurrency=config.intel_run_concurrency,
+            lease_seconds=config.intel_lease_seconds,
+            poll_seconds=config.intel_poll_seconds,
+        )
     finally:
         await http_client.aclose()
         await pool.close()

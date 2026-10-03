@@ -17,7 +17,7 @@ from imageshield.intel.bounds import MAX_RUN_ATTEMPTS
 from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.run_log import RunLog, current_run_log
 from imageshield.intel.store import PostgresIntelStore
-from imageshield.intel.worker import tick
+from imageshield.intel.worker import fill, serve, tick
 from tests.intel_fakes import (
     NOW,
     POLICY,
@@ -377,3 +377,160 @@ async def test_a_finish_is_refused_once_another_claim_holds_the_run(
     )
     (run,) = await store.list_runs(cursor=None, limit=1)
     assert (run.status, run.outcome) == ("completed", {"x": 2})
+
+
+# ── several runs at once (spec 2026-10-03-intel-throughput §3) ───────────────────────────────
+
+URL_B = "https://n.example/b"
+
+
+class _BrokenFor(GatedFetcher):
+    """A GatedFetcher whose fetch of ``broken`` raises once released: a bug in one run."""
+
+    def __init__(self, pages: dict[str, Any], *, broken: str) -> None:
+        super().__init__(pages)
+        self.broken = broken
+
+    async def fetch_text(self, url: str, *, respect_robots: bool = False) -> Any:
+        fetched = await super().fetch_text(url, respect_robots=respect_robots)
+        if url == self.broken:
+            raise RuntimeError("bug")
+        return fetched
+
+
+async def _run_row(pool: AsyncConnectionPool, run_id: UUID) -> tuple[str, int]:
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT status, attempts FROM intel_runs WHERE run_id = %s", (run_id,)
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    return row[0], row[1]
+
+
+async def test_two_runs_execute_at_once_and_neither_is_claimed_twice(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    store = PostgresIntelStore(intel_pool)
+    first = await store.queue_adhoc(URL, operator="a")
+    second = await store.queue_adhoc(URL_B, operator="a")
+    fetcher = GatedFetcher({u: make_page(POLICY, u) for u in (URL, URL_B)})
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()))
+    running: set[asyncio.Task[None]] = set()
+    assert await fill(deps, running, concurrency=2, lease_seconds=900) == 2
+    await fetcher.until_waiting(2)  # both runs are mid-read at the same moment
+    # Every slot is busy, and with a third slot there is nothing left to claim: both are held.
+    assert await fill(deps, running, concurrency=2, lease_seconds=900) == 0
+    assert await fill(deps, running, concurrency=3, lease_seconds=900) == 0
+    tasks = list(running)
+    fetcher.release.set()
+    await asyncio.gather(*tasks)
+    assert running == set()
+    assert await _run_row(intel_pool, first) == ("completed", 1)
+    assert await _run_row(intel_pool, second) == ("completed", 1)
+    assert await _documents(intel_pool) == 2
+    # Each run wrote its own log, and only its own: the same work, the same rows.
+    logs = [await store.run_events(run_id) for run_id in (first, second)]
+    kinds = [[e.kind for e in read.events] for read in logs if read is not None]
+    assert len(kinds) == 2 and kinds[0] == kinds[1]
+    assert kinds[0][0] == "run_started" and kinds[0][-1] == "run_finished"
+    assert kinds[0].count("run_started") == 1 and kinds[0].count("run_finished") == 1
+    assert current_run_log.get() is None
+
+
+async def test_one_run_crashing_leaves_the_other_finishing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    store = PostgresIntelStore(intel_pool)
+    crashing = await store.queue_adhoc(URL, operator="a")
+    fine = await store.queue_adhoc(URL_B, operator="a")
+    fetcher = _BrokenFor({u: make_page(POLICY, u) for u in (URL, URL_B)}, broken=URL)
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()))
+    running: set[asyncio.Task[None]] = set()
+    with structlog.testing.capture_logs() as logs:
+        assert await fill(deps, running, concurrency=2, lease_seconds=900) == 2
+        await fetcher.until_waiting(2)
+        tasks = list(running)
+        fetcher.release.set()
+        await asyncio.gather(*tasks)  # neither task raises: the crash is that run's alone
+    crashed = [e for e in logs if e["event"] == "intel.run_crashed"]
+    assert [e["run_id"] for e in crashed] == [str(crashing)]
+    assert await _run_row(intel_pool, crashing) == ("running", 1)  # leased for a reclaim
+    assert await _run_row(intel_pool, fine) == ("completed", 1)
+    read = await store.run_events(fine)
+    assert read is not None and read.events[-1].kind == "run_finished"
+
+
+def _serve(deps: Any, stopping: asyncio.Event, **overrides: Any) -> asyncio.Task[None]:
+    settings: dict[str, Any] = {
+        "enabled": True,
+        "run_concurrency": 2,
+        "lease_seconds": 900,
+        "poll_seconds": 60,
+        **overrides,
+    }
+    return asyncio.create_task(serve(deps, stopping=stopping, **settings))
+
+
+async def test_serve_refills_a_slot_as_soon_as_a_run_ends(intel_pool: AsyncConnectionPool) -> None:
+    """One slot, two queued runs, a poll interval far longer than the test: the second run is
+    claimed the moment the first ends, not a poll later."""
+    store = PostgresIntelStore(intel_pool)
+    first = await store.queue_adhoc(URL, operator="a")
+    second = await store.queue_adhoc(URL_B, operator="a")
+    fetcher = GatedFetcher({u: make_page(POLICY, u) for u in (URL, URL_B)}, hold={URL})
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()))
+    stopping = asyncio.Event()
+    loop = _serve(deps, stopping, run_concurrency=1)
+    await fetcher.until_waiting(1)
+    assert await _run_row(intel_pool, second) == ("queued", 0)  # the one slot is busy
+    fetcher.release.set()
+    for _ in range(100):
+        if (await _run_row(intel_pool, second))[0] == "completed":
+            break
+        await asyncio.sleep(0.05)
+    assert await _run_row(intel_pool, first) == ("completed", 1)
+    assert await _run_row(intel_pool, second) == ("completed", 1)
+    stopping.set()
+    await asyncio.wait_for(loop, 5)
+
+
+async def test_stopping_lets_in_flight_runs_finish_within_the_drain(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    store = PostgresIntelStore(intel_pool)
+    first = await store.queue_adhoc(URL, operator="a")
+    second = await store.queue_adhoc(URL_B, operator="a")
+    fetcher = GatedFetcher({u: make_page(POLICY, u) for u in (URL, URL_B)})
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()))
+    stopping = asyncio.Event()
+    loop = _serve(deps, stopping, drain_seconds=10)
+    await fetcher.until_waiting(2)
+    stopping.set()
+    await asyncio.sleep(0.2)
+    await store.queue_adhoc("https://n.example/c", operator="a")  # stopping: never claimed
+    fetcher.release.set()
+    await asyncio.wait_for(loop, 10)
+    assert await _run_row(intel_pool, first) == ("completed", 1)
+    assert await _run_row(intel_pool, second) == ("completed", 1)
+    queued = "SELECT count(*) FROM intel_runs WHERE status = 'queued'"
+    assert await _scalar(intel_pool, queued) == 1
+
+
+async def test_runs_still_going_after_the_drain_are_left_leased(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    store = PostgresIntelStore(intel_pool)
+    run_id = await store.queue_adhoc(URL, operator="a")
+    fetcher = GatedFetcher({URL: make_page(POLICY, URL)})  # never released
+    deps = make_deps(intel_pool, fetcher, FakeModel(make_signal()))
+    stopping = asyncio.Event()
+    with structlog.testing.capture_logs() as logs:
+        loop = _serve(deps, stopping, drain_seconds=0.2)
+        await fetcher.until_waiting(1)
+        stopping.set()
+        await asyncio.wait_for(loop, 5)
+    assert "intel.runs_left_leased" in {e["event"] for e in logs}
+    assert await _run_row(intel_pool, run_id) == ("running", 1)
+    lease = "SELECT lease_expires_at IS NOT NULL FROM intel_runs"
+    assert await _scalar(intel_pool, lease) is True
