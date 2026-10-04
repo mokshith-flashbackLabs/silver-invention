@@ -71,6 +71,11 @@ class IntelConfig(BaseSettings):
     intel_run_concurrency: int
     intel_source_read_concurrency: int
     intel_search_read_effort: Literal["low", "medium", "high", "xhigh", "max"]
+    # The recency window (spec 2026-10-04-intel-evidence-quality §3), in days: a threat_event is for
+    # an incident whose evidence is this recent. The generation prompt states it and generation
+    # drops a threat whose cited evidence is all dated and older. The API reads the same key
+    # (``imageshield.config.Config``) for the approvability flag and the decision. Required.
+    intel_threat_recency_days: int
 
     provider_config_cache_seconds: float = 10.0
     provider_failure_threshold: int = 5
@@ -104,6 +109,7 @@ class IntelConfig(BaseSettings):
         "intel_max_calls_per_suggestion_run",
         "intel_run_concurrency",
         "intel_source_read_concurrency",
+        "intel_threat_recency_days",
         "intel_lease_seconds",
         "db_pool_max_size",
         "provider_failure_threshold",

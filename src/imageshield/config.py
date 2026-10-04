@@ -392,6 +392,15 @@ class Config(BaseSettings):
     # constant beside the route.
     csam_age_low_threshold: int
 
+    # Likeness intel's recency window (spec 2026-10-04-intel-evidence-quality §3): a threat_event
+    # proposal whose active evidence is all dated and all older than this many days is
+    # ``evidence_stale``, unapprovable, and refused at decision (409 proposal_evidence_stale). The
+    # API answers both of those, so it reads the key; the intel worker reads the SAME key
+    # (``IntelConfig``) for its prompt and its generation-time check, and
+    # tests/test_ecs_task_defs.py holds every container of an environment to one value.
+    # Required, no default, like every key the intel spec gives none.
+    intel_threat_recency_days: int
+
     # Requested via SERVICE_TOKEN_AUTH_DISABLED=1; only takes effect in
     # development — see :attr:`auth_disabled`.
     service_token_auth_disabled: bool = False
@@ -467,7 +476,7 @@ class Config(BaseSettings):
             raise ValueError("must be between 0 and 100")
         return value
 
-    @field_validator("enrolment_collision_max_faces")
+    @field_validator("enrolment_collision_max_faces", "intel_threat_recency_days")
     @classmethod
     def _at_least_one(cls, value: int) -> int:
         if value < 1:

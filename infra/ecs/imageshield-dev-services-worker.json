@@ -36,7 +36,8 @@
         { "name": "SQS_SEARCH_RUNS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-search-runs" },
         { "name": "SQS_CONFIRM_HITS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-confirm-hits" },
         { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" },
-        { "name": "CSAM_AGE_LOW_THRESHOLD", "value": "18" }
+        { "name": "CSAM_AGE_LOW_THRESHOLD", "value": "18" },
+        { "name": "INTEL_THREAT_RECENCY_DAYS", "value": "90" }
       ],
       "secrets": [
         { "name": "DB_HOST", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:host::" },
@@ -90,7 +91,8 @@
         { "name": "SQS_SEARCH_RUNS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-search-runs" },
         { "name": "SQS_CONFIRM_HITS_URL", "value": "https://sqs.ap-south-1.amazonaws.com/225989356895/imageshield-dev-confirm-hits" },
         { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" },
-        { "name": "CSAM_AGE_LOW_THRESHOLD", "value": "18" }
+        { "name": "CSAM_AGE_LOW_THRESHOLD", "value": "18" },
+        { "name": "INTEL_THREAT_RECENCY_DAYS", "value": "90" }
       ],
       "secrets": [
         { "name": "DB_HOST", "valueFrom": "arn:aws:secretsmanager:ap-south-1:225989356895:secret:imageshield/dev/db/app_services-5s1Jim:host::" },
@@ -135,6 +137,7 @@
         { "name": "INTEL_RUN_CONCURRENCY", "value": "3" },
         { "name": "INTEL_SOURCE_READ_CONCURRENCY", "value": "4" },
         { "name": "INTEL_SEARCH_READ_EFFORT", "value": "medium" },
+        { "name": "INTEL_THREAT_RECENCY_DAYS", "value": "90" },
         { "name": "FETCHER_BASE_URL", "value": "http://localhost:8083" }
       ],
       "secrets": [

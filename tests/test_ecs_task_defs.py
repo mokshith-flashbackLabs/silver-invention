@@ -584,3 +584,31 @@ def test_the_task_role_may_mint_the_web_identity_token_claude_platform_forwards(
         "https://api.anthropic.com",
         "https://platform.claude.com",
     ]
+
+
+PROD_SERVICES_TASK = ECS_DIR / "prod" / "services.json"
+PROD_CONFIRM_TASK = ECS_DIR / "prod" / "confirm.json"
+_ALL_TASKS = {
+    "dev": [SERVICES_TASK, WORKER_TASK, CONFIRM_TASK],
+    "prod": [PROD_SERVICES_TASK, PROD_WORKER_TASK, PROD_CONFIRM_TASK],
+}
+
+
+@pytest.mark.parametrize("environment", ["dev", "prod"])
+def test_every_container_of_an_environment_reads_one_threat_recency_window(
+    environment: str,
+) -> None:
+    """Spec 2026-10-04-intel-evidence-quality §3: the API answers ``evidence_stale`` and refuses
+    the decision, and the intel worker writes the window into its prompt and drops stale threats
+    at generation. Two values in one environment would have the worker propose what the API then
+    refuses (or the reverse), so every container that reads the key carries the same 90."""
+    values = {
+        (path.name, container["name"]): entry["value"]
+        for path in _ALL_TASKS[environment]
+        for container in _load(path)["containerDefinitions"]
+        for entry in container.get("environment", [])
+        if entry["name"] == "INTEL_THREAT_RECENCY_DAYS"
+    }
+    worker = PROD_WORKER_TASK if environment == "prod" else WORKER_TASK
+    assert (worker.name, "intel-worker") in values
+    assert set(values.values()) == {"90"}, values

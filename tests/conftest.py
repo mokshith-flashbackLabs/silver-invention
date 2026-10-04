@@ -112,6 +112,7 @@ VALID_ENV: dict[str, str] = {
     "FETCHER_BASE_URL": "http://localhost:8083",
     "FETCHER_TOKEN": "fetcher-token-for-tests-0003",
     "CSAM_AGE_LOW_THRESHOLD": "18",
+    "INTEL_THREAT_RECENCY_DAYS": "90",
     # ENVIRONMENT is unset here, so this block loads as `production` — which is
     # the point: VALID_ENV is what a real deployed environment looks like. A
     # production config carrying the stub is now refused at boot (the stub
@@ -153,6 +154,7 @@ def make_config(**overrides: Any) -> Config:
         "fetcher_base_url": VALID_ENV["FETCHER_BASE_URL"],
         "fetcher_token": VALID_ENV["FETCHER_TOKEN"],
         "csam_age_low_threshold": 18,
+        "intel_threat_recency_days": 90,
     }
     values.update(overrides)
     # A production config carrying the stub is refused at boot: the stub searches

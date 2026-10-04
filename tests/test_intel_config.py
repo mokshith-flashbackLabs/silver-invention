@@ -28,6 +28,7 @@ BASE = {
     "INTEL_RUN_CONCURRENCY": "3",
     "INTEL_SOURCE_READ_CONCURRENCY": "4",
     "INTEL_SEARCH_READ_EFFORT": "medium",
+    "INTEL_THREAT_RECENCY_DAYS": "90",
     "FETCHER_BASE_URL": "http://localhost:8083",
     "FETCHER_TOKEN": "fetcher-token-for-tests-0003",
 }

@@ -117,6 +117,10 @@
         {
           "name": "CSAM_AGE_LOW_THRESHOLD",
           "value": "18"
+        },
+        {
+          "name": "INTEL_THREAT_RECENCY_DAYS",
+          "value": "90"
         }
       ],
       "secrets": [
