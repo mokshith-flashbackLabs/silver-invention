@@ -389,6 +389,12 @@ with `newer_proposal`.
   on decision, and the per-option `corroborated` flag on weight suggestions (which calls the corroboration predicate
   per option). So **a proposal the panel shows as approvable is never one the decision refuses**, except for races the
   transaction itself catches (`proposal_not_pending`, `proposal_cell_awaiting_publish`).
+- *Amended 2026-10-04 (spec `2026-10-04-intel-evidence-quality-design.md`):* corroboration counts **independent
+  sources**, not distinct domains: excerpts that echo one text are one source and a company's own domains are one
+  publisher (§3 there). `why_not` gains `evidence_stale` after `evidence_retracted`: a threat_event whose active evidence
+  is all dated and older than `INTEL_THREAT_RECENCY_DAYS` (§2.1 there). Both reads add `evidence_dates`,
+  `independent_sources` and `overlaps`, and approving a proposal supersedes the pending ones it overlaps
+  `covered_by_decision` (§4 there).
 
 ### 3.7 Events and the contract view
 
@@ -598,6 +604,7 @@ weights release, bootstrap), **after every tag or mapping change**, once at work
 | Provider control | The four `PostgresProviderControlStore` settings with `Config`'s defaults: `PROVIDER_CONFIG_CACHE_SECONDS`, `PROVIDER_FAILURE_THRESHOLD`, `BREAKER_COOLDOWN_SECONDS`, `BREAKER_COOLDOWN_MAX_SECONDS`. The store is built from `providers.store` directly, never through `search.worker`. |
 | Plumbing | `FETCHER_BASE_URL`, `FETCHER_TOKEN`, `INTEL_POLL_SECONDS` (default 30), `INTEL_LEASE_SECONDS` (default 900) |
 | Throughput (*added 2026-10-03*, spec `2026-10-03-intel-throughput-design.md` §8) | `INTEL_RUN_CONCURRENCY`, `INTEL_SOURCE_READ_CONCURRENCY` (ints ≥ 1) and `INTEL_SEARCH_READ_EFFORT` (`low` · `medium` · `high` · `xhigh` · `max`), all **required**; the intel worker's `DB_POOL_MAX_SIZE` should be at least `RUN × (READ + 1) + 1` |
+| Threat recency (*added 2026-10-04*, spec `2026-10-04-intel-evidence-quality-design.md` §2.1) | `INTEL_THREAT_RECENCY_DAYS` (int ≥ 1), **required**, 90 in every environment. Read by the intel worker (prompt, generation) AND the services API (`evidence_stale`, the decision), so it is on every container that loads either settings class |
 
 **Safety constants live in `intel/bounds.py`, not env** (§4.5). A value that guards a promise costs a code change, a
 review and a `git blame` to move.

@@ -765,6 +765,10 @@ also answers the framework `401` and `422 validation_error` for a body or query 
   `uncorroborated` · `tags_unmapped`, or null. *`renewed_credit_ended` is new 2026-10-01 (final review M3/M4):* a
   PENDING renewal whose credit was retracted or has reached its review date. The decision refuses it
   `409 proposal_not_pending`; it can still be rejected.
+- *Amended 2026-10-04 (evidence quality, below):* `why_not` gains `evidence_stale` between `evidence_retracted` and
+  `uncorroborated`, and every Proposal gains `evidence_dates`, `independent_sources` and `overlaps`. See "Likeness
+  intel — evidence quality" for the shapes, `409 proposal_evidence_stale`, and `supersede_reason:
+  'covered_by_decision'`.
 
 **`Signal`** (detail only) is `{signal_id, category, direction, tags, unregistered_subjects, summary, status,
 retracted_at, retract_reason, created_at, excerpts: [{excerpt_id, quote_text, char_start, char_end, quote_sha256}],
@@ -1185,6 +1189,54 @@ changes.** What the backend and the console will see:
 **Deploy order:** services only (image and task definitions, which add the three required keys and raise the
 intel-worker's `DB_POOL_MAX_SIZE` to 16). No migration; the backend changes nothing. Rolling back is the previous image
 and task definitions.
+
+### Likeness intel — evidence quality: dates, independent sources, one proposal per body of evidence (2026-10-04)
+
+**Owner review of dev, 2026-10-04** (spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md`). No
+route is added or removed and no `svc` view changes. The proposal reads and the decision gain fields, `why_not` gains a
+value, the decision gains one refusal, and the stored row gains one `supersede_reason`. Migration 0048.
+
+**Both proposal reads** (`GET /v1/admin/intel/proposals`, each item, and `GET /v1/admin/intel/proposals/{id}`) gain
+three fields on every proposal:
+
+| Field | Shape | Meaning |
+|---|---|---|
+| `evidence_dates` | `{newest: "YYYY-MM-DD" \| null, oldest: "YYYY-MM-DD" \| null, undated: int}` | Over the ACTIVE evidence, one entry per document (a page with three signals is one). Dates are the publisher's own publication date (UTC), never when we read it. `undated` counts documents with none. The console can say "evidence from 12 Sep – 2 Oct · 3 undated". |
+| `independent_sources` | int | How many independent sources the active evidence comes from: one per publisher, with a company's own domains as one (google.com and blog.youtube; fb.com and instagram.com …) and every set of excerpts quoting the same text as one. This is the number INVARIANTS #50 compares with 2. |
+| `overlaps` | `[{proposal_id, kind}]` | For a PENDING proposal: the other pending proposals that rest on the same evidence on an overlapping tag (a weight change's tags are its option's mapped tags). Always `[]` on a proposal that is not pending. Approving this proposal supersedes exactly these. |
+
+**`why_not` gains `evidence_stale`**, in this fixed order: `not_decidable` · `renewed_credit_ended` ·
+`evidence_retracted` · **`evidence_stale`** · `uncorroborated` · `tags_unmapped`. It answers only a `threat_event` whose
+active evidence is all dated AND all older than `INTEL_THREAT_RECENCY_DAYS` (90 on dev and prod): an old or ended
+incident is not a threat. Undated evidence never makes one stale. Such a proposal can still be rejected. Suggested
+words: "This incident's evidence is all older than 90 days — reject it, or attach recent evidence."
+
+**The decision** (`POST /v1/admin/intel/proposals/{id}/decision`):
+- **`409 proposal_evidence_stale`** — the decision's own re-check of `evidence_stale`. **Map it by name**, as every
+  other code (`INTEL_PROPOSAL_EVIDENCE_STALE`, say); unmapped it falls to the generic `CONFLICT`.
+- **`superseded: [uuid]`** is added to the 200 body: the pending proposals this APPROVAL superseded, now `status:
+  'superseded'` with **`supersede_reason: 'covered_by_decision'`**. A rejection answers `superseded: []` and supersedes
+  nothing. The same ids are in services' audit row (`intel.proposal_decided`, `metadata.superseded`). A superseded
+  proposal answers any later decision `409 proposal_not_pending`.
+
+**`supersede_reason` gains `covered_by_decision`** beside `newer_proposal`, `cell_changed` and `resolved_by_quiz`.
+
+**Fewer proposals, fewer duplicates — nothing to do on your side:**
+- `uncorroborated` now fires on a proposal whose only evidence is one sentence echoed by several outlets, or a
+  company's own sites. It still never fires when any signal is `listed` (a page from a source an operator registered
+  or chose in Suggest points, or pasted). **Note for the owner:** that is every accepted source, with no publisher
+  allow-list behind it — on dev, pimeyes.com's own page is `listed`.
+- Generation now drops a threat whose evidence is all older than the window, and a repeat of a pending proposal it
+  previously missed (an older run's signal on another tag; a concurrent run). A repeat with new evidence attaches to
+  the pending proposal instead.
+- `prompt_version` on new proposals is `propose-v4`; new signals carry `prompt_version: extract-v2`.
+- A signal's `document.published_at` on the detail read is now filled for pages and search results too, whenever the
+  page's metadata, the search result or the text itself states a date.
+
+**Deploy order:** services first — migration 0048, then services, services-worker and the fetcher, with this commit's
+task definitions (every dev and prod container that loads either settings class gains the required
+`INTEL_THREAT_RECENCY_DAYS`). The backend relays the new fields as they come, so it needs only the new code mapped. On
+the way down: services' code first, then 0048's down, which relabels `covered_by_decision` rows `newer_proposal`.
 
 ---
 

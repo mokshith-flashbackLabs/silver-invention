@@ -1005,6 +1005,16 @@ previous task definitions. Two services-worker tasks (prod) can hold up to 32 in
 ceiling, against the shared cluster's `max_connections` (about 225 on `db.t4g.small`); the ceiling is reached only
 when every slot is mid-statement at once, and idle connections close after ten minutes.
 
+*Evidence quality (2026-10-04, spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md`):* one new
+required key, `INTEL_THREAT_RECENCY_DAYS=90`, with no default, on EVERY container that loads either settings class --
+`services`, `relay`, `search-worker`, `intel-worker` and `confirm-worker`, in both environments -- because the API
+answers `evidence_stale` and refuses its decision while the intel worker writes the window into its prompt.
+`tests/test_ecs_task_defs.py` holds each environment to one value. Order: `migrate up` (0048, a widened
+`supersede_reason` CHECK), then the services, services-worker, confirm and fetcher task definitions from this commit
+with the new image (the fetcher's new `published_at` is optional for the worker either way). Rolling back: the
+previous image and task definitions, then 0048's down (it relabels `covered_by_decision` rows `newer_proposal`). The
+backend needs only the new `409 proposal_evidence_stale` mapped by name.
+
 **As of 2026-09-30 dev ships `INTEL_ENABLED=true` and prod `INTEL_ENABLED=false`.** The workspace ids
 confirmed by the step-0 probe (2026-09-29) replaced the `pending-step0` placeholder in all **three** places: the dev container's `ANTHROPIC_AWS_WORKSPACE_ID`
 (`infra/ecs/imageshield-dev-services-worker.json`), the prod container's (`infra/ecs/prod/services-worker.json`),

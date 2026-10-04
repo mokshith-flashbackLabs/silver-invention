@@ -1404,6 +1404,24 @@ than 10 characters so the operator's text is kept, and restores `NOT NULL` and `
 
 ---
 
+## 2l. Likeness intel — `covered_by_decision` (migration 0048)
+
+*2026-10-04, spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md` §4.2.* One CHECK changes:
+
+```sql
+intel_proposals.supersede_reason IN ('newer_proposal', 'cell_changed', 'resolved_by_quiz',
+                                     'covered_by_decision')   -- intel_proposals_supersede_reason_check
+```
+
+Approving a proposal supersedes, in the decision's transaction, every pending proposal it overlaps (the same body of
+evidence on an overlapping tag, `intel/overlap.py`) with `covered_by_decision`. 0039 wrote the CHECK unnamed, so the up
+finds it by its definition (0043's and 0047's precedent) and restores it under the name Postgres gave it. The down
+relabels `covered_by_decision` rows `newer_proposal` and restores 0039's three values; the deciding approval's audit row
+(`intel.proposal_decided`, `metadata.superseded`) still names them. No grant: 0039's table grants cover the column.
+
+No other schema change rides with this spec: `intel_documents.published_at` (0039) is now filled for pages and search
+results too, whenever the publisher's date can be read (§2 of the spec), and never with the fetch time.
+
 ## 3. Adjudication service
 
 ⚠ **This section is the original match-module-era sketch and was never built as written.** It predates

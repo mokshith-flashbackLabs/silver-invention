@@ -862,3 +862,22 @@ be approved until signals from at least `CORROBORATION_MIN_PUBLISHERS` distinct 
 predicate answers that question for every caller.
 
 Check: one web publisher → 409; two subdomains of one publisher → 409; two publishers → approvable.
+
+*Amended 2026-10-04 (spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md` §3):* "distinct
+registrable domains" became **independent sources**. Copies of one source used to count as corroboration: four outlets
+quoting one sentence of YouTube's own announcement, and google.com beside blog.youtube. The predicate
+(`intel/corroboration.py`, still the one predicate for both reads, the decision and a suggestion's `corroborated`) now
+counts groups after two collapses:
+- **echoes**: signals whose verbatim excerpts share a run of 12 consecutive words, or 80% of the shorter excerpt's
+  distinct words (when it has at least 8), normalised for case, whitespace, punctuation and quote marks, are one
+  source, transitively;
+- **a company's own domains** (`PUBLISHER_ORGANISATIONS`: Google/YouTube, Meta, X, ByteDance, Snap, Microsoft) are one
+  publisher.
+
+A `listed` signal still corroborates on its own. `listed` is every page from a source an operator registered or chose
+in Suggest points, or pasted; there is no publisher allow-list behind it (reported to the owner, not changed). Both
+reads publish the count as `independent_sources`.
+
+Check: one sentence on four domains → one source, uncorroborated; google.com + blog.youtube → one; two publishers in
+their own words → corroborated; a listed signal → corroborated alone
+(`tests/test_intel_approvable.py::test_one_sentence_quoted_by_four_outlets_is_one_source` and the tests after it).
