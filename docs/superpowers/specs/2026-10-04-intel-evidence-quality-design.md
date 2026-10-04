@@ -57,7 +57,7 @@ none, the document is undated. The run outcome counts the source: `published_fro
 `_metadata` · `_search` · `_text` · `_unknown`. The fetcher still holds no database credentials and
 persists nothing: this is metadata read from bytes already in memory, stdlib only.
 
-### 2.1 Recency
+## 3. Fix 1, continued — recency
 
 `INTEL_THREAT_RECENCY_DAYS` (new, **required, no default**; 90 in every dev and prod container):
 a threat_event is for an incident whose evidence is recent.
@@ -80,7 +80,7 @@ a threat_event is for an incident whose evidence is recent.
 The services API reads the key (approvability, decision) and so does the intel worker (prompt,
 generation); `tests/test_ecs_task_defs.py` holds every container of an environment to one value.
 
-## 3. Fix 2 — corroboration that ignores copies
+## 4. Fix 2 — corroboration that ignores copies
 
 ONE predicate still (`intel/corroboration.py`), for every caller: the approvable flag on both reads,
 the decision's re-check, and a weight suggestion's per-option `corroborated`. It counts INDEPENDENT
@@ -102,7 +102,7 @@ source groups after two collapses (union-find over the active signals):
 A claim is corroborated by `CORROBORATION_MIN_PUBLISHERS` (2) such groups, or by a `listed` signal on
 its own (unchanged). Both reads carry `independent_sources` (int), the count the rule compares.
 
-### 3.1 What `listed` means (reported, not changed)
+### 4.1 What `listed` means (reported, not changed)
 
 There is no publisher allow-list in code, config or a table. `trust = 'listed'` is set by the
 pipeline on every document read from a REGISTERED source with a URL (`policy_page`, `feed` and its
@@ -117,9 +117,9 @@ signal corroborates alone" means *any page from any accepted source* corroborate
 a face-search engine's own marketing page, or a platform's own help page about itself. Left as is,
 for the owner to decide.
 
-## 4. Fix 3 — no duplicates, no double-counting
+## 5. Fix 3 — no duplicates, no double-counting
 
-### 4.1 Same kind
+### 5.1 Same kind
 
 - `duplicate_of` treats a tag set equal to OR inside the other's (one a subset of the other) as the
   same scope; partly overlapping or disjoint sets are still another scope.
@@ -131,7 +131,7 @@ for the owner to decide.
   (`proposal_converted_to_attach_at_write`) or, with none, is dropped
   (`proposal_dropped_duplicate_event_at_write`).
 
-### 4.2 Cross kind (`intel/overlap.py`)
+### 5.2 Cross kind (`intel/overlap.py`)
 
 Two PENDING proposals **overlap** when they could be one fact (different kinds among
 weight_change/threat_event/protection_event, or the same event kind; never two weight changes, never a
@@ -155,7 +155,7 @@ different announcements by one company are two pieces of evidence.
   kind of proposal — a temporary incident is a threat_event, a lasting policy state a weight_change;
   never both, and never the same fact as both a protection and a risk.
 
-## 5. Contract changes (services → backend)
+## 6. Contract changes (services → backend)
 
 | Change | Where |
 |---|---|
@@ -170,7 +170,7 @@ different announcements by one company are two pieces of evidence.
 
 No route is added or removed, and no `svc` view changes.
 
-## 6. Deploy
+## 7. Deploy
 
 Migration 0048, then services, services-worker and the fetcher (any order between those three: the
 worker reads a missing `published_at` as null, and an older worker ignores the new key). The new

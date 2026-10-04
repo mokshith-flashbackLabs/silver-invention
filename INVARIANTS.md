@@ -863,7 +863,7 @@ predicate answers that question for every caller.
 
 Check: one web publisher → 409; two subdomains of one publisher → 409; two publishers → approvable.
 
-*Amended 2026-10-04 (spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md` §3):* "distinct
+*Amended 2026-10-04 (spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md` §4):* "distinct
 registrable domains" became **independent sources**. Copies of one source used to count as corroboration: four outlets
 quoting one sentence of YouTube's own announcement, and google.com beside blog.youtube. The predicate
 (`intel/corroboration.py`, still the one predicate for both reads, the decision and a suggestion's `corroborated`) now

@@ -1406,7 +1406,7 @@ than 10 characters so the operator's text is kept, and restores `NOT NULL` and `
 
 ## 2l. Likeness intel — `covered_by_decision` (migration 0048)
 
-*2026-10-04, spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md` §4.2.* One CHECK changes:
+*2026-10-04, spec `docs/superpowers/specs/2026-10-04-intel-evidence-quality-design.md` §5.2.* One CHECK changes:
 
 ```sql
 intel_proposals.supersede_reason IN ('newer_proposal', 'cell_changed', 'resolved_by_quiz',
