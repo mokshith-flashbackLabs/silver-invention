@@ -346,6 +346,9 @@ async def text(
         "final_url": fetched.final_url,
         "truncated": fetched.truncated,
         "items": [i.model_dump() for i in extracted.items] if extracted.items is not None else None,
+        # The page's own publication date from its HTML metadata, ISO-8601, or null (spec
+        # 2026-10-04-intel-evidence-quality §2). Never the fetch time.
+        "published_at": extracted.published_at,
     }
 
 
