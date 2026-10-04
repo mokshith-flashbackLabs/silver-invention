@@ -555,6 +555,8 @@ async def decide_proposal(
         "status": result.status,
         "applied_ref": result.applied_ref,
         "decided": result.decided,
+        # The pending proposals this approval superseded covered_by_decision (2026-10-04).
+        "superseded": list(result.superseded),
     }
 
 

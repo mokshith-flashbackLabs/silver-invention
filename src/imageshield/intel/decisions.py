@@ -29,6 +29,14 @@ review date: so the new credit always starts in the future and approving it move
 a late or orphaned renewal is refused (409 proposal_not_pending) exactly as both reads report
 it (``why_not = renewed_credit_ended``; final review M3/M4, 2026-10-01).
 
+*2026-10-04 (spec 2026-10-04-intel-evidence-quality §5).* Approving a proposal supersedes, in the
+same transaction, every pending proposal it OVERLAPS -- the same body of evidence on an
+overlapping tag (intel/overlap.py), exactly the ``overlaps`` both reads show -- with
+``supersede_reason = 'covered_by_decision'``, and names them on ``Decided.superseded`` and the
+audit row. Rejecting supersedes nothing. Every decision takes ``PROPOSAL_WRITE_LOCK`` first, as
+the generation write and the reconcile do, so two approvals that overlap each other serialise
+(the second answers 409 proposal_not_pending) instead of deadlocking.
+
 The acknowledgement (``mark_applied``) is the second system write (spec §4.7). It moves only
 approved weight changes, keeps the approval's decided_by, decided_at and decision_reason, and
 is audited only for rows that actually move.
@@ -56,6 +64,7 @@ from imageshield.intel.approvable import (
     why_not,
 )
 from imageshield.intel.cells import cell_problem, published_unacknowledged
+from imageshield.intel.overlap import overlaps_of
 from imageshield.intel.proposal_models import (
     AppliedResult,
     ContextSignal,
@@ -75,8 +84,10 @@ from imageshield.intel.proposal_models import (
 from imageshield.intel.proposal_store import (
     LIVE_CREDIT_SQL,
     PROPOSAL_COLUMNS,
+    PROPOSAL_WRITE_LOCK,
     fetch_linked_signals,
     load_scoring_vocabulary,
+    overlap_pool,
     record_of,
 )
 from imageshield.intel.recency import Recency
@@ -168,6 +179,13 @@ _REJECT_SQL = """
            decided_at = now(), decision_reason = %(reason)s
      WHERE proposal_id = %(proposal_id)s AND status = %(from_status)s
     RETURNING status, applied_ref, decided
+"""
+
+# The pending proposals an approval covers (intel/overlap.py). Literal statuses, as everywhere.
+_COVERED_SQL = """
+    UPDATE intel_proposals SET status = 'superseded', supersede_reason = 'covered_by_decision'
+     WHERE proposal_id = ANY(%s::uuid[]) AND status = 'pending'
+    RETURNING proposal_id
 """
 
 _APPLIED_SQL = """
@@ -446,8 +464,10 @@ class PostgresDecisionStore:
     ) -> Decided:
         event_id: UUID | None = None
         renews: UUID | None = None
+        superseded: list[UUID] = []
         try:
             async with self._pool.connection() as conn, conn.transaction():
+                await conn.execute(PROPOSAL_WRITE_LOCK)
                 cur = conn.cursor(row_factory=dict_row)
                 await cur.execute(
                     f"SELECT {PROPOSAL_COLUMNS} FROM intel_proposals"
@@ -526,6 +546,17 @@ class PostgresDecisionStore:
                 updated = await cur.fetchone()
                 if updated is None:  # belt and braces: the row is locked
                     raise _refuse("proposal_not_pending")
+                if decision == "approved":
+                    # What both reads showed as ``overlaps``, computed from the proposal as it
+                    # stood (pending) against every pending proposal now.
+                    pool = await overlap_pool(conn, vocabulary, extra=[row])
+                    covered = [
+                        o["proposal_id"]
+                        for o in overlaps_of(pool, only=[proposal_id]).get(proposal_id, [])
+                    ]
+                    if covered:
+                        moved = await conn.execute(_COVERED_SQL, (covered,))
+                        superseded = [r[0] for r in await moved.fetchall()]
                 await conn.execute(
                     _AUDIT_SQL,
                     {
@@ -541,6 +572,11 @@ class PostgresDecisionStore:
                                 "decided": updated["decided"],
                                 "reason": reason,
                                 **({"event_id": str(event_id)} if event_id is not None else {}),
+                                **(
+                                    {"superseded": [str(i) for i in superseded]}
+                                    if superseded
+                                    else {}
+                                ),
                                 **(
                                     {
                                         "applies_regardless_of_location": True,
@@ -568,6 +604,7 @@ class PostgresDecisionStore:
             status=updated["status"],
             applied_ref=updated["applied_ref"],
             decided=updated["decided"],
+            superseded=tuple(superseded),
         )
 
     async def mark_applied(

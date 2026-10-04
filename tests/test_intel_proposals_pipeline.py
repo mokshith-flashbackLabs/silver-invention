@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -17,6 +18,7 @@ from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.generation import GeneratedBatch, validate_proposals
 from imageshield.intel.model import ModelCall, ModelUnavailable
 from imageshield.intel.pipeline import run
+from imageshield.intel.proposal_models import NewProposal
 from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.schemas import (
     ProposalOutput,
@@ -881,3 +883,166 @@ async def test_a_model_proposed_global_protection_is_never_written(
     assert await _rows(
         intel_pool, "SELECT count(*) FROM intel_proposals WHERE kind = 'protection_event'"
     ) == [(0,)]
+
+
+# ── evidence quality (spec 2026-10-04-intel-evidence-quality §5) ───────────────────────────────
+
+
+def protection_citing_related(tags: tuple[str, ...]) -> Callable[[dict[str, Any]], ProposalOutput]:
+    """A fake model that proposes one protection on ``tags`` citing only the RELATED evidence it
+    was shown: an older run's signals."""
+
+    def build(payload: dict[str, Any]) -> ProposalOutput:
+        ids = [s["signal_id"] for s in payload["related_evidence"]]
+        values = {**PROTECTION_SUGGESTED, "tags": list(tags), "rationale": "Shipped a tool."}
+        return ProposalOutput(
+            protection_events=[ProposedProtectionEvent(**values, signal_ids=ids)]
+        )
+
+    return build
+
+
+async def test_the_youtube_duplicate_a_repeat_citing_an_older_runs_signal_is_not_written(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The dev failure of 2026-10-03, reproduced. Run 1 proposes a protection on {linkedin} from
+    its own page. Run 2 reads a DIFFERENT page whose signals carry another tag (instagram), and
+    the model re-proposes the same protection citing only run 1's signal, shown to it as related
+    evidence. The pending candidates used to be loaded by the run's NEW signals' tags alone, so
+    the pending {linkedin} protection was never compared and a second one was written. Now it is
+    loaded through the related evidence's tags, shown to the model, and the repeat -- citing
+    nothing new -- is dropped as a duplicate."""
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresIntelStore(intel_pool)
+    other = "https://q.example/news"
+    fetcher = FakeFetcher({URL: make_page(POLICY, URL), other: make_page(POLICY, other)})
+    await store.queue_adhoc(URL, operator="a")
+    first = FakeModel(
+        make_signal(tags=["linkedin"]), propose_with=propose_protection(tags=["linkedin"])
+    )
+    await run_once(intel_pool, make_deps(intel_pool, fetcher, first))
+    assert await _rows(intel_pool, "SELECT count(*) FROM intel_proposals") == [(1,)]
+    await store.queue_adhoc(other, operator="b")
+    second_model = FakeModel(
+        make_signal(tags=["instagram"]), propose_with=protection_citing_related(("linkedin",))
+    )
+    second = await run_once(intel_pool, make_deps(intel_pool, fetcher, second_model))
+    payload = json.loads(second_model.proposal_users[0])
+    assert [s["tags"] for s in payload["new_evidence"]] == [["instagram"]]
+    assert len(payload["pending_events"]) == 1  # loaded through the related signal's tag
+    assert second.outcome["proposal_dropped_duplicate_event"] == 1
+    assert second.outcome.get("proposals_written", 0) == 0
+    assert await _rows(intel_pool, "SELECT count(*) FROM intel_proposals") == [(1,)]
+
+
+async def test_a_narrower_or_wider_tag_set_on_the_same_page_is_the_same_proposal(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """2026-10-04: one tag set inside the other is the same scope. Run 2 re-reads run 1's page and
+    proposes the same protection on {instagram, linkedin} where run 1 proposed {instagram}: its new
+    evidence attaches, and no second proposal is written."""
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresIntelStore(intel_pool)
+    fetcher = FakeFetcher({URL: make_page(POLICY, URL)})
+    await store.queue_adhoc(URL, operator="a")
+    narrow = _model(propose_with=propose_protection())
+    await run_once(intel_pool, make_deps(intel_pool, fetcher, narrow))
+    await store.queue_adhoc(URL, operator="b")
+    wider = _model(propose_with=propose_protection(tags=["instagram", "linkedin"]))
+    second = await run_once(intel_pool, make_deps(intel_pool, fetcher, wider))
+    assert second.outcome["proposal_converted_to_attach"] == 1
+    assert await _rows(intel_pool, "SELECT count(*) FROM intel_proposals") == [(1,)]
+
+
+async def test_the_write_attaches_a_duplicate_the_run_never_loaded(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The write's own check, under its lock: a pending proposal the generation step never saw (a
+    concurrent run's, written after this run loaded its context) still turns a repeat into an
+    attachment of the run's new evidence, and a repeat with no new evidence into nothing."""
+    await seed_quiz_vocabulary(intel_pool)
+    page = "https://p.example/same-page"
+    old = await seed_signal(intel_pool, tags=("instagram",), url=page)
+    pending = await seed_threat_proposal(intel_pool, signal_ids=[old], tags=("instagram",))
+    run_id = await PostgresIntelStore(intel_pool).queue_adhoc(page, operator="a")
+    new = await seed_signal(intel_pool, tags=("instagram",), url=page, run_id=run_id)
+    keys = await _document_keys(intel_pool)
+    assert keys[old] == keys[new]  # two document rows, one canonical URL
+    repeat = NewProposal(
+        "threat_event",
+        {"tags": ["instagram"]},
+        dict(THREAT_SUGGESTED),
+        "A reported breach.",
+        (old, new),
+        (keys[new],),
+        fresh_signal_ids=(new,),
+    )
+    no_new_evidence = replace(repeat, fresh_signal_ids=())
+    proposals = PostgresProposalStore(intel_pool, threat_recency_days=90)
+    result = await proposals.write_generated(
+        run_id,
+        [repeat, no_new_evidence],
+        against_scoring_version="s2",
+        against_release_no=2,
+        model_id="claude-opus-5-5",
+        prompt_version="propose-v4",
+    )
+    assert result is not None
+    assert (result.written, result.attached) == ((), (pending,))
+    assert (result.converted, result.dropped_duplicate) == (1, 1)
+    assert await _rows(
+        intel_pool, f"SELECT count(*) FROM intel_proposal_signals WHERE proposal_id = '{pending}'"
+    ) == [(2,)]
+
+
+async def test_the_prompt_dates_each_signal_and_shows_pending_weight_changes(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    dated = await seed_signal(
+        intel_pool, tags=("instagram",), published_at=NOW - timedelta(days=400)
+    )
+    change = await seed_proposal(intel_pool, signal_ids=[dated])
+    await settle_runs(intel_pool)
+    await PostgresIntelStore(intel_pool).queue_adhoc(URL, operator="a")
+    model = _model()
+    fetcher = FakeFetcher({URL: make_page(POLICY, URL)})
+    await run_once(intel_pool, make_deps(intel_pool, fetcher, model))
+    payload = json.loads(model.proposal_users[0])
+    assert payload["today"] == NOW.date().isoformat() and payload["threat_recency_days"] == 90
+    (related,) = payload["related_evidence"]
+    assert related["published"] == (NOW - timedelta(days=400)).date().isoformat()
+    assert payload["new_evidence"][0]["published"] == "undated"
+    (pending,) = payload["pending_weight_changes"]
+    assert pending == {
+        "proposal_id": str(change),
+        "question_key": "platforms",
+        "option": "Instagram",
+        "delta": 1,
+        "signal_ids": [str(dated)],
+    }
+    system = " ".join(model.proposal_systems[0].split())
+    assert "threat_recency_days" in system
+    assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in system
+
+
+async def test_a_threat_resting_only_on_old_evidence_is_dropped_at_generation(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await seed_signal(intel_pool, tags=("instagram",), published_at=NOW - timedelta(days=400))
+    await settle_runs(intel_pool)
+    await PostgresIntelStore(intel_pool).queue_adhoc(URL, operator="a")
+
+    def old_threat(payload: dict[str, Any]) -> ProposalOutput:
+        ids = [s["signal_id"] for s in payload["related_evidence"]]
+        event = ProposedThreatEvent(
+            **THREAT_SUGGESTED, tags=["instagram"], rationale="An old breach.", signal_ids=ids
+        )
+        return ProposalOutput(threat_events=[event])
+
+    fetcher = FakeFetcher({URL: make_page(POLICY, URL)})
+    model = _model(propose_with=old_threat)
+    result = await run_once(intel_pool, make_deps(intel_pool, fetcher, model))
+    assert result.outcome["proposal_dropped_evidence_stale"] == 1
+    assert await _rows(intel_pool, "SELECT count(*) FROM intel_proposals") == [(0,)]

@@ -83,6 +83,7 @@ from imageshield.intel.generation import (
     prompt_live_event,
     prompt_live_protection,
     prompt_pending_event,
+    prompt_pending_weight_change,
     prompt_quiz,
     prompt_registry,
     prompt_signal,
@@ -111,7 +112,7 @@ from imageshield.intel.protection_store import (
 )
 from imageshield.intel.publisher import publisher_domain
 from imageshield.intel.question_store import QuestionStore
-from imageshield.intel.recency import choose_published, parse_page_age, stated_date
+from imageshield.intel.recency import Recency, choose_published, parse_page_age, stated_date
 from imageshield.intel.reconcile import Reconciler
 from imageshield.intel.renewal import RenewalPage, plan_renewal
 from imageshield.intel.schemas import ExtractedSignal
@@ -857,9 +858,14 @@ async def _generate(ctx: _Ctx) -> None:
         unmapped_tags=sorted((registry.active | registry.retired) - vocabulary.mapped_tags),
         limit=COVERAGE_GAP_POOL_MAX,
     )
+    # The pending proposals on every tag the prompt's evidence carries, related evidence included
+    # (2026-10-04): the model may cite an older run's signal, and it must see the proposal that
+    # signal already backs. The write re-checks every pending one under its lock as well.
+    evidence_tags = sorted(set(tags) | {t for s in related for t in s.tags})
     pending_events = await store.pending_event_proposals(
-        tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
+        tags=evidence_tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
     )
+    pending_changes = await store.pending_weight_changes(limit=PROPOSAL_CONTEXT_MAX_EVENTS)
     live_events = await store.active_threat_events(tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS)
     live_protections = await store.active_protection_events(
         tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
@@ -871,7 +877,10 @@ async def _generate(ctx: _Ctx) -> None:
         quiz=prompt_quiz(vocabulary),
         registry_tags=prompt_registry(vocabulary, relevant),
         mapped_tags=sorted(vocabulary.mapped_tags),
+        today=now.date().isoformat(),
+        threat_recency_days=ctx.deps.threat_recency_days,
         pending_events=[prompt_pending_event(e) for e in pending_events],
+        pending_weight_changes=[prompt_pending_weight_change(c) for c in pending_changes],
         live_events=[prompt_live_event(e) for e in live_events],
         live_protections=[prompt_live_protection(e) for e in live_protections],
         events_only=regenerate is not None,
@@ -888,6 +897,7 @@ async def _generate(ctx: _Ctx) -> None:
             vocabulary=vocabulary,
             now=now,
             counts=ctx.counts,
+            recency=Recency(now, ctx.deps.threat_recency_days),
             pending_events={e.proposal_id: e for e in pending_events},
             new_signal_ids=frozenset(s.signal_id for s in new),
             events_only=regenerate is not None,
@@ -910,6 +920,10 @@ async def _generate(ctx: _Ctx) -> None:
         ctx.counts["proposals_attached"] += len(result.attached)
     if result.attach_dropped:
         ctx.counts["attach_dropped_not_pending"] += result.attach_dropped
+    if result.converted:  # duplicates only the write's own check could see (2026-10-04)
+        ctx.counts["proposal_converted_to_attach_at_write"] += result.converted
+    if result.dropped_duplicate:
+        ctx.counts["proposal_dropped_duplicate_event_at_write"] += result.dropped_duplicate
 
 
 def _newest(signals: list[ContextSignal], ctx: _Ctx) -> list[ContextSignal]:

@@ -988,3 +988,99 @@ async def test_the_window_is_the_configured_one_and_recent_evidence_is_approvabl
         pid, decision="approved", values=None, reason="checked the sources", operator="ann"
     )
     assert decided.status == "applied"
+
+
+# ── one body of evidence, one proposal (spec 2026-10-04-intel-evidence-quality §5) ─────────────
+
+
+async def _overlapping_pair(pool: AsyncConnectionPool) -> tuple[UUID, UUID]:
+    """A pending +1 on Instagram and a pending Instagram threat resting on the same two pages."""
+    sids = [
+        await seed_signal(pool, trust="web", publisher=p, tags=("instagram",))
+        for p in ("a.example", "b.example")
+    ]
+    change = await seed_proposal(pool, signal_ids=sids)
+    threat = await seed_threat_proposal(pool, signal_ids=sids)
+    return change, threat
+
+
+async def test_overlapping_proposals_name_each_other_on_both_reads(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    change, threat = await _overlapping_pair(intel_pool)
+    elsewhere = await seed_threat_proposal(
+        intel_pool,
+        signal_ids=[await seed_signal(intel_pool, publisher="c.example", tags=("instagram",))],
+    )
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
+    listed = {
+        p["proposal_id"]: p
+        for p in await store.list_proposals(statuses=None, kinds=None, cursor=None, limit=50)
+    }
+    assert listed[change]["overlaps"] == [{"proposal_id": threat, "kind": "threat_event"}]
+    assert listed[threat]["overlaps"] == [{"proposal_id": change, "kind": "weight_change"}]
+    assert listed[elsewhere]["overlaps"] == []
+    detail = await store.get_proposal(threat)
+    assert detail is not None
+    assert detail["overlaps"] == [{"proposal_id": change, "kind": "weight_change"}]
+    assert detail["independent_sources"] == 2
+
+
+async def test_approving_one_supersedes_what_it_overlaps_covered_by_decision(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    change, threat = await _overlapping_pair(intel_pool)
+    elsewhere = await seed_threat_proposal(
+        intel_pool,
+        signal_ids=[await seed_signal(intel_pool, publisher="c.example", tags=("instagram",))],
+    )
+    decided = await _decide(intel_pool, threat)
+    assert decided.status == "applied" and decided.superseded == (change,)
+    async with intel_pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT proposal_id, status, supersede_reason FROM intel_proposals"
+            " WHERE proposal_id = ANY(%s::uuid[])",
+            ([change, elsewhere],),
+        )
+        rows = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+    assert rows == {
+        change: ("superseded", "covered_by_decision"),
+        elsewhere: ("pending", None),
+    }
+    metadata = await _scalar(
+        intel_pool,
+        "SELECT metadata FROM audit_log WHERE action = 'intel.proposal_decided'"
+        " AND resource_id = %s",
+        threat,
+    )
+    assert metadata["superseded"] == [str(change)]
+    # A superseded proposal is no longer open to a decision.
+    assert await _refused(intel_pool, change) == "proposal_not_pending"
+
+
+async def test_rejecting_one_supersedes_nothing(intel_pool: AsyncConnectionPool) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    change, threat = await _overlapping_pair(intel_pool)
+    rejected = await _decide(intel_pool, threat, "rejected")
+    assert rejected.status == "rejected" and rejected.superseded == ()
+    assert await _scalar(
+        intel_pool, "SELECT status FROM intel_proposals WHERE proposal_id = %s", change
+    ) == "pending"
+    read = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(change)
+    assert read is not None and read["overlaps"] == []  # the rejected one is no longer pending
+
+
+async def test_approving_a_weight_change_covers_the_protection_framed_from_the_same_fact(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    sids = [
+        await seed_signal(intel_pool, trust="web", publisher=p, tags=("instagram",))
+        for p in ("a.example", "b.example")
+    ]
+    change = await seed_proposal(intel_pool, signal_ids=sids)
+    protection = await seed_protection_proposal(intel_pool, signal_ids=sids[:1])
+    decided = await _decide(intel_pool, change)
+    assert decided.status == "approved" and decided.superseded == (protection,)

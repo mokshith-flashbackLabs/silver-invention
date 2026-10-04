@@ -44,7 +44,11 @@ from imageshield.intel.proposal_models import (
     SupersedeReason,
     WeightChangeTarget,
 )
-from imageshield.intel.proposal_store import active_subject_signals, load_scoring_vocabulary
+from imageshield.intel.proposal_store import (
+    PROPOSAL_WRITE_LOCK,
+    active_subject_signals,
+    load_scoring_vocabulary,
+)
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject, parse_vocabulary
 
 log = structlog.get_logger("imageshield.intel")
@@ -271,6 +275,9 @@ class PostgresReconciler:
             vocabulary = parse_vocabulary(Vocabulary.model_validate(row))
             if vocabulary is None:
                 return None
+            # Serialised with generation writes and decisions (intel/proposal_store.py), after the
+            # vocabulary row: nothing that holds this lock waits on that row.
+            await conn.execute(PROPOSAL_WRITE_LOCK)
             await cur.execute(
                 "SELECT proposal_id, target, against_release_no, created_at FROM intel_proposals"
                 " WHERE kind = 'weight_change' AND status = 'pending' FOR UPDATE"
@@ -364,6 +371,7 @@ class PostgresReconciler:
             vocabulary = await load_scoring_vocabulary(conn)
             if vocabulary is None:
                 return GapPass(0, 0)
+            await conn.execute(PROPOSAL_WRITE_LOCK)
             cur = conn.cursor(row_factory=dict_row)
             await cur.execute(_LOCK_PENDING_GAPS_SQL)
             locked = [r["proposal_id"] for r in await cur.fetchall()]

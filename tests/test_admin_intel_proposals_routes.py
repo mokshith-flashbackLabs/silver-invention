@@ -139,6 +139,7 @@ def test_a_decision_answers_the_spec_body() -> None:
         "status": "approved",
         "applied_ref": None,
         "decided": {"delta": -1},
+        "superseded": [],
     }
     assert decisions.decisions[0]["operator"] == "ann"
 
@@ -194,6 +195,7 @@ def test_a_threat_approval_answers_applied_with_the_event_id() -> None:
         "status": "applied",
         "applied_ref": str(event_id),
         "decided": decided,
+        "superseded": [],
     }
 
 
@@ -285,4 +287,15 @@ def test_a_protection_approval_answers_applied_with_the_event_id() -> None:
         "status": "applied",
         "applied_ref": str(event_id),
         "decided": decided,
+        "superseded": [],
     }
+
+
+def test_an_approval_names_the_proposals_it_covered() -> None:
+    """2026-10-04: the pending proposals an approval superseded covered_by_decision."""
+    client, _, decisions = _client()
+    pid, covered = uuid4(), uuid4()
+    decisions.result = Decided(pid, "weight_change", "approved", None, {"delta": 1}, (covered,))
+    r = client.post(f"/v1/admin/intel/proposals/{pid}/decision", headers=ADMIN, json=_decision())
+    assert r.status_code == 200, r.text
+    assert r.json()["superseded"] == [str(covered)]

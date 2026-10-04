@@ -13,6 +13,17 @@ Nothing DELETEs, because intel_rw holds no DELETE grant (0039).
 This module also reads threat_events and protection_events, with its own SQL (the threat store is
 not importable from intel/, spec §6.1): the live events for the prompt, and each event proposal's
 related_events, which are the live events of its own direction.
+
+*2026-10-04 (spec 2026-10-04-intel-evidence-quality §5).* Every write of generated proposals
+takes ``PROPOSAL_WRITE_LOCK``, as every decision does (intel/decisions.py) and the reconcile, so
+the three serialise: an approval superseding the proposals it overlaps never deadlocks with a
+write attaching to one of them. Under that lock the write re-checks each event proposal for a
+pending DUPLICATE (``generation.duplicate_of``) against every pending proposal of its kind on its
+tags -- not only the ones the run loaded for its prompt, which is how a second "YouTube likeness
+detection" protection was written on dev on 2026-10-03: the run cited an older run's signal on
+``youtube`` while its own new signals carried no ``youtube`` tag, so the pending one was never
+loaded. Both reads name, for a pending proposal, the pending proposals it OVERLAPS
+(``overlaps``, intel/overlap.py).
 """
 
 from __future__ import annotations
@@ -29,8 +40,10 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.approvable import EVENT_KINDS, read_flags
-from imageshield.intel.bounds import PROPOSAL_CONTEXT_MAX_EVENTS
+from imageshield.intel.bounds import OVERLAP_POOL_MAX, PROPOSAL_CONTEXT_MAX_EVENTS
+from imageshield.intel.generation import duplicate_of
 from imageshield.intel.models import Vocabulary
+from imageshield.intel.overlap import OVERLAP_KINDS, OverlapCandidate, overlaps_of, pool_of
 from imageshield.intel.proposal_models import (
     Attachment,
     ContextSignal,
@@ -38,6 +51,7 @@ from imageshield.intel.proposal_models import (
     LiveProtection,
     NewProposal,
     PendingEvent,
+    PendingWeightChange,
     ProposalRecord,
     WriteResult,
 )
@@ -73,6 +87,31 @@ _CONTEXT_FROM = "intel_signals s JOIN intel_documents d ON d.document_id = s.doc
 _AUDIT_SQL = """
     INSERT INTO audit_log (actor_type, action, resource_id, metadata)
     VALUES (%(actor_type)s, %(action)s, %(resource_id)s, %(metadata)s)
+"""
+
+# One transaction-scoped lock for everything that moves pending proposals as a SET: a generation
+# write, a decision, the reconcile (see the module docstring).
+PROPOSAL_WRITE_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('intel_proposal_writes', 0))"
+
+# The pending proposals overlap is computed against, newest first, bounded.
+_PENDING_POOL_SQL = f"""
+    SELECT {PROPOSAL_COLUMNS} FROM intel_proposals
+     WHERE status = 'pending' AND kind = ANY(%(kinds)s::text[])
+     ORDER BY created_at DESC, proposal_id DESC
+     LIMIT %(limit)s
+"""
+
+_PENDING_WEIGHT_CHANGES_SQL = """
+    SELECT p.proposal_id, p.target, p.suggested,
+           coalesce(array_agg(ps.signal_id ORDER BY ps.signal_id)
+                    FILTER (WHERE s.status = 'active'), '{}') AS signal_ids
+      FROM intel_proposals p
+      LEFT JOIN intel_proposal_signals ps ON ps.proposal_id = p.proposal_id
+      LEFT JOIN intel_signals s ON s.signal_id = ps.signal_id
+     WHERE p.kind = 'weight_change' AND p.status = 'pending'
+     GROUP BY p.proposal_id
+     ORDER BY p.created_at DESC, p.proposal_id DESC
+     LIMIT %(limit)s
 """
 
 _INSERT_SQL = """
@@ -235,6 +274,26 @@ def _live_protection(row: dict[str, Any]) -> LiveProtection:
     )
 
 
+async def overlap_pool(
+    conn: AsyncConnection[Any],
+    vocabulary: ScoringVocabulary | None,
+    *,
+    extra: Sequence[dict[str, Any]] = (),
+) -> list[OverlapCandidate]:
+    """The pending proposals that can overlap (intel/overlap.py), newest first and bounded, with
+    their linked signals, plus each row of ``extra`` not already among them (a page's own pending
+    rows, or the proposal a decision is approving)."""
+    cur = conn.cursor(row_factory=dict_row)
+    await cur.execute(
+        _PENDING_POOL_SQL, {"kinds": sorted(OVERLAP_KINDS), "limit": OVERLAP_POOL_MAX}
+    )
+    rows = list(await cur.fetchall())
+    present = {r["proposal_id"] for r in rows}
+    rows += [r for r in extra if r["proposal_id"] not in present]
+    linked = await fetch_linked_signals(conn, [r["proposal_id"] for r in rows])
+    return pool_of([record_of(r) for r in rows], linked, vocabulary)
+
+
 async def load_scoring_vocabulary(conn: AsyncConnection[Any]) -> ScoringVocabulary | None:
     cur = conn.cursor(row_factory=dict_row)
     await cur.execute(
@@ -354,6 +413,7 @@ class ProposalStore(Protocol):
     async def active_protection_events(
         self, *, tags: Sequence[str], limit: int
     ) -> list[LiveProtection]: ...
+    async def pending_weight_changes(self, *, limit: int) -> list[PendingWeightChange]: ...
     async def write_generated(
         self,
         run_id: UUID,
@@ -504,6 +564,29 @@ class PostgresProposalStore:
         async with self._pool.connection() as conn:
             return await live_protection_events(conn, tags=tags, limit=limit)
 
+    async def pending_weight_changes(self, *, limit: int) -> list[PendingWeightChange]:
+        """Pending weight changes, newest first, bounded, each with its ACTIVE signals: what the
+        generation prompt shows so one body of evidence is not proposed as a second kind (spec
+        2026-10-04-intel-evidence-quality §5)."""
+        async with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(_PENDING_WEIGHT_CHANGES_SQL, {"limit": limit})
+            rows = await cur.fetchall()
+        changes: list[PendingWeightChange] = []
+        for row in rows:
+            target, suggested = row["target"] or {}, row["suggested"] or {}
+            delta = suggested.get("delta")
+            changes.append(
+                PendingWeightChange(
+                    proposal_id=row["proposal_id"],
+                    question_key=str(target.get("question_key", "")),
+                    option=str(target.get("option", "")),
+                    delta=delta if isinstance(delta, int) and not isinstance(delta, bool) else None,
+                    signal_ids=tuple(row["signal_ids"]),
+                )
+            )
+        return changes
+
     async def write_generated(
         self,
         run_id: UUID,
@@ -521,7 +604,11 @@ class PostgresProposalStore:
         consumed model verdict (refusal, max_tokens) is recorded."""
         written: list[UUID] = []
         superseded: list[UUID] = []
+        attached: list[UUID] = []
+        converted = 0
+        dropped_duplicate = 0
         async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(PROPOSAL_WRITE_LOCK)
             cur = await conn.execute(
                 "UPDATE intel_runs SET proposals_written_at = now()"
                 " WHERE run_id = %s AND proposals_written_at IS NULL RETURNING 1",
@@ -532,8 +619,24 @@ class PostgresProposalStore:
             pending_gaps: list[tuple[UUID, dict[str, Any]]] | None = None
             for proposal in proposals:
                 # A weight change and a coverage gap supersede their pending twin. An event
-                # proposal of either kind supersedes nothing: a repeat of a pending one was
-                # made an attachment before it got here (spec §4.3), so what arrives is new.
+                # proposal of either kind supersedes nothing: a repeat of a pending one becomes an
+                # attachment (spec §4.3) -- at generation for the proposals the run loaded, and
+                # here, under the lock, for every pending one of its kind on its tags (2026-10-04).
+                if proposal.kind in EVENT_KINDS:
+                    twin = await _pending_duplicate(conn, proposal)
+                    if twin is not None:
+                        if proposal.fresh_signal_ids:
+                            await conn.execute(
+                                "INSERT INTO intel_proposal_signals (proposal_id, signal_id)"
+                                " SELECT %s, unnest(%s::uuid[]) ON CONFLICT DO NOTHING",
+                                (twin, list(proposal.fresh_signal_ids)),
+                            )
+                            if twin not in attached:
+                                attached.append(twin)
+                            converted += 1
+                        else:
+                            dropped_duplicate += 1
+                        continue
                 if proposal.kind == "weight_change":
                     cur = await conn.execute(
                         _SUPERSEDE_CELL_SQL,
@@ -580,7 +683,6 @@ class PostgresProposalStore:
                     (proposal_id, list(proposal.signal_ids)),
                 )
                 written.append(proposal_id)
-            attached: list[UUID] = []
             attach_dropped = 0
             if attachments:
                 # spec §4.3, re-checked under lock: the target must STILL be a pending event
@@ -619,7 +721,14 @@ class PostgresProposalStore:
                         ),
                     },
                 )
-        return WriteResult(tuple(written), tuple(superseded), tuple(attached), attach_dropped)
+        return WriteResult(
+            tuple(written),
+            tuple(superseded),
+            tuple(attached),
+            attach_dropped,
+            converted=converted,
+            dropped_duplicate=dropped_duplicate,
+        )
 
     async def list_proposals(
         self,
@@ -653,11 +762,27 @@ class PostgresProposalStore:
             vocabulary = await load_scoring_vocabulary(conn)
             linked = await fetch_linked_signals(conn, [r["proposal_id"] for r in rows])
             ended = await ended_renewals(conn, rows)
+            pending = [r for r in rows if r["status"] == "pending"]
+            overlaps = (
+                overlaps_of(
+                    await overlap_pool(conn, vocabulary, extra=pending),
+                    only=[r["proposal_id"] for r in pending],
+                )
+                if pending
+                else {}
+            )
         recency = self._recency()
         return [
-            _annotated(
-                row, linked[row["proposal_id"]], vocabulary, recency, row["proposal_id"] in ended
-            )
+            {
+                **_annotated(
+                    row,
+                    linked[row["proposal_id"]],
+                    vocabulary,
+                    recency,
+                    row["proposal_id"] in ended,
+                ),
+                "overlaps": overlaps.get(row["proposal_id"], []),
+            }
             for row in rows
         ]
 
@@ -674,6 +799,10 @@ class PostgresProposalStore:
             vocabulary = await load_scoring_vocabulary(conn)
             linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
             ended = await ended_renewals(conn, [row])
+            overlaps: list[dict[str, Any]] = []
+            if row["status"] == "pending":
+                pool = await overlap_pool(conn, vocabulary, extra=[row])
+                overlaps = overlaps_of(pool, only=[proposal_id]).get(proposal_id, [])
             signal_ids = [s.signal_id for s in linked]
             await cur.execute(
                 "SELECT signal_id, document_id, category, direction, tags, unregistered_subjects,"
@@ -720,6 +849,7 @@ class PostgresProposalStore:
             by_signal.setdefault(excerpt.pop("signal_id"), []).append(excerpt)
         return {
             **_annotated(row, linked, vocabulary, self._recency(), proposal_id in ended),
+            "overlaps": overlaps,
             "related_events": related,
             "signals": [
                 {
@@ -732,6 +862,20 @@ class PostgresProposalStore:
                 for s in signals
             ],
         }
+
+
+async def _pending_duplicate(conn: AsyncConnection[Any], proposal: NewProposal) -> UUID | None:
+    """The pending proposal ``proposal`` duplicates (``generation.duplicate_of``: same kind, a
+    tag set equal to or inside the other's, a shared document by canonical URL), read under the
+    write lock from every pending proposal of its kind on its tags. None when there is none."""
+    tags = [t for t in proposal.target.get("tags", ()) if isinstance(t, str)]
+    if not tags:
+        return None
+    cur = conn.cursor(row_factory=dict_row)
+    await cur.execute(
+        _PENDING_EVENTS_SQL, {"kinds": [proposal.kind], "tags": tags, "limit": OVERLAP_POOL_MAX}
+    )
+    return duplicate_of(proposal, [_pending_event(r) for r in await cur.fetchall()])
 
 
 def _annotated(

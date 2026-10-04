@@ -14,6 +14,12 @@ active signal of the window that concerns the subject.
 An event proposal of either kind that repeats a pending proposal is that proposal again,
 decided here by rule, never by the model: same kind, same tag set, a shared signal document
 (spec §4.3). It becomes an attachment of the run's own new evidence.
+*Amended 2026-10-04 (spec 2026-10-04-intel-evidence-quality §5):* a tag set inside the other's
+(one a subset of the other) counts as the same, and the write re-checks under its lock against
+every pending proposal of the kind on the tags, not only those the run loaded
+(intel/proposal_store.py). A threat_event whose cited evidence is all dated and older than
+``INTEL_THREAT_RECENCY_DAYS`` is dropped (``evidence_stale``): an old or ended incident is not a
+threat, and the decision would refuse it.
 
 The model may not make a protection credit global: it cannot know that a protection applies
 wherever a person lives (spec §4.5). Such a proposal is dropped (global_not_proposable); a global
@@ -24,8 +30,8 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from imageshield.intel.bounds import (
@@ -53,6 +59,7 @@ from imageshield.intel.prompts import (
     PromptLiveProtection,
     PromptOption,
     PromptPendingEvent,
+    PromptPendingWeightChange,
     PromptQuestion,
     PromptSignal,
     RegistryTag,
@@ -65,6 +72,7 @@ from imageshield.intel.proposal_models import (
     LiveProtection,
     NewProposal,
     PendingEvent,
+    PendingWeightChange,
     ProtectionEventSuggested,
     ProtectionEventTarget,
     SuggestedTag,
@@ -73,6 +81,7 @@ from imageshield.intel.proposal_models import (
     WeightChangeTarget,
     WeightDelta,
 )
+from imageshield.intel.recency import Recency, evidence_stale
 from imageshield.intel.schemas import (
     ProposalOutput,
     ProposedAttach,
@@ -113,6 +122,7 @@ def validate_proposals(
     vocabulary: ScoringVocabulary,
     now: datetime,
     counts: Counter[str],
+    recency: Recency,
     pending_events: Mapping[UUID, PendingEvent] | None = None,
     new_signal_ids: Collection[UUID] = (),
     events_only: bool = False,
@@ -120,7 +130,8 @@ def validate_proposals(
     """``pending_events`` are the pending event proposals of both kinds the run loaded (those the
     prompt showed): attach targets and duplicate candidates. ``new_signal_ids`` are the run's own
     new evidence, the only signals an attachment may add. ``events_only`` is a gap_regenerate
-    run, which writes event proposals and attachments and nothing else (spec §4.9)."""
+    run, which writes event proposals and attachments and nothing else (spec §4.9). ``recency``
+    is ``INTEL_THREAT_RECENCY_DAYS`` now: a threat whose evidence is all older is dropped."""
     batch = GeneratedBatch()
     if events_only:
         dropped = len(output.weight_changes) + len(output.coverage_gaps)
@@ -151,7 +162,7 @@ def validate_proposals(
             batch.coverage_gaps.append(proposal)
     pending = pending_events or {}
     for event in output.threat_events:
-        proposal = _threat_event(event, context, vocabulary, counts)
+        proposal = _threat_event(event, context, vocabulary, counts, recency)
         if proposal is not None:
             _keep_event(proposal, batch.threat_events, batch, pending, new_signal_ids, counts)
     for credit in output.protection_events:
@@ -165,17 +176,26 @@ def validate_proposals(
     return batch
 
 
+def same_scope(a: Iterable[str], b: Iterable[str]) -> bool:
+    """Two tag sets that describe one incident or protection: equal, or one inside the other
+    (2026-10-04: {youtube} and {youtube, google} are the same YouTube feature). Two empty sets are
+    never the same scope: a proposal with no tags is about nothing to compare."""
+    left, right = frozenset(a), frozenset(b)
+    return bool(left and right) and (left <= right or right <= left)
+
+
 def duplicate_of(proposal: NewProposal, pending: Iterable[PendingEvent]) -> UUID | None:
-    """spec §4.3: a new event proposal whose kind and tag set equal a pending proposal's, and
-    which shares any signal document with it, IS that proposal. A document is a page, compared
-    by canonical URL hash, so a page a later run read again counts (spec note 2026-09-30). The
-    first match in the order given (the store's newest first) wins."""
-    tags = frozenset(proposal.target.get("tags", ()))
+    """spec §4.3: a new event proposal whose kind matches a pending proposal's, whose tag set is
+    the same scope (``same_scope``), and which shares any signal document with it, IS that
+    proposal. A document is a page, compared by canonical URL hash (``intel_documents.url_hash``),
+    never by document row: a page a later run read again is a new row with the same hash (spec
+    note 2026-09-30). The first match in the order given (the store's newest first) wins."""
+    tags = proposal.target.get("tags", ())
     documents = frozenset(proposal.document_keys)
     for candidate in pending:
         if (
             candidate.kind == proposal.kind
-            and frozenset(candidate.tags) == tags
+            and same_scope(candidate.tags, tags)
             and candidate.document_keys & documents
         ):
             return candidate.proposal_id
@@ -186,7 +206,7 @@ def _same_event(a: NewProposal, b: NewProposal) -> bool:
     """Two event proposals in one batch that duplicate_of would call one incident."""
     return (
         a.kind == b.kind
-        and frozenset(a.target.get("tags", ())) == frozenset(b.target.get("tags", ()))
+        and same_scope(a.target.get("tags", ()), b.target.get("tags", ()))
         and bool(set(a.document_keys) & set(b.document_keys))
     )
 
@@ -215,7 +235,14 @@ def _keep_event(
     if any(_same_event(proposal, earlier) for earlier in kept):
         counts["proposal_dropped_duplicate_event"] += 1
         return
-    kept.append(proposal)
+    # The run's own new evidence among its citations: what the write attaches if, under its lock,
+    # it finds a pending duplicate the run never loaded (intel/proposal_store.py).
+    kept.append(
+        replace(
+            proposal,
+            fresh_signal_ids=tuple(i for i in proposal.signal_ids if i in new_signal_ids),
+        )
+    )
 
 
 def concerns(
@@ -409,6 +436,7 @@ def _threat_event(
     context: Mapping[UUID, ContextSignal],
     vocabulary: ScoringVocabulary,
     counts: Counter[str],
+    recency: Recency,
 ) -> NewProposal | None:
     """§4.5 for threat_event. Every tag must be a registered, non-retired slug, and a miss is
     dropped, never fixed up. A proposal whose tags are all UNMAPPED is kept: it is written
@@ -434,6 +462,9 @@ def _threat_event(
         return None
     signal_ids = _cited(item.signal_ids, context, counts)
     if signal_ids is None:
+        return None
+    if evidence_stale([context[i] for i in signal_ids], recency):
+        counts["proposal_dropped_evidence_stale"] += 1
         return None
     title = _free_text(item.title, field_name="title", limit=MAX_EVENT_TITLE_CHARS, counts=counts)
     if title is None:
@@ -571,6 +602,13 @@ def _concerns_target(signal: ContextSignal, target: PendingEvent) -> bool:
 
 
 def prompt_signal(signal: ContextSignal) -> PromptSignal:
+    """``published`` (propose-v4) is the document's publication date, ``YYYY-MM-DD``, or
+    ``"undated"``: the model needs it to tell a current incident from an old one."""
+    published = (
+        signal.published_at.astimezone(UTC).date().isoformat()
+        if signal.published_at is not None
+        else "undated"
+    )
     return PromptSignal(
         signal_id=str(signal.signal_id),
         category=signal.category,
@@ -580,6 +618,7 @@ def prompt_signal(signal: ContextSignal) -> PromptSignal:
         summary=signal.summary,
         publisher=signal.publisher_domain,
         trust=signal.trust,
+        published=published,
     )
 
 
@@ -591,6 +630,16 @@ def prompt_pending_event(event: PendingEvent) -> PromptPendingEvent:
         severity=event.severity,
         tags=list(event.tags),
         signal_ids=[str(i) for i in event.signal_ids],
+    )
+
+
+def prompt_pending_weight_change(change: PendingWeightChange) -> PromptPendingWeightChange:
+    return PromptPendingWeightChange(
+        proposal_id=str(change.proposal_id),
+        question_key=change.question_key,
+        option=change.option,
+        delta=change.delta,
+        signal_ids=[str(i) for i in change.signal_ids],
     )
 
 

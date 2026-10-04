@@ -36,6 +36,7 @@ from imageshield.intel.proposal_models import (
     NewProposal,
     PendingEvent,
 )
+from imageshield.intel.recency import Recency
 from imageshield.intel.schemas import (
     ProposalOutput,
     ProposedAttach,
@@ -49,6 +50,7 @@ from tests.intel_fakes import scoring
 
 NOW = datetime(2026, 9, 30, 12, tzinfo=UTC)
 V = scoring()
+RECENCY = Recency(NOW, 90)
 
 
 def _sig(
@@ -60,6 +62,7 @@ def _sig(
     status: str = "active",
     days_old: int = 1,
     document: str | None = None,
+    published: datetime | None = None,
 ) -> ContextSignal:
     return ContextSignal(
         signal_id=uuid4(),
@@ -73,6 +76,7 @@ def _sig(
         status=status,
         created_at=NOW - timedelta(days=days_old),
         document_key=document,
+        published_at=published,
     )
 
 
@@ -106,6 +110,7 @@ def _validate(
         vocabulary=V,
         now=NOW,
         counts=counts,
+        recency=RECENCY,
         pending_events=pending,
         new_signal_ids=frozenset(new or ()),
         events_only=events_only,
@@ -391,15 +396,17 @@ def test_a_duplicate_citing_no_new_evidence_is_dropped() -> None:
 
 
 def test_another_tag_set_or_no_shared_document_is_a_new_proposal() -> None:
+    """A tag set neither equal to nor inside the pending one's is another scope (2026-10-04: a
+    narrower or wider one is the same scope, below)."""
     doc = "hash-of-the-page"
     pid = uuid4()
     pending = {pid: _pending(pid, documents=frozenset({doc}))}  # tags == ("instagram",)
-    wider = _sig(tags=("instagram", "linkedin"), document=doc)
+    other = _sig(tags=("linkedin",), document=doc)
     batch, _ = _validate(
-        ProposalOutput(threat_events=[_threat(wider, tags=["instagram", "linkedin"])]),
-        [wider],
+        ProposalOutput(threat_events=[_threat(other, tags=["linkedin"])]),
+        [other],
         pending=pending,
-        new={wider.signal_id},
+        new={other.signal_id},
     )
     assert len(batch.threat_events) == 1
     elsewhere = _sig(tags=("instagram",), document="hash-of-another-page")
@@ -451,11 +458,14 @@ def test_duplicate_of_needs_kind_tag_set_and_a_page_and_the_first_match_wins() -
     newest, older = pending_event("instagram"), pending_event("instagram")
     assert duplicate_of(new_event("instagram"), [newest, older]) == newest.proposal_id
     assert duplicate_of(new_event("instagram"), [older, newest]) == older.proposal_id
-    # the tags are a set: their order is nothing, and neither a wider nor a narrower one matches
+    # the tags are a set: their order is nothing, and (2026-10-04) a narrower or a wider one is the
+    # same scope, while a set that only partly overlaps, or not at all, is another
     both = pending_event("linkedin", "instagram")
     assert duplicate_of(new_event("instagram", "linkedin"), [both]) == both.proposal_id
-    assert duplicate_of(new_event("instagram"), [both]) is None
-    assert duplicate_of(new_event("instagram", "linkedin"), [newest]) is None
+    assert duplicate_of(new_event("instagram"), [both]) == both.proposal_id
+    assert duplicate_of(new_event("instagram", "linkedin"), [newest]) == newest.proposal_id
+    assert duplicate_of(new_event("instagram", "x"), [both]) is None
+    assert duplicate_of(new_event("x"), [newest]) is None
     # a page must be shared, and a proposal citing no known page shares none
     elsewhere = pending_event("instagram", pages=frozenset({"hash-of-another-page"}))
     assert duplicate_of(new_event("instagram"), [elsewhere]) is None
@@ -564,6 +574,8 @@ def test_the_prompt_carries_the_quiz_with_mutability_and_no_person_data() -> Non
         quiz=prompt_quiz(V),
         registry_tags=prompt_registry(V, {"instagram"}),
         mapped_tags=sorted(V.mapped_tags),
+        today="2026-09-30",
+        threat_recency_days=90,
     )
     payload = json.loads(user)
     platforms = payload["quiz"][0]
@@ -603,6 +615,8 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
             quiz=prompt_quiz(V),
             registry_tags=prompt_registry(V, set()),
             mapped_tags=sorted(V.mapped_tags),
+            today="2026-09-30",
+            threat_recency_days=90,
             pending_events=[pending],
             live_events=[live],
             events_only=events_only,
@@ -616,7 +630,7 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
     assert "Propose only threat_events, protection_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v3"
+    assert PROPOSE_PROMPT_VERSION == "propose-v4"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -653,13 +667,15 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
         quiz=prompt_quiz(V),
         registry_tags=prompt_registry(V, set()),
         mapped_tags=sorted(V.mapped_tags),
+        today="2026-09-30",
+        threat_recency_days=90,
         live_protections=[live],
     )
     payload = json.loads(user)
     assert payload["live_protections"] == [live] and payload["live_events"] == []
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
-    assert PROPOSE_PROMPT_VERSION == "propose-v3"
+    assert PROPOSE_PROMPT_VERSION == "propose-v4"
 
 
 def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
@@ -790,3 +806,59 @@ def test_the_live_protection_prompt_item_carries_ids_as_strings() -> None:
         "review_by": review.isoformat(),
         "signal_ids": [str(sid)],
     }
+
+
+# ── evidence quality (spec 2026-10-04-intel-evidence-quality) ──────────────────────────────────
+
+
+def test_a_threat_resting_only_on_old_dated_evidence_is_dropped() -> None:
+    old = _sig(tags=("instagram",), published=NOW - timedelta(days=200))
+    batch, counts = _validate(ProposalOutput(threat_events=[_threat(old)]), [old])
+    assert batch.threat_events == [] and counts["proposal_dropped_evidence_stale"] == 1
+    undated = _sig(tags=("instagram",))
+    batch, _ = _validate(ProposalOutput(threat_events=[_threat(old, undated)]), [old, undated])
+    assert len(batch.threat_events) == 1  # undated evidence never makes a threat stale
+    recent = _sig(tags=("instagram",), published=NOW - timedelta(days=3))
+    batch, _ = _validate(ProposalOutput(threat_events=[_threat(old, recent)]), [old, recent])
+    assert len(batch.threat_events) == 1
+    # A lasting weight change may rest on old evidence.
+    batch, _ = _validate(ProposalOutput(weight_changes=[_change(old)]), [old])
+    assert len(batch.weight_changes) == 1
+
+
+def test_a_kept_event_names_its_new_evidence_for_the_writes_own_duplicate_check() -> None:
+    old, new = _sig(tags=("instagram",)), _sig(tags=("instagram",))
+    batch, _ = _validate(
+        ProposalOutput(threat_events=[_threat(old, new)]), [old, new], new={new.signal_id}
+    )
+    (kept,) = batch.threat_events
+    assert kept.signal_ids == (old.signal_id, new.signal_id)
+    assert kept.fresh_signal_ids == (new.signal_id,)
+
+
+def test_each_prompt_signal_carries_its_publication_date_or_undated() -> None:
+    dated = _sig(published=datetime(2026, 9, 12, 23, 30, tzinfo=UTC))
+    assert prompt_signal(dated)["published"] == "2026-09-12"
+    assert prompt_signal(_sig())["published"] == "undated"
+
+
+def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() -> None:
+    system, user = proposal_request(
+        [],
+        [],
+        quiz=prompt_quiz(V),
+        registry_tags=prompt_registry(V, set()),
+        mapped_tags=sorted(V.mapped_tags),
+        today="2026-10-04",
+        threat_recency_days=90,
+    )
+    flat = " ".join(system.split())
+    assert PROPOSE_PROMPT_VERSION == "propose-v4"
+    assert "published within threat_recency_days days of today" in flat
+    assert "has ended" in flat and "is not a threat" in flat
+    assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in flat
+    assert "never a weight_change and a threat_event from the same reports" in flat
+    assert "never present the same fact as both a protection and a risk" in flat
+    payload = json.loads(user)
+    assert (payload["today"], payload["threat_recency_days"]) == ("2026-10-04", 90)
+    assert payload["pending_weight_changes"] == []

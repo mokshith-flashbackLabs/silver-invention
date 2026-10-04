@@ -37,7 +37,11 @@ from imageshield.intel.bounds import (
 )
 from imageshield.intel.tags import is_well_formed
 
-SupersedeReason = Literal["newer_proposal", "cell_changed", "resolved_by_quiz"]
+# ``covered_by_decision`` (2026-10-04, migration 0048): an operator approved a proposal this one
+# overlaps -- the same body of evidence on an overlapping tag (intel/overlap.py).
+SupersedeReason = Literal[
+    "newer_proposal", "cell_changed", "resolved_by_quiz", "covered_by_decision"
+]
 TagKind = Literal["platform", "service", "practice"]
 ThreatKind = Literal["leak", "deepfake_wave", "platform_incident", "other"]
 
@@ -241,7 +245,11 @@ class ContextSignal:
 @dataclass(frozen=True)
 class NewProposal:
     """One validated proposal, pre-insert. ``document_keys`` are the canonical URL hashes of
-    its cited signals' documents: duplicate detection compares them (spec §4.3)."""
+    its cited signals' documents: duplicate detection compares them (spec §4.3).
+
+    ``fresh_signal_ids`` (2026-10-04) are the cited signals that are the run's own new evidence:
+    what the write attaches to a pending proposal it finds this one duplicates, under its lock
+    (intel/proposal_store.py), when the generation-time check could not see that proposal."""
 
     kind: Literal["weight_change", "coverage_gap", "threat_event", "protection_event"]
     target: dict[str, Any]
@@ -249,6 +257,7 @@ class NewProposal:
     rationale: str
     signal_ids: tuple[UUID, ...]
     document_keys: tuple[str, ...] = ()
+    fresh_signal_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -278,6 +287,19 @@ class PendingEvent:
     signal_ids: tuple[UUID, ...]
     document_keys: frozenset[str]
     categories: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class PendingWeightChange:
+    """A pending weight_change as the generation prompt shows it (spec
+    2026-10-04-intel-evidence-quality §5): so the model can see that evidence already backs a
+    lasting change before it frames the same facts as an incident or a protection."""
+
+    proposal_id: UUID
+    question_key: str
+    option: str
+    delta: int | None
+    signal_ids: tuple[UUID, ...]
 
 
 @dataclass(frozen=True)
@@ -369,19 +391,29 @@ class RenewalRequest(_Stored):
 
 @dataclass(frozen=True)
 class WriteResult:
+    """``converted`` / ``dropped_duplicate`` (2026-10-04): event proposals the write found to
+    duplicate a pending proposal under its lock, made attachments of their new evidence or
+    dropped for having none."""
+
     written: tuple[UUID, ...]
     superseded: tuple[UUID, ...]
     attached: tuple[UUID, ...] = ()
     attach_dropped: int = 0
+    converted: int = 0
+    dropped_duplicate: int = 0
 
 
 @dataclass(frozen=True)
 class Decided:
+    """``superseded`` (2026-10-04): the pending proposals an approval superseded
+    ``covered_by_decision``, because they rested on the same evidence (intel/overlap.py)."""
+
     proposal_id: UUID
     kind: str
     status: str
     applied_ref: str | None
     decided: dict[str, Any] | None
+    superseded: tuple[UUID, ...] = ()
 
 
 DecisionRefusal = Literal[

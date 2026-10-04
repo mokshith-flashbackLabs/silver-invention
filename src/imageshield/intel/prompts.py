@@ -12,7 +12,7 @@ from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v1"
-PROPOSE_PROMPT_VERSION = "propose-v3"
+PROPOSE_PROMPT_VERSION = "propose-v4"
 
 
 class RegistryTag(TypedDict):
@@ -198,6 +198,9 @@ def suggestion_request(
 
 
 class PromptSignal(TypedDict):
+    """``published`` (propose-v4): the document's publication date, ``YYYY-MM-DD``, or
+    ``"undated"`` -- never the date we read it."""
+
     signal_id: str
     category: str
     direction: str
@@ -206,6 +209,7 @@ class PromptSignal(TypedDict):
     summary: str
     publisher: str
     trust: str
+    published: str
 
 
 class PromptOption(TypedDict):
@@ -228,6 +232,17 @@ class PromptPendingEvent(TypedDict):
     title: str
     severity: int | None
     tags: list[str]
+    signal_ids: list[str]
+
+
+class PromptPendingWeightChange(TypedDict):
+    """A pending weight change (propose-v4), shown so the same evidence is not proposed again as
+    an incident or a protection."""
+
+    proposal_id: str
+    question_key: str
+    option: str
+    delta: int | None
     signal_ids: list[str]
 
 
@@ -257,6 +272,9 @@ named operator, who approves or rejects exact values.
 
 You may propose four kinds of change, and attach new evidence to a pending proposal.
 
+Every piece of evidence carries "published": the date its document was published, or "undated".
+"today" is today's date. Dates matter: an old story is not news.
+
 weight_changes -- the evidence shows a LASTING change to a platform, service or practice that a
 quiz option names, and the change makes choosing that option more (or less) risky for how a
 person's photos and likeness can be misused. For that ONE option give:
@@ -271,7 +289,12 @@ never for one incident or one news cycle.
 
 threat_events -- the evidence shows a TIME-LIMITED incident -- a breach, a leak, a wave of
 deepfakes, an abuse campaign, an outage -- that raises the risk to people exposed through one or
-more tags in the registry below. For each incident give:
+more tags in the registry below, AND the incident is current: its evidence is recent, published
+within threat_recency_days days of today. An older incident, or one the evidence itself says
+has ended (a feature withdrawn, a leak closed, a campaign over), is not a threat: it may support
+a lasting weight_change, or nothing. A threat proposal resting only on evidence older than that
+window is discarded. Undated evidence: judge from what it says, and never present an old story
+as a new incident. For each incident give:
 - kind: leak | deepfake_wave | platform_incident | other.
 - title: a short, plain, factual headline. Once an operator approves it, the people it concerns
   may read it, so never name a private individual, never give contact details, and never say
@@ -302,6 +325,13 @@ Never propose a protection that applies only in some countries, states or region
 regulator's order or a feature limited to some places -- because the service holds nobody's
 location. Never propose a protection already in live_protections. If a proposal in
 pending_events already covers it, attach the new evidence to that proposal instead.
+
+ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL. A temporary incident is a threat_event; a lasting
+policy state is a weight_change; a new safeguard is a protection_event. Never propose two kinds
+from the same evidence -- never a weight_change and a threat_event from the same reports -- and
+never present the same fact as both a protection and a risk. If a proposal in pending_events or
+pending_weight_changes already rests on this evidence, attach new evidence to it (events only) or
+propose nothing more from it.
 
 coverage_gaps -- several pieces of evidence concern a platform, service or practice that no
 mapped tag covers (named in unregistered_subjects, or tagged with a tag not in mapped_tags).
@@ -336,22 +366,29 @@ def proposal_request(
     quiz: Sequence[PromptQuestion],
     registry_tags: Sequence[RegistryTag],
     mapped_tags: Sequence[str],
+    today: str,
+    threat_recency_days: int,
     pending_events: Sequence[PromptPendingEvent] = (),
+    pending_weight_changes: Sequence[PromptPendingWeightChange] = (),
     live_events: Sequence[PromptLiveEvent] = (),
     live_protections: Sequence[PromptLiveProtection] = (),
     events_only: bool = False,
 ) -> tuple[str, str]:
-    """Signals, the public quiz with its weights, the tag registry, the pending event proposals,
-    and the live threat events and protection credits whose tags overlap (every live global
-    credit too). Never a person, and never a quiz answer (INVARIANTS #48)."""
+    """Signals, the public quiz with its weights, the tag registry, the pending proposals (event
+    proposals, and from propose-v4 weight changes), and the live threat events and protection
+    credits whose tags overlap (every live global credit too), with today's date and the threat
+    recency window. Never a person, and never a quiz answer (INVARIANTS #48)."""
     user = json.dumps(
         {
+            "today": today,
+            "threat_recency_days": threat_recency_days,
             "new_evidence": list(new_signals),
             "related_evidence": list(related_signals),
             "quiz": list(quiz),
             "tag_registry": list(registry_tags),
             "mapped_tags": sorted(mapped_tags),
             "pending_events": list(pending_events),
+            "pending_weight_changes": list(pending_weight_changes),
             "live_events": list(live_events),
             "live_protections": list(live_protections),
         },
