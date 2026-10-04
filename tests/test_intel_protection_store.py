@@ -243,7 +243,7 @@ _CREDIT_ROW = "SELECT 1 FROM protection_events WHERE event_id = %s"
 
 
 async def _approve(pool: AsyncConnectionPool, proposal_id: UUID) -> Decided:
-    return await PostgresDecisionStore(pool).decide(
+    return await PostgresDecisionStore(pool, threat_recency_days=90).decide(
         proposal_id,
         decision="approved",
         values=None,
@@ -521,7 +521,8 @@ async def test_the_renewal_write_is_one_transaction_and_happens_once(
     assert await store.write_renewal(run_id, evidence, plan, now=NOW) == RenewalWrite(
         "not_due"  # the credit now has a renewal proposal: never a second one
     )
-    read = await PostgresProposalStore(intel_pool).get_proposal(written.proposal_id)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
+    read = await store.get_proposal(written.proposal_id)
     assert read is not None and read["approvable"] is True  # listed evidence corroborates alone
     assert (
         await _scalar(

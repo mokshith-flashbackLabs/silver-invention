@@ -48,7 +48,7 @@ async def _renewal_runs(pool: AsyncConnectionPool) -> list[Run]:
 
 
 async def _pending_renewals(pool: AsyncConnectionPool) -> list[dict[str, Any]]:
-    rows = await PostgresProposalStore(pool).list_proposals(
+    rows = await PostgresProposalStore(pool, threat_recency_days=90).list_proposals(
         statuses=["pending"], kinds=["protection_event"], cursor=None, limit=10
     )
     return [r for r in rows if "renews_event_id" in r["target"]]
@@ -165,7 +165,7 @@ async def test_an_approved_renewal_continues_the_credit_from_its_review_date(
     deps = make_deps(intel_pool, FakeFetcher({URL: make_page(QUOTE, URL)}), FakeModel())
     await tick(deps, lease_seconds=900)
     (renewal,) = await _pending_renewals(intel_pool)
-    decided = await PostgresDecisionStore(intel_pool).decide(
+    decided = await PostgresDecisionStore(intel_pool, threat_recency_days=90).decide(
         renewal["proposal_id"],
         decision="approved",
         values=None,

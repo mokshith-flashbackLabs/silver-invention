@@ -296,7 +296,7 @@ def make_deps(
         fetcher=fetcher,
         model=model,
         control=control,
-        proposals=PostgresProposalStore(pool),
+        proposals=PostgresProposalStore(pool, threat_recency_days=90),
         reconciler=PostgresReconciler(pool),
         protections=PostgresProtectionStore(pool),
         clock=clock or (lambda: NOW),
@@ -307,6 +307,7 @@ def make_deps(
         # One at a time unless a test asks for more: the tests written before reads ran side by
         # side pin the order pages are fetched in, which concurrency makes a race.
         source_read_concurrency=source_read_concurrency,
+        threat_recency_days=90,
     )
 
 
@@ -435,6 +436,13 @@ async def seed_quiz_vocabulary(
     )
 
 
+def unique_quote() -> str:
+    """A quote no other call returns: eight random hex words, so no two share a run of words or
+    most of their words (intel/corroboration.py)."""
+    words = uuid4().hex + uuid4().hex
+    return "Seeded finding " + " ".join(words[i : i + 4] for i in range(0, 32, 4)) + "."
+
+
 async def seed_signal(
     pool: AsyncConnectionPool,
     *,
@@ -445,14 +453,23 @@ async def seed_signal(
     category: str = "policy",
     created_at: datetime | None = None,
     run_id: UUID | None = None,
+    quote: str | None = None,
+    published_at: datetime | None = None,
+    url: str | None = None,
 ) -> UUID:
     """One active signal on its own document, through the real record_unit. Each call makes
-    its own adhoc run unless ``run_id`` is given."""
+    its own adhoc run unless ``run_id`` is given.
+
+    *2026-10-04:* each signal quotes its OWN text unless ``quote`` is given -- corroboration
+    collapses echoes (INVARIANTS #50 amended), so seeds sharing one quote would be one source.
+    ``url`` names the document (two seeds on one ``url`` are one page read twice), and
+    ``published_at`` its publication date."""
     if run_id is None:
         run_id = await PostgresIntelStore(pool).queue_adhoc(
             f"https://{publisher}/seed", operator="seed"
         )
-    url = f"https://{publisher}/{uuid4()}"
+    url = url or f"https://{publisher}/{uuid4()}"
+    quote = quote or unique_quote()
     document_id = await PostgresEvidenceStore(pool).record_unit(
         DocumentRecord(
             run_id=run_id,
@@ -464,7 +481,7 @@ async def seed_signal(
             content_sha256="0" * 64,
             truncated=False,
             title="",
-            published_at=None,
+            published_at=published_at,
         ),
         [
             SignalRecord(
@@ -475,7 +492,7 @@ async def seed_signal(
                 summary="seeded",
                 model_id="claude-sonnet-5",
                 prompt_version="extract-v1",
-                quotes=(VerifiedQuote(QUOTE, 0, len(QUOTE), "0" * 64),),
+                quotes=(VerifiedQuote(quote, 0, len(quote), "0" * 64),),
             )
         ],
         snapshot=None,

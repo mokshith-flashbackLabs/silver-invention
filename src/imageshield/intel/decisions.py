@@ -36,8 +36,8 @@ is audited only for rows that actually move.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -79,6 +79,7 @@ from imageshield.intel.proposal_store import (
     load_scoring_vocabulary,
     record_of,
 )
+from imageshield.intel.recency import Recency
 from imageshield.intel.tags import TagRegistry, membership_problems
 from imageshield.intel.vocabulary import ScoringVocabulary
 
@@ -96,7 +97,11 @@ _MESSAGES: dict[DecisionRefusal, str] = {
     "proposal_not_pending": "This proposal is no longer open to this decision.",
     "proposal_not_decidable": "This kind of proposal cannot take this decision.",
     "proposal_evidence_retracted": "Every signal behind this proposal has been retracted.",
-    "proposal_uncorroborated": "Web-only evidence needs a second, independent publisher.",
+    "proposal_evidence_stale": (
+        "Every piece of evidence behind this threat is dated and older than the recency window;"
+        " an old or ended incident is not a threat."
+    ),
+    "proposal_uncorroborated": "Web-only evidence needs a second, independent source.",
     "proposal_tags_unmapped": "No option of the live quiz maps to any of this event's tags.",
     "proposal_cell_awaiting_publish": "Another approved change for this option awaits publish.",
     "values_out_of_bounds": "These values fall outside the bounds for this option.",
@@ -110,6 +115,7 @@ _WHY_NOT_REFUSAL: dict[str, DecisionRefusal] = {
     "not_decidable": "proposal_not_decidable",
     "renewed_credit_ended": "proposal_not_pending",
     "evidence_retracted": "proposal_evidence_retracted",
+    "evidence_stale": "proposal_evidence_stale",
     "uncorroborated": "proposal_uncorroborated",
     "tags_unmapped": "proposal_tags_unmapped",
 }
@@ -336,6 +342,7 @@ def _approval_decided(
     vocabulary: ScoringVocabulary | None,
     values: dict[str, Any] | None,
     *,
+    recency: Recency,
     attested: bool | None = None,
     renewed_credit_ended: bool = False,
 ) -> dict[str, Any]:
@@ -344,7 +351,9 @@ def _approval_decided(
         raise _refuse("proposal_not_decidable")
     if proposal.status != "pending":
         raise _refuse("proposal_not_pending")
-    reason = why_not(proposal, active, vocabulary, renewed_credit_ended=renewed_credit_ended)
+    reason = why_not(
+        proposal, active, vocabulary, recency=recency, renewed_credit_ended=renewed_credit_ended
+    )
     if reason == "renewed_credit_ended":
         raise DecisionRefused("proposal_not_pending", _RENEWAL_ENDED)
     if reason is not None:
@@ -410,8 +419,20 @@ class DecisionStore(Protocol):
 
 
 class PostgresDecisionStore:
-    def __init__(self, pool: AsyncConnectionPool) -> None:
+    """``threat_recency_days`` is ``INTEL_THREAT_RECENCY_DAYS`` (spec
+    2026-10-04-intel-evidence-quality §3), required with no default: the decision re-checks
+    ``evidence_stale`` with it at the moment it decides. ``clock`` is for tests."""
+
+    def __init__(
+        self,
+        pool: AsyncConnectionPool,
+        *,
+        threat_recency_days: int,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._pool = pool
+        self._recency_days = threat_recency_days
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def decide(
         self,
@@ -450,6 +471,7 @@ class PostgresDecisionStore:
                         active,
                         vocabulary,
                         values,
+                        recency=Recency(self._clock(), self._recency_days),
                         attested=applies_regardless_of_location,
                         renewed_credit_ended=renews is not None and starts is None,
                     )

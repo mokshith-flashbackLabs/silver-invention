@@ -140,9 +140,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if getattr(app.state, "evidence_store", None) is None:
         app.state.evidence_store = PostgresEvidenceStore(pool)
     if getattr(app.state, "proposal_store", None) is None:
-        app.state.proposal_store = PostgresProposalStore(pool)
+        app.state.proposal_store = PostgresProposalStore(
+            pool, threat_recency_days=cfg.intel_threat_recency_days
+        )
     if getattr(app.state, "decision_store", None) is None:
-        app.state.decision_store = PostgresDecisionStore(pool)
+        app.state.decision_store = PostgresDecisionStore(
+            pool, threat_recency_days=cfg.intel_threat_recency_days
+        )
     if getattr(app.state, "question_store", None) is None:
         app.state.question_store = PostgresQuestionStore(pool)
     log = structlog.get_logger("imageshield.http")

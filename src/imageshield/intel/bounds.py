@@ -106,3 +106,40 @@ RENEWAL_MAX_RUNS = 7
 # slack absorbs a publisher's timezone and a page dated "tomorrow" in its own zone.
 PUBLISHED_MIN_YEAR = 1990
 PUBLISHED_FUTURE_SLACK_DAYS = 2
+
+# Corroboration counts INDEPENDENT sources (INVARIANTS #50 as amended 2026-10-04). Two excerpts are
+# ECHOES -- one source, however many outlets printed it -- when, after normalising case,
+# whitespace, punctuation and quote marks, they share a run of at least ECHO_MIN_SHARED_RUN_WORDS
+# consecutive words, or at least ECHO_MIN_TOKEN_OVERLAP of the shorter excerpt's distinct words
+# appear in the other. The overlap rule needs ECHO_MIN_OVERLAP_WORDS distinct words in the shorter
+# excerpt: two short phrases share most of their words by chance. Twelve words is a sentence
+# copied, not a topic shared; two reports of one announcement in their own words stay two sources.
+ECHO_MIN_SHARED_RUN_WORDS = 12
+ECHO_MIN_TOKEN_OVERLAP = 0.8
+ECHO_MIN_OVERLAP_WORDS = 8
+# A company's OWN registrable domains are one publisher: its blog, its help centre and its
+# newsroom corroborate nothing about it to each other. Organisation -> its domains, as
+# intel/publisher.py records them (the registrable domain, so ``blog.youtube`` stays whole).
+PUBLISHER_ORGANISATIONS: dict[str, tuple[str, ...]] = {
+    "google": ("google.com", "youtube.com", "blog.youtube", "youtu.be", "googleblog.com"),
+    "meta": (
+        "meta.com",
+        "fb.com",
+        "facebook.com",
+        "instagram.com",
+        "threads.net",
+        "threads.com",
+        "whatsapp.com",
+        "messenger.com",
+    ),
+    "x": ("x.com", "twitter.com"),
+    "bytedance": ("tiktok.com", "bytedance.com"),
+    "snap": ("snap.com", "snapchat.com"),
+    "microsoft": ("microsoft.com", "linkedin.com", "bing.com"),
+}
+# Cross-kind overlap (spec 2026-10-04-intel-evidence-quality §5): two pending proposals on an
+# overlapping tag rest on the same body of evidence when the evidence units they share (a document,
+# with its echoes) are at least OVERLAP_MIN_SHARE of either one's units. A read and the approval
+# compare a proposal against at most OVERLAP_POOL_MAX pending proposals, newest first.
+OVERLAP_MIN_SHARE = 0.5
+OVERLAP_POOL_MAX = 500

@@ -155,7 +155,10 @@ class PipelineDeps:
     ``max_calls_per_suggestion_run`` is ``INTEL_MAX_CALLS_PER_SUGGESTION_RUN``, a weight
     suggestion's reading cap (spec §4.10), with no default for the same reason.
     ``source_read_concurrency`` is ``INTEL_SOURCE_READ_CONCURRENCY`` (spec
-    2026-10-03-intel-throughput §5): how many sources or pages one run reads at once."""
+    2026-10-03-intel-throughput §5): how many sources or pages one run reads at once.
+    ``threat_recency_days`` is ``INTEL_THREAT_RECENCY_DAYS`` (spec
+    2026-10-04-intel-evidence-quality §3): the window the generation prompt states and the
+    generation-time staleness check applies, with no default for the same reason."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -171,6 +174,7 @@ class PipelineDeps:
     questions: QuestionStore
     max_calls_per_suggestion_run: int
     source_read_concurrency: int
+    threat_recency_days: int
 
 
 @dataclass(frozen=True)

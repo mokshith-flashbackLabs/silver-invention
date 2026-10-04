@@ -356,13 +356,16 @@ async def run_forever(config: IntelConfig) -> None:
             default_cooldown_seconds=config.breaker_cooldown_seconds,
             max_cooldown_seconds=config.breaker_cooldown_max_seconds,
         ),
-        proposals=PostgresProposalStore(pool),
+        proposals=PostgresProposalStore(
+            pool, threat_recency_days=config.intel_threat_recency_days
+        ),
         reconciler=PostgresReconciler(pool),
         protections=PostgresProtectionStore(pool),
         clock=lambda: datetime.now(UTC),
         # No default on PipelineDeps for either of these (task 10) -- a second
         # default beside IntelConfig's would be a second source of truth.
         max_calls_per_run=config.intel_max_calls_per_run,
+        threat_recency_days=config.intel_threat_recency_days,
         max_document_chars=config.intel_max_document_chars,
         questions=PostgresQuestionStore(pool),
         max_calls_per_suggestion_run=config.intel_max_calls_per_suggestion_run,

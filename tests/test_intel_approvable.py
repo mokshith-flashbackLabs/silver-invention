@@ -3,27 +3,37 @@
 from __future__ import annotations
 
 import copy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any
 from uuid import uuid4
 
+from imageshield.intel import approvable
 from imageshield.intel.approvable import (
     all_tags_unmapped,
-    read_flags,
     retired_tags,
     unmapped_tags,
-    why_not,
 )
-from imageshield.intel.corroboration import uncorroborated
+from imageshield.intel.corroboration import independent_sources, uncorroborated
 from imageshield.intel.proposal_models import ContextSignal, ProposalRecord
 from imageshield.intel.publisher import publisher_domain
+from imageshield.intel.recency import Recency
 from tests.intel_fakes import QUIZ_VOCABULARY, scoring
 
 NOW = datetime.now(UTC)
+RECENCY = Recency(NOW, 90)
+# The predicate and the read flags at NOW with a 90-day window.
+why_not = partial(approvable.why_not, recency=RECENCY)
+read_flags = partial(approvable.read_flags, recency=RECENCY)
 
 
 def _signal(
-    publisher: str = "a.example", *, trust: str = "web", status: str = "active"
+    publisher: str = "a.example",
+    *,
+    trust: str = "web",
+    status: str = "active",
+    excerpts: tuple[str, ...] = (),
+    published: datetime | None = None,
 ) -> ContextSignal:
     return ContextSignal(
         signal_id=uuid4(),
@@ -36,6 +46,9 @@ def _signal(
         publisher_domain=publisher,
         status=status,
         created_at=NOW,
+        document_key=uuid4().hex,
+        published_at=published,
+        excerpts=excerpts,
     )
 
 
@@ -157,3 +170,116 @@ def test_a_renewal_whose_credit_ended_is_not_approvable_whatever_its_evidence() 
     assert why_not(renewal, [], scoring(), renewed_credit_ended=False) == "evidence_retracted"
     gap = _proposal("coverage_gap", target={"subject": "Bumble"})
     assert why_not(gap, [], scoring(), renewed_credit_ended=True) == "not_decidable"
+
+
+# ── corroboration that ignores copies (INVARIANTS #50 amended 2026-10-04) ─────────────────────
+
+# YouTube's own announcement, as four outlets quoted it on dev (2026-10-03): one source.
+ANNOUNCEMENT = (
+    "Starting today, YouTube will let people request the removal of AI-generated or other"
+    " synthetic or altered content that simulates an identifiable individual, including their"
+    " face or voice."
+)
+
+
+def test_one_sentence_quoted_by_four_outlets_is_one_source() -> None:
+    echoes = [
+        _signal("techradar.com", excerpts=(ANNOUNCEMENT,)),
+        _signal("petapixel.com", excerpts=(f'"{ANNOUNCEMENT.upper()}"',)),
+        _signal("musicbusinessworldwide.com", excerpts=("YouTube said: " + ANNOUNCEMENT,)),
+        _signal("completemusicupdate.com", excerpts=(ANNOUNCEMENT.replace(",", " --"),)),
+    ]
+    assert independent_sources(echoes) == 1
+    assert uncorroborated(echoes)
+
+
+def test_echoes_chain_and_a_shorter_echo_counts_by_word_overlap() -> None:
+    short = "YouTube will let people request removal of AI-generated content simulating faces"
+    reworded = "People may now request removal of AI-generated content simulating faces on YouTube"
+    signals = [_signal("a.example", excerpts=(short,)), _signal("b.example", excerpts=(reworded,))]
+    assert independent_sources(signals) == 1  # most of the shorter excerpt's words, reordered
+
+
+def test_a_companys_own_domains_are_one_publisher() -> None:
+    google = [
+        _signal("google.com", excerpts=("Support page text about privacy complaints.",)),
+        _signal("blog.youtube", excerpts=("Our blog announces a separate disclosure tool.",)),
+    ]
+    assert independent_sources(google) == 1 and uncorroborated(google)
+    # As stored: the registrable domain of the fetcher's final URL (intel/publisher.py).
+    meta = [
+        _signal(publisher_domain(url))
+        for url in (
+            "https://about.fb.com/news",
+            "https://transparency.fb.com/x",
+            "https://www.instagram.com/",
+        )
+    ]
+    assert independent_sources(meta) == 1
+
+
+def test_two_genuinely_different_publishers_still_corroborate() -> None:
+    signals = [
+        _signal("techradar.com", excerpts=("TechRadar tested the removal form and it took days.",)),
+        _signal("theverge.com", excerpts=("A spokesperson confirmed the policy covers voices.",)),
+    ]
+    assert independent_sources(signals) == 2 and not uncorroborated(signals)
+    assert not uncorroborated([_signal("techradar.com"), _signal("google.com")])
+
+
+def test_a_listed_signal_still_corroborates_alone_however_it_echoes() -> None:
+    signals = [
+        _signal("pimeyes.com", trust="listed", excerpts=(ANNOUNCEMENT,)),
+        _signal("techradar.com", excerpts=(ANNOUNCEMENT,)),
+    ]
+    assert independent_sources(signals) == 1 and not uncorroborated(signals)
+
+
+def test_short_excerpts_sharing_common_words_are_not_echoes() -> None:
+    signals = [
+        _signal("a.example", excerpts=("The new tool is available now.",)),
+        _signal("b.example", excerpts=("The tool is now available.",)),
+    ]
+    assert independent_sources(signals) == 2
+
+
+def test_the_reads_expose_independent_sources_and_evidence_dates() -> None:
+    sept, octo = datetime(2026, 9, 12, tzinfo=UTC), datetime(2026, 10, 2, tzinfo=UTC)
+    signals = [
+        _signal("techradar.com", excerpts=(ANNOUNCEMENT,), published=sept),
+        _signal("petapixel.com", excerpts=(ANNOUNCEMENT,), published=octo),
+        _signal("theverge.com", excerpts=("Different words entirely, reported independently.",)),
+    ]
+    flags = read_flags(_proposal(), signals, scoring())
+    assert flags["independent_sources"] == 2 and flags["why_not"] is None
+    assert flags["evidence_dates"] == {"newest": "2026-10-02", "oldest": "2026-09-12", "undated": 1}
+
+
+# ── recency (spec 2026-10-04-intel-evidence-quality §3) ────────────────────────────────────────
+
+OLD = NOW - timedelta(days=200)
+
+
+def test_a_threat_whose_evidence_is_all_dated_and_old_reads_evidence_stale() -> None:
+    threat = _proposal(kind="threat_event", target={"tags": ["instagram"]})
+    old = [_signal("a.example", published=OLD), _signal("b.example", published=OLD)]
+    assert why_not(threat, old, scoring()) == "evidence_stale"
+    flags = read_flags(threat, old, scoring())
+    assert (flags["approvable"], flags["why_not"]) == (False, "evidence_stale")
+    # Before uncorroborated in the fixed order: one old web publisher is stale, not uncorroborated.
+    assert why_not(threat, old[:1], scoring()) == "evidence_stale"
+
+
+def test_undated_or_recent_evidence_keeps_a_threat_approvable() -> None:
+    threat = _proposal(kind="threat_event", target={"tags": ["instagram"]})
+    undated = [_signal("a.example", published=OLD), _signal("b.example")]
+    assert why_not(threat, undated, scoring()) is None
+    recent = [_signal("a.example", published=OLD), _signal("b.example", published=NOW)]
+    assert why_not(threat, recent, scoring()) is None
+
+
+def test_only_a_threat_can_be_stale() -> None:
+    old = [_signal("a.example", published=OLD), _signal("b.example", published=OLD)]
+    assert why_not(_proposal(), old, scoring()) is None  # a lasting weight change
+    protection = _proposal("protection_event", target={"tags": ["instagram"], "is_global": False})
+    assert why_not(protection, old, scoring()) is None

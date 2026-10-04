@@ -5,11 +5,13 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime
+from functools import partial
 from uuid import uuid4
 
-from imageshield.intel.approvable import read_flags
+from imageshield.intel import approvable
 from imageshield.intel.models import Run
 from imageshield.intel.proposal_models import ContextSignal, ProposalRecord, SuggestedTag
+from imageshield.intel.recency import Recency
 from imageshield.intel.schemas import ProposedTag, SuggestedOptionWeight, SuggestionOutput
 from imageshield.intel.suggestion import (
     OptionSuggestion,
@@ -22,6 +24,9 @@ from imageshield.intel.suggestion import (
     validate_suggestion,
 )
 from tests.intel_fakes import scoring
+
+# The read flags at a fixed moment: none of these proposals is a threat, so the window is moot.
+read_flags = partial(approvable.read_flags, recency=Recency(datetime.now(UTC), 90))
 
 T0 = datetime(2026, 9, 1, tzinfo=UTC)
 

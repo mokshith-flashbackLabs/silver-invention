@@ -17,8 +17,8 @@ related_events, which are the live events of its own direction.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -41,6 +41,7 @@ from imageshield.intel.proposal_models import (
     ProposalRecord,
     WriteResult,
 )
+from imageshield.intel.recency import Recency
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject, parse_vocabulary
 
 log = structlog.get_logger("imageshield.intel")
@@ -376,8 +377,23 @@ class ProposalStore(Protocol):
 
 
 class PostgresProposalStore:
-    def __init__(self, pool: AsyncConnectionPool) -> None:
+    """``threat_recency_days`` is ``INTEL_THREAT_RECENCY_DAYS`` (spec
+    2026-10-04-intel-evidence-quality §3), required with no default: both reads answer
+    ``evidence_stale`` with it, as the decision does. ``clock`` is for tests."""
+
+    def __init__(
+        self,
+        pool: AsyncConnectionPool,
+        *,
+        threat_recency_days: int,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._pool = pool
+        self._recency_days = threat_recency_days
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    def _recency(self) -> Recency:
+        return Recency(self._clock(), self._recency_days)
 
     async def proposals_written(self, run_id: UUID) -> bool:
         async with self._pool.connection() as conn:
@@ -637,8 +653,11 @@ class PostgresProposalStore:
             vocabulary = await load_scoring_vocabulary(conn)
             linked = await fetch_linked_signals(conn, [r["proposal_id"] for r in rows])
             ended = await ended_renewals(conn, rows)
+        recency = self._recency()
         return [
-            _annotated(row, linked[row["proposal_id"]], vocabulary, row["proposal_id"] in ended)
+            _annotated(
+                row, linked[row["proposal_id"]], vocabulary, recency, row["proposal_id"] in ended
+            )
             for row in rows
         ]
 
@@ -700,7 +719,7 @@ class PostgresProposalStore:
         for excerpt in excerpts:
             by_signal.setdefault(excerpt.pop("signal_id"), []).append(excerpt)
         return {
-            **_annotated(row, linked, vocabulary, proposal_id in ended),
+            **_annotated(row, linked, vocabulary, self._recency(), proposal_id in ended),
             "related_events": related,
             "signals": [
                 {
@@ -719,12 +738,17 @@ def _annotated(
     row: dict[str, Any],
     linked: list[ContextSignal],
     vocabulary: ScoringVocabulary | None,
+    recency: Recency,
     renewed_credit_ended: bool = False,
 ) -> dict[str, Any]:
     return {
         **row,
         "signal_ids": [s.signal_id for s in linked],
         **read_flags(
-            record_of(row), linked, vocabulary, renewed_credit_ended=renewed_credit_ended
+            record_of(row),
+            linked,
+            vocabulary,
+            recency=recency,
+            renewed_credit_ended=renewed_credit_ended,
         ),
     }

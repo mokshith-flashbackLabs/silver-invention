@@ -261,7 +261,7 @@ async def test_an_approved_change_is_never_rewritten_and_reads_stale(
         )
         == "Instagram"
     )
-    detail = await PostgresProposalStore(intel_pool).get_proposal(pid)
+    detail = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(pid)
     assert detail is not None
     assert detail["stale"] is True and detail["why_stale"] == "option_renamed"
 
@@ -427,7 +427,7 @@ async def test_tick_resolves_the_gap_then_runs_its_regeneration(
 
     deps = make_deps(intel_pool, FakeFetcher({}), FakeModel(propose_with=propose))
     assert await tick(deps, lease_seconds=900) is True
-    (threat,) = await PostgresProposalStore(intel_pool).list_proposals(
+    (threat,) = await PostgresProposalStore(intel_pool, threat_recency_days=90).list_proposals(
         statuses=["pending"], kinds=["threat_event"], cursor=None, limit=5
     )
     assert set(threat["signal_ids"]) == set(signals) and threat["approvable"] is True

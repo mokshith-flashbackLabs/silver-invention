@@ -75,7 +75,7 @@ async def test_generation_writes_pending_rows_once_per_run(
     await seed_quiz_vocabulary(intel_pool)
     run_id = await _run(intel_pool)
     sid = await seed_signal(intel_pool, run_id=run_id, tags=("instagram",))
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     assert not await store.proposals_written(run_id)
     result = await _write(store, run_id, _change(sid))
     assert result is not None and len(result.written) == 1 and result.superseded == ()
@@ -91,7 +91,7 @@ async def test_a_newer_pending_change_for_the_same_cell_supersedes_the_older(
     intel_pool: AsyncConnectionPool,
 ) -> None:
     await seed_quiz_vocabulary(intel_pool)
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     sid = await seed_signal(intel_pool, tags=("instagram",))
     first = await _write(store, await _run(intel_pool), _change(sid))
     other = await _write(store, await _run(intel_pool), _change(sid, option="LinkedIn", current=2))
@@ -116,7 +116,7 @@ async def test_a_newer_pending_change_for_the_same_cell_supersedes_the_older(
 async def test_a_newer_gap_with_the_same_normalised_subject_supersedes_the_older(
     intel_pool: AsyncConnectionPool,
 ) -> None:
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     sid = await seed_signal(intel_pool, subjects=("Bumble",))
     gap = NewProposal("coverage_gap", {"subject": "Bumble"}, {}, "r", (sid,))
     later = NewProposal("coverage_gap", {"subject": "bumble!"}, {}, "r", (sid,))
@@ -142,7 +142,7 @@ async def test_the_list_omits_weight_suggestion_unless_asked(
         status="delivered",
         target={"question_key": "platforms", "options": []},
     )
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     default = await store.list_proposals(statuses=None, kinds=None, cursor=None, limit=10)
     asked = await store.list_proposals(
         statuses=None, kinds=["weight_suggestion"], cursor=None, limit=10
@@ -161,7 +161,7 @@ async def test_the_list_filters_by_status_and_pages_by_keyset(
         for m in (3, 2, 1)
     ]
     await seed_proposal(intel_pool, signal_ids=[sid], status="rejected")
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     page = await store.list_proposals(statuses=["pending"], kinds=None, cursor=None, limit=2)
     assert [r["proposal_id"] for r in page] == [ids[2], ids[1]]
     rest = await store.list_proposals(
@@ -182,7 +182,7 @@ async def test_the_detail_carries_signals_excerpts_documents_and_read_flags(
         for p in ("a.example", "b.example")
     ]
     pid = await seed_proposal(intel_pool, signal_ids=sids)
-    detail = await PostgresProposalStore(intel_pool).get_proposal(pid)
+    detail = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(pid)
     assert detail is not None
     assert detail["approvable"] is True and detail["why_not"] is None
     assert detail["stale"] is False and detail["unmapped_tags"] == []
@@ -192,7 +192,7 @@ async def test_the_detail_carries_signals_excerpts_documents_and_read_flags(
     }
     assert all(s["excerpts"] and s["excerpts"][0]["quote_text"] for s in detail["signals"])
     assert (
-        await PostgresProposalStore(intel_pool).get_proposal(
+        await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(
             UUID("00000000-0000-0000-0000-000000000000")
         )
         is None
@@ -209,7 +209,7 @@ async def test_a_pending_change_whose_deduction_just_moved_reads_stale(
     doc = copy.deepcopy(QUIZ_VOCABULARY)
     doc["questions"][0]["deductions"]["Instagram"] = 5
     await seed_quiz_vocabulary(intel_pool, release_no=3, document=doc)
-    detail = await PostgresProposalStore(intel_pool).get_proposal(pid)
+    detail = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(pid)
     assert detail is not None
     assert detail["stale"] is True and detail["why_stale"] == "deduction_moved"
     assert detail["approvable"] is True  # no 409 applies; the decision answers 422
@@ -222,7 +222,7 @@ async def test_retracting_every_signal_reads_evidence_retracted(
     sid = await seed_signal(intel_pool, tags=("instagram",))
     pid = await seed_proposal(intel_pool, signal_ids=[sid])
     await PostgresEvidenceStore(intel_pool).retract_signal(sid, operator="a", reason="wrong page")
-    detail = await PostgresProposalStore(intel_pool).get_proposal(pid)
+    detail = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(pid)
     assert detail is not None
     assert detail["evidence_retracted"] is True and detail["why_not"] == "evidence_retracted"
     assert detail["approvable"] is False
@@ -240,7 +240,7 @@ async def test_context_reads(intel_pool: AsyncConnectionPool) -> None:
     )
     gap_subject = await seed_signal(intel_pool, subjects=("Bumble",), category="law")
     unmapped = await seed_signal(intel_pool, tags=("linkedin",), category="law")
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     assert [s.signal_id for s in await store.run_signals(run_id)] == [mine]
     related = await store.related_signals(
         exclude=[mine],
@@ -272,7 +272,7 @@ async def test_a_threat_proposal_is_written_pending_and_supersedes_nothing(
 ) -> None:
     await seed_quiz_vocabulary(intel_pool)
     sid = await seed_signal(intel_pool, tags=("instagram",))
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     first = await _write(store, await _run(intel_pool), _threat(sid))
     second = await _write(store, await _run(intel_pool), _threat(sid))
     assert second.superseded == () and len(second.written) == 1
@@ -297,7 +297,7 @@ async def test_an_attachment_adds_evidence_to_a_pending_event_proposal_and_nothi
     change = await seed_proposal(intel_pool, signal_ids=[old])  # a weight change, not an event
     run_id = await _run(intel_pool)
     new = await seed_signal(intel_pool, run_id=run_id, tags=("instagram",), publisher="b.example")
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     result = await store.write_generated(
         run_id,
         [],
@@ -331,7 +331,7 @@ async def test_pending_event_proposals_are_the_open_overlapping_ones_with_their_
     await seed_threat_proposal(intel_pool, signal_ids=[s2], tags=("linkedin",))
     await seed_threat_proposal(intel_pool, signal_ids=[s1], status="rejected")
     await seed_proposal(intel_pool, signal_ids=[s1])
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     (found,) = await store.pending_event_proposals(tags=["instagram"], limit=40)
     assert found.proposal_id == insta and found.kind == "threat_event"
     assert found.tags == ("instagram",) and found.signal_ids == (s1,)
@@ -360,7 +360,8 @@ async def test_pending_event_proposals_read_only_active_evidence(
     evidence = PostgresEvidenceStore(intel_pool)
     for sid in (gone, lone):
         assert await evidence.retract_signal(sid, operator="ann", reason="wrong") == "retracted"
-    (found,) = await PostgresProposalStore(intel_pool).pending_event_proposals(
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
+    (found,) = await store.pending_event_proposals(
         tags=["instagram"], limit=40
     )
     page = await _scalar(
@@ -390,7 +391,7 @@ async def test_active_threat_events_are_live_tagged_and_carry_the_approvals_evid
     await seed_threat_event(intel_pool, title="expired", starts_in_days=-10, ends_in_days=-1)
     await seed_threat_event(intel_pool, title="untagged", tags=(), domains=("evil.example",))
     await seed_threat_event(intel_pool, title="other tag", tags=("linkedin",))
-    events = await PostgresProposalStore(intel_pool).active_threat_events(
+    events = await PostgresProposalStore(intel_pool, threat_recency_days=90).active_threat_events(
         tags=["instagram"], limit=40
     )
     assert {e.title for e in events} == {"live", "by hand"}
@@ -406,7 +407,8 @@ async def test_signals_by_id_returns_the_active_ones_with_their_documents(
     keep = await seed_signal(intel_pool, subjects=("LinkedIn",))
     gone = await seed_signal(intel_pool, subjects=("LinkedIn",))
     await PostgresEvidenceStore(intel_pool).retract_signal(gone, operator="a", reason="wrong")
-    found = await PostgresProposalStore(intel_pool).signals_by_id([keep, gone, uuid4()])
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
+    found = await store.signals_by_id([keep, gone, uuid4()])
     assert [s.signal_id for s in found] == [keep] and found[0].document_key is not None
 
 
@@ -418,7 +420,7 @@ async def test_the_detail_read_names_related_live_events_for_event_kinds_only(
     proposal = await seed_threat_proposal(intel_pool, signal_ids=[sid])
     event_id = await seed_threat_event(intel_pool, title="Live breach")
     change = await seed_proposal(intel_pool, signal_ids=[sid])
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     detail = await store.get_proposal(proposal)
     assert detail is not None
     (related,) = detail["related_events"]
@@ -450,7 +452,7 @@ async def test_an_attach_only_write_is_audited_and_a_fully_dropped_one_is_not(
     old = await seed_signal(intel_pool, tags=("instagram",))
     pending = await seed_threat_proposal(intel_pool, signal_ids=[old])
     dismissed = await seed_threat_proposal(intel_pool, signal_ids=[old], status="rejected")
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     kept_run = await _run(intel_pool)
     new = await seed_signal(intel_pool, run_id=kept_run, tags=("instagram",), publisher="b.example")
     kept = await _write(store, kept_run, attachments=[Attachment(pending, (new,))])
@@ -504,7 +506,7 @@ async def test_the_attachment_recheck_waits_for_the_row_lock_a_decision_holds(
     pending = await seed_threat_proposal(intel_pool, signal_ids=[old])
     run_id = await _run(intel_pool)
     new = await seed_signal(intel_pool, run_id=run_id, tags=("instagram",), publisher="b.example")
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     async with await AsyncConnection.connect(intel_db) as decision:
         await decision.execute(
             "SELECT 1 FROM intel_proposals WHERE proposal_id = %s FOR UPDATE", (pending,)
@@ -557,7 +559,7 @@ async def test_the_event_reads_and_the_attachment_write_need_no_grant_intel_rw_l
     run_id = await _run(intel_pool)
     new = await seed_signal(intel_pool, run_id=run_id, tags=("instagram",), publisher="b.example")
     assert await _scalar(intel_rw_pool, "SELECT current_user") == "intel_rw"
-    store = PostgresProposalStore(intel_rw_pool)
+    store = PostgresProposalStore(intel_rw_pool, threat_recency_days=90)
     open_events = await store.pending_event_proposals(tags=["instagram"], limit=40)
     assert [p.proposal_id for p in open_events] == [pending]
     live = await store.active_threat_events(tags=["instagram"], limit=40)
@@ -583,7 +585,7 @@ async def test_related_events_leave_out_the_proposals_own_event_and_other_tags(
     await seed_threat_event(intel_pool, proposal_id=applied, title="its own")
     other = await seed_threat_event(intel_pool, title="someone else's")
     await seed_threat_event(intel_pool, title="different tag", tags=("linkedin",))
-    detail = await PostgresProposalStore(intel_pool).get_proposal(applied)
+    detail = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(applied)
     assert detail is not None
     assert [r["event_id"] for r in detail["related_events"]] == [other]
 
@@ -601,7 +603,7 @@ async def test_the_event_reads_are_newest_first_and_bounded(
     )
     for title in ("first", "second", "third"):
         await seed_threat_event(intel_pool, title=title)
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     both = await store.pending_event_proposals(tags=["instagram"], limit=40)
     assert [p.proposal_id for p in both] == [newer, older]
     one = await store.pending_event_proposals(tags=["instagram"], limit=1)
@@ -629,11 +631,10 @@ async def test_pending_event_proposals_read_other_event_kinds_and_refuse_a_boole
         target={"tags": ["instagram"]},
         suggested={"title": "odd", "severity": True},
     )
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     found = {
         p.proposal_id: p
-        for p in await PostgresProposalStore(intel_pool).pending_event_proposals(
-            tags=["instagram"], limit=40
-        )
+        for p in await store.pending_event_proposals(tags=["instagram"], limit=40)
     }
     assert found[protection].kind == "protection_event" and found[protection].severity is None
     assert found[protection].title == "Two-factor everywhere"
@@ -673,7 +674,7 @@ async def test_a_protection_proposal_is_written_pending_and_supersedes_nothing(
 ) -> None:
     await seed_quiz_vocabulary(intel_pool)
     sid = await seed_signal(intel_pool, tags=("instagram",))
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     first = await _write(store, await _run(intel_pool), _protection(sid))
     second = await _write(store, await _run(intel_pool), _protection(sid))
     assert second.superseded == () and len(second.written) == 1
@@ -698,7 +699,7 @@ async def test_active_protection_events_are_live_on_the_tags_or_global_with_thei
     await seed_protection_event(intel_pool, title="lapsed", starts_in_days=-100, ends_in_days=-1)
     await seed_protection_event(intel_pool, title="scheduled", starts_in_days=10, ends_in_days=100)
     await seed_protection_event(intel_pool, title="other tag", tags=("linkedin",))
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     events = await store.active_protection_events(tags=["instagram"], limit=40)
     assert {e.title for e in events} == {"live", "everyone"}
     (approved,) = [e for e in events if e.event_id == live]
@@ -718,7 +719,7 @@ async def test_each_event_kind_is_related_to_the_live_events_of_its_own_directio
     threat = await seed_threat_proposal(intel_pool, signal_ids=[sid])
     credit = await seed_protection_event(intel_pool, title="Live opt-out")
     incident = await seed_threat_event(intel_pool, title="Live breach")
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     detail = await store.get_proposal(protection)
     assert detail is not None
     (related,) = detail["related_events"]

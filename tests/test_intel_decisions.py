@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from collections.abc import AsyncIterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -55,7 +55,7 @@ async def _decide(
     values: dict[str, Any] | None = None,
     operator: str = "ann",
 ) -> Decided:
-    return await PostgresDecisionStore(pool).decide(
+    return await PostgresDecisionStore(pool, threat_recency_days=90).decide(
         pid,
         decision=decision,
         values=values,
@@ -145,7 +145,7 @@ async def test_approvable_on_the_read_equals_the_decision_not_409ing(
         for u in urls
     ]
     pid = await seed_proposal(intel_pool, signal_ids=sids)
-    read = await PostgresProposalStore(intel_pool).get_proposal(pid)
+    read = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(pid)
     assert read is not None and read["approvable"] is approvable
     if approvable:
         await _decide(intel_pool, pid)
@@ -309,7 +309,7 @@ async def test_applied_moves_approved_changes_once_and_keeps_the_approval(
 ) -> None:
     await seed_quiz_vocabulary(intel_pool)
     pid = await _approvable(intel_pool, status="approved", decided={"delta": 1})
-    store = PostgresDecisionStore(intel_pool)
+    store = PostgresDecisionStore(intel_pool, threat_recency_days=90)
     first = await store.mark_applied(scoring_version="s3", proposal_ids=[pid, pid])
     assert first.applied == (pid,) and first.already_applied == () and first.not_applied == ()
     row = await _scalar(
@@ -336,7 +336,7 @@ async def test_an_ack_naming_unknown_pending_or_withdrawn_ids_moves_nothing(
     pending = await _approvable(intel_pool)
     withdrawn = await _approvable(intel_pool, status="rejected")
     unknown = uuid4()
-    result = await PostgresDecisionStore(intel_pool).mark_applied(
+    result = await PostgresDecisionStore(intel_pool, threat_recency_days=90).mark_applied(
         scoring_version="s3", proposal_ids=[pending, withdrawn, unknown]
     )
     assert result.applied == () and result.already_applied == ()
@@ -506,7 +506,7 @@ async def test_an_all_unmapped_threat_waits_then_becomes_approvable_when_a_push_
     await seed_quiz_vocabulary(intel_pool)
     sid = await seed_signal(intel_pool, tags=("linkedin",))
     pid = await seed_threat_proposal(intel_pool, signal_ids=[sid], tags=("linkedin",))
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     read = await store.get_proposal(pid)
     assert read is not None and (read["approvable"], read["why_not"]) == (False, "tags_unmapped")
     assert await _refused(intel_pool, pid) == "proposal_tags_unmapped"
@@ -612,7 +612,7 @@ async def _decide_protection(
     attested: bool | None = True,
     operator: str = "ann",
 ) -> Decided:
-    return await PostgresDecisionStore(pool).decide(
+    return await PostgresDecisionStore(pool, threat_recency_days=90).decide(
         pid,
         decision=decision,  # type: ignore[arg-type]
         values=values,
@@ -773,7 +773,7 @@ async def test_an_all_unmapped_protection_waits_and_an_edit_to_only_unmapped_tag
     await seed_quiz_vocabulary(intel_pool)  # linkedin: registered, not mapped
     sid = await seed_signal(intel_pool, tags=("linkedin",))
     waiting = await seed_protection_proposal(intel_pool, signal_ids=[sid], tags=("linkedin",))
-    read = await PostgresProposalStore(intel_pool).get_proposal(waiting)
+    read = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(waiting)
     assert read is not None and (read["approvable"], read["why_not"]) == (False, "tags_unmapped")
     assert await _refused_protection(intel_pool, waiting) == "proposal_tags_unmapped"
     pid = await _protection_approvable(intel_pool)
@@ -844,7 +844,7 @@ async def test_a_renewal_of_a_credit_past_its_review_date_is_refused_and_reads_s
     await seed_quiz_vocabulary(intel_pool)
     old = await seed_protection_event(intel_pool, starts_in_days=-200, ends_in_days=-1)
     renewal = await _protection_approvable(intel_pool, renews=old)
-    store = PostgresProposalStore(intel_pool)
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
     read = await store.get_proposal(renewal)
     assert read is not None
     assert (read["approvable"], read["why_not"]) == (False, "renewed_credit_ended")
@@ -874,7 +874,7 @@ async def test_an_approved_renewal_of_a_live_credit_is_scheduled_and_moves_nobod
     await seed_quiz_vocabulary(intel_pool)
     old = await seed_protection_event(intel_pool, starts_in_days=-160, ends_in_days=2)
     renewal = await _protection_approvable(intel_pool, renews=old)
-    read = await PostgresProposalStore(intel_pool).get_proposal(renewal)
+    read = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(renewal)
     assert read is not None and (read["approvable"], read["why_not"]) == (True, None)
     decided = await _decide_protection(intel_pool, renewal)
     assert decided.applied_ref is not None
@@ -906,7 +906,7 @@ async def test_a_renewal_of_a_retracted_or_already_renewed_credit_is_refused(
         )
     # Final review M4: the retraction's SKIP LOCKED can leave such a proposal pending; it then
     # reads unapprovable rather than approvable-and-409-for-ever.
-    read = await PostgresProposalStore(intel_pool).get_proposal(stale)
+    read = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(stale)
     assert read is not None and read["status"] == "pending"
     assert (read["approvable"], read["why_not"]) == (False, "renewed_credit_ended")
     assert await _refused_protection(intel_pool, stale) == "proposal_not_pending"
@@ -945,3 +945,46 @@ async def test_a_renewal_carries_a_global_scope_and_a_retired_tag_forward(
     assert (await _decide_protection(intel_pool, retired_renewal)).status == "applied"
     plain = await _protection_approvable(intel_pool)
     assert (await _decide_protection(intel_pool, plain)).status == "applied"
+
+
+# ── recency (spec 2026-10-04-intel-evidence-quality §3) ────────────────────────────────────────
+
+
+async def _old_threat(pool: AsyncConnectionPool, *, days_old: int) -> UUID:
+    published = datetime.now(UTC) - timedelta(days=days_old)
+    sids = [
+        await seed_signal(
+            pool, trust="web", publisher=p, tags=("instagram",), published_at=published
+        )
+        for p in ("a.example", "b.example")
+    ]
+    return await seed_threat_proposal(pool, signal_ids=sids)
+
+
+async def test_a_threat_whose_evidence_is_all_dated_and_old_is_refused_and_reads_so(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _old_threat(intel_pool, days_old=200)
+    read = await PostgresProposalStore(intel_pool, threat_recency_days=90).get_proposal(pid)
+    assert read is not None
+    assert (read["approvable"], read["why_not"]) == (False, "evidence_stale")
+    assert read["evidence_dates"]["undated"] == 0 and read["evidence_dates"]["newest"] is not None
+    assert await _refused(intel_pool, pid) == "proposal_evidence_stale"
+    assert await _scalar(intel_pool, "SELECT count(*) FROM threat_events") == 0
+    # Still dismissable: a stale incident is rejected, never left hanging.
+    assert (await _decide(intel_pool, pid, "rejected")).status == "rejected"
+
+
+async def test_the_window_is_the_configured_one_and_recent_evidence_is_approvable(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _old_threat(intel_pool, days_old=60)
+    narrow = PostgresProposalStore(intel_pool, threat_recency_days=30)
+    read = await narrow.get_proposal(pid)
+    assert read is not None and read["why_not"] == "evidence_stale"
+    decided = await PostgresDecisionStore(intel_pool, threat_recency_days=90).decide(
+        pid, decision="approved", values=None, reason="checked the sources", operator="ann"
+    )
+    assert decided.status == "applied"

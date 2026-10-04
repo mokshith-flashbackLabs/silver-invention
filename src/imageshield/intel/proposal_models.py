@@ -389,6 +389,7 @@ DecisionRefusal = Literal[
     "proposal_not_pending",
     "proposal_not_decidable",
     "proposal_evidence_retracted",
+    "proposal_evidence_stale",
     "proposal_uncorroborated",
     "proposal_tags_unmapped",
     "proposal_cell_awaiting_publish",

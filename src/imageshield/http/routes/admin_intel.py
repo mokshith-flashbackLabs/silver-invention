@@ -453,6 +453,7 @@ _REFUSAL_STATUS: dict[str, int] = {
     "proposal_not_pending": 409,
     "proposal_not_decidable": 409,
     "proposal_evidence_retracted": 409,
+    "proposal_evidence_stale": 409,
     "proposal_uncorroborated": 409,
     "proposal_tags_unmapped": 409,
     "proposal_cell_awaiting_publish": 409,

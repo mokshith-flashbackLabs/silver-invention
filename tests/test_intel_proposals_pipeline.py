@@ -271,7 +271,7 @@ async def test_a_threat_on_unmapped_tags_is_written_and_waits_for_a_mapping(
     await run_once(
         intel_pool, make_deps(intel_pool, FakeFetcher({URL: make_page(POLICY, URL)}), model)
     )
-    (row,) = await PostgresProposalStore(intel_pool).list_proposals(
+    (row,) = await PostgresProposalStore(intel_pool, threat_recency_days=90).list_proposals(
         statuses=None, kinds=["threat_event"], cursor=None, limit=5
     )
     assert (row["approvable"], row["why_not"]) == (False, "tags_unmapped")
@@ -384,7 +384,7 @@ async def test_a_gap_regenerate_run_proposes_events_from_the_signals_it_names(
     assert "Propose only threat_events, protection_events and attach" in model.proposal_systems[0]
     payload = json.loads(model.proposal_users[0])
     assert {s["signal_id"] for s in payload["new_evidence"]} == {str(s) for s in signals}
-    (row,) = await PostgresProposalStore(intel_pool).list_proposals(
+    (row,) = await PostgresProposalStore(intel_pool, threat_recency_days=90).list_proposals(
         statuses=None, kinds=["threat_event"], cursor=None, limit=5
     )
     assert set(row["signal_ids"]) == set(signals) and row["approvable"] is True
