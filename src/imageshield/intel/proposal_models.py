@@ -217,7 +217,11 @@ class ContextSignal:
     ``publisher_domain`` come from its document. ``document_key`` is its document's canonical
     URL hash (``intel_documents.url_hash``): what duplicate detection compares, so a page read
     again by a later run is the same document (spec §4.3, note 2026-09-30). None only where a
-    test builds one by hand."""
+    test builds one by hand.
+
+    *2026-10-04 (spec 2026-10-04-intel-evidence-quality):* ``published_at`` is its document's
+    publication date (None: undated), which the recency predicate and the prompt read; ``excerpts``
+    are its verbatim quotes, which corroboration compares to collapse copies of one source."""
 
     signal_id: UUID
     category: str
@@ -230,6 +234,8 @@ class ContextSignal:
     status: str
     created_at: datetime
     document_key: str | None = None
+    published_at: datetime | None = None
+    excerpts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

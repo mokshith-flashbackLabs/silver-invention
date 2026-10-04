@@ -26,7 +26,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.evidence_store import DocumentRecord, PostgresEvidenceStore, SignalRecord
 from imageshield.intel.fetch_client import FetchFailure, TextFetch
-from imageshield.intel.model import ModelCall, ModelUnavailable
+from imageshield.intel.model import ModelCall, ModelUnavailable, WebResult
 from imageshield.intel.models import Run, Vocabulary
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
 from imageshield.intel.pricing import Usage
@@ -144,8 +144,11 @@ class FakeModel:
         proposal_outcome: str = "ok",
         propose_unavailable: ModelUnavailable | None = None,
         extract_delay: float = 0.0,
+        search_results: tuple[WebResult, ...] = (),
     ) -> None:
         self.extraction = extraction
+        # What a discovery's web search returned, with each result's page_age.
+        self.search_results = search_results
         # A slow extraction: each call waits this long, so calls from reads running side by side
         # overlap; `extracting` is how many are in flight now, `extract_peak` the most at once.
         self.extract_delay = extract_delay
@@ -200,6 +203,7 @@ class FakeModel:
             Usage(1, 1, 0, 0, 1),
             Decimal("0.02"),
             1,
+            search_results=self.search_results,
         )
 
     async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
@@ -230,7 +234,12 @@ class FakeModel:
 
 
 def make_page(
-    text: str, url: str, final: str | None = None, items: list[dict[str, Any]] | None = None
+    text: str,
+    url: str,
+    final: str | None = None,
+    items: list[dict[str, Any]] | None = None,
+    *,
+    published_at: datetime | None = None,
 ) -> TextFetch:
     return TextFetch(
         text=text,
@@ -238,6 +247,7 @@ def make_page(
         final_url=final or url,
         truncated=False,
         items=items,
+        published_at=published_at,
     )
 
 

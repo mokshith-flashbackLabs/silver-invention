@@ -23,11 +23,12 @@ a different remedy here.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import httpx
 import structlog
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 log = structlog.get_logger("imageshield.intel")
 
@@ -49,7 +50,12 @@ FETCHER_SIDE_CODES = frozenset({"fetcher_unreachable", "fetcher_error"})
 class TextFetch(BaseModel):
     """``/v1/text``'s 200 body. ``items`` is non-null only for a parsed feed:
     ``[{title, link, published}]``, ``published`` an ISO string, a raw string, or
-    null."""
+    null.
+
+    ``published_at`` (2026-10-04, spec 2026-10-04-intel-evidence-quality §2) is the page's own
+    publication date from its HTML metadata, or None. Lenient on purpose: an absent key (a fetcher
+    deployed before it) or a value that does not parse is None, never a failed fetch, because a
+    page with no readable date is still a page."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -58,6 +64,21 @@ class TextFetch(BaseModel):
     final_url: str
     truncated: bool
     items: list[dict[str, Any]] | None
+    published_at: datetime | None = None
+
+    @field_validator("published_at", mode="before")
+    @classmethod
+    def _lenient_date(cls, value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.strip())
+            except ValueError:
+                return None
+        else:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 class FetchFailure(BaseModel):

@@ -59,8 +59,14 @@ PROPOSAL_COLUMNS = """proposal_id, kind, status, supersede_reason, target, sugge
 
 # document_key: the document's canonical URL hash. Duplicate detection compares it, so a page a
 # later run reads again (a new intel_documents row) is the same document (spec §4.3).
+# published_at and excerpts (2026-10-04, spec 2026-10-04-intel-evidence-quality): the document's
+# publication date for the recency predicate and the prompt, and the signal's verbatim quotes for
+# corroboration's echo collapse.
 _CONTEXT_COLUMNS = """s.signal_id, s.category, s.direction, s.tags, s.unregistered_subjects,
-    s.summary, d.trust, d.publisher_domain, s.status, s.created_at, d.url_hash AS document_key"""
+    s.summary, d.trust, d.publisher_domain, s.status, s.created_at, d.url_hash AS document_key,
+    d.published_at,
+    ARRAY(SELECT e.quote_text FROM intel_excerpts e WHERE e.signal_id = s.signal_id
+           ORDER BY e.char_start, e.excerpt_id) AS excerpts"""
 _CONTEXT_FROM = "intel_signals s JOIN intel_documents d ON d.document_id = s.document_id"
 
 _AUDIT_SQL = """
@@ -165,6 +171,8 @@ def _context(row: dict[str, Any]) -> ContextSignal:
         status=row["status"],
         created_at=row["created_at"],
         document_key=row["document_key"],
+        published_at=row["published_at"],
+        excerpts=tuple(row["excerpts"] or ()),
     )
 
 

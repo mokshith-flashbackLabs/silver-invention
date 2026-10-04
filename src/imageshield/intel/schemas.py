@@ -28,7 +28,13 @@ class ExtractedSignal(_Out):
 
 
 class ExtractionOutput(_Out):
+    """``published_date`` (extract-v2, 2026-10-04): the date the document itself states it was
+    published, ``YYYY-MM-DD``, or null. A plain string, deliberately: a malformed value must not
+    make the whole extraction unparseable, and code accepts it only when it is a well-formed date
+    whose year appears in the text (``intel/recency.py``). Metadata wins over it."""
+
     signals: list[ExtractedSignal]
+    published_date: str | None = None
 
 
 class DiscoveryCandidate(_Out):

@@ -99,3 +99,10 @@ PROTECTION_RENEWAL_WINDOW_DAYS = 30
 # 2026-09-30).
 RENEWAL_RETRY_HOURS = 24
 RENEWAL_MAX_RUNS = 7
+
+# ── evidence quality (2026-10-04, spec 2026-10-04-intel-evidence-quality) ────
+# A publication date before this year, or more than PUBLISHED_FUTURE_SLACK_DAYS after the moment
+# it is read, is not a date anybody published: it is dropped and the document is undated. The
+# slack absorbs a publisher's timezone and a page dated "tomorrow" in its own zone.
+PUBLISHED_MIN_YEAR = 1990
+PUBLISHED_FUTURE_SLACK_DAYS = 2

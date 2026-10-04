@@ -315,6 +315,43 @@ def _paused(**usage: int) -> SimpleNamespace:
     )
 
 
+async def test_discover_returns_every_results_page_age_across_its_continuations(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """spec 2026-10-04-intel-evidence-quality §2: the search's own page_age for each result, from
+    the paused leg and the final one, rides back on the call. The SDK's ``WebSearchResultBlock``
+    carries ``page_age`` (anthropic 1.8.0); nothing else of the result is kept."""
+    def results(*pairs: tuple[str, str | None]) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="web_search_tool_result",
+            tool_use_id="srvtoolu_1",
+            content=[
+                SimpleNamespace(type="web_search_result", url=u, page_age=a, title="t")
+                for u, a in pairs
+            ],
+        )
+
+    paused = _paused(ws=1)
+    paused.content = [*paused.content, results(("https://n.example/a", "3 days ago"))]
+    output = DiscoveryOutput(candidates=[DiscoveryCandidate(url="https://n.example/a", reason="r")])
+    final = SimpleNamespace(
+        model="claude-sonnet-5",
+        stop_reason="end_turn",
+        usage=_usage(ws=1),
+        content=[
+            results(("https://n.example/b", "April 30, 2025"), ("https://n.example/c", None)),
+            _text_block(output.model_dump_json()),
+        ],
+    )
+    model, _ = _model([paused, final], clean_env)
+    call = await model.discover("sys", "find things")
+    assert [(r.url, r.page_age) for r in call.search_results] == [
+        ("https://n.example/a", "3 days ago"),
+        ("https://n.example/b", "April 30, 2025"),
+        ("https://n.example/c", None),
+    ]
+
+
 async def test_discover_resumes_a_pause_turn_with_the_first_user_turn_and_the_paused_content(
     clean_env: pytest.MonkeyPatch,
 ) -> None:

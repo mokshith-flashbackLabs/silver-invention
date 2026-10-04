@@ -94,6 +94,41 @@ _THINKING = {"type": "adaptive", "display": "summarized"}
 
 
 @dataclass(frozen=True)
+class WebResult:
+    """One result a web search returned: its URL and the search's own ``page_age`` for it (a
+    date or a relative age such as "3 days ago", or None). The page's publication date when
+    nothing better is known (spec 2026-10-04-intel-evidence-quality §2); never evidence."""
+
+    url: str
+    page_age: str | None
+
+
+def _field(obj: object, name: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def web_results(content: list[Any]) -> list[WebResult]:
+    """Every ``web_search_result`` in a response's ``web_search_tool_result`` blocks. A block
+    whose content is an error object rather than a list carries none."""
+    found: list[WebResult] = []
+    for block in content:
+        if _field(block, "type") != "web_search_tool_result":
+            continue
+        results = _field(block, "content")
+        if not isinstance(results, list):
+            continue
+        for result in results:
+            url = _field(result, "url")
+            if _field(result, "type") != "web_search_result" or not isinstance(url, str):
+                continue
+            age = _field(result, "page_age")
+            found.append(WebResult(url, age if isinstance(age, str) and age.strip() else None))
+    return found
+
+
+@dataclass(frozen=True)
 class ModelCall(Generic[T]):
     output: T | None
     outcome: Outcome
@@ -107,6 +142,9 @@ class ModelCall(Generic[T]):
     # resumed (discover()'s loop). Never persisted and never put in a stored
     # raw_response column (spec §5) -- it is a transport detail, not evidence.
     content: list[Any] = field(default_factory=list)
+    # Every result a web search returned across all its continuations, with its page_age
+    # (spec 2026-10-04-intel-evidence-quality §2). Empty for a call without the search tool.
+    search_results: tuple[WebResult, ...] = ()
 
 
 class ModelUnavailable(Exception):
@@ -366,6 +404,7 @@ class ClaudeIntelModel:
         pause_turns = 0
         total_calls = 0  # every actual API call this search makes, initial included
         total = Usage(0, 0, 0, 0, 0)
+        results: list[WebResult] = []
         while True:
             call = await self._send(
                 output_format,
@@ -377,6 +416,7 @@ class ClaudeIntelModel:
                 messages=messages,
             )
             total_calls += 1
+            results.extend(web_results(call.content))
             u = call.usage
             total = Usage(
                 total.input_tokens + u.input_tokens,
@@ -400,6 +440,7 @@ class ClaudeIntelModel:
                     cost_usd=cost_of(self._config.intel_extraction_model, total),
                     latency_ms=call.latency_ms,
                     pause_turns=pause_turns,
+                    search_results=tuple(results),
                 )
             pause_turns += 1
             await note_continuing(pause_turns)

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -21,7 +21,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import FetchFailure, HttpTextFetcher, TextFetch
-from imageshield.intel.model import ModelUnavailable
+from imageshield.intel.model import ModelUnavailable, WebResult
 from imageshield.intel.pii import contains_pii
 from imageshield.intel.pipeline import changed_hunks, run
 from imageshield.intel.schemas import (
@@ -781,3 +781,80 @@ async def test_a_stop_in_one_read_lets_the_reads_in_flight_finish(
     assert (result.status, result.error_code) == ("failed", "fetcher_unreachable")
     assert result.outcome["documents_recorded"] == 3 and model.extract_calls == 3
     assert sorted(fetcher.fetched) == sorted(urls[:4])  # the last two never started
+
+
+# ── publication dates (spec 2026-10-04-intel-evidence-quality §2) ────────────
+
+
+async def _published(pool: AsyncConnectionPool) -> Any:
+    return await _scalar(pool, "SELECT published_at FROM intel_documents")
+
+
+def _dated_extraction(published_date: str | None) -> ExtractionOutput:
+    return ExtractionOutput(signals=make_signal().signals, published_date=published_date)
+
+
+async def test_a_pages_metadata_date_wins_over_the_date_the_model_reports(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await PostgresIntelStore(intel_pool).queue_adhoc(ARTICLE, operator="a")
+    meta = datetime(2026, 9, 1, 8, tzinfo=UTC)
+    page = make_page("Updated 3 March 2025. " + POLICY, ARTICLE, published_at=meta)
+    model = FakeModel(_dated_extraction("2025-03-03"))
+    deps = make_deps(intel_pool, FakeFetcher({ARTICLE: page}), model)
+    result = await run(await claim(intel_pool), deps)
+    assert await _published(intel_pool) == meta
+    assert result.outcome["published_from_metadata"] == 1
+
+
+async def test_a_page_with_no_metadata_takes_the_date_its_text_states(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await PostgresIntelStore(intel_pool).queue_adhoc(ARTICLE, operator="a")
+    page = make_page("Published 15 August 2026. " + POLICY, ARTICLE)
+    model = FakeModel(_dated_extraction("2026-08-15"))
+    deps = make_deps(intel_pool, FakeFetcher({ARTICLE: page}), model)
+    result = await run(await claim(intel_pool), deps)
+    assert await _published(intel_pool) == datetime(2026, 8, 15, tzinfo=UTC)
+    assert result.outcome["published_from_text"] == 1
+
+
+async def test_an_unstated_date_is_dropped_and_the_fetch_time_is_never_used(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await PostgresIntelStore(intel_pool).queue_adhoc(ARTICLE, operator="a")
+    page = make_page(POLICY, ARTICLE)  # no year anywhere in the text
+    model = FakeModel(_dated_extraction("2026-08-15"))
+    deps = make_deps(intel_pool, FakeFetcher({ARTICLE: page}), model)
+    result = await run(await claim(intel_pool), deps)
+    assert await _published(intel_pool) is None
+    assert result.outcome["published_from_unknown"] == 1
+    assert await _scalar(intel_pool, "SELECT fetched_at IS NOT NULL FROM intel_documents")
+
+
+async def test_a_search_results_page_age_dates_a_page_without_metadata(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await _source(intel_pool, kind="search_query", url=None, query="platform AI training")
+    discovery = DiscoveryOutput(candidates=[DiscoveryCandidate(url=ARTICLE, reason="r")])
+    model = FakeModel(
+        _dated_extraction(None),
+        discovery=discovery,
+        search_results=(WebResult(ARTICLE + "?utm_source=x", "3 days ago"),),
+    )
+    fetcher = FakeFetcher({ARTICLE: make_page(POLICY, ARTICLE)})
+    result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
+    assert await _published(intel_pool) == NOW - timedelta(days=3)
+    assert result.outcome["published_from_search"] == 1
+
+
+async def test_a_feed_items_own_date_is_kept_over_the_pages_metadata(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await _source(intel_pool, kind="feed", url=FEED)
+    link = "https://n.example/item"
+    feed = make_page("feed", FEED, items=_feed_items([link], days_old=2))
+    page = make_page(POLICY, link, published_at=datetime(2020, 5, 5, tzinfo=UTC))
+    fetcher = FakeFetcher({FEED: feed, link: page})
+    await run(await claim(intel_pool), make_deps(intel_pool, fetcher, FakeModel(make_signal())))
+    assert await _published(intel_pool) == NOW - timedelta(days=2)

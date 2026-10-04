@@ -111,6 +111,7 @@ from imageshield.intel.protection_store import (
 )
 from imageshield.intel.publisher import publisher_domain
 from imageshield.intel.question_store import QuestionStore
+from imageshield.intel.recency import choose_published, parse_page_age, stated_date
 from imageshield.intel.reconcile import Reconciler
 from imageshield.intel.renewal import RenewalPage, plan_renewal
 from imageshield.intel.schemas import ExtractedSignal
@@ -545,6 +546,14 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
         ctx.counts[f"model_{call.outcome}"] += 1
         return
     ctx.counts["candidates"] += len(call.output.candidates)
+    # The search's own page_age for each result it returned, read against the moment it answered
+    # (spec 2026-10-04-intel-evidence-quality §2): a page's date when its metadata states none.
+    answered = _now(ctx)
+    page_ages: dict[str, datetime] = {}
+    for result in call.search_results:
+        age = parse_page_age(result.page_age, answered)
+        if age is not None:
+            page_ages.setdefault(url_hash(result.url), age)
 
     urls: list[str] = []
     listed: set[str] = set()
@@ -573,6 +582,7 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
             tag_hints=source.tags,
             source_kind="web_search_result",
             recent_days=DISCOVERY_DEDUP_DAYS,
+            page_age=page_ages.get(url_hash(url)),
         )
 
     # The search is one call; the pages it found are read several at once (spec
@@ -605,9 +615,12 @@ async def _read_url(
     title: str = "",
     published_at: datetime | None = None,
     recent_days: int | None = None,
+    page_age: datetime | None = None,
 ) -> None:
     """Fetch and read one page as one unit. ``recent_days`` skips a page whose
-    redirect lands on a document already read in that window (feeds, discovery)."""
+    redirect lands on a document already read in that window (feeds, discovery).
+    ``published_at`` is a feed item's own date, ``page_age`` a web search's date for the
+    page (spec 2026-10-04-intel-evidence-quality §2)."""
     if not _is_https(url):
         ctx.counts["not_https"] += 1
         return
@@ -643,6 +656,7 @@ async def _read_url(
         source_hash=None,
         title=title,
         published_at=published_at,
+        page_age=page_age,
     )
 
 
@@ -662,11 +676,17 @@ async def _extract_unit(
     source_hash: tuple[UUID, str] | None,
     title: str = "",
     published_at: datetime | None = None,
+    page_age: datetime | None = None,
 ) -> None:
     """One metered extraction, local verification, and the unit's one transaction.
 
     ``text`` is the UNMASKED normalised text every quote is verified against;
-    ``model_text`` is what the model reads (masked, or a masked policy diff)."""
+    ``model_text`` is what the model reads (masked, or a masked policy diff).
+
+    The document's publication date (spec 2026-10-04-intel-evidence-quality §2) is the first
+    plausible of: the feed item's ``published_at``, the page's metadata (``fetched``), the
+    search's ``page_age``, and a date the model reports that the text states. Never the fetch
+    time; none of them leaves the document undated."""
     requested_hash, final_hash = url_hash(requested_url), url_hash(fetched.final_url)
     if await ctx.deps.evidence.recorded_in_run(ctx.run.run_id, [requested_hash, final_hash]):
         ctx.counts["already_recorded"] += 1  # a reclaimed run: never billed twice
@@ -693,6 +713,14 @@ async def _extract_unit(
     masked_title, title_masks = mask(title)
     if title_masks:
         ctx.counts["pii_masked_title"] += 1
+    published, published_from = choose_published(
+        feed=published_at,
+        metadata=fetched.published_at,
+        page_age=page_age,
+        stated=stated_date(call.output.published_date, text) if call.output is not None else None,
+        now=_now(ctx),
+    )
+    ctx.counts[f"published_from_{published_from}"] += 1
     document = DocumentRecord(
         run_id=ctx.run.run_id,
         source_id=source_id,
@@ -705,7 +733,7 @@ async def _extract_unit(
         content_sha256=content_sha256(text),
         truncated=truncated,
         title=masked_title,
-        published_at=published_at,
+        published_at=published,
     )
     recorded = await ctx.deps.evidence.record_unit(
         document, signals, snapshot=snapshot, source_hash=source_hash
@@ -981,6 +1009,11 @@ async def _renewal_page(
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
+
+
+def _now(ctx: _Ctx) -> datetime:
+    now = ctx.deps.clock()
+    return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
 
 
 async def _call_model(
