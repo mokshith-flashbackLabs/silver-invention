@@ -80,12 +80,16 @@ def _sig(
     )
 
 
+BODY = "Photos shared publicly online now train AI models by default."
+
+
 def _change(signal: ContextSignal | None, **kw: object) -> ProposedWeightChange:
     fields: dict[str, object] = {
         "question_key": "platforms",
         "option": "Instagram",
         "current": 3,
         "delta": 1,
+        "body": BODY,
         "rationale": "Photos now train AI by default.",
         "signal_ids": [str(signal.signal_id)] if signal else [],
     }
@@ -126,7 +130,8 @@ def test_a_valid_change_is_kept_with_its_rationale_masked() -> None:
     batch, counts = _validate(out, [s])
     (proposal,) = batch.weight_changes
     assert proposal.target == {"question_key": "platforms", "option": "Instagram", "current": 3}
-    assert proposal.suggested == {"delta": 1} and proposal.signal_ids == (s.signal_id,)
+    assert proposal.suggested == {"delta": 1, "body": BODY}
+    assert proposal.signal_ids == (s.signal_id,)
     assert "press@example.com" not in proposal.rationale
     assert counts["pii_masked_rationale"] == 1
 
@@ -184,7 +189,7 @@ def test_two_changes_for_one_cell_in_one_run_keep_the_first() -> None:
     s = _sig()
     out = ProposalOutput(weight_changes=[_change(s, delta=1), _change(s, delta=2)])
     batch, counts = _validate(out, [s])
-    assert [p.suggested for p in batch.weight_changes] == [{"delta": 1}]
+    assert [p.suggested for p in batch.weight_changes] == [{"delta": 1, "body": BODY}]
     assert counts["proposal_dropped_duplicate_cell"] == 1
 
 
@@ -631,7 +636,7 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
     assert "Propose only threat_events, protection_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v5"
+    assert PROPOSE_PROMPT_VERSION == "propose-v6"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -676,7 +681,7 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
     assert payload["live_protections"] == [live] and payload["live_events"] == []
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
-    assert PROPOSE_PROMPT_VERSION == "propose-v5"
+    assert PROPOSE_PROMPT_VERSION == "propose-v6"
 
 
 def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
@@ -855,7 +860,7 @@ def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v5"
+    assert PROPOSE_PROMPT_VERSION == "propose-v6"
     assert "published within threat_recency_days days of today" in flat
     assert "has ended" in flat and "is not a threat" in flat
     assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in flat
@@ -910,9 +915,41 @@ def test_propose_v5_asks_for_a_body_on_both_event_kinds_and_never_a_finding() ->
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v5"
+    assert PROPOSE_PROMPT_VERSION == "propose-v6"
     assert flat.count("- body: what this") == 2
     assert "what this incident means for a person it concerns" in flat
     assert "what this protection means for a person it reaches" in flat
     assert "Never say that their photos or anything of theirs was found" in flat
     assert "Never say they are safe or protected" in flat
+
+
+# ── A points change's reason (spec 2026-10-06-intel-weight-reason) ─────────────────────────────
+
+
+def test_a_weight_change_keeps_its_reason_and_an_over_long_one_is_left_out() -> None:
+    s = _sig(tags=("instagram",))
+    kept, counts = _validate(ProposalOutput(weight_changes=[_change(s)]), [s])
+    (proposal,) = kept.proposals
+    assert proposal.suggested == {
+        "delta": 1,
+        "body": "Photos shared publicly online now train AI models by default.",
+    }
+    long, counts = _validate(ProposalOutput(weight_changes=[_change(s, body="x" * 201)]), [s])
+    (proposal,) = long.proposals
+    assert proposal.suggested == {"delta": 1, "body": ""} and counts["event_body_too_long"] == 1
+
+
+def test_propose_v6_asks_for_a_reason_that_names_no_platform_or_answer() -> None:
+    system, _ = proposal_request(
+        [],
+        [],
+        quiz=prompt_quiz(V),
+        registry_tags=prompt_registry(V, set()),
+        mapped_tags=sorted(V.mapped_tags),
+        today="2026-10-06",
+        threat_recency_days=90,
+    )
+    flat = " ".join(system.split())
+    assert PROPOSE_PROMPT_VERSION == "propose-v6"
+    assert "the reason for the change in ONE short plain sentence of at most 200 characters" in flat
+    assert "Never name a platform, app, service, website, quiz question or quiz answer" in flat

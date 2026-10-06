@@ -461,6 +461,7 @@ def test_the_proposal_schema_carries_no_numeric_or_length_bounds() -> None:
         assert keyword not in schema
     parsed = ProposalOutput.model_validate_json(
         '{"weight_changes": [{"question_key": "q", "option": "o", "current": 3, "delta": 7,'
+        ' "body": "b",'
         ' "rationale": "r", "signal_ids": []}], "coverage_gaps": []}'
     )
     assert parsed.weight_changes[0].delta == 7

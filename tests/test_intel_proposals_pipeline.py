@@ -69,6 +69,7 @@ INSTAGRAM_UP = {
     "option": "Instagram",
     "current": 3,
     "delta": 1,
+    "body": "Photos shared publicly online now train AI models by default.",
     "rationale": "Public photos now train AI models by default.",
 }
 

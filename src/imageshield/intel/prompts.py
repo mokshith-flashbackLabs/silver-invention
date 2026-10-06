@@ -12,7 +12,7 @@ from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v1"
-PROPOSE_PROMPT_VERSION = "propose-v5"
+PROPOSE_PROMPT_VERSION = "propose-v6"
 
 
 class RegistryTag(TypedDict):
@@ -284,6 +284,12 @@ person's photos and likeness can be misused. For that ONE option give:
 - delta: a whole number from -2 to 2, never 0. Positive means the option now costs more points
   (more risk); negative means fewer (less risk). current + delta must stay between 0 and 10,
   and not above the question's cap when it has one.
+- body: the reason for the change in ONE short plain sentence of at most 200 characters, stated
+  as a fact about the world, for example "Photos shared publicly online are being collected to
+  train AI image tools more than before." A person whose score this change moves reads exactly
+  this sentence, alone, in their app. Never name a platform, app, service, website, quiz question
+  or quiz answer, never address the reader, never name a private individual, never say anyone is
+  safe or protected, and never give contact details or links.
 Propose only for lasting changes -- a changed policy, a new default, a removed protection --
 never for one incident or one news cycle.
 

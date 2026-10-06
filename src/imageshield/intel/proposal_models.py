@@ -27,6 +27,7 @@ from pydantic import (
 from imageshield.intel.bounds import (
     MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
+    MAX_WEIGHT_REASON_CHARS,
     PROTECTION_REVIEW_MAX_DAYS,
     PROTECTION_REVIEW_MIN_DAYS,
     PROTECTION_STRENGTH_MAX,
@@ -59,9 +60,19 @@ class WeightChangeTarget(_Stored):
 
 class WeightDelta(_Stored):
     """A weight_change's ``suggested`` and ``decided``. StrictInt, so a fractional value or
-    a boolean is refused rather than coerced."""
+    a boolean is refused rather than coerced.
+
+    ``body`` (spec 2026-10-06-intel-weight-reason) is the change's reason in one plain sentence
+    that names no platform, answer or person: the person reads it as the whole line in their score
+    history when the published change moves their score. Empty on a proposal written before it."""
 
     delta: StrictInt
+    body: str = Field(default="", max_length=MAX_WEIGHT_REASON_CHARS)
+
+    @field_validator("body")
+    @classmethod
+    def _trimmed(cls, value: str) -> str:
+        return value.strip()
 
 
 class SuggestedTag(_Stored):

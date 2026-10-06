@@ -55,6 +55,7 @@ class ProposedWeightChange(_Out):
     option: str
     current: int
     delta: int
+    body: str
     rationale: str
     signal_ids: list[str] = Field(default_factory=list)
 

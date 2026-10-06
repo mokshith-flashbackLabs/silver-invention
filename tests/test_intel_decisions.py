@@ -83,7 +83,7 @@ async def test_approve_stores_decided_from_suggested_and_names_the_operator(
     decided = await _decide(intel_pool, pid)
     assert (decided.status, decided.decided, decided.kind) == (
         "approved",
-        {"delta": 1},
+        {"delta": 1, "body": ""},
         "weight_change",
     )
     row = await _scalar(
@@ -122,7 +122,34 @@ async def test_an_operator_edit_wins_and_an_out_of_bounds_edit_is_refused(
     pid = await _approvable(
         intel_pool, target={"question_key": "platforms", "option": "LinkedIn", "current": 2}
     )
-    assert (await _decide(intel_pool, pid, values={"delta": -1})).decided == {"delta": -1}
+    decided = await _decide(intel_pool, pid, values={"delta": -1})
+    assert decided.decided == {"delta": -1, "body": ""}
+
+
+async def test_a_points_edit_merges_over_the_suggestion_and_keeps_the_reason(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec 2026-10-06-intel-weight-reason: changing only the delta keeps the model's reason,
+    changing only the reason keeps the delta, and an over-long reason is refused."""
+    reason = "Photos shared publicly online now train AI models by default."
+    await seed_quiz_vocabulary(intel_pool)
+    # One approved change per cell, so each case decides a different cell.
+    long = await _approvable(intel_pool, suggested={"delta": 1, "body": reason})
+    assert await _refused(intel_pool, long, values={"body": "x" * 201}) == "values_out_of_bounds"
+    pid = await _approvable(intel_pool, suggested={"delta": 1, "body": reason})
+    assert (await _decide(intel_pool, pid, values={"delta": -1})).decided == {
+        "delta": -1,
+        "body": reason,
+    }
+    other = await _approvable(
+        intel_pool,
+        target={"question_key": "platforms", "option": "LinkedIn", "current": 2},
+        suggested={"delta": 1, "body": reason},
+    )
+    assert (await _decide(intel_pool, other, values={"body": "  Rewritten.  "})).decided == {
+        "delta": 1,
+        "body": "Rewritten.",
+    }
 
 
 @pytest.mark.parametrize(

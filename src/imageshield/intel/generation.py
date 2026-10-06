@@ -44,6 +44,7 @@ from imageshield.intel.bounds import (
     MAX_PROMPT_TAGS,
     MAX_RATIONALE_CHARS,
     MAX_SUGGESTED_QUESTION_CHARS,
+    MAX_WEIGHT_REASON_CHARS,
     PROTECTION_REVIEW_MAX_DAYS,
     PROTECTION_REVIEW_MIN_DAYS,
     PROTECTION_STRENGTH_MAX,
@@ -286,11 +287,12 @@ def _free_text(raw: str, *, field_name: str, limit: int, counts: Counter[str]) -
     return text
 
 
-def _event_body(raw: str, counts: Counter[str]) -> str:
-    """An event's "what it means for you" (spec 2026-10-06-intel-event-body): masked and
-    whitespace-normalised like every model-written field. Unlike the title it is never a reason to
-    drop the proposal: empty or over-long, it is LEFT OUT (``""``, counted), never truncated, and
-    the operator can write one before approving."""
+def _event_body(raw: str, counts: Counter[str], *, limit: int = MAX_EVENT_BODY_CHARS) -> str:
+    """An event's "what it means for you" (spec 2026-10-06-intel-event-body), or a points
+    change's reason (``limit`` MAX_WEIGHT_REASON_CHARS, spec 2026-10-06-intel-weight-reason):
+    masked and whitespace-normalised like every model-written field. Unlike the title it is never
+    a reason to drop the proposal: empty or over-long, it is LEFT OUT (``""``, counted), never
+    truncated, and the operator can write one before approving."""
     masked, masks = mask(raw)
     if masks:
         counts["pii_masked_body"] += 1
@@ -298,7 +300,7 @@ def _event_body(raw: str, counts: Counter[str]) -> str:
     if not text:
         counts["event_body_missing"] += 1
         return ""
-    if len(text) > MAX_EVENT_BODY_CHARS:
+    if len(text) > limit:
         counts["event_body_too_long"] += 1
         return ""
     return text
@@ -355,7 +357,9 @@ def _weight_change(
         target=WeightChangeTarget(
             question_key=item.question_key, option=item.option, current=item.current
         ).model_dump(),
-        suggested=WeightDelta(delta=item.delta).model_dump(),
+        suggested=WeightDelta(
+            delta=item.delta, body=_event_body(item.body, counts, limit=MAX_WEIGHT_REASON_CHARS)
+        ).model_dump(),
         rationale=rationale,
         signal_ids=signal_ids,
     )

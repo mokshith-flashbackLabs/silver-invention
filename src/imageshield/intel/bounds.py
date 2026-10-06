@@ -81,6 +81,10 @@ MAX_EVENT_TITLE_CHARS = 200
 # score history beside the title once approved (spec 2026-10-06-intel-event-body). An over-long
 # one is left out, never truncated, and the proposal is kept.
 MAX_EVENT_BODY_CHARS = 400
+# A points change's reason: ONE sentence the person reads as the whole line in their score history
+# when the change moves their score (spec 2026-10-06-intel-weight-reason). It names no platform,
+# answer or person. Left out past it, never truncated, and the proposal is kept.
+MAX_WEIGHT_REASON_CHARS = 200
 # Pending event proposals and live threat events a generation call is shown (spec §4.3).
 PROPOSAL_CONTEXT_MAX_EVENTS = 40
 # A regeneration refused or failed without writing proposals is queued again after this many

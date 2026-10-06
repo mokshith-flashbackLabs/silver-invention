@@ -385,7 +385,10 @@ def _approval_decided(
         return _protection_decided(proposal, vocabulary, values, attested)
     try:
         target = WeightChangeTarget.model_validate(proposal.target)
-        delta = WeightDelta.model_validate(values if values is not None else proposal.suggested)
+        # MERGED over ``suggested`` (2026-10-06), as a threat's and a protection's edit is: an
+        # operator who changes only the delta keeps the model's reason, and one who rewrites only
+        # the reason keeps the delta (spec 2026-10-06-intel-weight-reason).
+        delta = WeightDelta.model_validate({**proposal.suggested, **(values or {})})
     except ValidationError as exc:
         raise _refuse("values_out_of_bounds") from exc
     if vocabulary is None or cell_problem(
