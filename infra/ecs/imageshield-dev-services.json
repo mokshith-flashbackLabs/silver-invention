@@ -7,7 +7,7 @@
   "containerDefinitions": [
     {
       "name": "services",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:89ca6c6",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:3edd5bf",
       "essential": true,
       "memory": 576,
       "environment": [
