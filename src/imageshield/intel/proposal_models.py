@@ -25,6 +25,12 @@ from pydantic import (
 )
 
 from imageshield.intel.bounds import (
+    MAX_ACTION_LINK_CHARS,
+    MAX_ACTION_LINK_LABEL_CHARS,
+    MAX_ACTION_STEP_CHARS,
+    MAX_ACTION_STEPS,
+    MAX_ACTION_TITLE_CHARS,
+    MAX_ACTION_WHY_CHARS,
     MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
     MAX_WEIGHT_REASON_CHARS,
@@ -105,6 +111,47 @@ class ThreatEventTarget(_Stored):
         return _distinct_slugs(value)
 
 
+class ThreatActionSuggested(_Stored):
+    """A threat's recommended action (spec 2026-10-06-intel-threat-action): what a person it reaches
+    can do, and doing it gives them the threat's points back. The bounds are the backend's own for
+    an action, so a stored one is always one it can attach. Services never store an action on the
+    event: the backend attaches it from ``decided`` (its profile.threat_event_actions)."""
+
+    title: str = Field(min_length=1, max_length=MAX_ACTION_TITLE_CHARS)
+    why: str = Field(min_length=1, max_length=MAX_ACTION_WHY_CHARS)
+    steps: tuple[str, ...] = Field(min_length=1, max_length=MAX_ACTION_STEPS)
+    link_url: str | None = Field(default=None, max_length=MAX_ACTION_LINK_CHARS)
+    link_label: str | None = Field(default=None, max_length=MAX_ACTION_LINK_LABEL_CHARS)
+
+    @field_validator("title", "why")
+    @classmethod
+    def _text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value.strip()
+
+    @field_validator("steps")
+    @classmethod
+    def _steps(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        steps = tuple(step.strip() for step in value)
+        if any(not step or len(step) > MAX_ACTION_STEP_CHARS for step in steps):
+            raise ValueError(f"each step is 1 to {MAX_ACTION_STEP_CHARS} characters")
+        return steps
+
+    @field_validator("link_url")
+    @classmethod
+    def _https(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("https://"):
+            raise ValueError("a link must be https")
+        return value
+
+    @model_validator(mode="after")
+    def _label_needs_link(self) -> ThreatActionSuggested:
+        if self.link_label is not None and self.link_url is None:
+            raise ValueError("a link label needs a link")
+        return self
+
+
 class ThreatEventSuggested(_Stored):
     """A threat_event's ``suggested``: the model's numbers and text, kept forever (§3.6). The
     bounds are §4.5's, and they hold for an operator's final values too (ThreatEventDecided).
@@ -119,6 +166,8 @@ class ThreatEventSuggested(_Stored):
     body: str = Field(default="", max_length=MAX_EVENT_BODY_CHARS)
     severity: StrictInt = Field(ge=THREAT_SEVERITY_MIN, le=THREAT_SEVERITY_MAX)
     expires_in_days: StrictInt = Field(ge=THREAT_EXPIRES_MIN_DAYS, le=THREAT_EXPIRES_MAX_DAYS)
+    # The model's drafted recommended action, or none (spec 2026-10-06-intel-threat-action).
+    action: ThreatActionSuggested | None = None
 
     @field_validator("title")
     @classmethod
@@ -155,6 +204,8 @@ class ThreatEventValues(_Stored):
     kind: ThreatKind | None = None
     title: str | None = None
     body: str | None = None
+    # The whole action, replaced as one (2026-10-06); an explicit null removes it.
+    action: ThreatActionSuggested | None = None
     severity: StrictInt | None = None
     expires_in_days: StrictInt | None = None
     tags: tuple[str, ...] | None = None
@@ -270,6 +321,9 @@ class ContextSignal:
     document_key: str | None = None
     published_at: datetime | None = None
     excerpts: tuple[str, ...] = ()
+    # The document's final URL (2026-10-06): shown to the model so a drafted action's link can be
+    # one of the cited pages, and only those (spec 2026-10-06-intel-threat-action).
+    document_url: str | None = None
 
 
 @dataclass(frozen=True)

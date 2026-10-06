@@ -24,6 +24,7 @@ GOOD: dict[str, Any] = {
     "severity": 3,
     "expires_in_days": 30,
     "tags": ["instagram"],
+    "action": None,
 }
 
 

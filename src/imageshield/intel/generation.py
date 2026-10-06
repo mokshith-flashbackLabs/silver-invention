@@ -38,6 +38,12 @@ from imageshield.intel.bounds import (
     COVERAGE_GAP_MIN_PUBLISHERS,
     COVERAGE_GAP_MIN_SIGNALS,
     COVERAGE_GAP_WINDOW_DAYS,
+    MAX_ACTION_LINK_CHARS,
+    MAX_ACTION_LINK_LABEL_CHARS,
+    MAX_ACTION_STEP_CHARS,
+    MAX_ACTION_STEPS,
+    MAX_ACTION_TITLE_CHARS,
+    MAX_ACTION_WHY_CHARS,
     MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
     MAX_GAP_SUBJECT_CHARS,
@@ -78,6 +84,7 @@ from imageshield.intel.proposal_models import (
     ProtectionEventSuggested,
     ProtectionEventTarget,
     SuggestedTag,
+    ThreatActionSuggested,
     ThreatEventSuggested,
     ThreatEventTarget,
     WeightChangeTarget,
@@ -90,12 +97,14 @@ from imageshield.intel.schemas import (
     ProposedCoverageGap,
     ProposedProtectionEvent,
     ProposedTag,
+    ProposedThreatAction,
     ProposedThreatEvent,
     ProposedWeightChange,
 )
 from imageshield.intel.tags import is_well_formed, membership_problems
 from imageshield.intel.text import normalise
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject
+from imageshield.search.urlhash import url_hash
 
 
 @dataclass
@@ -306,6 +315,61 @@ def _event_body(raw: str, counts: Counter[str], *, limit: int = MAX_EVENT_BODY_C
     return text
 
 
+def _action_text(raw: str, limit: int, counts: Counter[str]) -> str | None:
+    masked, masks = mask(raw)
+    if masks:
+        counts["pii_masked_action"] += 1
+    text = normalise(masked)
+    return text if text and len(text) <= limit else None
+
+
+def _threat_action(
+    item: ProposedThreatAction | None,
+    cited: Sequence[ContextSignal],
+    counts: Counter[str],
+) -> dict[str, object] | None:
+    """A threat's drafted recommended action (spec 2026-10-06-intel-threat-action), or None.
+
+    Every text is masked and normalised like any model text. Anything out of bounds drops the
+    ACTION, never the threat: the operator can still write one, and a threat with no action is the
+    state every threat had before. The link is the one part with its own rule: it is kept only when
+    it is https and is one of THIS threat's cited evidence pages (compared by canonical URL hash),
+    because a model can invent a plausible URL and this one reaches a victim. Any other link is
+    dropped with its label, and the action kept."""
+    if item is None:
+        return None
+    title = _action_text(item.title, MAX_ACTION_TITLE_CHARS, counts)
+    why = _action_text(item.why, MAX_ACTION_WHY_CHARS, counts)
+    steps = [_action_text(step, MAX_ACTION_STEP_CHARS, counts) for step in item.steps]
+    if (
+        title is None
+        or why is None
+        or not steps
+        or len(steps) > MAX_ACTION_STEPS
+        or any(step is None for step in steps)
+    ):
+        counts["action_dropped_out_of_bounds"] += 1
+        return None
+    action: dict[str, object] = {"title": title, "why": why, "steps": steps}
+    link = (item.link_url or "").strip()
+    if link:
+        pages = {s.document_key for s in cited if s.document_key is not None}
+        if (
+            link.startswith("https://")
+            and len(link) <= MAX_ACTION_LINK_CHARS
+            and url_hash(link) in pages
+        ):
+            action["link_url"] = link
+            label = _action_text(item.link_label or "", MAX_ACTION_LINK_LABEL_CHARS, counts)
+            if label is not None:
+                action["link_label"] = label
+        else:
+            counts["action_link_not_cited"] += 1
+    # exclude_none: an absent link is ABSENT, never null, so the backend's action schema (where
+    # the link is optional, not nullable) reads it as it reads a hand-written one.
+    return ThreatActionSuggested.model_validate(action).model_dump(mode="json", exclude_none=True)
+
+
 def _cited(
     raw_ids: Sequence[str], context: Mapping[UUID, ContextSignal], counts: Counter[str]
 ) -> tuple[UUID, ...] | None:
@@ -503,13 +567,16 @@ def _threat_event(
     return NewProposal(
         kind="threat_event",
         target=ThreatEventTarget(tags=tuple(item.tags)).model_dump(mode="json"),
-        suggested=ThreatEventSuggested(
-            kind=item.kind,
-            title=title,
-            body=_event_body(item.body, counts),
-            severity=item.severity,
-            expires_in_days=item.expires_in_days,
-        ).model_dump(mode="json"),
+        suggested={
+            **ThreatEventSuggested(
+                kind=item.kind,
+                title=title,
+                body=_event_body(item.body, counts),
+                severity=item.severity,
+                expires_in_days=item.expires_in_days,
+            ).model_dump(mode="json", exclude={"action"}),
+            "action": _threat_action(item.action, [context[i] for i in signal_ids], counts),
+        },
         rationale=rationale,
         signal_ids=signal_ids,
         document_keys=documents,
@@ -644,6 +711,7 @@ def prompt_signal(signal: ContextSignal) -> PromptSignal:
         unregistered_subjects=list(signal.unregistered_subjects),
         summary=signal.summary,
         publisher=signal.publisher_domain,
+        url=signal.document_url or "",
         trust=signal.trust,
         published=published,
     )

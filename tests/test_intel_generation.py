@@ -636,7 +636,7 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
     assert "Propose only threat_events, protection_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v6"
+    assert PROPOSE_PROMPT_VERSION == "propose-v7"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -681,7 +681,7 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
     assert payload["live_protections"] == [live] and payload["live_events"] == []
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
-    assert PROPOSE_PROMPT_VERSION == "propose-v6"
+    assert PROPOSE_PROMPT_VERSION == "propose-v7"
 
 
 def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
@@ -860,7 +860,7 @@ def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v6"
+    assert PROPOSE_PROMPT_VERSION == "propose-v7"
     assert "published within threat_recency_days days of today" in flat
     assert "has ended" in flat and "is not a threat" in flat
     assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in flat
@@ -915,7 +915,7 @@ def test_propose_v5_asks_for_a_body_on_both_event_kinds_and_never_a_finding() ->
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v6"
+    assert PROPOSE_PROMPT_VERSION == "propose-v7"
     assert flat.count("- body: what this") == 2
     assert "what this incident means for a person it concerns" in flat
     assert "what this protection means for a person it reaches" in flat
@@ -950,6 +950,104 @@ def test_propose_v6_asks_for_a_reason_that_names_no_platform_or_answer() -> None
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v6"
+    assert PROPOSE_PROMPT_VERSION == "propose-v7"
     assert "the reason for the change in ONE short plain sentence of at most 200 characters" in flat
     assert "Never name a platform, app, service, website, quiz question or quiz answer" in flat
+
+
+# ── A threat's drafted recommended action (spec 2026-10-06-intel-threat-action) ─────────────────
+
+HELP = "https://help.instagram.com/two-factor"
+
+
+def _cited_page(url: str = HELP) -> ContextSignal:
+    from imageshield.search.urlhash import url_hash
+
+    return _sig(tags=("instagram",), document=url_hash(url))
+
+
+def _action(**kw: object) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "title": "Turn on two-factor authentication",
+        "why": "It stops someone who has your password from signing in.",
+        "steps": ["Open Settings", "Choose Security", "Turn on two-factor authentication"],
+        "link_url": HELP,
+        "link_label": "Instagram help",
+    }
+    fields.update(kw)
+    return fields
+
+
+def test_a_drafted_action_is_kept_with_its_link_when_the_link_is_a_cited_page() -> None:
+    s = _cited_page()
+    batch, counts = _validate(ProposalOutput(threat_events=[_threat(s, action=_action())]), [s])
+    (threat,) = batch.threat_events
+    assert threat.suggested["action"] == {
+        "title": "Turn on two-factor authentication",
+        "why": "It stops someone who has your password from signing in.",
+        "steps": ["Open Settings", "Choose Security", "Turn on two-factor authentication"],
+        "link_url": HELP,
+        "link_label": "Instagram help",
+    }
+    assert counts["action_link_not_cited"] == 0
+
+
+@pytest.mark.parametrize(
+    "link", ["https://help.instagram.com/somewhere-else", "http://help.instagram.com/two-factor"]
+)
+def test_a_link_that_is_not_a_cited_https_page_is_dropped_with_its_label(link: str) -> None:
+    s = _cited_page()
+    out = ProposalOutput(threat_events=[_threat(s, action=_action(link_url=link))])
+    batch, counts = _validate(out, [s])
+    (threat,) = batch.threat_events
+    action = threat.suggested["action"]
+    assert action is not None and "link_url" not in action and "link_label" not in action
+    assert action["title"] == "Turn on two-factor authentication"
+    assert counts["action_link_not_cited"] == 1
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"steps": []},
+        {"steps": ["x"] * 11},
+        {"steps": ["ok", "   "]},
+        {"title": "x" * 121},
+        {"why": ""},
+    ],
+)
+def test_an_out_of_bounds_action_is_dropped_and_the_threat_kept(bad: dict[str, object]) -> None:
+    s = _cited_page()
+    out = ProposalOutput(threat_events=[_threat(s, action=_action(**bad))])
+    batch, counts = _validate(out, [s])
+    (threat,) = batch.threat_events
+    assert threat.suggested["action"] is None
+    assert counts["action_dropped_out_of_bounds"] == 1
+
+
+def test_a_threat_without_an_action_stores_none() -> None:
+    s = _cited_page()
+    batch, _ = _validate(ProposalOutput(threat_events=[_threat(s)]), [s])
+    assert batch.threat_events[0].suggested["action"] is None
+
+
+def test_propose_v7_asks_for_an_action_only_with_a_real_step_and_a_cited_link() -> None:
+    system, _ = proposal_request(
+        [],
+        [],
+        quiz=prompt_quiz(V),
+        registry_tags=prompt_registry(V, set()),
+        mapped_tags=sorted(V.mapped_tags),
+        today="2026-10-06",
+        threat_recency_days=90,
+    )
+    flat = " ".join(system.split())
+    assert PROPOSE_PROMPT_VERSION == "propose-v7"
+    assert "Give one only when the evidence names a real step" in flat
+    assert "the url of ONE of the evidence items this proposal cites" in flat
+    assert "Never write any other address" in flat
+
+
+def test_each_prompt_signal_carries_its_page_url_or_empty() -> None:
+    assert prompt_signal(replace(_sig(), document_url=HELP))["url"] == HELP
+    assert prompt_signal(_sig())["url"] == ""

@@ -110,6 +110,18 @@ class ProposedCoverageGap(_Out):
     signal_ids: list[str] = Field(default_factory=list)
 
 
+class ProposedThreatAction(_Out):
+    """A threat's recommended action as the model drafts it (spec 2026-10-06-intel-threat-action).
+    No bounds here, for the reason ProposedWeightChange gives: intel/generation.py checks them and
+    drops the action, never the threat."""
+
+    title: str
+    why: str
+    steps: list[str] = Field(default_factory=list)
+    link_url: str | None = None
+    link_label: str | None = None
+
+
 class ProposedThreatEvent(_Out):
     """No numeric bounds here either (see ProposedWeightChange): §4.5's severity and expiry
     bounds run per proposal in intel/generation.py. ``kind`` is an enum, which structured
@@ -124,6 +136,9 @@ class ProposedThreatEvent(_Out):
     tags: list[str] = Field(default_factory=list)
     rationale: str
     signal_ids: list[str] = Field(default_factory=list)
+    # OPTIONAL by design: a threat whose evidence names nothing a person can do gets none, never
+    # generic advice (spec 2026-10-06-intel-threat-action).
+    action: ProposedThreatAction | None = None
 
 
 class ProposedAttach(_Out):

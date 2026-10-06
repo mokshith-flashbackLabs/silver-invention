@@ -12,7 +12,7 @@ from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v1"
-PROPOSE_PROMPT_VERSION = "propose-v6"
+PROPOSE_PROMPT_VERSION = "propose-v7"
 
 
 class RegistryTag(TypedDict):
@@ -208,6 +208,9 @@ class PromptSignal(TypedDict):
     unregistered_subjects: list[str]
     summary: str
     publisher: str
+    # The page's URL (2026-10-06), so a threat's drafted action can link to a cited page and only to
+    # one: "" when unknown.
+    url: str
     trust: str
     published: str
 
@@ -316,6 +319,20 @@ as a new incident. For each incident give:
   the risk.
 - tags: one or more slugs copied exactly from the tag registry. A tag missing from mapped_tags
   may still be used; the proposal then waits until the quiz maps it.
+- action: what a person exposed through these tags can DO about this incident, or null. Give one
+  only when the evidence names a real step, such as turning on two-factor authentication,
+  changing a password, revoking connected apps or changing a privacy setting; never generic
+  advice. A person who completes it gets this threat's points back, so it must be something they
+  can actually finish. Give:
+  - title: a short imperative, at most 120 characters ("Turn on two-factor authentication").
+  - why: one or two plain sentences, at most 300 characters, on why this step helps.
+  - steps: one to five short plain steps, each at most 300 characters, in order.
+  - link_url: the url of ONE of the evidence items this proposal cites, and only when that page is
+    where the person takes the step (the platform's own help or settings page); otherwise null.
+    Never write any other address.
+  - link_label: a short name for that link, at most 60 characters, or null.
+  Never say anyone is safe or protected, never ask them to contact ImageShield, and never give
+  contact details.
 Never propose an incident already in live_events. If a proposal in pending_events already covers
 it, attach the new evidence to that proposal instead of proposing it again. An incident about a
 platform, service or practice that no registry tag covers belongs in coverage_gaps instead.

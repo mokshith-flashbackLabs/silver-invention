@@ -81,6 +81,16 @@ MAX_EVENT_TITLE_CHARS = 200
 # score history beside the title once approved (spec 2026-10-06-intel-event-body). An over-long
 # one is left out, never truncated, and the proposal is kept.
 MAX_EVENT_BODY_CHARS = 400
+# A threat's recommended action, as the model drafts it (spec 2026-10-06-intel-threat-action). The
+# bounds are the backend's own for an action (its src/admin/schemas.ts threatActionBody), so a
+# drafted action is always one the backend can store. A link must be one of the threat's own cited
+# evidence pages: a model can invent a plausible URL, and this one reaches a victim.
+MAX_ACTION_TITLE_CHARS = 120
+MAX_ACTION_WHY_CHARS = 300
+MAX_ACTION_STEP_CHARS = 300
+MAX_ACTION_STEPS = 10
+MAX_ACTION_LINK_CHARS = 500
+MAX_ACTION_LINK_LABEL_CHARS = 60
 # A points change's reason: ONE sentence the person reads as the whole line in their score history
 # when the change moves their score (spec 2026-10-06-intel-weight-reason). It names no platform,
 # answer or person. Left out past it, never truncated, and the proposal is kept.

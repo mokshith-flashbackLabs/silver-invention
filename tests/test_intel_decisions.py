@@ -449,6 +449,46 @@ async def test_approving_a_threat_creates_the_event_from_decided_in_one_transact
     assert metadata["event_id"] == str(event_id) and metadata["operator"] == "ann"
 
 
+ACTION = {
+    "title": "Turn on two-factor authentication",
+    "why": "It stops someone who has your password from signing in.",
+    "steps": ["Open Settings", "Choose Security", "Turn on two-factor authentication"],
+    "link_url": "https://help.instagram.com/two-factor",
+    "link_label": "Instagram help",
+}
+
+
+async def test_a_drafted_action_travels_to_decided_and_the_operator_can_replace_or_remove_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec 2026-10-06-intel-threat-action: services never store an action on the event; the
+    backend attaches decided.action. So decided must carry exactly what the operator approved."""
+    await seed_quiz_vocabulary(intel_pool)
+    drafted = {**THREAT_SUGGESTED, "action": ACTION}
+    kept = await _decide(intel_pool, await _threat_approvable(intel_pool, suggested=drafted))
+    assert kept.decided is not None and kept.decided["action"] == ACTION
+
+    removed = await _decide(
+        intel_pool, await _threat_approvable(intel_pool, suggested=drafted), values={"action": None}
+    )
+    assert removed.decided is not None and removed.decided["action"] is None
+
+    mine = {
+        "title": "Check connected apps",
+        "why": "Old apps can still read your photos.",
+        "steps": ["Open Settings", "Remove apps you do not use"],
+    }
+    replaced = await _decide(
+        intel_pool, await _threat_approvable(intel_pool, suggested=drafted), values={"action": mine}
+    )
+    assert replaced.decided is not None
+    assert replaced.decided["action"] == {**mine, "link_url": None, "link_label": None}
+
+    insecure = await _threat_approvable(intel_pool, suggested=drafted)
+    bad = {**ACTION, "link_url": "http://help.instagram.com/two-factor"}
+    assert await _refused(intel_pool, insecure, values={"action": bad}) == "values_out_of_bounds"
+
+
 async def test_a_partial_edit_changes_only_what_it_names_and_keeps_the_proposals_tags(
     intel_pool: AsyncConnectionPool,
 ) -> None:

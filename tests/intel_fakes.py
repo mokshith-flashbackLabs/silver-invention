@@ -580,6 +580,7 @@ THREAT_SUGGESTED: dict[str, Any] = {
     "body": "Photos some Instagram users kept private were exposed in a breach.",
     "severity": 3,
     "expires_in_days": 30,
+    "action": None,
 }
 
 
@@ -602,6 +603,7 @@ async def seed_threat_proposal(
     status: str = "pending",
     decided: dict[str, Any] | None = None,
     created_at: datetime | None = None,
+    suggested: dict[str, Any] | None = None,
 ) -> UUID:
     """A threat_event proposal row written directly, shaped as generation writes one."""
     return await seed_proposal(
@@ -610,7 +612,7 @@ async def seed_threat_proposal(
         kind="threat_event",
         status=status,
         target={"tags": list(tags)},
-        suggested=dict(THREAT_SUGGESTED),
+        suggested=dict(THREAT_SUGGESTED) if suggested is None else suggested,
         decided=decided,
         created_at=created_at,
     )

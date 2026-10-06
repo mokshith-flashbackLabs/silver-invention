@@ -79,7 +79,7 @@ PROPOSAL_COLUMNS = """proposal_id, kind, status, supersede_reason, target, sugge
 # corroboration's echo collapse.
 _CONTEXT_COLUMNS = """s.signal_id, s.category, s.direction, s.tags, s.unregistered_subjects,
     s.summary, d.trust, d.publisher_domain, s.status, s.created_at, d.url_hash AS document_key,
-    d.published_at,
+    d.published_at, d.final_url AS document_url,
     ARRAY(SELECT e.quote_text FROM intel_excerpts e WHERE e.signal_id = s.signal_id
            ORDER BY e.char_start, e.excerpt_id) AS excerpts"""
 _CONTEXT_FROM = "intel_signals s JOIN intel_documents d ON d.document_id = s.document_id"
@@ -213,6 +213,7 @@ def _context(row: dict[str, Any]) -> ContextSignal:
         document_key=row["document_key"],
         published_at=row["published_at"],
         excerpts=tuple(row["excerpts"] or ()),
+        document_url=row.get("document_url"),
     )
 
 
