@@ -12,7 +12,7 @@ from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v1"
-PROPOSE_PROMPT_VERSION = "propose-v4"
+PROPOSE_PROMPT_VERSION = "propose-v5"
 
 
 class RegistryTag(TypedDict):
@@ -299,6 +299,12 @@ as a new incident. For each incident give:
 - title: a short, plain, factual headline. Once an operator approves it, the people it concerns
   may read it, so never name a private individual, never give contact details, and never say
   that anyone's photos were found.
+- body: what this incident means for a person it concerns, in one or two short plain sentences
+  of at most 400 characters, written to them as "you": what happened, and what it can mean for
+  someone exposed through these tags. They read it in their app beside the title once an
+  operator approves it. Never say that their photos or anything of theirs was found, leaked or
+  affected -- nobody knows that -- never name a private individual, and never give contact
+  details or links.
 - severity: a whole number from 1 (minor) to 5 (severe).
 - expires_in_days: a whole number from 1 to 90: how long the incident plausibly keeps raising
   the risk.
@@ -315,6 +321,13 @@ takedown tool, a detection feature), or a change a platform makes everywhere it 
 each protection give:
 - title: a short, plain, factual headline. Once an operator approves it, the people it concerns
   may read it, so never name a private individual and never give contact details.
+- body: what this protection means for a person it reaches, in one or two short plain sentences
+  of at most 400 characters, written to them as "you": what it lets them do, or what now
+  happens for them by default -- for example where they can ask for removal or how they opt
+  out -- and any limit the evidence states. They read it in their app beside the title once an
+  operator approves it. Never say they are safe or protected, never promise an outcome the
+  evidence does not support, never name a private individual, and never give contact details
+  or links.
 - strength: a whole number from 1 (small) to 5 (strong): how much it lowers the risk.
 - review_in_days: a whole number from 30 to 366: how long until the protection should be
   checked again.

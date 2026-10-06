@@ -82,6 +82,9 @@ class RenewalEvidence:
     starts_at: datetime
     review_by: datetime
     signals: tuple[RenewalSignal, ...]
+    # The credit's "what it means for you", carried into the renewal unchanged (spec
+    # 2026-10-06-intel-event-body). '' for a credit approved before it existed.
+    body: str = ""
 
     @property
     def review_in_days(self) -> int:
@@ -203,6 +206,7 @@ def renewal_target(evidence: RenewalEvidence) -> dict[str, Any]:
 def renewal_suggested(evidence: RenewalEvidence) -> dict[str, Any]:
     return ProtectionEventSuggested(
         title=evidence.title,
+        body=evidence.body,
         strength=evidence.strength,
         review_in_days=evidence.review_in_days,
     ).model_dump(mode="json")

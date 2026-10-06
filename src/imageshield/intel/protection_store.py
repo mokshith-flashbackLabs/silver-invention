@@ -154,8 +154,8 @@ _REJECT_PENDING_RENEWALS_SQL = """
 # A credit is due while it is live, not renewed and never given a renewal proposal, whatever
 # became of that proposal: a rejected renewal lapses the credit (spec note 2026-09-30).
 _DUE_EVENT_SQL = """
-    SELECT e.event_id, e.title, e.strength, e.tags, e.is_global, e.starts_at, e.review_by,
-           e.proposal_id
+    SELECT e.event_id, e.title, e.body, e.strength, e.tags, e.is_global, e.starts_at,
+           e.review_by, e.proposal_id
       FROM protection_events e
      WHERE e.event_id = %(event_id)s AND e.status = 'active'
        AND e.starts_at <= %(now)s AND e.review_by > %(now)s
@@ -433,6 +433,7 @@ class PostgresProtectionStore:
         return RenewalEvidence(
             event_id=event["event_id"],
             title=event["title"],
+            body=event["body"],
             strength=event["strength"],
             tags=tuple(event["tags"]),
             is_global=event["is_global"],

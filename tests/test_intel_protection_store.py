@@ -500,7 +500,7 @@ async def test_the_renewal_write_is_one_transaction_and_happens_once(
         "protection_event",
         "pending",
         {"tags": ["instagram"], "is_global": False, "renews_event_id": str(event)},
-        {"title": "Seeded protection", "strength": 2, "review_in_days": 180},
+        {"title": "Seeded protection", "body": "", "strength": 2, "review_in_days": 180},
         "code:renewal",
         "renewal-v1",
         run_id,

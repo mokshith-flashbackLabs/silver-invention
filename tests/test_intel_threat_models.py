@@ -20,6 +20,7 @@ from imageshield.intel.proposal_models import (
 GOOD: dict[str, Any] = {
     "kind": "leak",
     "title": "Instagram breach exposes private photos",
+    "body": "Photos some Instagram users kept private were exposed in a breach.",
     "severity": 3,
     "expires_in_days": 30,
     "tags": ["instagram"],
@@ -28,6 +29,13 @@ GOOD: dict[str, Any] = {
 
 def test_a_complete_threat_decision_parses_and_dumps_as_stored() -> None:
     assert ThreatEventDecided.model_validate(GOOD).model_dump(mode="json") == GOOD
+
+
+def test_a_threat_written_before_bodies_reads_as_an_empty_trimmed_body() -> None:
+    """spec 2026-10-06-intel-event-body: a stored suggestion with no body still parses."""
+    without = {k: v for k, v in GOOD.items() if k != "body"}
+    assert ThreatEventDecided.model_validate(without).body == ""
+    assert ThreatEventDecided.model_validate({**GOOD, "body": "  padded  "}).body == "padded"
 
 
 @pytest.mark.parametrize(
@@ -47,7 +55,7 @@ def test_a_complete_threat_decision_parses_and_dumps_as_stored() -> None:
         {"tags": []},
         {"tags": ["Instagram"]},
         {"tags": ["x", "x"]},
-        {"body": "a threat proposal carries no body"},
+        {"body": "x" * 401},  # editable since 2026-10-06, up to 400 characters
     ],
 )
 def test_a_threat_decision_outside_the_bounds_is_refused(bad: dict[str, Any]) -> None:
@@ -86,6 +94,9 @@ def test_suggested_is_the_decided_keys_without_tags() -> None:
 def test_values_are_any_subset_of_the_decided_keys_and_nothing_else() -> None:
     assert ThreatEventValues.model_validate({"severity": 5}).model_dump(exclude_unset=True) == {
         "severity": 5
+    }
+    assert ThreatEventValues.model_validate({"body": "b"}).model_dump(exclude_unset=True) == {
+        "body": "b"
     }
     assert ThreatEventValues.model_validate({}).model_dump(exclude_unset=True) == {}
     with pytest.raises(ValidationError):

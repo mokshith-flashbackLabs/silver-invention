@@ -284,6 +284,7 @@ def _threat(*signals: ContextSignal, **kw: object) -> ProposedThreatEvent:
     fields: dict[str, object] = {
         "kind": "leak",
         "title": "Instagram breach exposes private photos",
+        "body": "Photos some Instagram users kept private were exposed in a breach.",
         "severity": 3,
         "expires_in_days": 30,
         "tags": ["instagram"],
@@ -630,7 +631,7 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
     assert "Propose only threat_events, protection_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v4"
+    assert PROPOSE_PROMPT_VERSION == "propose-v5"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -675,12 +676,13 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
     assert payload["live_protections"] == [live] and payload["live_events"] == []
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
-    assert PROPOSE_PROMPT_VERSION == "propose-v4"
+    assert PROPOSE_PROMPT_VERSION == "propose-v5"
 
 
 def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
     fields: dict[str, object] = {
         "title": "Instagram lets people keep their photos out of AI training",
+        "body": "You can keep your Instagram photos out of AI training in your settings.",
         "strength": 2,
         "review_in_days": 180,
         "tags": ["instagram"],
@@ -853,7 +855,7 @@ def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v4"
+    assert PROPOSE_PROMPT_VERSION == "propose-v5"
     assert "published within threat_recency_days days of today" in flat
     assert "has ended" in flat and "is not a threat" in flat
     assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in flat
@@ -862,3 +864,55 @@ def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() 
     payload = json.loads(user)
     assert (payload["today"], payload["threat_recency_days"]) == ("2026-10-04", 90)
     assert payload["pending_weight_changes"] == []
+
+
+# ── An event's "what it means for you" (spec 2026-10-06-intel-event-body) ─────────────────────
+
+
+def test_a_threat_and_a_protection_keep_their_body_masked_and_normalised() -> None:
+    s = _sig(tags=("instagram",))
+    out = ProposalOutput(
+        threat_events=[_threat(s, body="  Private  photos were exposed;\ncall +44 20 7946 0958 ")],
+        protection_events=[_protection(s, body="You can   opt out in your settings.")],
+    )
+    batch, counts = _validate(out, [s])
+    (threat,) = batch.threat_events
+    (protection,) = batch.protection_events
+    assert threat.suggested["body"].startswith("Private photos were exposed; call ")
+    assert "7946" not in threat.suggested["body"] and counts["pii_masked_body"] == 1
+    assert protection.suggested["body"] == "You can opt out in your settings."
+
+
+@pytest.mark.parametrize(
+    ("body", "counter"),
+    [("   ", "event_body_missing"), ("x" * 401, "event_body_too_long")],
+)
+def test_an_empty_or_over_long_body_is_left_out_and_the_proposal_kept(
+    body: str, counter: str
+) -> None:
+    s = _sig(tags=("instagram",))
+    out = ProposalOutput(
+        threat_events=[_threat(s, body=body)], protection_events=[_protection(s, body=body)]
+    )
+    batch, counts = _validate(out, [s])
+    assert [p.suggested["body"] for p in batch.proposals] == ["", ""]
+    assert counts[counter] == 2
+
+
+def test_propose_v5_asks_for_a_body_on_both_event_kinds_and_never_a_finding() -> None:
+    system, _ = proposal_request(
+        [],
+        [],
+        quiz=prompt_quiz(V),
+        registry_tags=prompt_registry(V, set()),
+        mapped_tags=sorted(V.mapped_tags),
+        today="2026-10-06",
+        threat_recency_days=90,
+    )
+    flat = " ".join(system.split())
+    assert PROPOSE_PROMPT_VERSION == "propose-v5"
+    assert flat.count("- body: what this") == 2
+    assert "what this incident means for a person it concerns" in flat
+    assert "what this protection means for a person it reaches" in flat
+    assert "Never say that their photos or anything of theirs was found" in flat
+    assert "Never say they are safe or protected" in flat

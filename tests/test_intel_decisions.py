@@ -408,7 +408,7 @@ async def test_approving_a_threat_creates_the_event_from_decided_in_one_transact
         pid,
         30,
         timedelta(days=30),
-        "",
+        THREAT_SUGGESTED["body"],
     )
     assert await _scalar(
         intel_pool,
@@ -457,7 +457,7 @@ async def test_an_out_of_bounds_threat_edit_is_refused_and_writes_no_event(
         {"tags": []},
         {"tags": ["Instagram"]},
         {"tags": ["instagram", "instagram"]},
-        {"body": "a threat carries no body"},
+        {"body": "x" * 401},  # a body is editable since 2026-10-06, up to 400 characters
         {"delta": 1},
     ):
         pid = await _threat_approvable(intel_pool)
@@ -654,7 +654,7 @@ async def test_approving_a_protection_creates_the_credit_from_decided_in_one_tra
         pid,
         None,
         timedelta(days=180),
-        "",
+        PROTECTION_SUGGESTED["body"],
     )
     assert await _scalar(
         intel_pool,
@@ -710,6 +710,60 @@ async def test_a_partial_protection_edit_changes_only_what_it_names(
     ) == (4, timedelta(days=90))
 
 
+async def test_an_operator_rewrites_or_clears_the_body_and_the_event_carries_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec 2026-10-06-intel-event-body: the body is what the person reads beside the title, so
+    the operator's edit is what is stored, trimmed, and an empty one is allowed."""
+    await seed_quiz_vocabulary(intel_pool)
+    threat = await _threat_approvable(intel_pool)
+    decided = await _decide(intel_pool, threat, values={"body": "  Rewritten for the reader.  "})
+    assert decided.decided is not None and decided.decided["body"] == "Rewritten for the reader."
+    assert (
+        await _scalar(intel_pool, "SELECT body FROM threat_events WHERE proposal_id = %s", threat)
+        == "Rewritten for the reader."
+    )
+    protection = await _protection_approvable(intel_pool)
+    decided = await _decide_protection(intel_pool, protection, values={"body": ""})
+    assert decided.decided == protection_decided(body="")
+    assert (
+        await _scalar(
+            intel_pool, "SELECT body FROM protection_events WHERE proposal_id = %s", protection
+        )
+        == ""
+    )
+
+
+async def test_an_over_long_body_edit_is_refused_and_creates_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    assert (
+        await _refused_protection(intel_pool, pid, values={"body": "x" * 401})
+        == "values_out_of_bounds"
+    )
+    assert await _scalar(intel_pool, "SELECT count(*) FROM protection_events") == 0
+
+
+async def test_a_proposal_written_before_bodies_existed_approves_with_an_empty_body(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    pid = await _protection_approvable(intel_pool)
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE intel_proposals SET suggested = suggested - 'body' WHERE proposal_id = %s",
+            (pid,),
+        )
+    decided = await _decide_protection(intel_pool, pid)
+    assert decided.decided == protection_decided(body="")
+    assert (
+        await _scalar(intel_pool, "SELECT body FROM protection_events WHERE proposal_id = %s", pid)
+        == ""
+    )
+
+
 async def test_an_out_of_bounds_protection_edit_is_refused_and_creates_nothing(
     intel_pool: AsyncConnectionPool,
 ) -> None:
@@ -726,7 +780,7 @@ async def test_an_out_of_bounds_protection_edit_is_refused_and_creates_nothing(
         {"tags": ["Instagram"]},
         {"tags": ["instagram", "instagram"]},
         {"is_global": "yes"},
-        {"body": "a protection carries no body"},
+        {"body": "x" * 401},  # a body is editable since 2026-10-06, up to 400 characters
         {"applies_regardless_of_location": True},  # a body field, never a value
         {"renews_event_id": str(uuid4())},
         {"severity": 3},

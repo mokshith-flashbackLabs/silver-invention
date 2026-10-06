@@ -577,6 +577,7 @@ async def seed_proposal(
 THREAT_SUGGESTED: dict[str, Any] = {
     "kind": "leak",
     "title": "Instagram breach exposes private photos",
+    "body": "Photos some Instagram users kept private were exposed in a breach.",
     "severity": 3,
     "expires_in_days": 30,
 }
@@ -664,6 +665,7 @@ async def settle_runs(pool: AsyncConnectionPool) -> None:
 
 PROTECTION_SUGGESTED: dict[str, Any] = {
     "title": "Instagram lets people keep their photos out of AI training",
+    "body": "You can keep your Instagram photos out of AI training in your settings.",
     "strength": 2,
     "review_in_days": 180,
 }

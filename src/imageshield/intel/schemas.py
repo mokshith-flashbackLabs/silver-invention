@@ -117,6 +117,7 @@ class ProposedThreatEvent(_Out):
 
     kind: Literal["leak", "deepfake_wave", "platform_incident", "other"]
     title: str
+    body: str
     severity: int
     expires_in_days: int
     tags: list[str] = Field(default_factory=list)
@@ -137,6 +138,7 @@ class ProposedProtectionEvent(_Out):
     an operator's edit on approval."""
 
     title: str
+    body: str
     strength: int
     review_in_days: int
     tags: list[str] = Field(default_factory=list)

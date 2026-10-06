@@ -20,6 +20,7 @@ from imageshield.intel.proposal_models import (
 
 GOOD: dict[str, Any] = {
     "title": "Instagram lets people keep their photos out of AI training",
+    "body": "You can keep your Instagram photos out of AI training in your settings.",
     "strength": 2,
     "review_in_days": 180,
     "tags": ["instagram"],
@@ -56,7 +57,7 @@ def test_a_global_decision_carries_no_tags() -> None:
         {"tags": ["x", "x"]},
         {"is_global": "yes"},
         {"applies_regardless_of_location": False},
-        {"body": "a protection carries no body"},
+        {"body": "x" * 401},  # editable since 2026-10-06, up to 400 characters
         {"renews_event_id": str(uuid4())},  # what a renewal continues lives in its target
     ],
 )
@@ -71,8 +72,8 @@ def test_the_location_attestation_is_required() -> None:
         ProtectionEventDecided.model_validate(fields)
 
 
-def test_suggested_is_the_title_strength_and_review_period_only() -> None:
-    fields = {"title": GOOD["title"], "strength": 2, "review_in_days": 180}
+def test_suggested_is_the_title_body_strength_and_review_period_only() -> None:
+    fields = {"title": GOOD["title"], "body": GOOD["body"], "strength": 2, "review_in_days": 180}
     assert ProtectionEventSuggested.model_validate(fields).model_dump() == fields
     with pytest.raises(ValidationError):
         ProtectionEventSuggested.model_validate({**fields, "tags": ["instagram"]})
@@ -97,6 +98,9 @@ def test_a_target_is_tags_or_global_and_may_name_what_it_renews() -> None:
 def test_values_are_any_subset_of_the_editable_keys_and_nothing_else() -> None:
     assert ProtectionEventValues.model_validate({"strength": 4}).model_dump(exclude_unset=True) == {
         "strength": 4
+    }
+    assert ProtectionEventValues.model_validate({"body": "b"}).model_dump(exclude_unset=True) == {
+        "body": "b"
     }
     assert ProtectionEventValues.model_validate({}).model_dump(exclude_unset=True) == {}
     for bad in (

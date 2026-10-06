@@ -154,20 +154,21 @@ _APPLY_EVENT_SQL = """
 # decay_days is NOT NULL and inert since 0037: supplied as expires_in_days, never shown
 # (spec §4.5). No domains and never global: an intel threat reaches people by tags alone.
 _INSERT_THREAT_SQL = """
-    INSERT INTO threat_events (kind, title, severity, tags, domains, is_global,
+    INSERT INTO threat_events (kind, title, body, severity, tags, domains, is_global,
         expires_at, decay_days, status, created_by, proposal_id)
-    VALUES (%(kind)s, %(title)s, %(severity)s, %(tags)s, '{}', false,
+    VALUES (%(kind)s, %(title)s, %(body)s, %(severity)s, %(tags)s, '{}', false,
         now() + make_interval(days => %(days)s), %(days)s, 'active', %(operator)s,
         %(proposal_id)s)
     RETURNING event_id
 """
 
-# body is '': a protection proposal carries only a title. starts_at is now(), or for a renewal
+# body is the decided "what it means for you" ('' on a proposal written before 2026-10-06,
+# spec 2026-10-06-intel-event-body). starts_at is now(), or for a renewal
 # the old credit's review_by, so the two never overlap and never leave a gap (spec §4.7).
 _INSERT_PROTECTION_SQL = """
     INSERT INTO protection_events (title, body, strength, tags, is_global, starts_at, review_by,
         status, proposal_id, renews_event_id, created_by)
-    VALUES (%(title)s, '', %(strength)s, %(tags)s::text[], %(is_global)s,
+    VALUES (%(title)s, %(body)s, %(strength)s, %(tags)s::text[], %(is_global)s,
         coalesce(%(starts)s::timestamptz, now()),
         coalesce(%(starts)s::timestamptz, now()) + make_interval(days => %(days)s),
         'active', %(proposal_id)s, %(renews)s::uuid, %(operator)s)
@@ -243,6 +244,7 @@ async def _insert_threat_event(
         {
             "kind": decided["kind"],
             "title": decided["title"],
+            "body": decided.get("body", ""),
             "severity": decided["severity"],
             "tags": list(decided["tags"]),
             "days": decided["expires_in_days"],
@@ -338,6 +340,7 @@ async def _insert_protection_event(
         _INSERT_PROTECTION_SQL,
         {
             "title": decided["title"],
+            "body": decided.get("body", ""),
             "strength": decided["strength"],
             "tags": list(decided["tags"]),
             "is_global": decided["is_global"],

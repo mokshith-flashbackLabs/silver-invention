@@ -25,6 +25,7 @@ from pydantic import (
 )
 
 from imageshield.intel.bounds import (
+    MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
     PROTECTION_REVIEW_MAX_DAYS,
     PROTECTION_REVIEW_MIN_DAYS,
@@ -96,10 +97,15 @@ class ThreatEventTarget(_Stored):
 class ThreatEventSuggested(_Stored):
     """A threat_event's ``suggested``: the model's numbers and text, kept forever (§3.6). The
     bounds are §4.5's, and they hold for an operator's final values too (ThreatEventDecided).
-    There is no ``body``: a threat proposal carries only a title (spec note 2026-09-30)."""
+
+    ``body`` is what the event means for the people it reaches, in plain words, shown in their
+    app's score history beside the title (spec 2026-10-06-intel-event-body; it replaced the
+    2026-09-30 note "a threat proposal carries only a title"). Empty on every proposal written
+    before it, and on one whose model text was left out, so an approval still works without."""
 
     kind: ThreatKind
     title: str = Field(min_length=1, max_length=MAX_EVENT_TITLE_CHARS)
+    body: str = Field(default="", max_length=MAX_EVENT_BODY_CHARS)
     severity: StrictInt = Field(ge=THREAT_SEVERITY_MIN, le=THREAT_SEVERITY_MAX)
     expires_in_days: StrictInt = Field(ge=THREAT_EXPIRES_MIN_DAYS, le=THREAT_EXPIRES_MAX_DAYS)
 
@@ -109,6 +115,11 @@ class ThreatEventSuggested(_Stored):
         if not value.strip():
             raise ValueError("title must not be blank")
         return value
+
+    @field_validator("body")
+    @classmethod
+    def _trimmed(cls, value: str) -> str:
+        return value.strip()
 
 
 class ThreatEventDecided(ThreatEventSuggested):
@@ -132,6 +143,7 @@ class ThreatEventValues(_Stored):
 
     kind: ThreatKind | None = None
     title: str | None = None
+    body: str | None = None
     severity: StrictInt | None = None
     expires_in_days: StrictInt | None = None
     tags: tuple[str, ...] | None = None
@@ -166,10 +178,11 @@ class ProtectionEventTarget(_Stored):
 class ProtectionEventSuggested(_Stored):
     """A protection_event's ``suggested``: the model's numbers and text, or on a renewal the
     prior decided values (§4.8). The bounds are §4.5's and hold for an operator's final values
-    too (ProtectionEventDecided). No ``body``: a protection proposal carries only a title, as a
-    threat does (spec note 2026-09-30)."""
+    too (ProtectionEventDecided). ``body`` is what it means for the people it reaches, as a
+    threat's is (spec 2026-10-06-intel-event-body); a renewal carries the prior one forward."""
 
     title: str = Field(min_length=1, max_length=MAX_EVENT_TITLE_CHARS)
+    body: str = Field(default="", max_length=MAX_EVENT_BODY_CHARS)
     strength: StrictInt = Field(ge=PROTECTION_STRENGTH_MIN, le=PROTECTION_STRENGTH_MAX)
     review_in_days: StrictInt = Field(ge=PROTECTION_REVIEW_MIN_DAYS, le=PROTECTION_REVIEW_MAX_DAYS)
 
@@ -179,6 +192,11 @@ class ProtectionEventSuggested(_Stored):
         if not value.strip():
             raise ValueError("title must not be blank")
         return value
+
+    @field_validator("body")
+    @classmethod
+    def _trimmed(cls, value: str) -> str:
+        return value.strip()
 
 
 class ProtectionEventDecided(ProtectionEventSuggested):
@@ -202,13 +220,14 @@ class ProtectionEventDecided(ProtectionEventSuggested):
 
 
 class ProtectionEventValues(_Stored):
-    """An operator's edit of a protection approval: any subset of ``{title, strength,
+    """An operator's edit of a protection approval: any subset of ``{title, body, strength,
     review_in_days, tags, is_global}``, and nothing else. Merged over ``suggested`` and the
     target's scope; the result must parse as ProtectionEventDecided. So making a credit global
     names both halves of the scope, ``{is_global: true, tags: []}`` (spec note 2026-09-30).
     Types only here; the bounds are ProtectionEventDecided's."""
 
     title: str | None = None
+    body: str | None = None
     strength: StrictInt | None = None
     review_in_days: StrictInt | None = None
     tags: tuple[str, ...] | None = None

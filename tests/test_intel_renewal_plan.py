@@ -59,6 +59,7 @@ def _evidence(
         starts_at=T0 - timedelta(days=160),
         review_by=T0 + timedelta(days=20),
         signals=signals,
+        body="You can keep your photos out of AI training in your settings.",
     )
 
 
@@ -143,8 +144,11 @@ def test_the_proposal_carries_the_credits_own_scope_values_and_what_it_renews() 
         "is_global": False,
         "renews_event_id": str(evidence.event_id),
     }
+    # The credit's "what it means for you" is carried forward unchanged (spec
+    # 2026-10-06-intel-event-body).
     assert renewal_suggested(evidence) == {
         "title": "Instagram opt-out",
+        "body": "You can keep your photos out of AI training in your settings.",
         "strength": 2,
         "review_in_days": 180,
     }

@@ -38,6 +38,7 @@ from imageshield.intel.bounds import (
     COVERAGE_GAP_MIN_PUBLISHERS,
     COVERAGE_GAP_MIN_SIGNALS,
     COVERAGE_GAP_WINDOW_DAYS,
+    MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
     MAX_GAP_SUBJECT_CHARS,
     MAX_PROMPT_TAGS,
@@ -285,6 +286,24 @@ def _free_text(raw: str, *, field_name: str, limit: int, counts: Counter[str]) -
     return text
 
 
+def _event_body(raw: str, counts: Counter[str]) -> str:
+    """An event's "what it means for you" (spec 2026-10-06-intel-event-body): masked and
+    whitespace-normalised like every model-written field. Unlike the title it is never a reason to
+    drop the proposal: empty or over-long, it is LEFT OUT (``""``, counted), never truncated, and
+    the operator can write one before approving."""
+    masked, masks = mask(raw)
+    if masks:
+        counts["pii_masked_body"] += 1
+    text = normalise(masked)
+    if not text:
+        counts["event_body_missing"] += 1
+        return ""
+    if len(text) > MAX_EVENT_BODY_CHARS:
+        counts["event_body_too_long"] += 1
+        return ""
+    return text
+
+
 def _cited(
     raw_ids: Sequence[str], context: Mapping[UUID, ContextSignal], counts: Counter[str]
 ) -> tuple[UUID, ...] | None:
@@ -483,6 +502,7 @@ def _threat_event(
         suggested=ThreatEventSuggested(
             kind=item.kind,
             title=title,
+            body=_event_body(item.body, counts),
             severity=item.severity,
             expires_in_days=item.expires_in_days,
         ).model_dump(mode="json"),
@@ -543,7 +563,10 @@ def _protection_event(
             mode="json", exclude_none=True
         ),
         suggested=ProtectionEventSuggested(
-            title=title, strength=item.strength, review_in_days=item.review_in_days
+            title=title,
+            body=_event_body(item.body, counts),
+            strength=item.strength,
+            review_in_days=item.review_in_days,
         ).model_dump(mode="json"),
         rationale=rationale,
         signal_ids=signal_ids,

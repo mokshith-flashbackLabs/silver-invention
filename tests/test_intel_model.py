@@ -474,7 +474,7 @@ def test_the_threat_output_parses_out_of_range_numbers_for_code_to_drop() -> Non
     for keyword in ("minimum", "maximum", "maxLength", "minLength"):
         assert keyword not in schema
     parsed = ProposalOutput.model_validate_json(
-        '{"threat_events": [{"kind": "leak", "title": "t", "severity": 9,'
+        '{"threat_events": [{"kind": "leak", "title": "t", "body": "b", "severity": 9,'
         ' "expires_in_days": 400, "tags": [], "rationale": "r", "signal_ids": []}],'
         ' "attach": [{"proposal_id": "not-a-uuid", "signal_ids": []}]}'
     )
@@ -496,7 +496,7 @@ def test_the_protection_output_parses_out_of_range_numbers_for_code_to_drop() ->
         assert keyword not in schema
     assert "protection_events" in schema
     parsed = ProposalOutput.model_validate_json(
-        '{"protection_events": [{"title": "t", "strength": 9, "review_in_days": 4000,'
+        '{"protection_events": [{"title": "t", "body": "b", "strength": 9, "review_in_days": 4000,'
         ' "tags": [], "is_global": true, "rationale": "r", "signal_ids": []}]}'
     )
     (proposed,) = parsed.protection_events

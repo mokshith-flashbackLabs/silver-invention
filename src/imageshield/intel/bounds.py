@@ -77,6 +77,10 @@ THREAT_EXPIRES_MAX_DAYS = 90
 # A model-written headline that may become user-facing copy once approved. Dropped past it,
 # never truncated (spec note 2026-09-30).
 MAX_EVENT_TITLE_CHARS = 200
+# The event's "what it means for you": model-written, operator-edited, and shown in the app's
+# score history beside the title once approved (spec 2026-10-06-intel-event-body). An over-long
+# one is left out, never truncated, and the proposal is kept.
+MAX_EVENT_BODY_CHARS = 400
 # Pending event proposals and live threat events a generation call is shown (spec §4.3).
 PROPOSAL_CONTEXT_MAX_EVENTS = 40
 # A regeneration refused or failed without writing proposals is queued again after this many
