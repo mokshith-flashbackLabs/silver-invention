@@ -218,6 +218,8 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         "is_global": "boolean",
         "starts_at": "timestamp with time zone",
         "ends_at": "timestamp with time zone",
+        # 0049 (2026-10-08): the credit a renewal continues, appended; NULL for a threat.
+        "renews_event_id": "uuid",
     },
 }
 

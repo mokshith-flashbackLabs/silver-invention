@@ -186,6 +186,7 @@ FROZEN_CONTRACT_COLUMNS: dict[str, set[str]] = {
         "is_global",
         "starts_at",
         "ends_at",
+        "renews_event_id",
     },
 }
 
@@ -1350,3 +1351,35 @@ def test_active_scoped_events_carries_live_protections_beside_threats_and_no_per
     (general,) = [r for r in rows if r["event_id"] == everyone]
     assert general["tags"] == [] and general["is_global"] is True
     assert not {"person_ref", "user_ref"} & set(credit)
+
+
+def test_a_renewal_names_the_credit_it_continues_and_a_threat_names_none(migrated_db: str) -> None:
+    """0049 (2026-10-08): renews_event_id, appended to the view, so the backend can write a
+    weaker renewal's handover as one line carrying the renewal's own words, not as the old credit
+    'no longer counting'. NULL on a credit that renews nothing and on every threat."""
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        first = conn.execute(_PROTECTION_PROPOSAL).fetchone()
+        assert first is not None
+        old = conn.execute(
+            _SCOPED_PROTECTION,
+            (
+                "old", ["instagram"], False, "-10 days", "1 days", "active",
+                first[0], None, None, None,
+            ),
+        ).fetchone()
+        assert old is not None
+        second = conn.execute(_PROTECTION_PROPOSAL).fetchone()
+        assert second is not None
+        renewal = conn.execute(
+            "INSERT INTO protection_events (title, strength, tags, is_global, starts_at, review_by,"
+            " status, proposal_id, renews_event_id, created_by)"
+            " VALUES ('renewal', 1, ARRAY['instagram'], false, now() - interval '1 hour',"
+            " now() + interval '90 days', 'active', %s, %s, 'ops') RETURNING event_id",
+            (second[0], old[0]),
+        ).fetchone()
+        assert renewal is not None
+        conn.execute(_SCOPED_THREAT, ("threat", ["instagram"], [], "0 days", "7 days", "active"))
+    rows = {r["title"]: r for r in _rows(migrated_db, "SELECT * FROM svc.v_active_scoped_events")}
+    assert rows["renewal"]["renews_event_id"] == old[0]
+    assert rows["old"]["renews_event_id"] is None
+    assert rows["threat"]["renews_event_id"] is None
