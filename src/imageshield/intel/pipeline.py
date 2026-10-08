@@ -127,7 +127,10 @@ from imageshield.search.urlhash import canonicalise, url_hash
 log = structlog.get_logger("imageshield.intel.pipeline")
 
 T = TypeVar("T", bound=BaseModel)
-RunStatus = Literal["completed", "refused", "failed"]
+# "waiting" is a weight suggestion leaving the queue until the reads it queued are done (spec
+# 2026-10-08-intel-suggestion-waits-for-evidence §2): never a terminal status, so its RunResult
+# carries a RunWait and the run goes back to 'queued'.
+RunStatus = Literal["completed", "refused", "failed", "waiting"]
 Trust = Literal["listed", "web"]
 
 # intel_signals.summary's CHECK (0038). The schema caps the model's summary at the
@@ -179,12 +182,24 @@ class PipelineDeps:
 
 
 @dataclass(frozen=True)
+class RunWait:
+    """Why and until when a ``waiting`` run is held back (migration 0050): it is claimable once
+    none of ``awaiting`` has a read open, or once ``deadline`` passes, and never before
+    ``not_before``."""
+
+    awaiting: tuple[UUID, ...]
+    deadline: datetime
+    not_before: datetime | None = None
+
+
+@dataclass(frozen=True)
 class RunResult:
     status: RunStatus
     # Counts; a question run adds its results (spec §4.10: "their results live in the run's
     # outcome").
     outcome: dict[str, Any]
     error_code: str | None = None
+    wait: RunWait | None = None  # set exactly when status is "waiting"
 
 
 class _Stop(Exception):

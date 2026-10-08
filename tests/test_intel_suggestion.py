@@ -264,6 +264,8 @@ def test_the_poll_has_no_options_until_a_suggestion_is_written() -> None:
         "error_code": None,
         "options": None,
         "sources_deferred": 0,
+        "awaiting_sources": 0,
+        "wait_deadline": None,
     }
     done = _suggestion_run("completed", {"sources_deferred": 2, "model_calls": 5})
     proposal_id = uuid4()

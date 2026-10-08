@@ -7,14 +7,16 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.intel.bounds import SUGGESTION_WAIT_MAX_SECONDS, SUGGESTION_WAIT_RETRY_SECONDS
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import FetchFailure
-from imageshield.intel.pipeline import RunResult
+from imageshield.intel.pipeline import RunResult, run
 from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.schemas import (
     DiscoveryCandidate,
@@ -33,6 +35,7 @@ from tests.intel_fakes import (
     POLICY,
     FakeFetcher,
     GatedFetcher,
+    claim,
     make_deps,
     make_page,
     make_signal,
@@ -472,8 +475,8 @@ async def test_a_suggestion_reads_its_new_sources_first_then_suggests_and_genera
 async def test_a_newer_suggestion_supersedes_the_older_one_for_its_question_only(
     intel_pool: AsyncConnectionPool,
 ) -> None:
-    """A suggestion with no evidence at all is still delivered (Review Focus 5)."""
     await seed_quiz_vocabulary(intel_pool)
+    await seed_signal(intel_pool, run_id=await _done_run(intel_pool), tags=("instagram",))
     store = PostgresQuestionStore(intel_pool)
     model = FakeQuestionModel(suggest_with=_cite_everything())
     run_ids = []
@@ -494,15 +497,15 @@ async def test_a_newer_suggestion_supersedes_the_older_one_for_its_question_only
         run_ids[1]: ("delivered", None),
         run_ids[2]: ("delivered", None),
     }
-    assert await _scalar(intel_pool, "SELECT count(*) FROM intel_proposal_signals") == 0
     assert model.propose_calls == 0  # nothing was read, so there is nothing to generate over
 
 
-async def test_sources_past_the_suggestion_cap_are_deferred_and_made_due(
+async def test_sources_past_the_suggestion_cap_are_read_in_their_own_run_first(
     intel_pool: AsyncConnectionPool,
 ) -> None:
-    """spec §4.10: units past INTEL_MAX_CALLS_PER_SUGGESTION_RUN stay unconsumed, the poll says
-    how many sources, and the suggestion proceeds with what was read."""
+    """spec §4.10: units past INTEL_MAX_CALLS_PER_SUGGESTION_RUN stay unconsumed and the poll says
+    how many sources. Since 2026-10-08 the source left is queued as its own read and the
+    suggestion waits for it, then answers from both pages."""
     await seed_quiz_vocabulary(intel_pool)
     queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
         SUGGEST_REQUEST, [_chosen(), _chosen(NEW_SAFETY)], operator="ann"
@@ -511,14 +514,21 @@ async def test_sources_past_the_suggestion_cap_are_deferred_and_made_due(
     model = FakeQuestionModel(make_signal(tags=["instagram"]), suggest_with=_cite_everything())
     deps = make_deps(intel_pool, fetcher, model, max_calls_per_suggestion_run=1)
     result = await run_once(intel_pool, deps)
-    assert result.status == "completed", result
+    assert result.status == "waiting", result
     assert (result.outcome["sources_read"], result.outcome["sources_deferred"]) == (1, 1)
     assert fetcher.fetched == [NEW_TERMS]
-    assert model.suggest_calls == 1 and model.propose_calls == 1  # outside the reading cap
+    assert model.suggest_calls == 0 and model.propose_calls == 0  # nothing answered yet
     first, second = queued.registered
-    due = "SELECT next_check_at <= %s FROM intel_sources WHERE source_id = %s"
-    assert await _scalar(intel_pool, due, NOW, second) is True  # its first check comes next tick
-    assert await _scalar(intel_pool, due, NOW, first) is False
+    assert await _open_runs(intel_pool, second) == [("source_check", "queued", "schedule")]
+    assert await _open_runs(intel_pool, first) == []
+    checked = await run_once(intel_pool, deps)  # the second page's own read, not the suggestion
+    assert checked.status == "completed" and fetcher.fetched == [NEW_TERMS, NEW_SAFETY]
+    resumed = await run_once(intel_pool, deps)
+    assert resumed.status == "completed", resumed
+    assert model.suggest_calls == 1
+    assert resumed.outcome["sources_read"] == 1  # the first pass's counts are carried
+    payload = json.loads(model.suggestion_users[0])
+    assert len(payload["evidence"]) == 2  # one signal from each page
 
 
 async def test_a_gate_refusal_while_reading_refuses_the_run_before_any_suggestion(
@@ -683,19 +693,19 @@ async def test_the_suggestion_cap_is_exact_when_sources_are_read_at_once(
     )
     running = await _suggest_in_background(intel_pool, deps, PAGES)
     result = await asyncio.wait_for(running, 30)
-    assert result.status == "completed", result
+    assert result.status == "waiting", result
     assert model.extract_calls == 3 and model.extract_peak >= 2
     assert (result.outcome["sources_read"], result.outcome["sources_deferred"]) == (3, 3)
-    due = "SELECT count(*) FROM intel_sources WHERE next_check_at <= %s"
-    assert await _scalar(intel_pool, due, NOW) == 3
-    assert model.suggest_calls == 1  # the suggestion is outside the reading cap
+    reads = "SELECT count(*) FROM intel_runs WHERE kind = 'source_check' AND status = 'queued'"
+    assert await _scalar(intel_pool, reads) == 3  # each left page is read in its own run
+    assert model.suggest_calls == 0
 
 
 async def test_one_sources_outage_never_cancels_the_reads_beside_it(
     intel_pool: AsyncConnectionPool,
 ) -> None:
     """The fetcher fails for one source while two others are mid-read: those two are read, the
-    failed one waits for its own check, and the suggestion goes ahead with what was read."""
+    failed one is queued as its own read, and the suggestion waits for it."""
     urls = PAGES[:3]
     pages: dict[str, Any] = {url: make_page(POLICY, url) for url in urls}
     pages[urls[1]] = FetchFailure(code="fetcher_unreachable")
@@ -706,10 +716,10 @@ async def test_one_sources_outage_never_cancels_the_reads_beside_it(
     await fetcher.until_waiting(3)
     fetcher.release.set()
     result = await asyncio.wait_for(running, 30)
-    assert result.status == "completed", result
+    assert result.status == "waiting", result
     assert (result.outcome["sources_read"], result.outcome["sources_deferred"]) == (2, 1)
     assert result.outcome["stopped_fetcher_unreachable"] == 1
-    assert model.extract_calls == 2 and model.suggest_calls == 1
+    assert model.extract_calls == 2 and model.suggest_calls == 0
 
 
 async def test_validation_judges_candidates_at_once_and_keeps_their_order(
@@ -774,7 +784,8 @@ async def test_a_suggestion_hands_its_saved_searches_to_their_own_runs(
     intel_pool: AsyncConnectionPool,
 ) -> None:
     """The page is read inside the run; the saved search is not read there at all. It is queued
-    as its own discovery run, counted as deferred, and a later press includes what it found."""
+    as its own discovery run, counted as deferred, and (since 2026-10-08) the suggestion waits
+    for it and answers with what it found -- no second press needed."""
     await seed_quiz_vocabulary(intel_pool)
     store = PostgresQuestionStore(intel_pool)
     chosen = [_chosen(), _chosen_search()]
@@ -790,15 +801,22 @@ async def test_a_suggestion_hands_its_saved_searches_to_their_own_runs(
     )
     deps = make_deps(intel_pool, fetcher, model, source_read_concurrency=4)
     result = await run_once(intel_pool, deps)
-    assert result.status == "completed", result
+    assert result.status == "waiting", result
     assert model.discover_calls == 0 and fetcher.fetched == [NEW_TERMS]  # no search inside
     assert result.outcome["sources_read"] == 1
     assert result.outcome["sources_deferred"] == 1
     assert result.outcome["search_sources_deferred"] == 1
-    assert model.suggest_calls == 1  # written from the page and the evidence already held
+    assert model.suggest_calls == 0  # never written before the search is read
     assert await _open_runs(intel_pool, search_id) == [("discovery", "queued", "schedule")]
     assert await _open_runs(intel_pool, page_id) == []
-    # The search's own run, claimed by the next free slot: one search, its page read.
+    ((status, attempts, awaiting),) = await _rows(
+        intel_pool,
+        "SELECT status, attempts, awaiting_source_ids FROM intel_runs WHERE run_id = %s",
+        queued.run_id,
+    )
+    assert (status, attempts, awaiting) == ("queued", 0, [search_id])  # no attempt used up
+    # The search's own run, claimed by the next free slot (the waiting suggestion is not
+    # claimable while it is open): one search, its page read.
     searched = await run_once(intel_pool, deps)
     assert searched.status == "completed" and model.discover_calls == 1
     ((found,),) = await _rows(
@@ -807,12 +825,10 @@ async def test_a_suggestion_hands_its_saved_searches_to_their_own_runs(
         " ON d.document_id = s.document_id WHERE d.source_id = %s",
         search_id,
     )
-    # Asked again: the search has been read, so nothing is deferred and its evidence is shown.
-    again = await store.register_and_queue_suggestion(SUGGEST_REQUEST, chosen, operator="ann")
-    assert again.registered == ()
-    asked = await run_once(intel_pool, deps)
-    assert asked.status == "completed", asked
-    assert asked.outcome.get("sources_deferred", 0) == 0 and model.discover_calls == 1
+    # Now the suggestion resumes: it reads nothing itself and answers with what the search found.
+    resumed = await run_once(intel_pool, deps)
+    assert resumed.status == "completed", resumed
+    assert model.suggest_calls == 1 and model.discover_calls == 1 and model.extract_calls == 2
     payload = json.loads(model.suggestion_users[-1])
     assert str(found) in {e["signal_id"] for e in payload["evidence"]}
 
@@ -836,7 +852,7 @@ async def test_a_draft_options_saved_search_is_still_read_in_its_own_run(
     )
     deps = make_deps(intel_pool, fetcher, model)
     result = await run_once(intel_pool, deps)
-    assert result.status == "completed" and model.discover_calls == 0
+    assert result.status == "waiting" and model.discover_calls == 0
     assert await _open_runs(intel_pool, search_id) == [("discovery", "queued", "schedule")]
     searched = await run_once(intel_pool, deps)
     assert searched.status == "completed" and model.discover_calls == 1
@@ -859,7 +875,8 @@ async def test_a_saved_search_with_a_read_already_open_gets_no_second(
     already = await PostgresIntelStore(intel_pool).queue_source_check(search_id, operator="ann")
     model = FakeQuestionModel(suggest_with=_cite_everything())
     result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
-    assert result.status == "completed" and model.discover_calls == 0
+    assert result.status == "waiting" and model.discover_calls == 0
+    assert result.wait is not None and result.wait.awaiting == (search_id,)
     assert result.outcome["sources_deferred"] == 1
     assert result.outcome["search_sources_deferred"] == 1
     ((run_id,),) = await _rows(
@@ -868,3 +885,164 @@ async def test_a_saved_search_with_a_read_already_open_gets_no_second(
         search_id,
     )
     assert run_id == already
+
+
+# ── a suggestion waits for its evidence (spec 2026-10-08-intel-suggestion-waits-for-evidence) ──
+
+
+async def _run_at(pool: AsyncConnectionPool, deps: Any, when: datetime) -> RunResult | None:
+    """run_once with the claim and the run's clock at ``when``; None when nothing is claimable."""
+    store = PostgresIntelStore(pool)
+    claimed = await store.claim_next(when, lease_seconds=900)
+    if claimed is None:
+        return None
+    deps.clock = lambda: when
+    result = await run(claimed, deps)
+    if result.status == "waiting":
+        assert result.wait is not None
+        await store.wait_run(
+            claimed.run_id,
+            attempts=claimed.attempts,
+            outcome=dict(result.outcome),
+            awaiting=result.wait.awaiting,
+            deadline=result.wait.deadline,
+            not_before=result.wait.not_before,
+        )
+    else:
+        await store.finish_run(
+            claimed.run_id,
+            status=result.status,
+            outcome=dict(result.outcome),
+            error_code=result.error_code,
+        )
+    return result
+
+
+async def test_a_suggestion_with_no_evidence_at_all_answers_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """§2.5: an empty pool is never answered. No call, nothing written, and the question's
+    previous suggestion stays delivered."""
+    await seed_quiz_vocabulary(intel_pool)
+    signal = await seed_signal(intel_pool, run_id=await _done_run(intel_pool), tags=("instagram",))
+    store = PostgresQuestionStore(intel_pool)
+    model = FakeQuestionModel(suggest_with=_cite_everything())
+    deps = make_deps(intel_pool, FakeFetcher({}), model)
+    await store.register_and_queue_suggestion(SUGGEST_REQUEST, [], operator="ann")
+    first = await run_once(intel_pool, deps)
+    assert first.status == "completed" and model.suggest_calls == 1
+    await PostgresEvidenceStore(intel_pool).retract_signal(signal, operator="ann", reason="wrong")
+    await store.register_and_queue_suggestion(SUGGEST_REQUEST, [], operator="ann")
+    second = await run_once(intel_pool, deps)
+    assert (second.status, second.error_code) == ("failed", "no_evidence_found")
+    assert second.outcome["suggestion_no_evidence"] == 1
+    assert second.outcome["suggestion_evidence"] == 0
+    assert model.suggest_calls == 1  # never asked
+    rows = await _rows(
+        intel_pool, "SELECT status FROM intel_proposals WHERE kind = 'weight_suggestion'"
+    )
+    assert rows == [("delivered",)]
+
+
+async def test_an_awaited_read_an_outage_left_unread_is_queued_again_then_answered(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """§2.4: the second page's read fails (the fetcher is down), so coming back the suggestion
+    queues it again and waits, no sooner than the retry time; once it is read, it answers."""
+    await seed_quiz_vocabulary(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [_chosen(), _chosen(NEW_SAFETY)], operator="ann"
+    )
+    _, safety = queued.registered
+    down: dict[str, Any] = {
+        NEW_TERMS: make_page(POLICY, NEW_TERMS),
+        NEW_SAFETY: FetchFailure(code="fetcher_unreachable"),
+    }
+    model = FakeQuestionModel(make_signal(tags=["instagram"]), suggest_with=_cite_everything())
+    deps = make_deps(intel_pool, FakeFetcher(down), model)
+    assert (await run_once(intel_pool, deps)).status == "waiting"
+    failed = await run_once(intel_pool, deps)  # the page's own read, still down
+    assert failed.status == "failed"
+    # A fetcher-side failure says nothing about the page, so the source records no check at all:
+    # it is still unread.
+    unread = "SELECT last_checked_at IS NULL FROM intel_sources WHERE source_id = %s"
+    assert await _scalar(intel_pool, unread, safety) is True
+    back = await run_once(intel_pool, deps)  # the suggestion: queues the read again, waits
+    assert back.status == "waiting" and back.wait is not None
+    assert back.wait.not_before == NOW + timedelta(seconds=SUGGESTION_WAIT_RETRY_SECONDS)
+    assert back.outcome["suggestion_reads_requeued"] == 1 and model.suggest_calls == 0
+    up = make_deps(
+        intel_pool,
+        FakeFetcher({url: make_page(POLICY, url) for url in (NEW_TERMS, NEW_SAFETY)}),
+        model,
+    )
+    read = await run_once(intel_pool, up)  # the read queued again; the page answers now
+    assert read.status == "completed"
+    assert await _run_at(intel_pool, up, NOW) is None  # not before its retry time
+    later = NOW + timedelta(seconds=SUGGESTION_WAIT_RETRY_SECONDS + 1)
+    answered = await _run_at(intel_pool, up, later)
+    assert answered is not None and answered.status == "completed", answered
+    assert model.suggest_calls == 1
+    assert len(json.loads(model.suggestion_users[0])["evidence"]) == 2
+
+
+async def test_past_its_deadline_a_suggestion_answers_from_what_it_holds(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """§2.4: a saved search that is never read does not hold the suggestion forever."""
+    await seed_quiz_vocabulary(intel_pool)
+    await seed_signal(intel_pool, run_id=await _done_run(intel_pool), tags=("instagram",))
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [_chosen_search()], operator="ann"
+    )
+    (search_id,) = queued.registered
+    model = FakeQuestionModel(suggest_with=_cite_everything())
+    deps = make_deps(intel_pool, FakeFetcher({}), model)
+    assert (await run_once(intel_pool, deps)).status == "waiting"
+    async with intel_pool.connection() as conn:  # its read is stuck: claimed, never finished
+        await conn.execute(
+            "UPDATE intel_runs SET status = 'running', lease_expires_at = %s WHERE source_id = %s",
+            (NOW + timedelta(days=1), search_id),
+        )
+    assert await _run_at(intel_pool, deps, NOW + timedelta(minutes=10)) is None
+    late = NOW + timedelta(seconds=SUGGESTION_WAIT_MAX_SECONDS + 1)
+    answered = await _run_at(intel_pool, deps, late)
+    assert answered is not None and answered.status == "completed", answered
+    assert answered.outcome["suggestion_wait_timed_out"] == 1
+    assert answered.outcome["suggestion_sources_unread"] == 1
+    assert model.suggest_calls == 1
+
+
+async def test_a_later_press_is_never_replaced_by_an_earlier_one_that_waited(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """§2.7: the first press waits for its saved search; a second press for the same question
+    answers meanwhile; when the first finally answers, it is born superseded."""
+    await seed_quiz_vocabulary(intel_pool)
+    await seed_signal(intel_pool, run_id=await _done_run(intel_pool), tags=("instagram",))
+    store = PostgresQuestionStore(intel_pool)
+    model = FakeQuestionModel(discovery=_found_article(), suggest_with=_cite_everything())
+    fetcher = FakeFetcher({ARTICLE: make_page(POLICY, ARTICLE)})
+    deps = make_deps(intel_pool, fetcher, model)
+    earlier = await store.register_and_queue_suggestion(
+        SUGGEST_REQUEST, [_chosen_search()], operator="ann"
+    )
+    assert (await run_once(intel_pool, deps)).status == "waiting"
+    search_run = await claim(intel_pool)  # the search's read, in flight
+    later = await store.register_and_queue_suggestion(SUGGEST_REQUEST, [], operator="bob")
+    assert (await run_once(intel_pool, deps)).status == "completed"  # the later press
+    searched = await run(search_run, deps)
+    await PostgresIntelStore(intel_pool).finish_run(
+        search_run.run_id, status=searched.status, outcome=dict(searched.outcome)
+    )
+    resumed = await run_once(intel_pool, deps)
+    assert resumed.status == "completed", resumed
+    rows = await _rows(
+        intel_pool,
+        "SELECT run_id, status, supersede_reason FROM intel_proposals"
+        " WHERE kind = 'weight_suggestion'",
+    )
+    assert {r[0]: (r[1], r[2]) for r in rows} == {
+        later.run_id: ("delivered", None),
+        earlier.run_id: ("superseded", "newer_proposal"),
+    }

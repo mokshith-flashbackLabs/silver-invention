@@ -351,8 +351,13 @@ def prompt_suggestion_question(
 def render_suggestion(run: Run, found: tuple[UUID, list[dict[str, Any]]] | None) -> dict[str, Any]:
     """GET /weight-suggestions/{run_id} (spec §4.6, §4.10). ``proposal_id`` and ``options`` are
     null until the run wrote a suggestion (``found``, from the store); ``sources_deferred``
-    counts the sources left for their first scheduled check."""
+    counts the sources this run could not read itself.
+
+    *Amended 2026-10-08 (spec 2026-10-08-intel-suggestion-waits-for-evidence §4):* while the run
+    waits for those reads, ``awaiting_sources`` says how many and ``wait_deadline`` until when at
+    most; both are 0 / null once it has resumed or ended."""
     deferred = run.outcome.get("sources_deferred", 0)
+    waiting = run.status == "queued" and run.awaiting_source_ids is not None
     return {
         "run_id": run.run_id,
         "status": run.status,
@@ -360,4 +365,6 @@ def render_suggestion(run: Run, found: tuple[UUID, list[dict[str, Any]]] | None)
         "error_code": run.error_code,
         "options": found[1] if found is not None else None,
         "sources_deferred": deferred if isinstance(deferred, int) else 0,
+        "awaiting_sources": len(run.awaiting_source_ids or []) if waiting else 0,
+        "wait_deadline": run.wait_deadline if waiting else None,
     }

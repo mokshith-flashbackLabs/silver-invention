@@ -75,6 +75,10 @@ class Run(BaseModel):
     error_code: str | None
     created_at: datetime
     completed_at: datetime | None
+    # A waiting weight suggestion's awaited sources and deadline (migration 0050); null on
+    # every other run, and on a suggestion that never waited.
+    awaiting_source_ids: list[UUID] | None = None
+    wait_deadline: datetime | None = None
 
 
 class RunEvent(BaseModel):

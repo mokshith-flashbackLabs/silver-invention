@@ -26,6 +26,7 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Literal, Protocol, get_args
 from urllib.parse import urlsplit
@@ -52,6 +53,7 @@ RunEventKind = Literal[
     "model_call_skipped",
     "run_finished",
     "truncated",
+    "waiting",  # migration 0050: a weight suggestion waiting for the reads it queued
 ]
 RUN_EVENT_KINDS: tuple[str, ...] = get_args(RunEventKind)
 
@@ -242,7 +244,26 @@ def run_started_event(run: Run) -> tuple[str, dict[str, Any]]:
         kind=run.kind,
     )
     attempt = f" (attempt {run.attempts})" if run.attempts > 1 else ""
+    if run.awaiting_source_ids is not None:
+        # A suggestion coming back from waiting (migration 0050): its reads are done, or its
+        # deadline passed. Not a new attempt.
+        detail = {"run_kind": run.kind, "attempt": run.attempts, "resumed": True}
+        return f"Resumed: {what}", detail
     return f"Started: {what}{attempt}", {"run_kind": run.kind, "attempt": run.attempts}
+
+
+def run_waiting_event(
+    awaiting: int, deadline: datetime, *, retry: bool
+) -> tuple[str, dict[str, Any]]:
+    """``Waiting for 3 sources to be read before suggesting`` (spec 2026-10-08 §4). ``retry``:
+    some of them were read once and left unread (an outage), and are queued again."""
+    sources = _plural(awaiting, "source", "sources")
+    text = (
+        f"Waiting: {sources} could not be read yet, trying again"
+        if retry
+        else f"Waiting for {sources} to be read before suggesting"
+    )
+    return text, {"awaiting": awaiting, "deadline": deadline.isoformat(), "retry": retry}
 
 
 def run_finished_event(

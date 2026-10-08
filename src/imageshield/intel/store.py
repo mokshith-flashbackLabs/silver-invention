@@ -46,7 +46,7 @@ SOURCE_COLUMNS = """source_id, kind, source_url, url_hash, query_text, tags, che
     consecutive_failures, disabled_reason, created_by, created_at, origin, proposed_for,
     validation_run_id, validated_at"""
 RUN_COLUMNS = """run_id, kind, source_id, request, status, attempts, requested_by, outcome,
-    error_code, created_at, completed_at"""
+    error_code, created_at, completed_at, awaiting_source_ids, wait_deadline"""
 
 _AUDIT_SQL = """
     INSERT INTO audit_log (actor_type, action, resource_id, metadata)
@@ -78,13 +78,31 @@ _CLAIM_SQL = f"""
            started_at = coalesce(started_at, %(now)s),
            lease_expires_at = %(now)s + make_interval(secs => %(lease)s)
      WHERE run_id = (
-        SELECT run_id FROM intel_runs
-         WHERE attempts < %(max_attempts)s
-           AND (status = 'queued' OR (status = 'running' AND lease_expires_at <= %(now)s))
-         ORDER BY created_at
-         FOR UPDATE SKIP LOCKED
+        SELECT q.run_id FROM intel_runs q
+         WHERE q.attempts < %(max_attempts)s
+           AND (q.status = 'queued' OR (q.status = 'running' AND q.lease_expires_at <= %(now)s))
+           -- A waiting suggestion (0050): not before its retry time, and only once none of the
+           -- sources it awaits has a read open, or its deadline has passed.
+           AND (q.not_before IS NULL OR q.not_before <= %(now)s)
+           AND (q.awaiting_source_ids IS NULL OR q.wait_deadline <= %(now)s
+                OR NOT EXISTS (SELECT 1 FROM intel_runs a
+                                WHERE a.source_id = ANY(q.awaiting_source_ids)
+                                  AND a.status IN ('queued', 'running')))
+         ORDER BY q.created_at
+         FOR UPDATE OF q SKIP LOCKED
          LIMIT 1)
     RETURNING {RUN_COLUMNS}
+"""
+
+# A weight suggestion gives its claim back and waits (spec 2026-10-08 §2): 'queued' again with
+# its awaited sources, deadline and retry time, and the claim's attempt returned, so waiting
+# never uses one up. Guarded on the claim exactly like finish_run.
+_WAIT_SQL = """
+    UPDATE intel_runs SET status = 'queued', attempts = attempts - 1, outcome = %(outcome)s,
+           awaiting_source_ids = %(awaiting)s, wait_deadline = %(deadline)s,
+           not_before = %(not_before)s, lease_expires_at = NULL
+     WHERE run_id = %(run_id)s AND status = 'running' AND attempts = %(attempts)s
+    RETURNING 1
 """
 
 _EXPIRE_SQL = """
@@ -203,6 +221,16 @@ class IntelStore(Protocol):
         outcome: dict[str, Any],
         error_code: str | None = None,
         attempts: int | None = None,
+    ) -> bool: ...
+    async def wait_run(
+        self,
+        run_id: UUID,
+        *,
+        attempts: int,
+        outcome: dict[str, Any],
+        awaiting: Sequence[UUID],
+        deadline: datetime,
+        not_before: datetime | None,
     ) -> bool: ...
     async def set_run_vocabulary(
         self, run_id: UUID, *, release_no: int, map_version: int
@@ -446,6 +474,33 @@ class PostgresIntelStore:
         if count:
             log.error("intel.run_attempts_exhausted", count=count)
         return count
+
+    async def wait_run(
+        self,
+        run_id: UUID,
+        *,
+        attempts: int,
+        outcome: dict[str, Any],
+        awaiting: Sequence[UUID],
+        deadline: datetime,
+        not_before: datetime | None,
+    ) -> bool:
+        """A weight suggestion gives its claim back until the reads it queued are done (spec
+        2026-10-08-intel-suggestion-waits-for-evidence §2): 'queued' again, the attempt returned,
+        guarded on the claim like ``finish_run``. Returns whether the row was written."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                _WAIT_SQL,
+                {
+                    "outcome": Jsonb(outcome),
+                    "awaiting": list(awaiting),
+                    "deadline": deadline,
+                    "not_before": not_before,
+                    "run_id": run_id,
+                    "attempts": attempts,
+                },
+            )
+            return await cur.fetchone() is not None
 
     async def finish_run(
         self,

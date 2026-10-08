@@ -658,6 +658,17 @@ def test_the_suggestion_poll_answers_options_once_written_and_counts_deferred_so
     questions.runs[queued.run_id] = queued
     body = client.get(f"/v1/admin/intel/weight-suggestions/{queued.run_id}", headers=ADMIN).json()
     assert (body["status"], body["proposal_id"], body["options"]) == ("queued", None, None)
+    assert (body["awaiting_sources"], body["wait_deadline"]) == (0, None)
+    # Waiting for the reads it queued (spec 2026-10-08 §4): how many, and until when at most.
+    deadline = _now() + timedelta(minutes=45)
+    waiting = _run("weight_suggestion", status="queued", outcome={"sources_deferred": 2})
+    waiting = waiting.model_copy(
+        update={"awaiting_source_ids": [uuid4(), uuid4()], "wait_deadline": deadline}
+    )
+    questions.runs[waiting.run_id] = waiting
+    body = client.get(f"/v1/admin/intel/weight-suggestions/{waiting.run_id}", headers=ADMIN).json()
+    assert (body["status"], body["options"], body["awaiting_sources"]) == ("queued", None, 2)
+    assert datetime.fromisoformat(body["wait_deadline"]) == deadline
     done = _run("weight_suggestion", outcome={"sources_deferred": 3})
     proposal_id = uuid4()
     questions.runs[done.run_id] = done

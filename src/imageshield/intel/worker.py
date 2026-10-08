@@ -47,7 +47,7 @@ from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import HttpTextFetcher
 from imageshield.intel.model import ClaudeIntelModel, IntelModel
 from imageshield.intel.models import Run
-from imageshield.intel.pipeline import PipelineDeps, run
+from imageshield.intel.pipeline import PipelineDeps, RunResult, run
 from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.protection_store import PostgresProtectionStore
 from imageshield.intel.question_store import PostgresQuestionStore
@@ -57,6 +57,7 @@ from imageshield.intel.run_log import (
     current_run_log,
     run_finished_event,
     run_started_event,
+    run_waiting_event,
 )
 from imageshield.intel.store import PostgresIntelStore
 from imageshield.providers.store import PostgresProviderControlStore
@@ -198,6 +199,9 @@ async def execute(claimed: Run, deps: PipelineDeps, *, lease_seconds: int) -> No
                 "intel.run_result_dropped", run_id=run_id, kind=claimed.kind, status=result.status
             )
             return
+        if result.status == "waiting":
+            await _wait(claimed, result, deps, run_log)
+            return
         await run_log.append(
             "run_finished",
             *run_finished_event(
@@ -228,6 +232,48 @@ async def execute(claimed: Run, deps: PipelineDeps, *, lease_seconds: int) -> No
         )
     finally:
         await lease.stop()
+
+
+async def _wait(claimed: Run, result: RunResult, deps: PipelineDeps, run_log: RunLog) -> None:
+    """A weight suggestion leaves the queue until the reads it queued are done (spec
+    2026-10-08-intel-suggestion-waits-for-evidence §2): a ``waiting`` step, never
+    ``run_finished``, then the claim given back. Guarded on the claim like a finish."""
+    wait = result.wait
+    run_id = str(claimed.run_id)
+    if wait is None:  # a bug in the run: never leave it 'running' with nothing to say why
+        log.error("intel.run_wait_missing", run_id=run_id, kind=claimed.kind)
+        await deps.store.finish_run(
+            claimed.run_id,
+            status="failed",
+            outcome=result.outcome,
+            error_code="wait_missing",
+            attempts=claimed.attempts,
+        )
+        return
+    await run_log.append(
+        "waiting",
+        *run_waiting_event(
+            len(wait.awaiting), wait.deadline, retry=wait.not_before is not None
+        ),
+    )
+    waited = await deps.store.wait_run(
+        claimed.run_id,
+        attempts=claimed.attempts,
+        outcome=result.outcome,
+        awaiting=wait.awaiting,
+        deadline=wait.deadline,
+        not_before=wait.not_before,
+    )
+    if not waited:
+        log.warning("intel.run_result_dropped", run_id=run_id, kind=claimed.kind, status="waiting")
+        return
+    log.info(
+        "intel.run_waiting",
+        run_id=run_id,
+        kind=claimed.kind,
+        awaiting=len(wait.awaiting),
+        deadline=wait.deadline.isoformat(),
+    )
 
 
 async def _execute_alone(claimed: Run, deps: PipelineDeps, *, lease_seconds: int) -> None:

@@ -82,18 +82,31 @@ _REGISTER_SQL = """
     RETURNING source_id
 """
 
-_SUPERSEDE_SUGGESTION_SQL = """
-    UPDATE intel_proposals SET status = 'superseded', supersede_reason = 'newer_proposal'
-     WHERE kind = 'weight_suggestion' AND status = 'delivered'
-       AND target->>'question_key' = %s
-    RETURNING proposal_id
+# A newer press always wins (spec 2026-10-08-intel-suggestion-waits-for-evidence §2.7). A
+# suggestion that waited for its reads can finish after a later press for the same question, so
+# it supersedes only the delivered suggestions of runs created no later than its own, and is
+# itself born superseded if a later run's suggestion is already delivered.
+_RUN_CREATED = "coalesce((SELECT created_at FROM intel_runs WHERE run_id = {}), '-infinity')"
+_SUPERSEDE_SUGGESTION_SQL = f"""
+    UPDATE intel_proposals p SET status = 'superseded', supersede_reason = 'newer_proposal'
+     WHERE p.kind = 'weight_suggestion' AND p.status = 'delivered'
+       AND p.target->>'question_key' = %(question_key)s
+       AND {_RUN_CREATED.format("p.run_id")} <= {_RUN_CREATED.format("%(run_id)s")}
+    RETURNING p.proposal_id
+"""
+_NEWER_SUGGESTION_SQL = f"""
+    SELECT 1 FROM intel_proposals p
+     WHERE p.kind = 'weight_suggestion' AND p.status = 'delivered'
+       AND p.target->>'question_key' = %(question_key)s
+       AND {_RUN_CREATED.format("p.run_id")} > {_RUN_CREATED.format("%(run_id)s")}
+     LIMIT 1
 """
 
 _INSERT_SUGGESTION_SQL = """
-    INSERT INTO intel_proposals (kind, status, target, suggested, rationale,
+    INSERT INTO intel_proposals (kind, status, supersede_reason, target, suggested, rationale,
         against_scoring_version, against_release_no, run_id, model_id, prompt_version)
-    VALUES ('weight_suggestion', 'delivered', %(target)s, '{}'::jsonb, '', %(asv)s, %(arn)s,
-            %(run_id)s, %(model_id)s, %(prompt_version)s)
+    VALUES ('weight_suggestion', %(status)s, %(reason)s, %(target)s, '{}'::jsonb, '', %(asv)s,
+            %(arn)s, %(run_id)s, %(model_id)s, %(prompt_version)s)
     RETURNING proposal_id
 """
 
@@ -468,9 +481,11 @@ class PostgresQuestionStore:
     ) -> WriteResult | None:
         """spec §3.6: born 'delivered', superseding the older delivered suggestion for the same
         question_key, in ONE transaction with its signal links and its audit row. The links are
-        every option's cited signals, and there may be none: "no evidence, operator's call" is an
-        answer (§3.6, note of 2026-09-30). None when this run already wrote one: a reclaimed run
-        never writes twice. The advisory lock orders two suggestions for one question."""
+        every option's cited signals; an option may cite none (its honest "no evidence"), but
+        since 2026-10-08 the run never writes a suggestion when it held no evidence at all. None
+        when this run already wrote one: a reclaimed run never writes twice. The advisory lock
+        orders two suggestions for one question; a later press's suggestion already delivered
+        makes this one born superseded (spec 2026-10-08 §2.7)."""
         signal_ids: list[UUID] = []
         for option in options:
             signal_ids += [s for s in option.signal_ids if s not in signal_ids]
@@ -486,12 +501,19 @@ class PostgresQuestionStore:
             )
             if await cur.fetchone() is not None:
                 return None
-            cur = await conn.execute(_SUPERSEDE_SUGGESTION_SQL, (question_key,))
-            superseded = [r[0] for r in await cur.fetchall()]
+            keys = {"question_key": question_key, "run_id": run_id}
+            cur = await conn.execute(_NEWER_SUGGESTION_SQL, keys)
+            outrun = await cur.fetchone() is not None
+            superseded: list[UUID] = []
+            if not outrun:
+                cur = await conn.execute(_SUPERSEDE_SUGGESTION_SQL, keys)
+                superseded = [r[0] for r in await cur.fetchall()]
             target = {"question_key": question_key, "options": [o.as_json() for o in options]}
             cur = await conn.execute(
                 _INSERT_SUGGESTION_SQL,
                 {
+                    "status": "superseded" if outrun else "delivered",
+                    "reason": "newer_proposal" if outrun else None,
                     "target": Jsonb(target),
                     "asv": against_scoring_version,
                     "arn": against_release_no,
@@ -520,6 +542,7 @@ class PostgresQuestionStore:
                             "run_id": str(run_id),
                             "question_key": question_key,
                             "superseded": [str(i) for i in superseded],
+                            "outrun_by_newer": outrun,
                         }
                     ),
                 },

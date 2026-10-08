@@ -327,6 +327,19 @@ async def run_once(pool: AsyncConnectionPool, deps: PipelineDeps) -> RunResult:
     """Claim, run AND finish -- a run left 'running' blocks the source's next check."""
     claimed = await claim(pool)
     result = await run(claimed, deps)
+    if result.status == "waiting":
+        # A weight suggestion waiting for the reads it queued (migration 0050): back to the
+        # queue exactly as the worker's _wait does it.
+        assert result.wait is not None
+        await PostgresIntelStore(pool).wait_run(
+            claimed.run_id,
+            attempts=claimed.attempts,
+            outcome=dict(result.outcome),
+            awaiting=result.wait.awaiting,
+            deadline=result.wait.deadline,
+            not_before=result.wait.not_before,
+        )
+        return result
     await PostgresIntelStore(pool).finish_run(
         claimed.run_id,
         status=result.status,

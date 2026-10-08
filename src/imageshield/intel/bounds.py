@@ -32,6 +32,12 @@ SUGGESTION_CONTEXT_MAX_SIGNALS = 80
 # How many recent candidate signals the subject and category classes read. A read bound, never
 # sent to the model.
 SUGGESTION_POOL_MAX = 2000
+# A suggestion waits for the reads it queued (spec 2026-10-08-intel-suggestion-waits-for-evidence
+# §2): at most this long from its first wait, then it answers from what it holds; and an awaited
+# source whose read ended unread is queued again no sooner than this, so an outage is not
+# retried in a tight loop.
+SUGGESTION_WAIT_MAX_SECONDS = 45 * 60
+SUGGESTION_WAIT_RETRY_SECONDS = 120
 # Request bounds. The backend enforces 50 options and 250 candidates or sources itself; these accept
 # at least that.
 MAX_QUESTION_OPTIONS = 50

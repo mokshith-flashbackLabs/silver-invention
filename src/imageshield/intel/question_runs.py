@@ -23,7 +23,8 @@ the pipeline's internals and why the pipeline imports this module lazily.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -35,6 +36,8 @@ from imageshield.intel.bounds import (
     SUGGESTION_CONTEXT_DAYS,
     SUGGESTION_CONTEXT_MAX_SIGNALS,
     SUGGESTION_POOL_MAX,
+    SUGGESTION_WAIT_MAX_SECONDS,
+    SUGGESTION_WAIT_RETRY_SECONDS,
 )
 from imageshield.intel.fetch_client import FetchFailure
 from imageshield.intel.generation import prompt_registry, prompt_signal
@@ -43,6 +46,7 @@ from imageshield.intel.pii import contains_pii
 from imageshield.intel.pipeline import (
     RunResult,
     RunStatus,
+    RunWait,
     _call_model,
     _CallCap,
     _Ctx,
@@ -293,17 +297,33 @@ async def _validate_search(ctx: _Ctx, query: str, refused: _Refused) -> str | No
 
 
 async def _weight_suggestion(ctx: _Ctx) -> RunResult:
-    """Read, suggest, generate. The run's status is the suggestion's: completed once one is
+    """Read, wait, suggest, generate. The run's status is the suggestion's: completed once one is
     written. A gate refusal while reading ends the run ``refused`` before any suggestion,
-    because the same gate would refuse that too; an outage while reading lets the suggestion
-    go ahead with what was read. Generation runs unless the gate refused."""
+    because the same gate would refuse that too. Generation runs unless the gate refused.
+
+    *Amended 2026-10-08 (spec 2026-10-08-intel-suggestion-waits-for-evidence §2):* a suggestion
+    never answers from evidence it has not read yet. Whatever this pass could not read -- its
+    saved searches, sources past the cap, sources an outage stopped -- is queued as that
+    source's own read, and the run WAITS (``RunResult("waiting")``): it leaves the queue until
+    none of those reads is open, or SUGGESTION_WAIT_MAX_SECONDS have passed. Coming back it
+    reads nothing itself; an awaited source whose read ended unread is queued again (within the
+    deadline, no sooner than SUGGESTION_WAIT_RETRY_SECONDS) and the run waits again."""
     try:
         request = SuggestionRunRequest.model_validate(ctx.run.request)
     except ValidationError:
         return RunResult("failed", ctx.outcome(), "request_unreadable")
-    stop = await _read_new_sources(ctx, request)
-    if stop is not None and stop.gate:
-        return RunResult("refused", {**ctx.outcome(), "refused_by": "gate"}, stop.reason)
+    if ctx.run.awaiting_source_ids is not None:
+        _carry_waiting_counts(ctx)
+        wait = await _still_waiting(ctx)
+        if wait is not None:
+            return _waiting(ctx, wait)
+    else:
+        stop, awaited = await _read_new_sources(ctx, request)
+        if stop is not None and stop.gate:
+            return RunResult("refused", {**ctx.outcome(), "refused_by": "gate"}, stop.reason)
+        if awaited:
+            deadline = _now(ctx) + timedelta(seconds=SUGGESTION_WAIT_MAX_SECONDS)
+            return _waiting(ctx, RunWait(awaiting=tuple(awaited), deadline=deadline))
     status, error = await _suggest(ctx, request)
     if status != "refused":
         try:
@@ -314,6 +334,57 @@ async def _weight_suggestion(ctx: _Ctx) -> RunResult:
     if status == "refused":
         outcome["refused_by"] = "gate"
     return RunResult(status, outcome, error)
+
+
+def _now(ctx: _Ctx) -> datetime:
+    now = ctx.deps.clock()
+    return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+
+
+def _waiting(ctx: _Ctx, wait: RunWait) -> RunResult:
+    outcome: dict[str, Any] = {**ctx.outcome(), "prompt_version": SUGGEST_PROMPT_VERSION}
+    return RunResult("waiting", outcome, None, wait)
+
+
+def _carry_waiting_counts(ctx: _Ctx) -> None:
+    """A run coming back from waiting starts a fresh context; its outcome so far is its earlier
+    passes' counts, calls and cost, carried so the finished outcome tells the whole run."""
+    for key, value in ctx.run.outcome.items():
+        if key == "model_calls" and isinstance(value, int):
+            ctx.model_calls += value
+        elif key == "cost_usd" and isinstance(value, str):
+            try:
+                ctx.cost_usd += Decimal(value)
+            except InvalidOperation:
+                continue
+        elif isinstance(value, int) and not isinstance(value, bool):
+            ctx.counts[key] += value
+
+
+async def _still_waiting(ctx: _Ctx) -> RunWait | None:
+    """Coming back from waiting (spec 2026-10-08 §2.4). The queue let this run in because none of
+    its awaited sources has a read open, or its deadline passed. Any of them whose read ended
+    without the page being read (``_unread``: an outage, a gate refusal) is queued again, and the
+    run waits again -- until the deadline, after which it answers from what it holds."""
+    awaited = list(ctx.run.awaiting_source_ids or ())
+    deadline = ctx.run.wait_deadline
+    now = _now(ctx)
+    sources = await ctx.deps.questions.sources_by_ids(awaited)
+    unread = [source.source_id for source in sources if _unread(source)]
+    if deadline is not None and now < deadline:
+        if not unread:
+            return None
+        await ctx.deps.questions.queue_source_reads(unread, now=now)
+        ctx.counts["suggestion_reads_requeued"] += len(unread)
+        return RunWait(
+            awaiting=tuple(awaited),
+            deadline=deadline,
+            not_before=now + timedelta(seconds=SUGGESTION_WAIT_RETRY_SECONDS),
+        )
+    ctx.counts["suggestion_wait_timed_out"] += 1
+    if unread:
+        ctx.counts["suggestion_sources_unread"] += len(unread)
+    return None
 
 
 def _unread(source: Source) -> bool:
@@ -329,7 +400,9 @@ def _unread(source: Source) -> bool:
     return no_evidence and (source.enabled or source.disabled_reason == "unmapped")
 
 
-async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop | None:
+async def _read_new_sources(
+    ctx: _Ctx, request: SuggestionRunRequest
+) -> tuple[_Stop | None, list[UUID]]:
     """Each newly registered source in the request's order, then each other named source no check
     has read yet (``_unread``), until the cap, a gate refusal or an outage ends reading. Every
     source left unread or part-read is made due, so its first scheduled check comes at once
@@ -385,11 +458,18 @@ async def _read_new_sources(ctx: _Ctx, request: SuggestionRunRequest) -> _Stop |
             deferred.append(source.source_id)
         else:
             ctx.counts["sources_read"] += 1
-    if deferred:
-        await ctx.deps.questions.mark_sources_due(deferred, now=ctx.deps.clock())
     if deferred or searches:
         ctx.counts["sources_deferred"] += len(deferred) + len(searches)
-    return stop
+    if stop is not None and stop.gate:
+        # The run is refused, and the same gate would refuse every read queued now: the sources
+        # are made due for their first scheduled check instead, as before.
+        await ctx.deps.questions.mark_sources_due(deferred, now=ctx.deps.clock())
+        return stop, []
+    if deferred:
+        # Each read this pass could not finish becomes that source's own run, which the
+        # suggestion then waits for (spec 2026-10-08 §2.1).
+        await ctx.deps.questions.queue_source_reads(deferred, now=ctx.deps.clock())
+    return stop, [*searches, *deferred]
 
 
 async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> tuple[RunStatus, str | None]:
@@ -425,6 +505,11 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> tuple[RunStatus,
         candidates, options=request.options, limit=SUGGESTION_CONTEXT_MAX_SIGNALS
     )
     ctx.counts["suggestion_evidence"] = len(context)
+    if not context:
+        # Never an answer from no evidence at all (spec 2026-10-08 §2.5): no call, nothing
+        # written, and the question's previous suggestion stays delivered.
+        ctx.counts["suggestion_no_evidence"] += 1
+        return "failed", "no_evidence_found"
     relevant = option_tag_set | {t for s in context for t in s.tags} | set(vocabulary.mapped_tags)
     system, user = suggestion_request(
         prompt_suggestion_question(request, tags_by_option, vocabulary),
