@@ -19,6 +19,9 @@ INTEL_STALE_GRACE_HOURS = 6
 # ── sources per question and weight suggestions (step 5, spec §4.6, §4.10) ───
 MIN_SOURCE_TEXT_CHARS = 200
 MAX_PROPOSED_SOURCES_PER_OPTION = 5
+# Of those, saved searches: each becomes a multi-minute research call on every check, and a page
+# is cheaper and more specific (spec 2026-10-08-intel-source-proposal-v2 §2).
+MAX_PROPOSED_SEARCHES_PER_OPTION = 2
 # A validation result is honoured this long (§4.10 stage 4).
 VALIDATION_TTL_HOURS = 24
 # How far back stage 4 looks for the question's stage-1 runs, to record a chosen source they

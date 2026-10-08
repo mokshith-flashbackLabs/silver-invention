@@ -1046,3 +1046,60 @@ async def test_a_later_press_is_never_replaced_by_an_earlier_one_that_waited(
         later.run_id: ("delivered", None),
         earlier.run_id: ("superseded", "newer_proposal"),
     }
+
+
+# ── sources-v2 (spec 2026-10-08-intel-source-proposal-v2) ─────────────────────────────────────
+
+
+def _searches(option: str, count: int) -> ProposedOptionSources:
+    return ProposedOptionSources(
+        option=option,
+        candidates=[
+            ProposedSource(kind="search_query", query_text=f"{option} deepfake {n}", reason="r")
+            for n in range(count)
+        ]
+        + [ProposedSource(kind="research", source_url=f"https://r.example/{option}", reason="r")],
+    )
+
+
+async def test_a_source_proposal_keeps_at_most_two_saved_searches_per_option(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """§2: a saved search is a multi-minute research call on every check; pages come first."""
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
+    sources = SourceProposalOutput(options=[_searches("Instagram", 4), _searches("Bumble", 1)])
+    model = FakeQuestionModel(sources=sources)
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert result.status == "completed", result
+    instagram, bumble = result.outcome["options"]
+    kinds = [c["kind"] for c in instagram["proposed"]]
+    assert kinds == ["search_query", "search_query", "research"]
+    assert [c["kind"] for c in bumble["proposed"]] == ["search_query", "research"]
+    assert result.outcome["candidate_dropped_search_over_cap"] == 2
+    assert result.outcome["prompt_version"] == "sources-v2"
+
+
+async def test_a_source_proposal_with_nothing_for_any_answer_fails(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """§2: v1 'completed' a gender question with no search made and no source anywhere."""
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
+    model = FakeQuestionModel(sources=SourceProposalOutput())
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert (result.status, result.error_code) == ("failed", "no_sources_found")
+    assert result.outcome["source_proposal_empty"] == 1
+    assert [o["proposed"] for o in result.outcome["options"]] == [[], []]
+
+
+async def test_existing_sources_alone_still_complete_a_source_proposal(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    existing = await _registered(intel_pool, "https://p.example/instagram-terms", ("instagram",))
+    await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
+    model = FakeQuestionModel(sources=SourceProposalOutput())
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert result.status == "completed", result
+    assert result.outcome["options"][0]["existing"] == [str(existing)]

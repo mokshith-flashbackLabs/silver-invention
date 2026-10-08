@@ -86,6 +86,11 @@ _MAX_TOKENS = 8000
 # _MAX_TOKENS: the 0.45 worst case in migration 0041 assumes 8 000 output tokens, and a
 # proposal call that stops there is consumed and counted (proposal_model_max_tokens).
 _PROPOSAL_EFFORT = "high"
+# Stage 1's source proposal answers for every option at once (up to 5 candidates each) after up
+# to INTEL_MAX_SOURCE_PROPOSAL_SEARCHES searches, and adaptive thinking spends from the same
+# budget: at _MAX_TOKENS an age question was cut off and its whole answer lost (spec
+# 2026-10-08-intel-source-proposal-v2 §1). Migration 0051 prices the larger call.
+_SOURCE_PROPOSAL_MAX_TOKENS = 16000
 # spec §4.10 stage 3: a search_query candidate costs ONE web search.
 _VALIDATION_SEARCHES = 1
 # The run log shows Claude's reasoning summary (spec 2026-10-03 §2): on Claude 5 models the
@@ -274,6 +279,7 @@ class ClaudeIntelModel:
         model: str,
         effort: str | None = None,
         announce: bool = True,
+        max_tokens: int = _MAX_TOKENS,
         **kwargs: Any,
     ) -> ModelCall[T]:
         """One streamed API call, retried within ``_RETRIES``. ``announce`` writes the run log's
@@ -292,7 +298,7 @@ class ClaudeIntelModel:
             try:
                 async with self._client.messages.stream(
                     model=model,
-                    max_tokens=_MAX_TOKENS,
+                    max_tokens=max_tokens,
                     thinking=_THINKING,
                     output_config=output_config,
                     **kwargs,
@@ -383,6 +389,7 @@ class ClaudeIntelModel:
         user: str,
         max_uses: int,
         effort: str | None = None,
+        max_tokens: int = _MAX_TOKENS,
     ) -> ModelCall[T]:
         """One web-search call on the extraction model, its pause_turn continuations driven to
         completion (spec §4.4), bounded by INTEL_MAX_CALLS_PER_RUN, usage summed across them.
@@ -411,6 +418,7 @@ class ClaudeIntelModel:
                 model=self._config.intel_extraction_model,
                 effort=effort,
                 announce=pause_turns == 0,
+                max_tokens=max_tokens,
                 system=system,
                 tools=tools,
                 messages=messages,
@@ -468,6 +476,7 @@ class ClaudeIntelModel:
             system=system,
             user=user,
             max_uses=self._config.intel_max_source_proposal_searches,
+            max_tokens=_SOURCE_PROPOSAL_MAX_TOKENS,
         )
 
     async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:

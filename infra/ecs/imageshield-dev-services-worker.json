@@ -133,7 +133,7 @@
         { "name": "INTEL_EXTRACTION_MODEL", "value": "claude-sonnet-5" },
         { "name": "INTEL_PROPOSAL_MODEL", "value": "claude-opus-5-5" },
         { "name": "INTEL_WEB_SEARCH_TOOL_TYPE", "value": "web_search_20260209" },
-        { "name": "INTEL_MAX_SOURCE_PROPOSAL_SEARCHES", "value": "10" },
+        { "name": "INTEL_MAX_SOURCE_PROPOSAL_SEARCHES", "value": "25" },
         { "name": "INTEL_RUN_CONCURRENCY", "value": "3" },
         { "name": "INTEL_SOURCE_READ_CONCURRENCY", "value": "4" },
         { "name": "INTEL_SEARCH_READ_EFFORT", "value": "medium" },

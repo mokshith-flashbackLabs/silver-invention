@@ -362,14 +362,30 @@ def test_proposal_shape_checks(migrated_db: str) -> None:
 
 
 def test_0041_prices_the_proposal_models_worst_case(migrated_db: str) -> None:
-    """Step 2 calls Opus 5.5; the step-0 worst case across both models is 0.45."""
+    """Step 2 calls Opus 5.5; the step-0 worst case across both models is 0.45 (0051 raises it
+    for stage 1's larger source proposal; rolling back through 0041 restores 0.25)."""
     query = "SELECT cost_per_call_usd FROM providers WHERE provider_id = 'claude_intel'"
+    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0042_"))
+    assert down.returncode == 0, down.stderr
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         assert conn.execute(query).fetchone() == (Decimal("0.45"),)
-    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0041_"))
+    down = run_migrate(migrated_db, "down", "--steps", "1")
     assert down.returncode == 0, down.stderr
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         assert conn.execute(query).fetchone() == (Decimal("0.25"),)
+    assert run_migrate(migrated_db, "up").returncode == 0
+
+
+def test_0051_prices_the_larger_source_proposal(migrated_db: str) -> None:
+    """spec 2026-10-08-intel-source-proposal-v2: 25 searches and 16k output tokens come to about
+    1.71, so the gate's estimate is 2.00; down restores 0041's 0.45."""
+    query = "SELECT cost_per_call_usd FROM providers WHERE provider_id = 'claude_intel'"
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(query).fetchone() == (Decimal("2.00"),)
+    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0051_"))
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(query).fetchone() == (Decimal("0.45"),)
     assert run_migrate(migrated_db, "up").returncode == 0
 
 

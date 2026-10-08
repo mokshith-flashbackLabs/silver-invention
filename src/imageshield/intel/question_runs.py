@@ -31,6 +31,7 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from imageshield.intel.bounds import (
+    MAX_PROPOSED_SEARCHES_PER_OPTION,
     MAX_PROPOSED_SOURCES_PER_OPTION,
     MAX_SEARCH_RESULTS_CHECKED,
     SUGGESTION_CONTEXT_DAYS,
@@ -160,13 +161,25 @@ async def _source_proposal(ctx: _Ctx) -> RunResult:
                 )
             )
             for option, candidates in cleaned.items():
+                searches = 0
                 for candidate in candidates:
                     if candidate.source_url is not None and url_hash(candidate.source_url) in hits:
                         ctx.counts["candidate_dropped_known_hit_location"] += 1
                     elif len(proposed[option]) >= MAX_PROPOSED_SOURCES_PER_OPTION:
                         ctx.counts["candidate_dropped_over_cap"] += 1
+                    elif (
+                        candidate.kind == "search_query"
+                        and searches >= MAX_PROPOSED_SEARCHES_PER_OPTION
+                    ):
+                        ctx.counts["candidate_dropped_search_over_cap"] += 1
                     else:
+                        searches += candidate.kind == "search_query"
                         proposed[option].append(candidate)
+            if not any(proposed[option] or existing[option] for option in request.options):
+                # Nothing for any answer is not a result (spec 2026-10-08-intel-source-proposal-v2
+                # §2): v1 "completed" a gender question with no search made and no source at all.
+                ctx.counts["source_proposal_empty"] += 1
+                status, error = "failed", "no_sources_found"
     outcome: dict[str, Any] = {
         **ctx.outcome(),
         "prompt_version": SOURCE_PROPOSAL_PROMPT_VERSION,

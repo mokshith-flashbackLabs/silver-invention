@@ -554,6 +554,8 @@ async def test_propose_sources_searches_with_its_own_budget_on_the_extraction_mo
     sent = fake.calls[0]
     assert sent["model"] == "claude-sonnet-5" and "effort" not in sent["output_config"]
     assert sent["tools"][0]["max_uses"] == 7
+    # sources-v2 (spec 2026-10-08): its own output budget, twice every other call's.
+    assert sent["max_tokens"] == 16000
     assert call.cost_usd == cost_of("claude-sonnet-5", Usage(1000, 100, 0, 0, 2))
 
 
