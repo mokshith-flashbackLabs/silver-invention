@@ -65,6 +65,10 @@ class RegistryEntry:
     label: str
     description: str
     retired: bool
+    # platform | service | practice, as the backend's profile.exposure_tags holds it (its 0070);
+    # "" from a document written before the push carried it. The news watch reads it
+    # (intel/news_watch.py).
+    kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -177,6 +181,7 @@ def parse_vocabulary(row: Vocabulary) -> ScoringVocabulary | None:
                 label=_str(raw.get("label", slug)),
                 description=_str(raw.get("description", "")),
                 retired=bool(raw.get("retired", False)),
+                kind=_str(raw.get("kind", "")),
             )
         option_tags: dict[tuple[str, str], tuple[str, ...]] = {}
         for raw in document.get("option_tags") or []:

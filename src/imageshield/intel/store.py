@@ -32,6 +32,11 @@ from imageshield.intel.models import (
     SpendToday,
     Vocabulary,
 )
+from imageshield.intel.news_watch import (
+    NEWS_WATCH_CHECK_EVERY_HOURS,
+    NEWS_WATCH_CREATED_BY,
+    watches,
+)
 from imageshield.intel.vocabulary import parse_vocabulary
 from imageshield.providers.store import utc_spend_date
 from imageshield.search.urlhash import NORMALISATION_VERSION, canonicalise, url_hash
@@ -160,6 +165,17 @@ _PATCH_SOURCE_SQL = f"""
     RETURNING {SOURCE_COLUMNS}
 """
 
+# The daily news watch (spec 2026-10-09-intel-news-watch-design §2.2): one saved search per
+# mapped platform tag. 0052's partial unique index makes this idempotent, and a watch an operator
+# disabled or edited is never re-created or reset, because its row still exists.
+_ENSURE_NEWS_WATCHES_SQL = """
+    INSERT INTO intel_sources (kind, query_text, tags, check_every_hours, created_by, origin)
+    SELECT 'search_query', w.query_text, ARRAY[w.tag], %(every)s, %(by)s, 'news_watch'
+      FROM unnest(%(tags)s::text[], %(queries)s::text[]) AS w(tag, query_text)
+    ON CONFLICT ((tags[1])) WHERE origin = 'news_watch' DO NOTHING
+    RETURNING source_id, tags[1] AS tag
+"""
+
 # spec §4.9, §4.10: a source whose NON-EMPTY tags are all unmapped in the live vocabulary pauses;
 # one paused that way resumes when any of its tags is mapped again, or when its tags are cleared
 # (an untagged source never pauses). A source disabled for any other reason, or by an operator
@@ -264,6 +280,7 @@ class IntelStore(Protocol):
     ) -> bool: ...
     async def load_vocabulary(self) -> Vocabulary | None: ...
     async def pause_unmapped_sources(self) -> SourcePause: ...
+    async def ensure_news_watches(self) -> tuple[UUID, ...]: ...
     async def spend_today(self, now: datetime) -> SpendToday: ...
 
 
@@ -702,6 +719,56 @@ class PostgresIntelStore:
             spent_today_usd=cost or Decimal("0"),
             daily_budget_usd=budget,
         )
+
+    async def ensure_news_watches(self) -> tuple[UUID, ...]:
+        """One daily news watch for every platform tag the live quiz maps (spec
+        2026-10-09-intel-news-watch-design §2.2), created by code on a worker tick. Returns the
+        watches created now. With no vocabulary, or one that cannot be read, nothing is created."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(
+                "SELECT release_no, map_version, scoring_version, quiz_version, document"
+                " FROM intel_vocabulary WHERE id = 1"
+            )
+            row = await cur.fetchone()
+            vocabulary = (
+                parse_vocabulary(Vocabulary.model_validate(row)) if row is not None else None
+            )
+            if vocabulary is None:
+                return ()
+            wanted = watches(vocabulary)
+            if not wanted:
+                return ()
+            created = await conn.execute(
+                _ENSURE_NEWS_WATCHES_SQL,
+                {
+                    "every": NEWS_WATCH_CHECK_EVERY_HOURS,
+                    "by": NEWS_WATCH_CREATED_BY,
+                    "tags": [w.tag for w in wanted],
+                    "queries": [w.query_text for w in wanted],
+                },
+            )
+            rows = await created.fetchall()
+            if rows:
+                await conn.execute(
+                    _AUDIT_SQL,
+                    {
+                        "actor_type": "service",
+                        "action": "intel.news_watch_created",
+                        "resource_id": None,
+                        "metadata": Jsonb(
+                            {
+                                "release_no": vocabulary.release_no,
+                                "map_version": vocabulary.map_version,
+                                "sources": [str(r[0]) for r in rows],
+                                "tags": [r[1] for r in rows],
+                            }
+                        ),
+                    },
+                )
+        if rows:
+            log.info("intel.news_watch_created", tags=[r[1] for r in rows])
+        return tuple(r[0] for r in rows)
 
     async def pause_unmapped_sources(self) -> SourcePause:
         """spec §4.9's source row, STATE-BASED: run on every worker tick before scheduling, it

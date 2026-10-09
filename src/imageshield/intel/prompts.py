@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
-DISCOVER_PROMPT_VERSION = "discover-v1"
+DISCOVER_PROMPT_VERSION = "discover-v2"
 PROPOSE_PROMPT_VERSION = "propose-v9"
 
 
@@ -62,19 +62,31 @@ def extraction_request(
     return system, user
 
 
-_DISCOVER_SYSTEM = """You search the web for recent public reporting relevant to a
-likeness-protection service's saved query. Return candidate article or page URLs (https only)
-with a one-line reason each. Do not return URLs of explicit or abusive content. Prefer primary
-sources: platform announcements, regulators, established news, research publishers."""
+# discover-v2 (spec 2026-10-09-intel-news-watch-design §2.1): v1 said "recent" without a date, and
+# on dev 82 of 216 documents read were more than a year old, so almost no incident was current
+# enough to be a threat. The date and the window are now given; reference material may still be
+# older, because points rest on research as well as news.
+_DISCOVER_SYSTEM = """You search the web for public reporting relevant to a likeness-protection
+service's saved query. "today" is today's date. Return candidate article or page URLs (https only)
+with a one-line reason each.
+
+- News: prefer reports published within recent_days days of today, and put the current month and
+  year in the searches you run. Never return an old news story as if it were new.
+- Reference material -- research, regulator and law-enforcement reports, platform policies -- may be
+  older, but not more than five years old.
+- Prefer primary sources: platform announcements, regulators, established news, research publishers.
+- Do not return URLs of explicit or abusive content."""
 
 
-def discovery_request(query: str, *, registry_tags: Sequence[RegistryTag]) -> tuple[str, str]:
+def discovery_request(
+    query: str, *, registry_tags: Sequence[RegistryTag], today: str, recent_days: int
+) -> tuple[str, str]:
     system = (
         _DISCOVER_SYSTEM
         + "\n\nPlatforms and practices of interest:\n"
         + ", ".join(t["label"] for t in registry_tags)
     )
-    return system, json.dumps({"query": query})
+    return system, json.dumps({"query": query, "today": today, "recent_days": recent_days})
 
 
 # ── sources per question (step 5, spec §4.10) ─────────────────────────────────

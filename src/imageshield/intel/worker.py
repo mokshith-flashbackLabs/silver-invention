@@ -96,6 +96,9 @@ async def housekeeping(deps: PipelineDeps) -> None:
     await deps.reconciler.reconcile()
     await deps.reconciler.resolve_gaps(now)
     await deps.store.expire_exhausted(now)
+    # spec 2026-10-09-intel-news-watch-design: a daily news watch for every mapped platform tag,
+    # created before the pause and the schedule so a new one is due on this same tick.
+    await deps.store.ensure_news_watches()
     # spec §4.10: sources follow the quiz. State-based, and before scheduling, so a source whose
     # tags all left the live quiz is paused before it can be queued.
     await deps.store.pause_unmapped_sources()

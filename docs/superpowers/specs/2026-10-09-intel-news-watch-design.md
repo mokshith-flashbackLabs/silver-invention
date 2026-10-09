@@ -1,6 +1,8 @@
-# A daily news watch for threats — design (specified, NOT built)
+# A daily news watch for threats — design
 
-Date: 2026-10-09. Owner: "write spec for 1 but we are not going to do that today." Services only.
+Date: 2026-10-09. Owner: "write spec for 1 but we are not going to do that today", then the same day "so
+you build it now that you know its faults". BUILT 2026-10-09 (migration 0052, `intel/news_watch.py`,
+discover-v2). Services only.
 
 ## 1. Problem
 
@@ -32,14 +34,15 @@ payload. No schema change.
 
 ### 2.2 One news watch per mapped platform tag
 - **What:** for each registry tag of kind `platform` that a live quiz option maps (today: x, snapchat,
-  instagram, facebook, tiktok, youtube), one `search_query` source with `origin = 'news_watch'`, a query
-  such as "<platform label> deepfake OR impersonation OR leak OR sextortion", tags `[<slug>]`, and
-  `check_every_hours = 24`.
-- **Who creates it:** code, not the model. The vocabulary push (`PUT /v1/admin/intel/vocabulary`) already
-  tells services which tags are mapped. On each push, services create a missing watch for a newly mapped
-  platform tag and disable (never delete) the watch of a tag no longer mapped (`disabled_reason
-  'unmapped'`, the existing pause). Idempotent: one watch per tag (unique on `origin, tags[1]` for
-  `news_watch`).
+  instagram, facebook, tiktok, youtube), one `search_query` source with `origin = 'news_watch'`, the query
+  "<platform label> deepfake OR impersonation OR leaked photos OR sextortion" (generic kinds of likeness
+  misuse, the same for every platform: never a case, product or person, so what it finds is the search's
+  own finding), tags `[<slug>]`, and `check_every_hours = 24`.
+- **Who creates it:** code, not the model, on every worker tick (`ensure_news_watches`, before the unmapped
+  pause and the schedule), from the live vocabulary, whose tags now carry their `kind`. The existing
+  unmapped pause disables the watch of a tag no longer mapped and resumes it when it is mapped again.
+  Idempotent: one watch per tag (0052's partial unique index on `tags[1]` where `origin = 'news_watch'`),
+  and a disabled or edited watch is never re-created or reset because its row still exists.
 - **Reads:** an ordinary `discovery` run on the existing schedule path, so generation (propose-v8 threats)
   runs on what it finds. The suggestion flow never registers or waits for a watch.
 - **Operator control:** the watch shows on the Sources screen with its origin; an operator may disable it

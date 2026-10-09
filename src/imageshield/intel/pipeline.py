@@ -560,7 +560,12 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
     """One model call with web search; its candidate URLs are then fetched and read
     like any other page. The model's own search text is never evidence (#49)."""
     query = source.query_text or ""
-    system, user = discovery_request(query, registry_tags=ctx.registry_tags(source.tags, query))
+    system, user = discovery_request(
+        query,
+        registry_tags=ctx.registry_tags(source.tags, query),
+        today=_now(ctx).date().isoformat(),
+        recent_days=ctx.deps.threat_recency_days,
+    )
     call = await _call_model(ctx, lambda: ctx.deps.model.discover(system, user))
     if call.output is None:
         ctx.counts[f"model_{call.outcome}"] += 1
