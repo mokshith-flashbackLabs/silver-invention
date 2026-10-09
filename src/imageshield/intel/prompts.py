@@ -12,7 +12,7 @@ from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v1"
-PROPOSE_PROMPT_VERSION = "propose-v8"
+PROPOSE_PROMPT_VERSION = "propose-v9"
 
 
 class RegistryTag(TypedDict):
@@ -327,22 +327,19 @@ person's photos and likeness can be misused. For that ONE option give:
 Propose only for lasting changes -- a changed policy, a new default, a removed protection --
 never for one incident or one news cycle.
 
-threat_events -- the evidence shows an INCIDENT or an ONGOING ABUSE that raises the risk to people
-exposed through one or more tags in the registry below, AND it is current:
-- an incident is a breach, a leak, a wave of deepfakes, an outage: current when its evidence is
-  recent, published within threat_recency_days days of today;
-- an ongoing abuse is people actively misusing a platform or a tool on it -- a built-in AI that
-  keeps generating sexual images of real people, nudify ads that keep running, impersonation or
-  scam campaigns that keep coming back after removals: current for as long as the NEWEST report
-  that it is still happening is within threat_recency_days days of today, however long ago it
-  began. Judge it by that newest report, and cite it.
-A platform's claim to have stopped an abuse does not end it when a later report says it
-continues; an abuse or incident that the newest evidence says has ended (a feature withdrawn and
-no longer working, a leak closed, a campaign over) is not a threat. Lawsuits, rulings, studies and
-retrospectives are not incidents themselves, but one that reports the abuse is still happening is
-evidence that it is current. A threat proposal resting only on evidence older than that window is
-discarded. Undated evidence: judge from what it says, and never present an old story as a new
-incident. For each threat give:
+threat_events -- the evidence shows something raising the risk to people exposed through one or
+more tags in the registry below, AND it is current. It is either:
+- an INCIDENT -- a breach, a leak, a wave of deepfakes, an outage: current when its evidence was
+  published within threat_recency_days days of today; or
+- an ONGOING ABUSE -- misuse of a platform, or of a tool on it, that continues over time: current
+  while the NEWEST report that it is still happening was published within threat_recency_days
+  days of today, however long ago it began. Judge it by that newest report, and cite it.
+Whether something has stopped is decided by the newest evidence, not by an announcement: if a
+later report says it continues, it has not ended. If the newest evidence says it has ended, it is
+not a threat. A lawsuit, ruling, study or retrospective is not an incident by itself, but it can
+show that an abuse is still happening. A threat proposal resting only on evidence older than that
+window is discarded. Undated evidence: judge from what it says, and never present an old story as
+a new incident. For each threat give:
 - kind: leak | deepfake_wave | platform_incident | other (an ongoing abuse is usually
   deepfake_wave or platform_incident).
 - title: a short, plain, factual headline. Once an operator approves it, the people it concerns

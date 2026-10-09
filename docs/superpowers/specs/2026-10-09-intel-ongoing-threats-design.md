@@ -24,19 +24,24 @@ itself says has ended … is not a threat". Read that way:
 Both are abuse that is still going on. Under v7 neither could ever be a threat again, because its start
 date never moves.
 
-## 2. The rule (propose-v8)
+## 2. The rule (propose-v9)
 
-A threat is an INCIDENT or an ONGOING ABUSE that raises the risk to people exposed through a registry tag,
-and it is current:
-- an incident (a breach, a leak, a wave of deepfakes, an outage) when its evidence is recent, as before;
-- an ongoing abuse (people actively misusing a platform or a tool on it: a built-in AI that keeps making
-  sexual images of real people, nudify ads that keep running, impersonation or scam campaigns that keep
-  coming back) for as long as the NEWEST report that it is still happening is within the window, however
-  long ago it began. The model judges it by that report and cites it.
+*v8 (133161d) illustrated an ongoing abuse with "a built-in AI that keeps generating sexual images of
+real people" and "nudify ads that keep running" -- the very cases a manual search had just found. The
+owner: "I don't want bias from my side, just the AI has to find if it is needed." v9 states the rule with
+no platform, product or case in it, and the reports that search found were NOT pasted in. A test fails if
+the prompt names one.*
+
+A threat is something raising the risk to people exposed through a registry tag, and current. It is either:
+- an INCIDENT (a breach, a leak, a wave of deepfakes, an outage), current when its evidence was published
+  within the window, as before; or
+- an ONGOING ABUSE (misuse of a platform, or of a tool on it, that continues over time), current while the
+  NEWEST report that it is still happening was published within the window, however long ago it began.
+  The model judges it by that report and cites it.
 
 Also:
-- A platform's claim to have stopped an abuse does not end it when a later report says it continues. An
-  abuse the newest evidence says has ended is still not a threat.
+- Whether something has stopped is decided by the newest evidence, not by an announcement: a later report
+  that it continues means it has not ended. One the newest evidence says has ended is not a threat.
 - Lawsuits, rulings, studies and retrospectives are not incidents themselves, but one that reports the
   abuse is still happening is evidence that it is current.
 - `expires_in_days` for an ongoing abuse: how long it plausibly continues without a fresh report (≤ 90,
@@ -51,5 +56,6 @@ is dated and older than the window, so one recent report keeps an ongoing abuse 
 
 The rule can only use evidence the pipeline has read. The 2026-09-29 Grok report was not among the
 documents dev held; the stage-1 sources are evidence for points, checked weekly. Getting fresh news in is
-`2026-10-09-intel-news-watch-design.md` (specified, not built). Until then an operator can paste a report
-as a document (`POST /v1/admin/intel/documents`), and its generation runs under this rule.
+`2026-10-09-intel-news-watch-design.md` (specified, not built). Pasting hand-picked reports in would answer
+the question for the AI, so that was deliberately not done; whether a threat follows is the pipeline's own
+finding from the sources it reads.
