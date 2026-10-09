@@ -12,7 +12,7 @@ from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v1"
-PROPOSE_PROMPT_VERSION = "propose-v7"
+PROPOSE_PROMPT_VERSION = "propose-v8"
 
 
 class RegistryTag(TypedDict):
@@ -327,15 +327,24 @@ person's photos and likeness can be misused. For that ONE option give:
 Propose only for lasting changes -- a changed policy, a new default, a removed protection --
 never for one incident or one news cycle.
 
-threat_events -- the evidence shows a TIME-LIMITED incident -- a breach, a leak, a wave of
-deepfakes, an abuse campaign, an outage -- that raises the risk to people exposed through one or
-more tags in the registry below, AND the incident is current: its evidence is recent, published
-within threat_recency_days days of today. An older incident, or one the evidence itself says
-has ended (a feature withdrawn, a leak closed, a campaign over), is not a threat: it may support
-a lasting weight_change, or nothing. A threat proposal resting only on evidence older than that
-window is discarded. Undated evidence: judge from what it says, and never present an old story
-as a new incident. For each incident give:
-- kind: leak | deepfake_wave | platform_incident | other.
+threat_events -- the evidence shows an INCIDENT or an ONGOING ABUSE that raises the risk to people
+exposed through one or more tags in the registry below, AND it is current:
+- an incident is a breach, a leak, a wave of deepfakes, an outage: current when its evidence is
+  recent, published within threat_recency_days days of today;
+- an ongoing abuse is people actively misusing a platform or a tool on it -- a built-in AI that
+  keeps generating sexual images of real people, nudify ads that keep running, impersonation or
+  scam campaigns that keep coming back after removals: current for as long as the NEWEST report
+  that it is still happening is within threat_recency_days days of today, however long ago it
+  began. Judge it by that newest report, and cite it.
+A platform's claim to have stopped an abuse does not end it when a later report says it
+continues; an abuse or incident that the newest evidence says has ended (a feature withdrawn and
+no longer working, a leak closed, a campaign over) is not a threat. Lawsuits, rulings, studies and
+retrospectives are not incidents themselves, but one that reports the abuse is still happening is
+evidence that it is current. A threat proposal resting only on evidence older than that window is
+discarded. Undated evidence: judge from what it says, and never present an old story as a new
+incident. For each threat give:
+- kind: leak | deepfake_wave | platform_incident | other (an ongoing abuse is usually
+  deepfake_wave or platform_incident).
 - title: a short, plain, factual headline. Once an operator approves it, the people it concerns
   may read it, so never name a private individual, never give contact details, and never say
   that anyone's photos were found.
@@ -347,7 +356,7 @@ as a new incident. For each incident give:
   details or links.
 - severity: a whole number from 1 (minor) to 5 (severe).
 - expires_in_days: a whole number from 1 to 90: how long the incident plausibly keeps raising
-  the risk.
+  the risk. For an ongoing abuse, how long it plausibly continues without a fresh report.
 - tags: one or more slugs copied exactly from the tag registry. A tag missing from mapped_tags
   may still be used; the proposal then waits until the quiz maps it.
 - action: what a person exposed through these tags can DO about this incident, or null. Give one
@@ -393,8 +402,9 @@ regulator's order or a feature limited to some places -- because the service hol
 location. Never propose a protection already in live_protections. If a proposal in
 pending_events already covers it, attach the new evidence to that proposal instead.
 
-ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL. A temporary incident is a threat_event; a lasting
-policy state is a weight_change; a new safeguard is a protection_event. Never propose two kinds
+ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL. An incident, or an abuse that is still going on, is a
+threat_event; a lasting change to a platform's own policy or default is a weight_change; a new
+safeguard is a protection_event. Never propose two kinds
 from the same evidence -- never a weight_change and a threat_event from the same reports -- and
 never present the same fact as both a protection and a risk. If a proposal in pending_events or
 pending_weight_changes already rests on this evidence, attach new evidence to it (events only) or
