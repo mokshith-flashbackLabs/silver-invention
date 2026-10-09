@@ -7,7 +7,7 @@ nothing here has anything to do with the proxy's consent records.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
@@ -89,6 +89,46 @@ def discovery_request(
         + ", ".join(t["label"] for t in registry_tags)
     )
     return system, json.dumps({"query": query, "today": today, "recent_days": recent_days})
+
+
+# The second look (spec 2026-10-09-intel-discovery-reads-results §4): when a search read's own
+# answer failed -- URLs from memory, or nothing at all although its searches returned pages -- the
+# model is shown those pages as plain text and chooses which to read. Same rules as discover-v3.
+CHOOSE_RESULTS_PROMPT_VERSION = "choose-v1"
+
+_CHOOSE_SYSTEM = """You choose which pages a likeness-protection service should read for a saved
+query. "results" are the pages its web searches returned, each with its title and, when the search
+gave one, its age. "today" is today's date.
+
+- Choose at most max_candidates pages: the ones most likely to hold evidence about misuse of
+  people's photos and likeness for this query.
+- News: prefer reports published within recent_days days of today. Reference material -- research,
+  regulator and law-enforcement reports, platform policies -- may be older, but not more than five
+  years old.
+- Skip search pages, product or marketing pages, and pages that host explicit or abusive content.
+- Return only urls copied exactly from results, each with a one-line reason. If none is worth
+  reading, return no candidates."""
+
+
+def choose_results_request(
+    query: str,
+    results: Sequence[Mapping[str, str | None]],
+    *,
+    today: str,
+    recent_days: int,
+    max_candidates: int,
+) -> tuple[str, str]:
+    user = json.dumps(
+        {
+            "query": query,
+            "today": today,
+            "recent_days": recent_days,
+            "max_candidates": max_candidates,
+            "results": list(results),
+        },
+        ensure_ascii=False,
+    )
+    return _CHOOSE_SYSTEM, user
 
 
 # ── sources per question (step 5, spec §4.10) ─────────────────────────────────

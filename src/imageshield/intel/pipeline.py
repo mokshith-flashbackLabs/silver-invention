@@ -99,6 +99,7 @@ from imageshield.intel.prompts import (
     EXTRACT_PROMPT_VERSION,
     PROPOSE_PROMPT_VERSION,
     RegistryTag,
+    choose_results_request,
     discovery_request,
     extraction_request,
     proposal_request,
@@ -578,6 +579,53 @@ def _from_search_results(results: Sequence[WebResult], *, exclude: set[str]) -> 
     return first + rest
 
 
+async def _choose_from_results(
+    ctx: _Ctx,
+    query: str,
+    results: Sequence[WebResult],
+    *,
+    exclude: set[str],
+    limit: int,
+) -> list[str] | None:
+    """The second look (spec 2026-10-09-intel-discovery-reads-results §4): one call, no tool, with
+    the pages the searches returned as plain text. Returns the pages chosen, only ever ones the
+    searches returned, at most ``limit``; None when the call gave no answer."""
+    listing: list[dict[str, str | None]] = []
+    seen: set[str] = set(exclude)
+    for result in results:
+        key = url_hash(result.url)
+        if not _is_https(result.url) or key in seen:
+            continue
+        seen.add(key)
+        listing.append({"url": result.url, "title": result.title, "page_age": result.page_age})
+    if not listing or limit <= 0:
+        return []
+    system, user = choose_results_request(
+        query,
+        listing,
+        today=_now(ctx).date().isoformat(),
+        recent_days=ctx.deps.threat_recency_days,
+        max_candidates=limit,
+    )
+    call = await _call_model(ctx, lambda: ctx.deps.model.choose_results(system, user))
+    if call.output is None:
+        ctx.counts[f"choose_model_{call.outcome}"] += 1
+        return None
+    offered = {str(url_hash(str(item["url"]))) for item in listing}
+    taken: set[str] = set()
+    chosen: list[str] = []
+    for candidate in call.output.candidates:
+        picked = str(url_hash(candidate.url)) if _is_https(candidate.url) else ""
+        if picked not in offered or picked in taken:
+            ctx.counts["choose_dropped_not_offered"] += 1
+            continue
+        taken.add(picked)
+        chosen.append(candidate.url)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 async def _discover(ctx: _Ctx, source: Source) -> None:
     """One model call with web search; its candidate URLs are then fetched and read
     like any other page. The model's own search text is never evidence (#49)."""
@@ -621,17 +669,31 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
             continue
         listed.add(candidate_hash)
         urls.append(candidate.url)
-    if len(urls) < len(call.output.candidates) and returned:
+    # Fill from the real results when the model's own list failed: a guess was dropped, or it
+    # answered with nothing although its searches returned pages (the dev X rerun: it read its
+    # in-code results as empty, obeyed "never from memory", and returned no candidates over 50
+    # real results). A short list the model chose from real results is read as chosen.
+    if returned and (len(urls) < len(call.output.candidates) or not call.output.candidates):
         target = min(
             DISCOVERY_MAX_RESULT_PAGES,
             max(DISCOVERY_MIN_RESULT_PAGES, len(call.output.candidates)),
         )
-        for url in _from_search_results(call.search_results, exclude=listed):
-            if len(urls) >= target:
-                break
+        # The model chooses again from the real results, shown as plain text (§4). Only when that
+        # call itself gives no answer are the results taken in search order; a choice of none is
+        # its verdict and reads nothing more.
+        chosen = await _choose_from_results(
+            ctx, query, call.search_results, exclude=listed, limit=target - len(urls)
+        )
+        if chosen is None:
+            chosen = _from_search_results(call.search_results, exclude=listed)[
+                : target - len(urls)
+            ]
+            ctx.counts["candidate_from_search_results"] += len(chosen)
+        else:
+            ctx.counts["candidate_chosen_from_results"] += len(chosen)
+        for url in chosen:
             listed.add(url_hash(url))
             urls.append(url)
-            ctx.counts["candidate_from_search_results"] += 1
     recent = await ctx.deps.evidence.recently_fetched(
         [url_hash(u) for u in urls], days=DISCOVERY_DEDUP_DAYS
     )

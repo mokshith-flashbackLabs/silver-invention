@@ -106,6 +106,8 @@ class WebResult:
 
     url: str
     page_age: str | None
+    # What a later choice reads (spec 2026-10-09-intel-discovery-reads-results §4).
+    title: str | None = None
 
 
 def _field(obj: object, name: str) -> Any:
@@ -129,7 +131,14 @@ def web_results(content: list[Any]) -> list[WebResult]:
             if _field(result, "type") != "web_search_result" or not isinstance(url, str):
                 continue
             age = _field(result, "page_age")
-            found.append(WebResult(url, age if isinstance(age, str) and age.strip() else None))
+            title = _field(result, "title")
+            found.append(
+                WebResult(
+                    url,
+                    age if isinstance(age, str) and age.strip() else None,
+                    title.strip() if isinstance(title, str) and title.strip() else None,
+                )
+            )
     return found
 
 
@@ -227,6 +236,7 @@ class IntelModel(Protocol):
     async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]: ...
     async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
     async def suggest_weights(self, system: str, user: str) -> ModelCall[SuggestionOutput]: ...
+    async def choose_results(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
 
 
 def _usage(raw: Any) -> Usage:
@@ -486,6 +496,18 @@ class ClaudeIntelModel:
             user=user,
             max_uses=_VALIDATION_SEARCHES,
             effort=self._config.intel_search_read_effort,
+        )
+
+    async def choose_results(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
+        """A saved search's second look (spec 2026-10-09-intel-discovery-reads-results §4): the
+        pages its searches returned, given as plain text, with no tool, so nothing can be misread
+        inside a code tool. Same model and effort as the search read itself."""
+        return await self._send(
+            DiscoveryOutput,
+            model=self._config.intel_extraction_model,
+            effort=self._config.intel_search_read_effort,
+            system=system,
+            messages=[{"role": "user", "content": user}],
         )
 
     async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:

@@ -145,10 +145,16 @@ class FakeModel:
         propose_unavailable: ModelUnavailable | None = None,
         extract_delay: float = 0.0,
         search_results: tuple[WebResult, ...] = (),
+        choice: DiscoveryOutput | None = None,
     ) -> None:
         self.extraction = extraction
         # What a discovery's web search returned, with each result's page_age.
         self.search_results = search_results
+        # choose_results (spec 2026-10-09-intel-discovery-reads-results §4): None answers with no
+        # output, so the run falls back to search order.
+        self.choice = choice
+        self.choose_calls = 0
+        self.choose_users: list[str] = []
         # A slow extraction: each call waits this long, so calls from reads running side by side
         # overlap; `extracting` is how many are in flight now, `extract_peak` the most at once.
         self.extract_delay = extract_delay
@@ -204,6 +210,19 @@ class FakeModel:
             Decimal("0.02"),
             1,
             search_results=self.search_results,
+        )
+
+    async def choose_results(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
+        self.choose_calls += 1
+        self.choose_users.append(user)
+        return ModelCall(
+            self.choice,
+            "ok" if self.choice is not None else "unparseable",
+            "claude-sonnet-5",
+            "end_turn",
+            Usage(1, 1, 0, 0, 0),
+            Decimal("0.01"),
+            1,
         )
 
     async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:

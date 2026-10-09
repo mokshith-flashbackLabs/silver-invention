@@ -905,3 +905,75 @@ async def test_candidates_the_searches_returned_are_read_as_chosen(
     assert fetcher.fetched == [chosen]
     assert "candidate_not_in_search_results" not in result.outcome
     assert "candidate_from_search_results" not in result.outcome
+
+
+async def test_an_empty_answer_over_real_results_reads_the_results(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The dev X rerun: 50 real results, the model saw none of them and returned no candidates."""
+    await _source(intel_pool, kind="search_query", url=None, query="platform deepfake")
+    results = [f"https://site{n}.example/story" for n in range(7)]
+    model = FakeModel(
+        make_signal(),
+        discovery=DiscoveryOutput(candidates=[]),
+        search_results=tuple(WebResult(u, None) for u in results),
+    )
+    fetcher = FakeFetcher({u: make_page(POLICY, u) for u in results})
+    result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
+    assert fetcher.fetched == results[:5]  # DISCOVERY_MIN_RESULT_PAGES
+    assert result.outcome["candidate_from_search_results"] == 5
+
+
+async def test_an_empty_answer_with_no_results_reads_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await _source(intel_pool, kind="search_query", url=None, query="platform deepfake")
+    model = FakeModel(make_signal(), discovery=DiscoveryOutput(candidates=[]))
+    fetcher = FakeFetcher({})
+    result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
+    assert fetcher.fetched == [] and "candidate_from_search_results" not in result.outcome
+
+
+async def test_the_model_chooses_again_from_the_real_results_when_its_answer_failed(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """§4: the second look shows the real results as plain text and reads what it picks, in its
+    order, dropping anything it names that the searches did not return."""
+    await _source(intel_pool, kind="search_query", url=None, query="platform deepfake")
+    results = [f"https://site{n}.example/story" for n in range(7)]
+    picks = [results[5], "https://made.up/page", results[2]]
+    model = FakeModel(
+        make_signal(),
+        discovery=DiscoveryOutput(candidates=[]),
+        search_results=tuple(
+            WebResult(u, "2 days ago", f"Story {n}") for n, u in enumerate(results)
+        ),
+        choice=DiscoveryOutput(candidates=[DiscoveryCandidate(url=u, reason="r") for u in picks]),
+    )
+    fetcher = FakeFetcher({u: make_page(POLICY, u) for u in results})
+    result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
+    assert fetcher.fetched == [results[5], results[2]]
+    assert result.outcome["candidate_chosen_from_results"] == 2
+    assert result.outcome["choose_dropped_not_offered"] == 1
+    assert "candidate_from_search_results" not in result.outcome
+    payload = json.loads(model.choose_users[0])
+    assert payload["results"][0] == {
+        "url": results[0], "title": "Story 0", "page_age": "2 days ago"
+    }
+    assert payload["max_candidates"] == 5 and payload["recent_days"] == 90
+
+
+async def test_a_second_look_that_chooses_nothing_reads_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await _source(intel_pool, kind="search_query", url=None, query="platform deepfake")
+    results = [f"https://site{n}.example/story" for n in range(3)]
+    model = FakeModel(
+        make_signal(),
+        discovery=DiscoveryOutput(candidates=[]),
+        search_results=tuple(WebResult(u, None) for u in results),
+        choice=DiscoveryOutput(candidates=[]),
+    )
+    fetcher = FakeFetcher({u: make_page(POLICY, u) for u in results})
+    await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
+    assert fetcher.fetched == [] and model.choose_calls == 1
