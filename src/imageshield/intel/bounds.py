@@ -14,6 +14,12 @@ FEED_MAX_ITEM_AGE_DAYS = 30
 MAX_SOURCE_CONSECUTIVE_FAILURES = 10
 MAX_PROMPT_TAGS = 300
 DISCOVERY_DEDUP_DAYS = 30
+# A saved search reads only pages its searches returned (spec
+# 2026-10-09-intel-discovery-reads-results):
+# a candidate the model gave from memory is replaced from the real results, up to the model's own
+# candidate count, never fewer than MIN and never more than MAX pages.
+DISCOVERY_MIN_RESULT_PAGES = 5
+DISCOVERY_MAX_RESULT_PAGES = 8
 INTEL_STALE_GRACE_HOURS = 6
 
 # ── sources per question and weight suggestions (step 5, spec §4.6, §4.10) ───

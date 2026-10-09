@@ -858,3 +858,50 @@ async def test_a_feed_items_own_date_is_kept_over_the_pages_metadata(
     fetcher = FakeFetcher({FEED: feed, link: page})
     await run(await claim(intel_pool), make_deps(intel_pool, fetcher, FakeModel(make_signal())))
     assert await _published(intel_pool) == NOW - timedelta(days=2)
+
+
+# ── a saved search reads only pages its searches returned (2026-10-09) ─────────────────────────
+
+
+async def test_a_candidate_no_search_returned_is_replaced_from_the_real_results(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The dev X watch: its searches returned the reporting, the model misread them inside its
+    code tool and answered with URLs from memory, all unreadable. Those are dropped and the real
+    results are read instead, one page per site first."""
+    await _source(intel_pool, kind="search_query", url=None, query="platform deepfake")
+    guesses = ["https://guess.example/one", "https://guess.example/two"]
+    first, second, other = (
+        "https://a.example/report",
+        "https://a.example/follow-up",
+        "https://b.example/story",
+    )
+    model = FakeModel(
+        make_signal(),
+        discovery=DiscoveryOutput(
+            candidates=[DiscoveryCandidate(url=u, reason="r") for u in guesses]
+        ),
+        search_results=tuple(WebResult(u, None) for u in (first, second, other)),
+    )
+    fetcher = FakeFetcher({u: make_page(POLICY, u) for u in (first, second, other)})
+    result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
+    assert fetcher.fetched == [first, other, second]
+    assert result.outcome["candidate_not_in_search_results"] == 2
+    assert result.outcome["candidate_from_search_results"] == 3
+
+
+async def test_candidates_the_searches_returned_are_read_as_chosen(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await _source(intel_pool, kind="search_query", url=None, query="platform deepfake")
+    chosen, unchosen = "https://a.example/report", "https://b.example/story"
+    model = FakeModel(
+        make_signal(),
+        discovery=DiscoveryOutput(candidates=[DiscoveryCandidate(url=chosen, reason="r")]),
+        search_results=(WebResult(chosen + "?utm_source=x", None), WebResult(unchosen, None)),
+    )
+    fetcher = FakeFetcher({u: make_page(POLICY, u) for u in (chosen, unchosen)})
+    result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
+    assert fetcher.fetched == [chosen]
+    assert "candidate_not_in_search_results" not in result.outcome
+    assert "candidate_from_search_results" not in result.outcome

@@ -62,6 +62,8 @@ from imageshield.intel.bounds import (
     COVERAGE_GAP_POOL_MAX,
     COVERAGE_GAP_WINDOW_DAYS,
     DISCOVERY_DEDUP_DAYS,
+    DISCOVERY_MAX_RESULT_PAGES,
+    DISCOVERY_MIN_RESULT_PAGES,
     FEED_MAX_ITEM_AGE_DAYS,
     FEED_MAX_ITEMS_PER_RUN,
     MAX_PROMPT_TAGS,
@@ -90,7 +92,7 @@ from imageshield.intel.generation import (
     validate_proposals,
 )
 from imageshield.intel.metering import metered
-from imageshield.intel.model import IntelModel, ModelCall
+from imageshield.intel.model import IntelModel, ModelCall, WebResult
 from imageshield.intel.models import Run, Source, Vocabulary
 from imageshield.intel.pii import mask
 from imageshield.intel.prompts import (
@@ -556,6 +558,26 @@ async def read_source(ctx: _Ctx, source: Source) -> None:
         await _check_listed(ctx, source, source.source_url)
 
 
+def _from_search_results(results: Sequence[WebResult], *, exclude: set[str]) -> list[str]:
+    """The https pages the searches returned, in the order they came back, one per site first and
+    then the rest, so a fill does not read five pages of one publisher."""
+    first: list[str] = []
+    rest: list[str] = []
+    seen: set[str] = set(exclude)
+    sites: set[str] = set()
+    for result in results:
+        if not _is_https(result.url):
+            continue
+        key = url_hash(result.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        site = publisher_domain(result.url)
+        (rest if site in sites else first).append(result.url)
+        sites.add(site)
+    return first + rest
+
+
 async def _discover(ctx: _Ctx, source: Source) -> None:
     """One model call with web search; its candidate URLs are then fetched and read
     like any other page. The model's own search text is never evidence (#49)."""
@@ -582,6 +604,7 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
 
     urls: list[str] = []
     listed: set[str] = set()
+    returned = {url_hash(r.url) for r in call.search_results}
     for candidate in call.output.candidates:
         if not _is_https(candidate.url):
             ctx.counts["not_https"] += 1
@@ -590,8 +613,25 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
         if candidate_hash in listed:
             ctx.counts["candidate_duplicate"] += 1
             continue
+        if returned and candidate_hash not in returned:
+            # Not a page any of its searches returned: a URL from memory (spec
+            # 2026-10-09-intel-discovery-reads-results). On dev the X watch's five such guesses
+            # were all unreadable while its searches had returned the reporting it needed.
+            ctx.counts["candidate_not_in_search_results"] += 1
+            continue
         listed.add(candidate_hash)
         urls.append(candidate.url)
+    if len(urls) < len(call.output.candidates) and returned:
+        target = min(
+            DISCOVERY_MAX_RESULT_PAGES,
+            max(DISCOVERY_MIN_RESULT_PAGES, len(call.output.candidates)),
+        )
+        for url in _from_search_results(call.search_results, exclude=listed):
+            if len(urls) >= target:
+                break
+            listed.add(url_hash(url))
+            urls.append(url)
+            ctx.counts["candidate_from_search_results"] += 1
     recent = await ctx.deps.evidence.recently_fetched(
         [url_hash(u) for u in urls], days=DISCOVERY_DEDUP_DAYS
     )

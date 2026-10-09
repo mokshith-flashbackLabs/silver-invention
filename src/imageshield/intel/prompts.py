@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from typing import TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
-DISCOVER_PROMPT_VERSION = "discover-v2"
+DISCOVER_PROMPT_VERSION = "discover-v3"
 PROPOSE_PROMPT_VERSION = "propose-v9"
 
 
@@ -75,6 +75,8 @@ with a one-line reason each.
 - Reference material -- research, regulator and law-enforcement reports, platform policies -- may be
   older, but not more than five years old.
 - Prefer primary sources: platform announcements, regulators, established news, research publishers.
+- Return only pages your searches returned, never a URL from memory. If your searches returned
+  nothing usable, return no candidates.
 - Do not return URLs of explicit or abusive content."""
 
 
