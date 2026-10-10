@@ -22,9 +22,11 @@ the pipeline's internals and why the pipeline imports this module lazily.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from typing import Any
 from uuid import UUID
 
@@ -56,10 +58,12 @@ from imageshield.intel.pipeline import (
 from imageshield.intel.prompts import (
     SOURCE_PROPOSAL_PROMPT_VERSION,
     SUGGEST_PROMPT_VERSION,
+    RegistryTag,
     source_proposal_request,
     suggestion_request,
     validation_search_request,
 )
+from imageshield.intel.schemas import SourceProposalOutput
 from imageshield.intel.source_choice import (
     FETCH_REASONS,
     Candidate,
@@ -124,9 +128,10 @@ async def _source_proposal(ctx: _Ctx) -> RunResult:
     status: RunStatus = "completed"
     error: str | None = None
     limits = ctx.deps.limits
+    registry_tags = prompt_registry(vocabulary, set(all_tags)) if vocabulary is not None else []
     system, user = source_proposal_request(
         prompt_source_question(request, tags_by_option),
-        registry_tags=prompt_registry(vocabulary, set(all_tags)) if vocabulary is not None else [],
+        registry_tags=registry_tags,
         per_option=limits.proposed_sources_per_answer,
         searches_per_option=limits.proposed_searches_per_answer,
     )
@@ -141,39 +146,20 @@ async def _source_proposal(ctx: _Ctx) -> RunResult:
             ctx.counts[f"model_{call.outcome}"] += 1  # a verdict: consumed
             status, error = "failed", f"source_proposal_{call.outcome}"
         else:
-            cleaned = clean_candidates(
-                call.output,
-                options=request.options,
-                existing={
-                    o: frozenset(source_identity(s) for s in ss) for o, ss in existing.items()
-                },
-                counts=ctx.counts,
+            await _keep_candidates(
+                ctx, call.output, options=request.options, existing=existing, proposed=proposed
             )
-            hits = await ctx.deps.questions.known_hits(
-                sorted(
-                    {
-                        str(url_hash(c.source_url))
-                        for candidates in cleaned.values()
-                        for c in candidates
-                        if c.source_url is not None
-                    }
-                )
+            await _ask_for_uncovered(
+                ctx,
+                request,
+                tags_by_option,
+                registry_tags=registry_tags,
+                existing=existing,
+                proposed=proposed,
             )
-            for option, candidates in cleaned.items():
-                searches = 0
-                for candidate in candidates:
-                    if candidate.source_url is not None and url_hash(candidate.source_url) in hits:
-                        ctx.counts["candidate_dropped_known_hit_location"] += 1
-                    elif len(proposed[option]) >= limits.proposed_sources_per_answer:
-                        ctx.counts["candidate_dropped_over_cap"] += 1
-                    elif (
-                        candidate.kind == "search_query"
-                        and searches >= limits.proposed_searches_per_answer
-                    ):
-                        ctx.counts["candidate_dropped_search_over_cap"] += 1
-                    else:
-                        searches += candidate.kind == "search_query"
-                        proposed[option].append(candidate)
+            uncovered = sum(1 for o in request.options if not proposed[o] and not existing[o])
+            if uncovered:
+                ctx.counts["source_proposal_uncovered"] += uncovered
             if not any(proposed[option] or existing[option] for option in request.options):
                 # Nothing for any answer is not a result (spec 2026-10-08-intel-source-proposal-v2
                 # §2): v1 "completed" a gender question with no search made and no source at all.
@@ -188,6 +174,8 @@ async def _source_proposal(ctx: _Ctx) -> RunResult:
                 "tags": list(tags_by_option[option]),
                 "existing": [str(s.source_id) for s in existing[option]],
                 "proposed": [c.as_json() for c in proposed[option]],
+                # No source aimed at this answer, after the coverage asks (spec 2026-10-10 §2.1).
+                "uncovered": not proposed[option] and not existing[option],
             }
             for option in request.options
         ],
@@ -195,6 +183,98 @@ async def _source_proposal(ctx: _Ctx) -> RunResult:
     if status == "refused":
         outcome["refused_by"] = "gate"
     return RunResult(status, outcome, error)
+
+
+async def _keep_candidates(
+    ctx: _Ctx,
+    output: SourceProposalOutput,
+    *,
+    options: Sequence[str],
+    existing: Mapping[str, Sequence[Source]],
+    proposed: dict[str, list[Candidate]],
+) -> None:
+    """One proposal call's answer through the same cleaning, known-hit drop and per-answer caps
+    (spec §4.10 stage 1), appended to ``proposed``. A candidate already proposed for the option
+    counts as existing, so a coverage ask never repeats one."""
+    limits = ctx.deps.limits
+    cleaned = clean_candidates(
+        output,
+        options=options,
+        existing={
+            o: frozenset(source_identity(s) for s in existing[o])
+            | frozenset(c.identity for c in proposed[o])
+            for o in options
+        },
+        counts=ctx.counts,
+    )
+    hits = await ctx.deps.questions.known_hits(
+        sorted(
+            {
+                str(url_hash(c.source_url))
+                for candidates in cleaned.values()
+                for c in candidates
+                if c.source_url is not None
+            }
+        )
+    )
+    for option, candidates in cleaned.items():
+        searches = sum(1 for c in proposed[option] if c.kind == "search_query")
+        for candidate in candidates:
+            if candidate.source_url is not None and url_hash(candidate.source_url) in hits:
+                ctx.counts["candidate_dropped_known_hit_location"] += 1
+            elif len(proposed[option]) >= limits.proposed_sources_per_answer:
+                ctx.counts["candidate_dropped_over_cap"] += 1
+            elif (
+                candidate.kind == "search_query"
+                and searches >= limits.proposed_searches_per_answer
+            ):
+                ctx.counts["candidate_dropped_search_over_cap"] += 1
+            else:
+                searches += candidate.kind == "search_query"
+                proposed[option].append(candidate)
+
+
+async def _ask_for_uncovered(
+    ctx: _Ctx,
+    request: QuestionRequest,
+    tags_by_option: Mapping[str, Sequence[str]],
+    *,
+    registry_tags: Sequence[RegistryTag],
+    existing: Mapping[str, Sequence[Source]],
+    proposed: dict[str, list[Candidate]],
+) -> None:
+    """spec 2026-10-10-intel-every-answer-researched §2.1: up to
+    INTEL_SOURCE_PROPOSAL_COVERAGE_ASKS more proposal calls, each naming only the answers that
+    still have no source aimed at them. A refusal, an unavailable model or a verdict ends the
+    asking; what is already proposed stands."""
+    limits = ctx.deps.limits
+    for _ in range(limits.source_proposal_coverage_asks):
+        uncovered = tuple(o for o in request.options if not proposed[o] and not existing[o])
+        if not uncovered:
+            return
+        ctx.counts["source_proposal_coverage_asks"] += 1
+        ask = request.model_copy(update={"options": uncovered})
+        system, user = source_proposal_request(
+            prompt_source_question(ask, tags_by_option),
+            registry_tags=registry_tags,
+            per_option=limits.proposed_sources_per_answer,
+            searches_per_option=limits.proposed_searches_per_answer,
+            coverage_ask=True,
+        )
+        try:
+            more = await _call_model(ctx, partial(ctx.deps.model.propose_sources, system, user))
+        except _Stop as stop:
+            ctx.counts[f"source_proposal_coverage_{stop.reason}"] += 1
+            return
+        except _CallCap:
+            ctx.counts["source_proposal_coverage_run_call_cap"] += 1
+            return
+        if more.output is None:
+            ctx.counts[f"source_proposal_coverage_{more.outcome}"] += 1
+            return
+        await _keep_candidates(
+            ctx, more.output, options=uncovered, existing=existing, proposed=proposed
+        )
 
 
 # ── stage 3: source validation ───────────────────────────────────────────────

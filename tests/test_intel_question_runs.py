@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -33,6 +34,7 @@ from imageshield.search.urlhash import url_hash
 from tests.intel_fakes import (
     NOW,
     POLICY,
+    TEST_LIMITS,
     FakeFetcher,
     GatedFetcher,
     claim,
@@ -1108,3 +1110,107 @@ async def test_existing_sources_alone_still_complete_a_source_proposal(
     result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
     assert result.status == "completed", result
     assert result.outcome["options"][0]["existing"] == [str(existing)]
+
+
+# ── stage 1: coverage asks (spec 2026-10-10-intel-every-answer-researched §2.1) ──
+
+
+def _proposal_for(*options: str) -> SourceProposalOutput:
+    return SourceProposalOutput(
+        options=[
+            ProposedOptionSources(
+                option=o,
+                candidates=[
+                    ProposedSource(
+                        kind="research",
+                        source_url=f"https://r.example/{o.lower()}",
+                        reason="findings for this answer",
+                    )
+                ],
+            )
+            for o in options
+        ]
+    )
+
+
+class _ScriptedSources(FakeQuestionModel):
+    """Answers each propose_sources call with the next scripted output (then nothing), and the
+    calls named in ``refuse_from`` onwards with a refusal."""
+
+    def __init__(
+        self, *outputs: SourceProposalOutput, refuse_from: int | None = None, **kwargs: Any
+    ) -> None:
+        super().__init__(**kwargs)
+        self._outputs = list(outputs)
+        self._refuse_from = refuse_from
+
+    async def propose_sources(self, system: str, user: str) -> Any:
+        if self._refuse_from is not None and self.source_proposal_calls >= self._refuse_from:
+            self.sources_outcome = "refusal"
+        self.sources = self._outputs.pop(0) if self._outputs else SourceProposalOutput()
+        return await super().propose_sources(system, user)
+
+
+async def test_an_uncovered_answer_gets_a_coverage_ask_naming_only_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
+    model = _ScriptedSources(_proposal_for("Instagram"), _proposal_for("Bumble"))
+    limits = replace(TEST_LIMITS, source_proposal_coverage_asks=1)
+    deps = make_deps(intel_pool, FakeFetcher({}), model, limits=limits)
+    result = await run_once(intel_pool, deps)
+    assert result.status == "completed", result
+    assert model.source_proposal_calls == 2
+    first, second = (json.loads(u) for u in model.source_proposal_users)
+    assert "coverage_ask" not in first
+    assert second["coverage_ask"] is True
+    assert [o["option"] for o in second["question"]["options"]] == ["Bumble"]
+    instagram, bumble = result.outcome["options"]
+    assert bumble["proposed"] and bumble["uncovered"] is False
+    assert instagram["uncovered"] is False
+    assert result.outcome["source_proposal_coverage_asks"] == 1
+    assert "source_proposal_uncovered" not in result.outcome
+
+
+async def test_a_still_uncovered_answer_is_reported_and_the_run_completes(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
+    model = _ScriptedSources(_proposal_for("Instagram"))  # every later ask finds nothing
+    limits = replace(TEST_LIMITS, source_proposal_coverage_asks=2)
+    deps = make_deps(intel_pool, FakeFetcher({}), model, limits=limits)
+    result = await run_once(intel_pool, deps)
+    assert result.status == "completed"
+    assert model.source_proposal_calls == 3
+    _, bumble = result.outcome["options"]
+    assert bumble["uncovered"] is True
+    assert result.outcome["source_proposal_uncovered"] == 1
+
+
+async def test_with_coverage_asks_off_no_second_call_is_made(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
+    model = _ScriptedSources(_proposal_for("Instagram"))
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert model.source_proposal_calls == 1
+    assert result.outcome["options"][1]["uncovered"] is True
+
+
+async def test_a_refused_coverage_ask_keeps_the_first_calls_sources(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
+    model = _ScriptedSources(_proposal_for("Instagram"), _proposal_for("Bumble"), refuse_from=1)
+    limits = replace(TEST_LIMITS, source_proposal_coverage_asks=2)
+    deps = make_deps(intel_pool, FakeFetcher({}), model, limits=limits)
+    result = await run_once(intel_pool, deps)
+    assert result.status == "completed"
+    assert model.source_proposal_calls == 2  # the refusal ends the asking
+    instagram, bumble = result.outcome["options"]
+    assert instagram["proposed"] and bumble["uncovered"] is True
+    assert result.outcome["source_proposal_coverage_refusal"] == 1

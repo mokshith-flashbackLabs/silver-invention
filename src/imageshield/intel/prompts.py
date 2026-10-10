@@ -183,6 +183,10 @@ Rules:
   selling a product, or a page that hosts explicit or abusive content.
 - If, after searching, an option truly has no source, return it with no candidates.
 
+If coverage_ask is true, an earlier search found no source aimed at these options. Search for each
+one specifically and, when nothing speaks to it directly, for the closest evidence, saying in each
+reason how it applies to that option.
+
 Each candidate is:
 - kind: policy_page | feed | news | breach_index | regulator | research | search_query (feed only
   for an RSS or Atom feed)
