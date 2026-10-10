@@ -54,6 +54,7 @@ RunEventKind = Literal[
     "run_finished",
     "truncated",
     "waiting",  # migration 0050: a weight suggestion waiting for the reads it queued
+    "research_round",  # migration 0053: a weight suggestion searching again (spec 2026-10-10)
 ]
 RUN_EVENT_KINDS: tuple[str, ...] = get_args(RunEventKind)
 
@@ -264,6 +265,15 @@ def run_waiting_event(
         else f"Waiting for {sources} to be read before suggesting"
     )
     return text, {"awaiting": awaiting, "deadline": deadline.isoformat(), "retry": retry}
+
+
+def run_research_event(answers: int, round_no: int, max_rounds: int) -> tuple[str, dict[str, Any]]:
+    """``Searching again for 2 answers (round 1 of 4)`` (spec 2026-10-10 §2.3)."""
+    text = (
+        f"Searching again for {_plural(answers, 'answer', 'answers')}"
+        f" (round {round_no} of {max_rounds})"
+    )
+    return text, {"answers": answers, "round": round_no, "max_rounds": max_rounds}
 
 
 def run_finished_event(

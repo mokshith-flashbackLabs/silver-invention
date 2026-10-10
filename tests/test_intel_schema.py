@@ -783,3 +783,75 @@ def test_0045_is_reversible(migrated_db: str) -> None:
     assert up.returncode == 0, up.stderr
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         assert present(conn) == set(_0045_INDEXES)
+
+
+# ── 0053: research sources and a suggestion's research state (spec 2026-10-10 §3) ──
+
+_RESEARCH_SOURCE = (
+    "INSERT INTO intel_sources (kind, query_text, tags, check_every_hours, enabled,"
+    " disabled_reason, created_by, origin, proposed_for)"
+    " VALUES (%s, 'research query', '{}', 168, false, 'research_once', 'system:research',"
+    " 'research', %s::jsonb)"
+)
+_PROPOSED_FOR = '{"question_key": "platforms", "option": "Bumble"}'
+
+
+def test_0053_research_sources_are_read_once_saved_searches(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(_RESEARCH_SOURCE, ("search_query", _PROPOSED_FOR))
+        # 0053's down refuses while a research source exists, and the next test's fixture
+        # rolls everything down: leave none behind.
+        conn.execute("DELETE FROM intel_sources WHERE origin = 'research'")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(_RESEARCH_SOURCE, ("search_query", None))  # needs proposed_for
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO intel_sources (kind, source_url, url_hash, normalisation_version,"
+                " tags, check_every_hours, created_by, origin, proposed_for)"
+                " VALUES ('news', 'https://r.example/a', 'h', 'v1', '{}', 168, 'x', 'research',"
+                " %s::jsonb)",
+                (_PROPOSED_FOR,),
+            )  # a research source is a saved search
+
+
+def test_0053_only_a_weight_suggestion_carries_research_state(migrated_db: str) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO intel_runs (kind, requested_by, request, research_round,"
+            " research_source_ids, research_pass)"
+            " VALUES ('weight_suggestion', 'a', '{}'::jsonb, 1, %s, '{}'::jsonb)",
+            ([uuid4()],),
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO intel_runs (kind, requested_by, request, research_round)"
+                " VALUES ('adhoc_url', 'a', '{}'::jsonb, 1)"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO intel_runs (kind, requested_by, request, research_round)"
+                " VALUES ('weight_suggestion', 'a', '{}'::jsonb, -1)"
+            )
+
+
+def test_0053_down_refuses_while_research_sources_exist_then_is_reversible(
+    migrated_db: str,
+) -> None:
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute(_RESEARCH_SOURCE, ("search_query", _PROPOSED_FOR))
+    refused = run_migrate(migrated_db, "down", "--steps", _steps_through("0053_"))
+    assert refused.returncode != 0 and "research sources exist" in refused.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        conn.execute("DELETE FROM intel_sources WHERE origin = 'research'")
+    down = run_migrate(migrated_db, "down", "--steps", _steps_through("0053_"))
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(migrated_db, autocommit=True) as conn:
+        cols = {
+            r[0]
+            for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'intel_runs'"
+            ).fetchall()
+        }
+        assert not cols & {"research_round", "research_source_ids", "research_pass"}
+    up = run_migrate(migrated_db, "up")
+    assert up.returncode == 0, up.stderr

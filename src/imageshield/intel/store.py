@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 import structlog
@@ -41,6 +41,9 @@ from imageshield.intel.vocabulary import parse_vocabulary
 from imageshield.providers.store import utc_spend_date
 from imageshield.search.urlhash import NORMALISATION_VERSION, canonicalise, url_hash
 
+if TYPE_CHECKING:  # pipeline imports this module
+    from imageshield.intel.pipeline import ResearchWait
+
 log = structlog.get_logger("imageshield.intel")
 
 CLAUDE_INTEL = "claude_intel"
@@ -51,7 +54,8 @@ SOURCE_COLUMNS = """source_id, kind, source_url, url_hash, query_text, tags, che
     consecutive_failures, disabled_reason, created_by, created_at, origin, proposed_for,
     validation_run_id, validated_at"""
 RUN_COLUMNS = """run_id, kind, source_id, request, status, attempts, requested_by, outcome,
-    error_code, created_at, completed_at, awaiting_source_ids, wait_deadline"""
+    error_code, created_at, completed_at, awaiting_source_ids, wait_deadline, research_round,
+    research_source_ids, research_pass"""
 
 _AUDIT_SQL = """
     INSERT INTO audit_log (actor_type, action, resource_id, metadata)
@@ -105,7 +109,10 @@ _CLAIM_SQL = f"""
 _WAIT_SQL = """
     UPDATE intel_runs SET status = 'queued', attempts = attempts - 1, outcome = %(outcome)s,
            awaiting_source_ids = %(awaiting)s, wait_deadline = %(deadline)s,
-           not_before = %(not_before)s, lease_expires_at = NULL
+           not_before = %(not_before)s, lease_expires_at = NULL,
+           research_round = coalesce(%(research_round)s, research_round),
+           research_source_ids = coalesce(%(research_source_ids)s::uuid[], research_source_ids),
+           research_pass = coalesce(%(research_pass)s, research_pass)
      WHERE run_id = %(run_id)s AND status = 'running' AND attempts = %(attempts)s
     RETURNING 1
 """
@@ -247,6 +254,7 @@ class IntelStore(Protocol):
         awaiting: Sequence[UUID],
         deadline: datetime,
         not_before: datetime | None,
+        research: ResearchWait | None = None,
     ) -> bool: ...
     async def set_run_vocabulary(
         self, run_id: UUID, *, release_no: int, map_version: int
@@ -501,6 +509,7 @@ class PostgresIntelStore:
         awaiting: Sequence[UUID],
         deadline: datetime,
         not_before: datetime | None,
+        research: ResearchWait | None = None,
     ) -> bool:
         """A weight suggestion gives its claim back until the reads it queued are done (spec
         2026-10-08-intel-suggestion-waits-for-evidence §2): 'queued' again, the attempt returned,
@@ -515,6 +524,12 @@ class PostgresIntelStore:
                     "not_before": not_before,
                     "run_id": run_id,
                     "attempts": attempts,
+                    # A research round's state (migration 0053); a plain wait keeps the row's.
+                    "research_round": research.round if research is not None else None,
+                    "research_source_ids": (
+                        list(research.source_ids) if research is not None else None
+                    ),
+                    "research_pass": Jsonb(research.kept) if research is not None else None,
                 },
             )
             return await cur.fetchone() is not None

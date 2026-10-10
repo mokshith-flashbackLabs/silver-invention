@@ -195,6 +195,20 @@ class RunWait:
     awaiting: tuple[UUID, ...]
     deadline: datetime
     not_before: datetime | None = None
+    research: ResearchWait | None = None
+
+
+@dataclass(frozen=True)
+class ResearchWait:
+    """A research round's state to keep while the run waits (spec 2026-10-10 §2.2, migration
+    0053): the round now in progress, every research search registered so far, the pass that
+    started this round (written if a later round cannot finish), and how many answers it
+    searches again (for the run log)."""
+
+    round: int
+    source_ids: tuple[UUID, ...]
+    kept: dict[str, Any]
+    answers: int
 
 
 @dataclass(frozen=True)

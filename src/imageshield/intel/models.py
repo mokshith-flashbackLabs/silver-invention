@@ -79,6 +79,12 @@ class Run(BaseModel):
     # every other run, and on a suggestion that never waited.
     awaiting_source_ids: list[UUID] | None = None
     wait_deadline: datetime | None = None
+    # A weight suggestion's research state across its waits (migration 0053, spec 2026-10-10
+    # §2.2): the round in progress, the research searches it registered, and the pass that
+    # started the current round. 0 / null on every other run.
+    research_round: int = 0
+    research_source_ids: list[UUID] | None = None
+    research_pass: dict[str, Any] | None = None
 
 
 class RunEvent(BaseModel):

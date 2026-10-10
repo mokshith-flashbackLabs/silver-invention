@@ -56,6 +56,7 @@ from imageshield.intel.run_log import (
     RunLog,
     current_run_log,
     run_finished_event,
+    run_research_event,
     run_started_event,
     run_waiting_event,
 )
@@ -253,6 +254,15 @@ async def _wait(claimed: Run, result: RunResult, deps: PipelineDeps, run_log: Ru
             attempts=claimed.attempts,
         )
         return
+    if wait.research is not None:
+        await run_log.append(
+            "research_round",
+            *run_research_event(
+                wait.research.answers,
+                wait.research.round,
+                deps.limits.suggestion_research_rounds,
+            ),
+        )
     await run_log.append(
         "waiting",
         *run_waiting_event(
@@ -266,6 +276,7 @@ async def _wait(claimed: Run, result: RunResult, deps: PipelineDeps, run_log: Ru
         awaiting=wait.awaiting,
         deadline=wait.deadline,
         not_before=wait.not_before,
+        research=wait.research,
     )
     if not waited:
         log.warning("intel.run_result_dropped", run_id=run_id, kind=claimed.kind, status="waiting")
