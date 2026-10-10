@@ -607,6 +607,9 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> tuple[RunStatus,
         prompt_suggestion_question(request, tags_by_option, vocabulary),
         [prompt_signal(s) for s in context],
         registry_tags=prompt_registry(vocabulary, relevant),
+        research_round=ctx.run.research_round + 1,
+        max_rounds=ctx.deps.limits.suggestion_research_rounds,
+        searches_per_answer=ctx.deps.limits.research_searches_per_answer,
     )
     try:
         call = await _call_model(

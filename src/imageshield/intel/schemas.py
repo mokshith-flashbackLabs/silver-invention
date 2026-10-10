@@ -96,6 +96,9 @@ class SuggestedOptionWeight(_Out):
     signal_ids: list[str] = Field(default_factory=list)
     suggested_tags: list[str] = Field(default_factory=list)
     new_tag: ProposedTag | None = None
+    # suggest-v2 (spec 2026-10-10-intel-every-answer-researched §2.2.3): web searches that could
+    # back an option the model cannot back yet. Filtered in code (intel/suggestion.plan_research).
+    research_searches: list[str] = Field(default_factory=list)
 
 
 class SuggestionOutput(_Out):

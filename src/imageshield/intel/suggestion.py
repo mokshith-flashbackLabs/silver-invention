@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 from uuid import UUID
 
@@ -43,10 +43,11 @@ from imageshield.intel.bounds import (
 )
 from imageshield.intel.corroboration import uncorroborated
 from imageshield.intel.models import Run
-from imageshield.intel.pii import mask
+from imageshield.intel.pii import contains_pii, mask
 from imageshield.intel.prompts import PromptSuggestionOption, PromptSuggestionQuestion
 from imageshield.intel.proposal_models import ContextSignal, SuggestedTag
 from imageshield.intel.schemas import ProposedTag, SuggestedOptionWeight, SuggestionOutput
+from imageshield.intel.source_choice import query_key
 from imageshield.intel.tags import TagRegistry, is_well_formed
 from imageshield.intel.text import normalise
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject
@@ -75,6 +76,33 @@ class SuggestionRunRequest(BaseModel):
 
 
 @dataclass(frozen=True)
+class ResearchSearch:
+    round: int
+    query: str
+
+    def as_json(self) -> dict[str, Any]:
+        return {"round": self.round, "query": self.query}
+
+
+@dataclass(frozen=True)
+class OptionResearch:
+    """What research did for one answer (spec 2026-10-10-intel-every-answer-researched §2.3).
+    ``exhausted``: still unbacked after research ended. The backend reads the flag and never
+    re-derives it."""
+
+    rounds: int
+    searches: tuple[ResearchSearch, ...]
+    exhausted: bool
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "rounds": self.rounds,
+            "searches": [s.as_json() for s in self.searches],
+            "exhausted": self.exhausted,
+        }
+
+
+@dataclass(frozen=True)
 class OptionSuggestion:
     option: str
     deduction: int | None
@@ -82,10 +110,14 @@ class OptionSuggestion:
     signal_ids: tuple[UUID, ...]
     suggested_tags: tuple[str, ...]
     new_tag: SuggestedTag | None
+    # The model's research searches for this option (suggest-v2): an ask, never stored.
+    research_searches: tuple[str, ...] = ()
+    # What research did for it, attached before the write (spec 2026-10-10 §2.3).
+    research: OptionResearch | None = None
 
     def as_json(self) -> dict[str, Any]:
         """One entry of the proposal's ``target.options`` (spec §3.6)."""
-        return {
+        out: dict[str, Any] = {
             "option": self.option,
             "deduction": self.deduction,
             "rationale": self.rationale,
@@ -93,6 +125,22 @@ class OptionSuggestion:
             "suggested_tags": list(self.suggested_tags),
             "new_tag": self.new_tag.model_dump() if self.new_tag is not None else None,
         }
+        if self.research is not None:
+            out["research"] = self.research.as_json()
+        return out
+
+    @classmethod
+    def from_json(cls, raw: Mapping[str, Any]) -> OptionSuggestion:
+        """A kept pass's entry back to an OptionSuggestion (spec 2026-10-10 §2.2.7)."""
+        new_tag = raw.get("new_tag")
+        return cls(
+            option=str(raw["option"]),
+            deduction=raw.get("deduction"),
+            rationale=str(raw.get("rationale", "")),
+            signal_ids=tuple(UUID(str(s)) for s in raw.get("signal_ids") or ()),
+            suggested_tags=tuple(str(t) for t in raw.get("suggested_tags") or ()),
+            new_tag=SuggestedTag(**new_tag) if isinstance(new_tag, dict) else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -275,9 +323,85 @@ def validate_suggestion(
                 new_tag=_new_tag(
                     chosen.new_tag, fits=bool(tags), registered=registered, counts=counts
                 ),
+                research_searches=tuple(chosen.research_searches),
             )
         )
     return suggestions
+
+
+def is_backed(option: OptionSuggestion, context: Mapping[UUID, ContextSignal]) -> bool:
+    """Backed (spec 2026-10-10-intel-every-answer-researched §2): a number, and its cited
+    evidence passes the one corroboration predicate -- the judgement ``suggestion_options``
+    reports as ``corroborated``."""
+    if option.deduction is None or not option.signal_ids:
+        return False
+    active = [
+        context[i] for i in option.signal_ids if i in context and context[i].status == "active"
+    ]
+    return bool(active) and not uncorroborated(active)
+
+
+def plan_research(
+    options: Sequence[OptionSuggestion],
+    *,
+    searched: Mapping[str, Sequence[Mapping[str, Any]]],
+    per_answer: int,
+    counts: Counter[str],
+) -> dict[str, list[str]]:
+    """Each unbacked answer's next searches (spec 2026-10-10 §2.2.3): the model's own, at most
+    ``per_answer``, never one that names a person, never one this run already made."""
+    seen = {query_key(str(s["query"])) for entries in searched.values() for s in entries}
+    planned: dict[str, list[str]] = {}
+    for option in options:
+        kept: list[str] = []
+        for raw in option.research_searches:
+            query = normalise(raw)
+            if not query:
+                continue
+            if contains_pii(query):
+                counts["research_search_names_a_person"] += 1
+                continue
+            key = query_key(query)
+            if key in seen:
+                counts["research_search_repeated"] += 1
+                continue
+            if len(kept) >= per_answer:
+                counts["research_search_over_cap"] += 1
+                continue
+            seen.add(key)
+            kept.append(query)
+        if kept:
+            planned[option.option] = kept
+    return planned
+
+
+def attach_research(
+    options: Sequence[OptionSuggestion],
+    *,
+    backed: Mapping[str, bool],
+    searched: Mapping[str, Sequence[Mapping[str, Any]]],
+    researching: bool,
+) -> list[OptionSuggestion]:
+    """Each option with its research record (spec 2026-10-10 §2.3). ``researching``: research
+    rounds were configured, so an answer still unbacked is ``exhausted``; with research off,
+    none is."""
+    out: list[OptionSuggestion] = []
+    for option in options:
+        entries = tuple(
+            ResearchSearch(int(s["round"]), str(s["query"]))
+            for s in searched.get(option.option, ())
+        )
+        out.append(
+            replace(
+                option,
+                research=OptionResearch(
+                    rounds=len({s.round for s in entries}),
+                    searches=entries,
+                    exhausted=researching and not backed.get(option.option, False),
+                ),
+            )
+        )
+    return out
 
 
 def _uuid(value: object) -> UUID | None:
@@ -318,6 +442,8 @@ def suggestion_options(
                 "new_tag": raw.get("new_tag"),
                 "corroborated": why is None,
                 "why_not": why,
+                # What research did for this answer (spec 2026-10-10 §2.3); absent before it.
+                "research": raw.get("research"),
             }
         )
     return rows
@@ -327,6 +453,8 @@ def prompt_suggestion_question(
     request: SuggestionRunRequest,
     tags_by_option: Mapping[str, Sequence[str]],
     vocabulary: ScoringVocabulary | None,
+    *,
+    searched: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> PromptSuggestionQuestion:
     return PromptSuggestionQuestion(
         key=request.question_key,
@@ -342,6 +470,7 @@ def prompt_suggestion_question(
                     if vocabulary is not None
                     else None
                 ),
+                searched=[str(s["query"]) for s in (searched or {}).get(option, ())],
             )
             for option in request.options
         ],
@@ -365,6 +494,7 @@ def render_suggestion(run: Run, found: tuple[UUID, list[dict[str, Any]]] | None)
         "error_code": run.error_code,
         "options": found[1] if found is not None else None,
         "sources_deferred": deferred if isinstance(deferred, int) else 0,
+        "research_round": run.research_round,
         "awaiting_sources": len(run.awaiting_source_ids or []) if waiting else 0,
         "wait_deadline": run.wait_deadline if waiting else None,
     }
