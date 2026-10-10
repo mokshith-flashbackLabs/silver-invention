@@ -920,7 +920,7 @@ async def test_an_empty_answer_over_real_results_reads_the_results(
     )
     fetcher = FakeFetcher({u: make_page(POLICY, u) for u in results})
     result = await run(await claim(intel_pool), make_deps(intel_pool, fetcher, model))
-    assert fetcher.fetched == results[:5]  # DISCOVERY_MIN_RESULT_PAGES
+    assert fetcher.fetched == results[:5]  # TEST_LIMITS.discovery_min_result_pages
     assert result.outcome["candidate_from_search_results"] == 5
 
 

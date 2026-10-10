@@ -62,8 +62,6 @@ from imageshield.intel.bounds import (
     COVERAGE_GAP_POOL_MAX,
     COVERAGE_GAP_WINDOW_DAYS,
     DISCOVERY_DEDUP_DAYS,
-    DISCOVERY_MAX_RESULT_PAGES,
-    DISCOVERY_MIN_RESULT_PAGES,
     FEED_MAX_ITEM_AGE_DAYS,
     FEED_MAX_ITEMS_PER_RUN,
     MAX_PROMPT_TAGS,
@@ -91,6 +89,7 @@ from imageshield.intel.generation import (
     prompt_signal,
     validate_proposals,
 )
+from imageshield.intel.limits import SearchLimits
 from imageshield.intel.metering import metered
 from imageshield.intel.model import IntelModel, ModelCall, WebResult
 from imageshield.intel.models import Run, Source, Vocabulary
@@ -165,7 +164,9 @@ class PipelineDeps:
     2026-10-03-intel-throughput §5): how many sources or pages one run reads at once.
     ``threat_recency_days`` is ``INTEL_THREAT_RECENCY_DAYS`` (spec
     2026-10-04-intel-evidence-quality §3): the window the generation prompt states and the
-    generation-time staleness check applies, with no default for the same reason."""
+    generation-time staleness check applies, with no default for the same reason.
+    ``limits`` is ``IntelConfig.search_limits()`` (spec 2026-10-10-intel-every-answer-researched
+    §5.1), with no default for the same reason."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -182,6 +183,7 @@ class PipelineDeps:
     max_calls_per_suggestion_run: int
     source_read_concurrency: int
     threat_recency_days: int
+    limits: SearchLimits
 
 
 @dataclass(frozen=True)
@@ -675,8 +677,8 @@ async def _discover(ctx: _Ctx, source: Source) -> None:
     # real results). A short list the model chose from real results is read as chosen.
     if returned and (len(urls) < len(call.output.candidates) or not call.output.candidates):
         target = min(
-            DISCOVERY_MAX_RESULT_PAGES,
-            max(DISCOVERY_MIN_RESULT_PAGES, len(call.output.candidates)),
+            ctx.deps.limits.discovery_max_result_pages,
+            max(ctx.deps.limits.discovery_min_result_pages, len(call.output.candidates)),
         )
         # The model chooses again from the real results, shown as plain text (§4). Only when that
         # call itself gives no answer are the results taken in search order; a choice of none is

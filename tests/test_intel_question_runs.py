@@ -1062,10 +1062,12 @@ def _searches(option: str, count: int) -> ProposedOptionSources:
     )
 
 
-async def test_a_source_proposal_keeps_at_most_two_saved_searches_per_option(
+async def test_a_source_proposal_keeps_at_most_the_configured_saved_searches_per_option(
     intel_pool: AsyncConnectionPool,
 ) -> None:
-    """§2: a saved search is a multi-minute research call on every check; pages come first."""
+    """§2: a saved search is a multi-minute research call on every check; pages come first. The
+    cap is INTEL_MAX_PROPOSED_SEARCHES_PER_ANSWER (2 in TEST_LIMITS), and the prompt states it
+    from the payload (sources-v3, spec 2026-10-10 §5.1)."""
     await seed_quiz_vocabulary(intel_pool)
     await PostgresQuestionStore(intel_pool).queue_source_proposal(QUESTION, operator="ann")
     sources = SourceProposalOutput(options=[_searches("Instagram", 4), _searches("Bumble", 1)])
@@ -1077,7 +1079,10 @@ async def test_a_source_proposal_keeps_at_most_two_saved_searches_per_option(
     assert kinds == ["search_query", "search_query", "research"]
     assert [c["kind"] for c in bumble["proposed"]] == ["search_query", "research"]
     assert result.outcome["candidate_dropped_search_over_cap"] == 2
-    assert result.outcome["prompt_version"] == "sources-v2"
+    assert result.outcome["prompt_version"] == "sources-v3"
+    payload = json.loads(model.source_proposal_users[0])
+    caps = (payload["max_candidates_per_option"], payload["max_search_queries_per_option"])
+    assert caps == (5, 2)
 
 
 async def test_a_source_proposal_with_nothing_for_any_answer_fails(

@@ -18,6 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from imageshield.config import SENTINEL_VALUES, ConfigError
 from imageshield.db.dsn import compose_database_url
 from imageshield.env import load_dotenv_local
+from imageshield.intel.limits import SearchLimits
 
 
 class IntelConfig(BaseSettings):
@@ -45,13 +46,30 @@ class IntelConfig(BaseSettings):
     intel_proposal_model: str
     # Config, not a literal: the phone-shaped build gate flags this string in src/.
     intel_web_search_tool_type: str
-    intel_max_web_searches_per_run: int = 5
+    intel_max_web_searches_per_run: int
     intel_blocked_domains: list[str] = []
     intel_max_calls_per_run: int = 20
     intel_max_document_chars: int = 200_000
     # Source proposal (step 5, spec §4.10): stage 1's web-search budget. Required with no default,
     # like every key the spec gives none (§4.1).
     intel_max_source_proposal_searches: int
+    # Search volume (spec 2026-10-10-intel-every-answer-researched §5.1). Required with no
+    # default, like every key that spec gives none: the values live in the task definitions.
+    # INTEL_MAX_WEB_SEARCHES_PER_RUN above is the saved-search read's search budget.
+    # Output-token ceilings of the two search calls (not secrets: named _MAX_OUTPUT so the
+    # task-definition secret-name check, which flags 'token', stays strict).
+    intel_source_proposal_max_output: int
+    intel_search_read_max_output: int
+    intel_max_proposed_sources_per_answer: int
+    intel_max_proposed_searches_per_answer: int
+    intel_discovery_min_result_pages: int
+    intel_discovery_max_result_pages: int
+    intel_validation_searches: int
+    intel_validation_result_pages: int
+    intel_research_searches_per_answer: int
+    # 0 turns the feature off.
+    intel_source_proposal_coverage_asks: int
+    intel_suggestion_research_rounds: int
     # A weight suggestion's first read of the sources it registered is legitimately larger than a
     # weekly check (§4.10), so it has its own call cap.
     intel_max_calls_per_suggestion_run: int = 60
@@ -106,6 +124,15 @@ class IntelConfig(BaseSettings):
         "intel_max_calls_per_run",
         "intel_max_document_chars",
         "intel_max_source_proposal_searches",
+        "intel_source_proposal_max_output",
+        "intel_search_read_max_output",
+        "intel_max_proposed_sources_per_answer",
+        "intel_max_proposed_searches_per_answer",
+        "intel_discovery_min_result_pages",
+        "intel_discovery_max_result_pages",
+        "intel_validation_searches",
+        "intel_validation_result_pages",
+        "intel_research_searches_per_answer",
         "intel_max_calls_per_suggestion_run",
         "intel_run_concurrency",
         "intel_source_read_concurrency",
@@ -128,6 +155,26 @@ class IntelConfig(BaseSettings):
         if value <= 0:
             raise ValueError("must be a positive number")
         return value
+
+    @field_validator("intel_source_proposal_coverage_asks", "intel_suggestion_research_rounds")
+    @classmethod
+    def _non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must be zero or a positive integer")
+        return value
+
+    def search_limits(self) -> SearchLimits:
+        """The run code's view of the §5.1 limits (``PipelineDeps.limits``)."""
+        return SearchLimits(
+            proposed_sources_per_answer=self.intel_max_proposed_sources_per_answer,
+            proposed_searches_per_answer=self.intel_max_proposed_searches_per_answer,
+            discovery_min_result_pages=self.intel_discovery_min_result_pages,
+            discovery_max_result_pages=self.intel_discovery_max_result_pages,
+            validation_result_pages=self.intel_validation_result_pages,
+            source_proposal_coverage_asks=self.intel_source_proposal_coverage_asks,
+            suggestion_research_rounds=self.intel_suggestion_research_rounds,
+            research_searches_per_answer=self.intel_research_searches_per_answer,
+        )
 
     def pool_size_needed(self) -> int:
         """The connections the worker can want at once: one per source read in flight and one per
@@ -165,6 +212,14 @@ class IntelConfig(BaseSettings):
     def _breaker_cooldown_ordered(self) -> IntelConfig:
         if self.breaker_cooldown_max_seconds < self.breaker_cooldown_seconds:
             raise ValueError("BREAKER_COOLDOWN_MAX_SECONDS must be >= BREAKER_COOLDOWN_SECONDS")
+        return self
+
+    @model_validator(mode="after")
+    def _discovery_pages_ordered(self) -> IntelConfig:
+        if self.intel_discovery_min_result_pages > self.intel_discovery_max_result_pages:
+            raise ValueError(
+                "INTEL_DISCOVERY_MIN_RESULT_PAGES must not exceed INTEL_DISCOVERY_MAX_RESULT_PAGES"
+            )
         return self
 
     @model_validator(mode="after")

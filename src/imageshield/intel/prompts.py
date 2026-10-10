@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import TypedDict
+from typing import Any, TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v3"
@@ -133,7 +133,7 @@ def choose_results_request(
 
 # ── sources per question (step 5, spec §4.10) ─────────────────────────────────
 
-SOURCE_PROPOSAL_PROMPT_VERSION = "sources-v2"
+SOURCE_PROPOSAL_PROMPT_VERSION = "sources-v3"
 
 
 class PromptSourceOption(TypedDict):
@@ -166,9 +166,8 @@ What fits depends on the option:
 - An option about the person -- their age, gender, how often they post, whether it has happened
   to them before, how they keep watch: research, surveys and statistics on who is targeted and
   how often, regulator and law-enforcement reports, and serious journalism about incidents. Every
-  question about the person has such evidence (for example, who deepfake abuse targets by gender
-  and by age). Search for it. Never decide that a question is "just demographic" or has nothing
-  to monitor.
+  question about the person has such evidence. Search for it. Never decide that a question is
+  "just demographic" or has nothing to monitor.
 
 Rules:
 - Search before you answer, one query at a time, and read the results. Every source_url must be a
@@ -178,7 +177,7 @@ Rules:
 - A source belongs under an option because it says something about THAT answer. List the same
   source under several options only when it gives findings for each of them, and say in each
   reason what it shows for that option.
-- Mostly pages: at most two search_query candidates per option.
+- Mostly pages: at most max_search_queries_per_option search_query candidates per option.
 - Never propose a help, removal or reporting service (a takedown tool, a breach checker, a reverse
   image search) as evidence: it shows where to get help, not who is at risk. Never propose a page
   selling a product, or a page that hosts explicit or abusive content.
@@ -201,17 +200,22 @@ def source_proposal_request(
     *,
     registry_tags: Sequence[RegistryTag],
     per_option: int,
+    searches_per_option: int,
+    coverage_ask: bool = False,
 ) -> tuple[str, str]:
-    """The question, its options with their tags, and the tag registry. Never a person."""
-    user = json.dumps(
-        {
-            "question": question,
-            "max_candidates_per_option": per_option,
-            "tag_registry": list(registry_tags),
-        },
-        ensure_ascii=False,
-    )
-    return _SOURCE_PROPOSAL_SYSTEM, user
+    """The question, its options with their tags, and the tag registry. Never a person.
+    sources-v3 (spec 2026-10-10-intel-every-answer-researched §2.4, §5.1): the saved-search cap
+    comes from the payload, and ``coverage_ask`` marks a follow-up ask for options an earlier
+    search found nothing aimed at."""
+    payload: dict[str, Any] = {
+        "question": question,
+        "max_candidates_per_option": per_option,
+        "max_search_queries_per_option": searches_per_option,
+        "tag_registry": list(registry_tags),
+    }
+    if coverage_ask:
+        payload["coverage_ask"] = True
+    return _SOURCE_PROPOSAL_SYSTEM, json.dumps(payload, ensure_ascii=False)
 
 
 _VALIDATION_SEARCH_SYSTEM = """Run exactly one web search for the query below, then list the https

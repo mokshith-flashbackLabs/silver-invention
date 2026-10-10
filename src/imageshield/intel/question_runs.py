@@ -31,9 +31,6 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from imageshield.intel.bounds import (
-    MAX_PROPOSED_SEARCHES_PER_OPTION,
-    MAX_PROPOSED_SOURCES_PER_OPTION,
-    MAX_SEARCH_RESULTS_CHECKED,
     SUGGESTION_CONTEXT_DAYS,
     SUGGESTION_CONTEXT_MAX_SIGNALS,
     SUGGESTION_POOL_MAX,
@@ -126,10 +123,12 @@ async def _source_proposal(ctx: _Ctx) -> RunResult:
     proposed: dict[str, list[Candidate]] = {option: [] for option in request.options}
     status: RunStatus = "completed"
     error: str | None = None
+    limits = ctx.deps.limits
     system, user = source_proposal_request(
         prompt_source_question(request, tags_by_option),
         registry_tags=prompt_registry(vocabulary, set(all_tags)) if vocabulary is not None else [],
-        per_option=MAX_PROPOSED_SOURCES_PER_OPTION,
+        per_option=limits.proposed_sources_per_answer,
+        searches_per_option=limits.proposed_searches_per_answer,
     )
     try:
         call = await _call_model(ctx, lambda: ctx.deps.model.propose_sources(system, user))
@@ -165,11 +164,11 @@ async def _source_proposal(ctx: _Ctx) -> RunResult:
                 for candidate in candidates:
                     if candidate.source_url is not None and url_hash(candidate.source_url) in hits:
                         ctx.counts["candidate_dropped_known_hit_location"] += 1
-                    elif len(proposed[option]) >= MAX_PROPOSED_SOURCES_PER_OPTION:
+                    elif len(proposed[option]) >= limits.proposed_sources_per_answer:
                         ctx.counts["candidate_dropped_over_cap"] += 1
                     elif (
                         candidate.kind == "search_query"
-                        and searches >= MAX_PROPOSED_SEARCHES_PER_OPTION
+                        and searches >= limits.proposed_searches_per_answer
                     ):
                         ctx.counts["candidate_dropped_search_over_cap"] += 1
                     else:
@@ -297,7 +296,7 @@ async def _validate_search(ctx: _Ctx, query: str, refused: _Refused) -> str | No
         if is_https(found.url) and (key := str(url_hash(found.url))) not in seen:
             seen.add(key)
             urls.append(found.url)
-    for url in urls[:MAX_SEARCH_RESULTS_CHECKED]:
+    for url in urls[: ctx.deps.limits.validation_result_pages]:
         reason = await _validate_url(ctx, "search_result", url)
         if reason is None:
             return None

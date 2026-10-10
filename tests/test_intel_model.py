@@ -516,7 +516,9 @@ async def test_discover_still_searches_with_the_per_run_budget(
     model, fake = _model([response], clean_env)
     await model.discover("sys", "q")
     (tool,) = fake.calls[0]["tools"]
-    assert tool["max_uses"] == 5 and tool["type"] == "web_search_20260209"
+    # INTEL_MAX_WEB_SEARCHES_PER_RUN and INTEL_SEARCH_READ_MAX_TOKENS (spec 2026-10-10 §5.1).
+    assert tool["max_uses"] == 10 and tool["type"] == "web_search_20260209"
+    assert fake.calls[0]["max_tokens"] == 16000
 
 
 async def test_propose_sources_searches_with_its_own_budget_on_the_extraction_model(
@@ -554,13 +556,15 @@ async def test_propose_sources_searches_with_its_own_budget_on_the_extraction_mo
     sent = fake.calls[0]
     assert sent["model"] == "claude-sonnet-5" and "effort" not in sent["output_config"]
     assert sent["tools"][0]["max_uses"] == 7
-    # sources-v2 (spec 2026-10-08): its own output budget, twice every other call's.
-    assert sent["max_tokens"] == 16000
+    # Its own output budget, INTEL_SOURCE_PROPOSAL_MAX_TOKENS (spec 2026-10-10 §5.1).
+    assert sent["max_tokens"] == 24000
     assert call.cost_usd == cost_of("claude-sonnet-5", Usage(1000, 100, 0, 0, 2))
 
 
-async def test_search_once_allows_exactly_one_search(clean_env: pytest.MonkeyPatch) -> None:
-    """spec §4.10 stage 3: a search_query candidate costs ONE web search."""
+async def test_search_once_searches_with_the_validation_budget(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """spec §4.10 stage 3, as INTEL_VALIDATION_SEARCHES since 2026-10-10 §5.1."""
     output = DiscoveryOutput(candidates=[DiscoveryCandidate(url="https://n.example/a", reason="r")])
     response = SimpleNamespace(
         model="claude-sonnet-5",
@@ -571,7 +575,8 @@ async def test_search_once_allows_exactly_one_search(clean_env: pytest.MonkeyPat
     model, fake = _model([response], clean_env)
     call = await model.search_once("sys", '{"query": "q"}')
     assert call.output == output
-    assert fake.calls[0]["tools"][0]["max_uses"] == 1
+    assert fake.calls[0]["tools"][0]["max_uses"] == 3
+    assert fake.calls[0]["max_tokens"] == 16000
     assert fake.calls[0]["model"] == "claude-sonnet-5"
 
 
@@ -790,8 +795,8 @@ async def test_a_streamed_search_becomes_its_steps(
         "search_results",
     ]
     started, thinking, writing, search, results, _, failed = events
-    assert started["text"] == "Asked claude-sonnet-5 (up to 5 web searches)"
-    assert started["detail"] == {"model": "claude-sonnet-5", "max_searches": 5}
+    assert started["text"] == "Asked claude-sonnet-5 (up to 10 web searches)"
+    assert started["detail"] == {"model": "claude-sonnet-5", "max_searches": 10}
     summary = "Looking for recent breaches on dating apps."
     assert thinking["text"] == summary and thinking["detail"] == {"chars": len(summary)}
     assert writing["text"] == "Writing the answer" and writing["detail"] == {}

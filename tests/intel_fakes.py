@@ -26,6 +26,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.evidence_store import DocumentRecord, PostgresEvidenceStore, SignalRecord
 from imageshield.intel.fetch_client import FetchFailure, TextFetch
+from imageshield.intel.limits import SearchLimits
 from imageshield.intel.model import ModelCall, ModelUnavailable, WebResult
 from imageshield.intel.models import Run, Vocabulary
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
@@ -291,6 +292,20 @@ def make_signal(
     )
 
 
+# The limits the tests written before 2026-10-10 assume (the old code constants), with coverage
+# asks and research rounds off: a test that wants either passes its own SearchLimits.
+TEST_LIMITS = SearchLimits(
+    proposed_sources_per_answer=5,
+    proposed_searches_per_answer=2,
+    discovery_min_result_pages=5,
+    discovery_max_result_pages=8,
+    validation_result_pages=5,
+    source_proposal_coverage_asks=0,
+    suggestion_research_rounds=0,
+    research_searches_per_answer=2,
+)
+
+
 def make_deps(
     pool: AsyncConnectionPool,
     fetcher: FakeFetcher,
@@ -301,6 +316,7 @@ def make_deps(
     max_document_chars: int = 200_000,
     clock: Callable[[], datetime] | None = None,
     source_read_concurrency: int = 1,
+    limits: SearchLimits = TEST_LIMITS,
 ) -> PipelineDeps:
     control = PostgresProviderControlStore(
         pool,
@@ -327,6 +343,7 @@ def make_deps(
         # side pin the order pages are fetched in, which concurrency makes a race.
         source_read_concurrency=source_read_concurrency,
         threat_recency_days=90,
+        limits=limits,
     )
 
 

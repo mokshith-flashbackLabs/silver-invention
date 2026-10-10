@@ -419,6 +419,7 @@ async def run_forever(config: IntelConfig) -> None:
         questions=PostgresQuestionStore(pool),
         max_calls_per_suggestion_run=config.intel_max_calls_per_suggestion_run,
         source_read_concurrency=config.intel_source_read_concurrency,
+        limits=config.search_limits(),
     )
     log.info(
         "intel.started",

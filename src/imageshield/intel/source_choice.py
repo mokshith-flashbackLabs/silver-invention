@@ -3,8 +3,8 @@
 Stage 1, proposing. The model names candidates per option, and code decides which survive: https
 only, canonical (search/urlhash.py), deduplicated within the option and against the option's
 existing registry sources, and never a person-shaped query. The run then drops known hit locations
-(a database read) and caps each option at MAX_PROPOSED_SOURCES_PER_OPTION. An option's "existing"
-sources are the registry sources whose tags intersect the option's tags.
+(a database read) and caps each option at INTEL_MAX_PROPOSED_SOURCES_PER_ANSWER. An option's
+"existing" sources are the registry sources whose tags intersect the option's tags.
 
 Identity. A source is one canonical URL (its url_hash) or one search query (normalised and
 case-folded), whatever kind it was proposed as: the registry reuses a row by that. A validation

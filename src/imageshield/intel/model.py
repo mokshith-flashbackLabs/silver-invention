@@ -86,13 +86,6 @@ _MAX_TOKENS = 8000
 # _MAX_TOKENS: the 0.45 worst case in migration 0041 assumes 8 000 output tokens, and a
 # proposal call that stops there is consumed and counted (proposal_model_max_tokens).
 _PROPOSAL_EFFORT = "high"
-# Stage 1's source proposal answers for every option at once (up to 5 candidates each) after up
-# to INTEL_MAX_SOURCE_PROPOSAL_SEARCHES searches, and adaptive thinking spends from the same
-# budget: at _MAX_TOKENS an age question was cut off and its whole answer lost (spec
-# 2026-10-08-intel-source-proposal-v2 §1). Migration 0051 prices the larger call.
-_SOURCE_PROPOSAL_MAX_TOKENS = 16000
-# spec §4.10 stage 3: a search_query candidate costs ONE web search.
-_VALIDATION_SEARCHES = 1
 # The run log shows Claude's reasoning summary (spec 2026-10-03 §2): on Claude 5 models the
 # default display is "omitted", an empty text. Billing does not depend on `display`.
 _THINKING = {"type": "adaptive", "display": "summarized"}
@@ -477,6 +470,7 @@ class ClaudeIntelModel:
             system=system,
             user=user,
             max_uses=self._config.intel_max_web_searches_per_run,
+            max_tokens=self._config.intel_search_read_max_output,
             effort=self._config.intel_search_read_effort,
         )
 
@@ -486,7 +480,11 @@ class ClaudeIntelModel:
             system=system,
             user=user,
             max_uses=self._config.intel_max_source_proposal_searches,
-            max_tokens=_SOURCE_PROPOSAL_MAX_TOKENS,
+            # Stage 1 answers for every option at once after up to
+            # INTEL_MAX_SOURCE_PROPOSAL_SEARCHES searches, and adaptive thinking spends from the
+            # same budget (spec 2026-10-08-intel-source-proposal-v2 §1): its own ceiling,
+            # INTEL_SOURCE_PROPOSAL_MAX_OUTPUT (spec 2026-10-10 §5.1).
+            max_tokens=self._config.intel_source_proposal_max_output,
         )
 
     async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
@@ -494,7 +492,9 @@ class ClaudeIntelModel:
             DiscoveryOutput,
             system=system,
             user=user,
-            max_uses=_VALIDATION_SEARCHES,
+            # spec §4.10 stage 3's search budget, INTEL_VALIDATION_SEARCHES (spec 2026-10-10 §5.1).
+            max_uses=self._config.intel_validation_searches,
+            max_tokens=self._config.intel_search_read_max_output,
             effort=self._config.intel_search_read_effort,
         )
 
@@ -508,6 +508,7 @@ class ClaudeIntelModel:
             effort=self._config.intel_search_read_effort,
             system=system,
             messages=[{"role": "user", "content": user}],
+            max_tokens=self._config.intel_search_read_max_output,
         )
 
     async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:

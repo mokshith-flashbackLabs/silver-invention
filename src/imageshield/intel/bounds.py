@@ -14,27 +14,18 @@ FEED_MAX_ITEM_AGE_DAYS = 30
 MAX_SOURCE_CONSECUTIVE_FAILURES = 10
 MAX_PROMPT_TAGS = 300
 DISCOVERY_DEDUP_DAYS = 30
-# A saved search reads only pages its searches returned (spec
-# 2026-10-09-intel-discovery-reads-results):
-# a candidate the model gave from memory is replaced from the real results, up to the model's own
-# candidate count, never fewer than MIN and never more than MAX pages.
-DISCOVERY_MIN_RESULT_PAGES = 5
-DISCOVERY_MAX_RESULT_PAGES = 8
 INTEL_STALE_GRACE_HOURS = 6
 
 # ── sources per question and weight suggestions (step 5, spec §4.6, §4.10) ───
+# The search-volume limits that lived here (pages a saved search keeps, sources and saved
+# searches per answer, validation result pages) are configuration since 2026-10-10
+# (intel/limits.py, spec 2026-10-10-intel-every-answer-researched §5.1).
 MIN_SOURCE_TEXT_CHARS = 200
-MAX_PROPOSED_SOURCES_PER_OPTION = 5
-# Of those, saved searches: each becomes a multi-minute research call on every check, and a page
-# is cheaper and more specific (spec 2026-10-08-intel-source-proposal-v2 §2).
-MAX_PROPOSED_SEARCHES_PER_OPTION = 2
 # A validation result is honoured this long (§4.10 stage 4).
 VALIDATION_TTL_HOURS = 24
 # How far back stage 4 looks for the question's stage-1 runs, to record a chosen source they
 # proposed as origin 'suggested'. Provenance only: nothing is matched or scored by origin.
 PROPOSAL_ORIGIN_DAYS = 7
-# How many of a validation search's result pages are fetched before the search counts as empty.
-MAX_SEARCH_RESULTS_CHECKED = 5
 DEFAULT_SOURCE_CHECK_EVERY_HOURS = 168
 SUGGESTION_CONTEXT_DAYS = 365
 SUGGESTION_CONTEXT_MAX_SIGNALS = 80
