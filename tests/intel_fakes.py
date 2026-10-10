@@ -374,6 +374,7 @@ async def run_once(pool: AsyncConnectionPool, deps: PipelineDeps) -> RunResult:
             awaiting=result.wait.awaiting,
             deadline=result.wait.deadline,
             not_before=result.wait.not_before,
+            research=result.wait.research,
         )
         return result
     await PostgresIntelStore(pool).finish_run(

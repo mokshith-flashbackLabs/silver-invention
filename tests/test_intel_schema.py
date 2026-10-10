@@ -799,9 +799,6 @@ _PROPOSED_FOR = '{"question_key": "platforms", "option": "Bumble"}'
 def test_0053_research_sources_are_read_once_saved_searches(migrated_db: str) -> None:
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         conn.execute(_RESEARCH_SOURCE, ("search_query", _PROPOSED_FOR))
-        # 0053's down refuses while a research source exists, and the next test's fixture
-        # rolls everything down: leave none behind.
-        conn.execute("DELETE FROM intel_sources WHERE origin = 'research'")
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute(_RESEARCH_SOURCE, ("search_query", None))  # needs proposed_for
         with pytest.raises(psycopg.errors.CheckViolation):
@@ -834,18 +831,18 @@ def test_0053_only_a_weight_suggestion_carries_research_state(migrated_db: str) 
             )
 
 
-def test_0053_down_refuses_while_research_sources_exist_then_is_reversible(
-    migrated_db: str,
-) -> None:
+def test_0053_down_relabels_research_sources_and_is_reversible(migrated_db: str) -> None:
+    """A rollback keeps a research source's evidence and keeps it off: it becomes a disabled
+    'suggested' source with no reason (how an operator's own disable reads)."""
     with psycopg.connect(migrated_db, autocommit=True) as conn:
         conn.execute(_RESEARCH_SOURCE, ("search_query", _PROPOSED_FOR))
-    refused = run_migrate(migrated_db, "down", "--steps", _steps_through("0053_"))
-    assert refused.returncode != 0 and "research sources exist" in refused.stderr
-    with psycopg.connect(migrated_db, autocommit=True) as conn:
-        conn.execute("DELETE FROM intel_sources WHERE origin = 'research'")
     down = run_migrate(migrated_db, "down", "--steps", _steps_through("0053_"))
     assert down.returncode == 0, down.stderr
     with psycopg.connect(migrated_db, autocommit=True) as conn:
+        assert conn.execute(
+            "SELECT origin, enabled, disabled_reason FROM intel_sources"
+            " WHERE query_text = 'research query'"
+        ).fetchall() == [("suggested", False, None)]
         cols = {
             r[0]
             for r in conn.execute(

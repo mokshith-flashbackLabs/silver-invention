@@ -10,6 +10,7 @@ transaction (actor_type 'operator', metadata.operator); the worker's own writes 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
@@ -20,6 +21,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from imageshield.intel.bounds import DEFAULT_SOURCE_CHECK_EVERY_HOURS
 from imageshield.intel.models import Run, Source
 from imageshield.intel.proposal_models import ContextSignal, WriteResult
 from imageshield.intel.proposal_store import (
@@ -43,6 +45,7 @@ from imageshield.intel.suggestion import (
     SuggestionCandidates,
     suggestion_options,
 )
+from imageshield.intel.text import normalise
 from imageshield.search.urlhash import NORMALISATION_VERSION, url_hash
 
 log = structlog.get_logger("imageshield.intel")
@@ -70,6 +73,28 @@ _QUEUE_READS_SQL = """
     ON CONFLICT DO NOTHING
     RETURNING run_id
 """
+
+# A research search (spec 2026-10-10-intel-every-answer-researched §2.2.4): a saved search read
+# once, by the read queue_source_reads queues for it, and never scheduled -- disabled
+# ('research_once'), because queue_source_reads reads a named source whatever enabled says and
+# advances next_check_at, so a date could not keep it off the schedule.
+_REGISTER_RESEARCH_SQL = """
+    INSERT INTO intel_sources (kind, query_text, tags, check_every_hours, next_check_at, enabled,
+        disabled_reason, created_by, origin, proposed_for)
+    VALUES ('search_query', %(query)s, %(tags)s, %(every)s, now(), false, 'research_once',
+            'system:research', 'research', %(proposed_for)s)
+    RETURNING source_id
+"""
+
+
+@dataclass(frozen=True)
+class ResearchSourceRequest:
+    """One research search a weight suggestion asks for (spec 2026-10-10 §2.2.4)."""
+
+    option: str
+    query: str
+    tags: tuple[str, ...]
+
 
 _REGISTER_SQL = """
     INSERT INTO intel_sources (kind, source_url, url_hash, normalisation_version, query_text, tags,
@@ -138,6 +163,9 @@ class QuestionStore(Protocol):
     async def mark_sources_due(self, source_ids: Sequence[UUID], *, now: datetime) -> None: ...
     async def queue_source_reads(
         self, source_ids: Sequence[UUID], *, now: datetime
+    ) -> list[UUID]: ...
+    async def register_research_sources(
+        self, run_id: UUID, *, question_key: str, searches: Sequence[ResearchSourceRequest]
     ) -> list[UUID]: ...
     async def suggestion_candidates(
         self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int
@@ -434,6 +462,57 @@ class PostgresQuestionStore:
         async with self._pool.connection() as conn, conn.transaction():
             cur = await conn.execute(_QUEUE_READS_SQL, {"ids": list(source_ids), "now": now})
             return [row[0] for row in await cur.fetchall()]
+
+    async def register_research_sources(
+        self, run_id: UUID, *, question_key: str, searches: Sequence[ResearchSourceRequest]
+    ) -> list[UUID]:
+        """spec 2026-10-10 §2.2.4, in ONE transaction under the registration lock: each search
+        reuses the saved search with the same normalised query (any origin), or is registered as
+        a read-once research source. Returns the ids in order, each once; a repeat registers
+        nothing and writes no audit row."""
+        ids: list[UUID] = []
+        created = 0
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended('intel_source_registration', 0))"
+            )
+            cur = await conn.execute(
+                "SELECT source_id, query_text FROM intel_sources WHERE kind = 'search_query'"
+            )
+            queries: dict[str, UUID] = {query_key(q): sid for sid, q in await cur.fetchall()}
+            for search in searches:
+                query = normalise(search.query)
+                found = queries.get(query_key(query))
+                if found is None:
+                    cur = await conn.execute(
+                        _REGISTER_RESEARCH_SQL,
+                        {
+                            "query": query,
+                            "tags": list(search.tags),
+                            "every": DEFAULT_SOURCE_CHECK_EVERY_HOURS,
+                            "proposed_for": Jsonb(
+                                {"question_key": question_key, "option": search.option}
+                            ),
+                        },
+                    )
+                    row = await cur.fetchone()
+                    assert row is not None
+                    found = row[0]
+                    queries[query_key(query)] = found
+                    created += 1
+                if found not in ids:
+                    ids.append(found)
+            if created:
+                await conn.execute(
+                    _AUDIT_SQL,
+                    {
+                        "actor_type": "service",
+                        "action": "intel.research_sources_registered",
+                        "resource_id": run_id,
+                        "metadata": Jsonb({"question_key": question_key, "registered": created}),
+                    },
+                )
+        return ids
 
     async def suggestion_candidates(
         self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int

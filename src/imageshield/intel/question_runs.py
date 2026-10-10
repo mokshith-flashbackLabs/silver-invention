@@ -41,9 +41,10 @@ from imageshield.intel.bounds import (
 )
 from imageshield.intel.fetch_client import FetchFailure
 from imageshield.intel.generation import prompt_registry, prompt_signal
-from imageshield.intel.models import Source
+from imageshield.intel.models import Run, Source
 from imageshield.intel.pii import contains_pii
 from imageshield.intel.pipeline import (
+    ResearchWait,
     RunResult,
     RunStatus,
     RunWait,
@@ -63,6 +64,7 @@ from imageshield.intel.prompts import (
     suggestion_request,
     validation_search_request,
 )
+from imageshield.intel.question_store import ResearchSourceRequest
 from imageshield.intel.schemas import SourceProposalOutput
 from imageshield.intel.source_choice import (
     FETCH_REASONS,
@@ -77,14 +79,18 @@ from imageshield.intel.source_choice import (
     url_verdict,
 )
 from imageshield.intel.suggestion import (
+    OptionSuggestion,
     SuggestionRunRequest,
+    attach_research,
+    is_backed,
+    plan_research,
     prompt_suggestion_question,
     select_context,
     slugs_named_by,
     validate_suggestion,
 )
 from imageshield.intel.text import normalise
-from imageshield.intel.vocabulary import parse_vocabulary
+from imageshield.intel.vocabulary import ScoringVocabulary, parse_vocabulary
 from imageshield.search.urlhash import canonicalise, url_hash
 
 
@@ -416,7 +422,10 @@ async def _weight_suggestion(ctx: _Ctx) -> RunResult:
         if awaited:
             deadline = _now(ctx) + timedelta(seconds=SUGGESTION_WAIT_MAX_SECONDS)
             return _waiting(ctx, RunWait(awaiting=tuple(awaited), deadline=deadline))
-    status, error = await _suggest(ctx, request)
+    step = await _suggest(ctx, request)
+    if step.wait is not None:
+        return _waiting(ctx, step.wait)
+    status, error = step.status, step.error
     if status != "refused":
         try:
             await _generate(ctx)
@@ -489,7 +498,10 @@ def _unread(source: Source) -> bool:
     no_evidence = source.last_checked_at is None or (source.last_run_status or "").startswith(
         "deferred_"
     )
-    return no_evidence and (source.enabled or source.disabled_reason == "unmapped")
+    # A research search (spec 2026-10-10 §2.2.4) is disabled 'research_once' and read the same way.
+    return no_evidence and (
+        source.enabled or source.disabled_reason in ("unmapped", "research_once")
+    )
 
 
 async def _read_new_sources(
@@ -564,19 +576,49 @@ async def _read_new_sources(
     return stop, [*searches, *deferred]
 
 
-async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> tuple[RunStatus, str | None]:
+@dataclass(frozen=True)
+class _SuggestStep:
+    status: RunStatus
+    error: str | None = None
+    wait: RunWait | None = None
+
+
+@dataclass(frozen=True)
+class _ResearchState:
+    """The run's research so far (migration 0053, spec 2026-10-10 §2.2): round 0 before any."""
+
+    round: int
+    source_ids: tuple[UUID, ...]
+    kept: dict[str, Any] | None
+    searched: dict[str, list[dict[str, Any]]]
+
+    @classmethod
+    def of(cls, run: Run) -> _ResearchState:
+        kept = run.research_pass
+        raw = kept.get("searches") if isinstance(kept, dict) else None
+        searched = (
+            {str(k): list(v) for k, v in raw.items() if isinstance(v, list)}
+            if isinstance(raw, dict)
+            else {}
+        )
+        return cls(run.research_round, tuple(run.research_source_ids or ()), kept, searched)
+
+
+async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> _SuggestStep:
     """Retrieval, ONE suggestion call outside the reading cap (like generation), validation in
-    code, and the write."""
+    code, then either a research round or the write (spec 2026-10-10-intel-every-answer-researched
+    §2.2). A later round that cannot finish -- the gate, the model, an unusable answer, no
+    evidence -- writes the pass that started it."""
     questions = ctx.deps.questions
+    limits = ctx.deps.limits
     if await questions.suggestion_written(ctx.run.run_id):
         ctx.counts["suggestion_already_written"] += 1  # a reclaimed run: never billed twice
-        return "completed", None
+        return _SuggestStep("completed")
     vocabulary = parse_vocabulary(ctx.vocabulary) if ctx.vocabulary is not None else None
     if vocabulary is None:
-        return "failed", "vocabulary_missing"
-    now = ctx.deps.clock()
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
+        return _SuggestStep("failed", "vocabulary_missing")
+    now = _now(ctx)
+    research = _ResearchState.of(ctx.run)
     tags_by_option = {
         option: option_tags(
             option,
@@ -588,7 +630,8 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> tuple[RunStatus,
     }
     option_tag_set = {t for tags in tags_by_option.values() for t in tags}
     candidates = await questions.suggestion_candidates(
-        source_ids=request.source_ids,
+        # The research searches' evidence is the request's own first class (spec 2026-10-10 §2.2).
+        source_ids=list(dict.fromkeys([*request.source_ids, *research.source_ids])),
         tags=sorted(option_tag_set | slugs_named_by(request.options, vocabulary)),
         since=now - timedelta(days=SUGGESTION_CONTEXT_DAYS),
         limit=SUGGESTION_POOL_MAX,
@@ -598,47 +641,156 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> tuple[RunStatus,
     )
     ctx.counts["suggestion_evidence"] = len(context)
     if not context:
+        if research.kept is not None:
+            return await _write_kept(ctx, request, vocabulary, research)
         # Never an answer from no evidence at all (spec 2026-10-08 §2.5): no call, nothing
         # written, and the question's previous suggestion stays delivered.
         ctx.counts["suggestion_no_evidence"] += 1
-        return "failed", "no_evidence_found"
+        return _SuggestStep("failed", "no_evidence_found")
     relevant = option_tag_set | {t for s in context for t in s.tags} | set(vocabulary.mapped_tags)
     system, user = suggestion_request(
-        prompt_suggestion_question(request, tags_by_option, vocabulary),
+        prompt_suggestion_question(
+            request, tags_by_option, vocabulary, searched=research.searched
+        ),
         [prompt_signal(s) for s in context],
         registry_tags=prompt_registry(vocabulary, relevant),
-        research_round=ctx.run.research_round + 1,
-        max_rounds=ctx.deps.limits.suggestion_research_rounds,
-        searches_per_answer=ctx.deps.limits.research_searches_per_answer,
+        research_round=research.round + 1,
+        max_rounds=limits.suggestion_research_rounds,
+        searches_per_answer=limits.research_searches_per_answer,
     )
     try:
         call = await _call_model(
             ctx, lambda: ctx.deps.model.suggest_weights(system, user), capped=False
         )
     except _Stop as stop:
-        return ("refused" if stop.gate else "failed"), stop.reason
+        if research.kept is not None:
+            ctx.counts[f"research_ended_{stop.reason}"] += 1
+            return await _write_kept(ctx, request, vocabulary, research)
+        return _SuggestStep("refused" if stop.gate else "failed", stop.reason)
     if call.output is None:
         ctx.counts[f"suggestion_model_{call.outcome}"] += 1  # a verdict: nothing to deliver
-        return "failed", f"suggestion_{call.outcome}"
+        if research.kept is not None:
+            return await _write_kept(ctx, request, vocabulary, research)
+        return _SuggestStep("failed", f"suggestion_{call.outcome}")
+    by_id = {s.signal_id: s for s in context}
     options = validate_suggestion(
         call.output,
         options=request.options,
         cap=request.cap,
-        context={s.signal_id: s for s in context},
+        context=by_id,
         vocabulary=vocabulary,
         counts=ctx.counts,
     )
-    written = await questions.write_suggestion(
+    backed = {o.option: is_backed(o, by_id) for o in options}
+    unbacked = [o for o in options if not backed[o.option]]
+    if unbacked and research.round < limits.suggestion_research_rounds:
+        planned = plan_research(
+            unbacked,
+            searched=research.searched,
+            per_answer=limits.research_searches_per_answer,
+            counts=ctx.counts,
+        )
+        if planned:
+            return await _start_round(
+                ctx, request, research, tags_by_option, planned, options, backed, call.answered_by
+            )
+    final = attach_research(
+        options,
+        backed=backed,
+        searched=research.searched,
+        researching=limits.suggestion_research_rounds > 0,
+    )
+    return await _write(ctx, request, vocabulary, final, model_id=call.answered_by)
+
+
+async def _start_round(
+    ctx: _Ctx,
+    request: SuggestionRunRequest,
+    research: _ResearchState,
+    tags_by_option: Mapping[str, Sequence[str]],
+    planned: Mapping[str, Sequence[str]],
+    options: Sequence[OptionSuggestion],
+    backed: Mapping[str, bool],
+    model_id: str,
+) -> _SuggestStep:
+    """Register each planned search as a read-once research source, queue its read, keep this
+    pass, and wait (spec 2026-10-10 §2.2.4-§2.2.7)."""
+    now = _now(ctx)
+    ids = await ctx.deps.questions.register_research_sources(
+        ctx.run.run_id,
+        question_key=request.question_key,
+        searches=[
+            ResearchSourceRequest(option, query, tuple(tags_by_option.get(option, ())))
+            for option, queries in planned.items()
+            for query in queries
+        ],
+    )
+    await ctx.deps.questions.queue_source_reads(ids, now=now)
+    next_round = research.round + 1
+    searched = {k: list(v) for k, v in research.searched.items()}
+    for option, queries in planned.items():
+        searched.setdefault(option, []).extend({"round": next_round, "query": q} for q in queries)
+    ctx.counts["research_rounds"] += 1
+    ctx.counts["research_searches"] += sum(len(q) for q in planned.values())
+    kept = {
+        "model_id": model_id,
+        "options": [o.as_json() for o in options],
+        "backed": dict(backed),
+        "searches": searched,
+    }
+    return _SuggestStep(
+        "waiting",
+        wait=RunWait(
+            awaiting=tuple(ids),
+            deadline=now + timedelta(seconds=SUGGESTION_WAIT_MAX_SECONDS),
+            research=ResearchWait(
+                round=next_round,
+                source_ids=tuple(dict.fromkeys([*research.source_ids, *ids])),
+                kept=kept,
+                answers=len(planned),
+            ),
+        ),
+    )
+
+
+async def _write_kept(
+    ctx: _Ctx,
+    request: SuggestionRunRequest,
+    vocabulary: ScoringVocabulary,
+    research: _ResearchState,
+) -> _SuggestStep:
+    """The pass that started the round now ending (spec 2026-10-10 §2.2.8): its numbers, with
+    every answer it left unbacked exhausted."""
+    assert research.kept is not None
+    options = [OptionSuggestion.from_json(o) for o in research.kept.get("options", [])]
+    backed = {str(k): bool(v) for k, v in dict(research.kept.get("backed", {})).items()}
+    final = attach_research(options, backed=backed, searched=research.searched, researching=True)
+    model_id = str(research.kept.get("model_id", ""))
+    return await _write(ctx, request, vocabulary, final, model_id=model_id)
+
+
+async def _write(
+    ctx: _Ctx,
+    request: SuggestionRunRequest,
+    vocabulary: ScoringVocabulary,
+    options: Sequence[OptionSuggestion],
+    *,
+    model_id: str,
+) -> _SuggestStep:
+    exhausted = sum(1 for o in options if o.research is not None and o.research.exhausted)
+    if exhausted:
+        ctx.counts["research_exhausted_answers"] += exhausted
+    written = await ctx.deps.questions.write_suggestion(
         ctx.run.run_id,
         question_key=request.question_key,
         options=options,
         against_scoring_version=vocabulary.scoring_version,
         against_release_no=vocabulary.release_no,
-        model_id=call.answered_by,
+        model_id=model_id,
         prompt_version=SUGGEST_PROMPT_VERSION,
     )
     if written is None:
         ctx.counts["suggestion_already_written"] += 1
     else:
         ctx.counts["suggestions_superseded"] += len(written.superseded)
-    return "completed", None
+    return _SuggestStep("completed")

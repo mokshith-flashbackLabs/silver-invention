@@ -10,15 +10,18 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.bounds import SUGGESTION_WAIT_MAX_SECONDS, SUGGESTION_WAIT_RETRY_SECONDS
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import FetchFailure
+from imageshield.intel.model import ModelUnavailable
+from imageshield.intel.models import Source
 from imageshield.intel.pipeline import RunResult, run
-from imageshield.intel.question_store import PostgresQuestionStore
+from imageshield.intel.question_runs import _unread
+from imageshield.intel.question_store import PostgresQuestionStore, ResearchSourceRequest
 from imageshield.intel.schemas import (
     DiscoveryCandidate,
     DiscoveryOutput,
@@ -1214,3 +1217,300 @@ async def test_a_refused_coverage_ask_keeps_the_first_calls_sources(
     instagram, bumble = result.outcome["options"]
     assert instagram["proposed"] and bumble["uncovered"] is True
     assert result.outcome["source_proposal_coverage_refusal"] == 1
+
+
+# ── stage 4: research rounds (spec 2026-10-10-intel-every-answer-researched §2.2) ──
+
+RESEARCH = replace(TEST_LIMITS, suggestion_research_rounds=2, research_searches_per_answer=1)
+
+
+def _scripted_suggestions(
+    *answers: Callable[[dict[str, Any]], SuggestionOutput],
+) -> Callable[[dict[str, Any]], SuggestionOutput]:
+    """The n-th suggestion call answers with the n-th function (the last one repeats)."""
+    calls = {"n": 0}
+
+    def answer(payload: dict[str, Any]) -> SuggestionOutput:
+        fn = answers[min(calls["n"], len(answers) - 1)]
+        calls["n"] += 1
+        return fn(payload)
+
+    return answer
+
+
+def _instagram_backed_bumble_searches(query: str) -> Callable[[dict[str, Any]], SuggestionOutput]:
+    """Instagram cites the listed (so corroborated) evidence; Bumble has none and asks to search."""
+
+    def answer(payload: dict[str, Any]) -> SuggestionOutput:
+        listed = [e["signal_id"] for e in payload["evidence"] if e["trust"] == "listed"]
+        return SuggestionOutput(
+            options=[
+                SuggestedOptionWeight(
+                    option="Instagram", deduction=4, rationale="r", signal_ids=listed[:1]
+                ),
+                SuggestedOptionWeight(
+                    option="Bumble", rationale="none yet", research_searches=[query]
+                ),
+            ]
+        )
+
+    return answer
+
+
+async def _seed_listed_instagram(pool: AsyncConnectionPool) -> None:
+    done = await _done_run(pool)
+    await seed_signal(pool, run_id=done, tags=("instagram",), trust="listed")
+
+
+async def _proposal_target(pool: AsyncConnectionPool, run_id: UUID) -> Any:
+    rows = await _rows(
+        pool,
+        "SELECT target FROM intel_proposals WHERE kind = 'weight_suggestion' AND run_id = %s",
+        run_id,
+    )
+    return rows[0][0] if rows else None
+
+
+def _research_model(
+    *answers: Callable[[dict[str, Any]], SuggestionOutput],
+) -> FakeQuestionModel:
+    return FakeQuestionModel(
+        make_signal(tags=["linkedin"]),
+        discovery=_found_article(),
+        suggest_with=_scripted_suggestions(*answers),
+    )
+
+
+def _research_deps(pool: AsyncConnectionPool, model: FakeQuestionModel) -> Any:
+    fetcher = FakeFetcher({ARTICLE: make_page(POLICY, ARTICLE)})
+    return make_deps(pool, fetcher, model, limits=RESEARCH)
+
+
+async def test_an_unbacked_answer_starts_a_research_round_and_the_run_waits(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = _research_model(_instagram_backed_bumble_searches("dating app photo misuse"))
+    result = await run_once(intel_pool, _research_deps(intel_pool, model))
+    assert result.status == "waiting", result
+    assert result.outcome["research_rounds"] == 1
+    ((round_no, research_ids, kept, awaiting),) = await _rows(
+        intel_pool,
+        "SELECT research_round, research_source_ids, research_pass, awaiting_source_ids"
+        " FROM intel_runs WHERE run_id = %s",
+        queued.run_id,
+    )
+    assert round_no == 1 and research_ids == awaiting and len(research_ids) == 1
+    assert kept["searches"] == {"Bumble": [{"round": 1, "query": "dating app photo misuse"}]}
+    assert kept["backed"] == {"Instagram": True, "Bumble": False}
+    ((origin, enabled, reason, proposed_for, query, created_by),) = await _rows(
+        intel_pool,
+        "SELECT origin, enabled, disabled_reason, proposed_for, query_text, created_by"
+        " FROM intel_sources WHERE source_id = %s",
+        research_ids[0],
+    )
+    assert (origin, enabled, reason) == ("research", False, "research_once")
+    assert proposed_for == {"question_key": "platforms", "option": "Bumble"}
+    assert (query, created_by) == ("dating app photo misuse", "system:research")
+    assert await _open_runs(intel_pool, research_ids[0]) == [("discovery", "queued", "schedule")]
+    assert model.suggest_calls == 1
+    assert await _proposal_target(intel_pool, queued.run_id) is None  # never written yet
+
+
+async def test_research_ends_at_the_configured_rounds_and_writes_once_with_exhausted(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = _research_model(
+        _instagram_backed_bumble_searches("round one query"),
+        _instagram_backed_bumble_searches("round two query"),
+        _instagram_backed_bumble_searches("round three query"),
+    )
+    deps = _research_deps(intel_pool, model)
+    for _ in range(8):  # suggestion, read, suggestion, read, final suggestion
+        await run_once(intel_pool, deps)
+        if await _proposal_target(intel_pool, queued.run_id) is not None:
+            break
+    assert model.suggest_calls == 3  # two research rounds, then the write
+    target = await _proposal_target(intel_pool, queued.run_id)
+    instagram, bumble = target["options"]
+    assert instagram["research"] == {"rounds": 0, "searches": [], "exhausted": False}
+    assert bumble["research"]["rounds"] == 2 and bumble["research"]["exhausted"] is True
+    queries = [s["query"] for s in bumble["research"]["searches"]]
+    assert queries == ["round one query", "round two query"]
+    payloads = [json.loads(u) for u in model.suggestion_users]
+    assert payloads[1]["question"]["options"][1]["searched"] == ["round one query"]
+    assert payloads[2]["research"] is None  # the last pass asks for no more searches
+
+
+async def test_a_backed_question_runs_no_research(intel_pool: AsyncConnectionPool) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    request = {**SUGGEST_REQUEST, "options": ["Instagram"], "tags": {"Instagram": ["instagram"]}}
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        request, [], operator="ann"
+    )
+
+    def backed(payload: dict[str, Any]) -> SuggestionOutput:
+        listed = [e["signal_id"] for e in payload["evidence"] if e["trust"] == "listed"]
+        return SuggestionOutput(
+            options=[
+                SuggestedOptionWeight(
+                    option="Instagram", deduction=4, rationale="r", signal_ids=listed
+                )
+            ]
+        )
+
+    model = FakeQuestionModel(suggest_with=backed)
+    result = await run_once(
+        intel_pool, make_deps(intel_pool, FakeFetcher({}), model, limits=RESEARCH)
+    )
+    assert result.status == "completed" and model.suggest_calls == 1
+    target = await _proposal_target(intel_pool, queued.run_id)
+    assert target["options"][0]["research"] == {"rounds": 0, "searches": [], "exhausted": False}
+
+
+async def test_a_model_that_gives_no_searches_ends_research_and_writes(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = FakeQuestionModel(suggest_with=_cite_everything())  # Bumble asks for nothing
+    result = await run_once(
+        intel_pool, make_deps(intel_pool, FakeFetcher({}), model, limits=RESEARCH)
+    )
+    assert result.status == "completed" and model.suggest_calls == 1
+    target = await _proposal_target(intel_pool, queued.run_id)
+    assert target["options"][1]["research"] == {"rounds": 0, "searches": [], "exhausted": True}
+
+
+async def test_rounds_zero_researches_nothing_and_exhausts_nothing(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = _research_model(_instagram_backed_bumble_searches("never registered"))
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert result.status == "completed" and model.suggest_calls == 1
+    assert json.loads(model.suggestion_users[0])["research"] is None
+    target = await _proposal_target(intel_pool, queued.run_id)
+    assert target["options"][1]["research"] == {"rounds": 0, "searches": [], "exhausted": False}
+    assert not await _rows(intel_pool, "SELECT 1 FROM intel_sources WHERE origin = 'research'")
+
+
+async def test_a_refused_second_round_writes_the_first_rounds_pass(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = _research_model(_instagram_backed_bumble_searches("round one query"))
+    deps = _research_deps(intel_pool, model)
+    assert (await run_once(intel_pool, deps)).status == "waiting"
+    assert (await run_once(intel_pool, deps)).status == "completed"  # the research read
+    model.suggest_unavailable = ModelUnavailable("timeout", "APITimeoutError")
+    resumed = await run_once(intel_pool, deps)
+    assert resumed.status == "completed", resumed
+    target = await _proposal_target(intel_pool, queued.run_id)
+    instagram, bumble = target["options"]
+    assert instagram["deduction"] == 4  # round 1's numbers, not nulls
+    assert bumble["research"] == {
+        "rounds": 1,
+        "searches": [{"round": 1, "query": "round one query"}],
+        "exhausted": True,
+    }
+
+
+async def test_research_searches_reuse_an_existing_saved_search_by_its_query(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    existing = await PostgresIntelStore(intel_pool).create_source(
+        kind="search_query",
+        source_url=None,
+        query_text="already read query",
+        tags=(),
+        check_every_hours=168,
+        terms_note=None,
+        operator="alice",
+    )
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = _research_model(_instagram_backed_bumble_searches("Already  READ query"))
+    first = await run_once(intel_pool, _research_deps(intel_pool, model))
+    assert first.status == "waiting"
+    ((research_ids,),) = await _rows(
+        intel_pool, "SELECT research_source_ids FROM intel_runs WHERE run_id = %s", queued.run_id
+    )
+    assert research_ids == [existing.source_id]
+    assert not await _rows(intel_pool, "SELECT 1 FROM intel_sources WHERE origin = 'research'")
+
+
+async def test_a_rerun_of_a_research_round_registers_nothing_twice(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresQuestionStore(intel_pool)
+    queued = await store.register_and_queue_suggestion(SUGGEST_REQUEST, [], operator="ann")
+    searches = [ResearchSourceRequest(option="Bumble", query="dating app photo misuse", tags=())]
+    first = await store.register_research_sources(
+        queued.run_id, question_key="platforms", searches=searches
+    )
+    again = await store.register_research_sources(
+        queued.run_id, question_key="platforms", searches=searches
+    )
+    assert first == again and len(first) == 1
+    audits = await _rows(
+        intel_pool,
+        "SELECT actor_type FROM audit_log WHERE action = 'intel.research_sources_registered'",
+    )
+    assert audits == [("service",)]  # the second call registered nothing
+
+
+def test_a_research_source_left_unread_is_one_the_suggestion_reads() -> None:
+    """A research source is disabled ('research_once'); _unread treats it like an 'unmapped'
+    draft source, so an outage-stopped research read is queued again."""
+    source = Source.model_validate(
+        {
+            "source_id": uuid4(),
+            "kind": "search_query",
+            "source_url": None,
+            "url_hash": None,
+            "query_text": "q",
+            "tags": [],
+            "check_every_hours": 168,
+            "next_check_at": NOW,
+            "enabled": False,
+            "terms_note": None,
+            "last_content_sha256": None,
+            "last_checked_at": None,
+            "last_run_status": None,
+            "consecutive_failures": 0,
+            "disabled_reason": "research_once",
+            "created_by": "system:research",
+            "created_at": NOW,
+            "origin": "research",
+            "proposed_for": {"question_key": "platforms", "option": "Bumble"},
+            "validation_run_id": None,
+            "validated_at": None,
+        }
+    )
+    assert _unread(source)
