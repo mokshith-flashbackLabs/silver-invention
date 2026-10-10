@@ -1422,6 +1422,32 @@ relabels `covered_by_decision` rows `newer_proposal` and restores 0039's three v
 No other schema change rides with this spec: `intel_documents.published_at` (0039) is now filled for pages and search
 results too, whenever the publisher's date can be read (§2 of the spec), and never with the fetch time.
 
+## 2m. Likeness intel — research rounds (migration 0053)
+
+Spec `2026-10-10-intel-every-answer-researched-design.md` §2.2, §3. A weight suggestion searches again for answers it
+could not back, through read-once research searches:
+
+```sql
+-- intel_sources
+origin           -- CHECK gains 'research'
+disabled_reason  -- CHECK gains 'research_once'
+-- intel_sources_research_shape: origin <> 'research' OR (kind = 'search_query' AND proposed_for IS NOT NULL)
+
+-- intel_runs
+research_round      SMALLINT NOT NULL DEFAULT 0  -- the round in progress
+research_source_ids UUID[]                       -- every research search registered so far
+research_pass       JSONB                        -- the pass that started the current round
+-- intel_runs_research_only_suggestions: kind = 'weight_suggestion' OR all three at their defaults
+-- intel_runs_research_round_non_negative: research_round >= 0
+
+-- intel_run_events.kind CHECK gains 'research_round'
+```
+
+A research source is registered `enabled = false`, `disabled_reason = 'research_once'`, `created_by =
+'system:research'`: `queue_source_reads` reads it at once and no schedule picks it up. `wait_run` writes the three
+run columns. The down relabels research sources as disabled `suggested` sources with no reason (evidence kept) and
+drops the rest.
+
 ## 3. Adjudication service
 
 ⚠ **This section is the original match-module-era sketch and was never built as written.** It predates

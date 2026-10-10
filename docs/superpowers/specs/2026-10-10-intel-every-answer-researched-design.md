@@ -100,9 +100,13 @@ A suggestion pass that leaves answers unbacked now leads to another round instea
    unbacked answer, the run stops researching and writes.
 4. **Each search is a saved search, read once.** Code registers it as a `search_query` source,
    `origin = 'research'`, tagged with the answer's tags (`option_tags`, possibly none),
-   `proposed_for` the question, with `next_check_at = 'infinity'`: it is read now, by the read
-   queued for it, and never scheduled again. Its id joins the run's `research_source_ids`, which
-   retrieval reads alongside `request.source_ids` from then on.
+   `proposed_for` the question, registered disabled (`enabled = false`, `disabled_reason =
+   'research_once'`): `queue_source_reads` reads it now, because it reads a named source whatever
+   `enabled` says, and no schedule ever picks it up. *(Corrected at build, 2026-10-10: this read
+   "with `next_check_at = 'infinity'`", which `queue_source_reads` would have overwritten, since it
+   advances `next_check_at` by one interval.)* A search whose normalised query matches a saved
+   search that already exists, of any origin, reuses it. Its id joins the run's
+   `research_source_ids`, which retrieval reads alongside `request.source_ids` from then on.
 5. **The run waits for those reads**, using the existing wait machinery unchanged
    (`queue_source_reads`, `RunWait`, `awaiting_source_ids`, `SUGGESTION_WAIT_MAX_SECONDS`,
    `SUGGESTION_WAIT_RETRY_SECONDS`). On resuming, `research_round` is incremented and the next pass
@@ -157,12 +161,17 @@ appears in either prompt's fixed text.
 ## 3. Schema (migration 0053)
 
 - `intel_sources.origin` CHECK gains `'research'`, plus a shape CHECK:
-  `origin <> 'research' OR kind = 'search_query'`.
+  `origin <> 'research' OR (kind = 'search_query' AND proposed_for IS NOT NULL)`.
+- `intel_sources.disabled_reason` CHECK gains `'research_once'` (§2.2.4).
 - `intel_runs` gains `research_round SMALLINT NOT NULL DEFAULT 0`, `research_source_ids UUID[]`
   and `research_pass JSONB` (§2.2.7), with a CHECK that only a `weight_suggestion` run carries
   any of them.
 - `intel_run_events.kind` CHECK gains `'research_round'`.
-- The down drops the columns and CHECKs, and refuses while any `research` source exists.
+- The down drops the columns and CHECKs. *(Changed at build, 2026-10-10: it was to refuse while
+  any `research` source exists.)* It relabels them instead: each becomes a disabled `suggested`
+  source with no reason, keeping its evidence, which is how an operator's own disable reads, so
+  nothing turns it on. A rollback should not need a hand-deletion of evidence, and the test suite
+  migrates every database down between tests.
 
 ## 4. What does not change
 
@@ -191,11 +200,11 @@ becomes a required key with no code default, raised as follows:
 | Limit | Today | Key | New value |
 |---|---|---|---|
 | web searches in one stage-1 source-proposal call | 25 (env) | `INTEL_MAX_SOURCE_PROPOSAL_SEARCHES` | 40 |
-| token ceiling of that call | 16000 (`_SOURCE_PROPOSAL_MAX_TOKENS`) | `INTEL_SOURCE_PROPOSAL_MAX_TOKENS` | 24000 |
+| output ceiling of that call, in tokens | 16000 (`_SOURCE_PROPOSAL_MAX_TOKENS`) | `INTEL_SOURCE_PROPOSAL_MAX_OUTPUT` | 24000 |
 | sources stage 1 keeps per answer | 5 (`MAX_PROPOSED_SOURCES_PER_OPTION`) | `INTEL_MAX_PROPOSED_SOURCES_PER_ANSWER` | 8 |
 | of those, saved searches | 2 (`MAX_PROPOSED_SEARCHES_PER_OPTION`) | `INTEL_MAX_PROPOSED_SEARCHES_PER_ANSWER` | 3 |
 | web searches in one saved-search read | 5 (code default, never set) | `INTEL_MAX_WEB_SEARCHES_PER_RUN` | 10 |
-| token ceiling of a saved-search read and its choose step | 8000 (`_MAX_TOKENS`) | `INTEL_SEARCH_READ_MAX_TOKENS` | 16000 |
+| output ceiling of a saved-search read, its choose step and a validation search, in tokens | 8000 (`_MAX_TOKENS`) | `INTEL_SEARCH_READ_MAX_OUTPUT` | 16000 |
 | pages a saved-search read keeps from its results | 5–8 (`DISCOVERY_MIN/MAX_RESULT_PAGES`) | `INTEL_DISCOVERY_MIN_RESULT_PAGES` / `INTEL_DISCOVERY_MAX_RESULT_PAGES` | 5 / 12 |
 | web searches in one stage-3 validation of a search | 1 (`_VALIDATION_SEARCHES`) | `INTEL_VALIDATION_SEARCHES` | 3 |
 | result pages fetched before a validation search counts as empty | 5 (`MAX_SEARCH_RESULTS_CHECKED`) | `INTEL_VALIDATION_RESULT_PAGES` | 8 |
@@ -204,7 +213,9 @@ becomes a required key with no code default, raised as follows:
 | research rounds (new, §2.2; owner's number) | — | `INTEL_SUGGESTION_RESEARCH_ROUNDS` | 4 |
 
 These are the values in both environments' task definitions and in `.env.example`; the code holds
-none of them. The two coverage and research keys are ≥ 0 (0 turns the feature off); every other
+none of them. *(Named at build, 2026-10-10: the two output ceilings were drafted as `*_MAX_TOKENS`;
+the task-definition test that refuses any `environment` name containing "token" as a possible
+secret stays strict, so they are `*_MAX_OUTPUT`.)* The two coverage and research keys are ≥ 0 (0 turns the feature off); every other
 key is ≥ 1, and `INTEL_DISCOVERY_MIN_RESULT_PAGES` must not exceed `INTEL_DISCOVERY_MAX_RESULT_PAGES`
 (boot refuses). Prompts that state a cap (`source_proposal_request`'s per-answer count) read the
 key. The `sources-v3` and `suggest-v2` prompt versions cover the changed numbers.

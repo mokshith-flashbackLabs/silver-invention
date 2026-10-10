@@ -328,6 +328,18 @@ at least a budget outage will not also relax everyone's cadence.
   not alarm on that, so **`no_successful_calls_24h` is suppressed for kind
   `llm`** — `intel_stale` is what actually watches this provider for silence.
 
+**Every answer researched (2026-10-10, spec `docs/superpowers/specs/2026-10-10-intel-every-answer-researched-design.md`).**
+- **A suggestion can take several rounds.** An answer the first pass could not back gets up to
+  `INTEL_SUGGESTION_RESEARCH_ROUNDS` (4) more rounds. Each round costs one suggestion call plus one saved-search
+  read per search (`INTEL_RESEARCH_SEARCHES_PER_ANSWER`, 3), and the run waits for those reads as it waits for any
+  other (`waiting`, then a `research_round` step in its log). Outcome counters: `research_rounds`,
+  `research_searches`, `research_exhausted_answers`, `research_search_names_a_person`, `research_search_repeated`.
+- **Research sources** show in the source list as disabled `research_once` saved searches. They are read once and
+  never scheduled; enabling one by hand turns it into an ordinary weekly saved search.
+- **Every search limit is a required key** (spec §5.1), set in both `services-worker` task definitions. A missing
+  key refuses boot naming it. Raising a search or output limit makes each call longer and larger, not more numerous;
+  `claude_intel`'s `cost_per_call_usd` (2.00, migration 0051) is the budget estimate per call.
+
 **Throughput (2026-10-03, spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`).**
 - **Several runs at once.** Each `intel-worker` keeps up to `INTEL_RUN_CONCURRENCY` (3) runs in flight, and one run
   reads up to `INTEL_SOURCE_READ_CONCURRENCY` (4) sources or pages at once. The `claude_intel` daily budget can
