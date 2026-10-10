@@ -174,29 +174,60 @@ appears in either prompt's fixed text.
 
 ## 5. Configuration
 
-Three new required keys on the intel worker, with no code default, as `INTEL_MAX_SOURCE_PROPOSAL_SEARCHES`
-already is (`intel/config.py`). They go in `.env.example`, `infra/ecs/imageshield-dev-services-worker.json`
-and `infra/ecs/prod/services-worker.json`:
+Every limit in this spec is a required key on the intel worker with no code default, as
+`INTEL_MAX_SOURCE_PROPOSAL_SEARCHES` already is (`intel/config.py`). They go in `.env.example`,
+`infra/ecs/imageshield-dev-services-worker.json` and `infra/ecs/prod/services-worker.json`. The
+full list, with values, is the table in §5.1.
 
-| Key | Starting value | Meaning | Validation |
+### 5.1 Every search limit raised, and moved to configuration
+
+Owner, approving this spec: "also increase search limits". Today two search limits are env keys
+and the rest are numbers in code (`intel/bounds.py`, `intel/model.py`), one with a code default
+the task definitions never set. `bounds.py` keeps safety limits as code constants on purpose, and
+that stays true for the safety limits (quote lengths, attempts, the PII check, the corroboration
+floor). These are volume and cost knobs, so, by the owner's "do not hardcode anything", each
+becomes a required key with no code default, raised as follows:
+
+| Limit | Today | Key | New value |
 |---|---|---|---|
-| `INTEL_SOURCE_PROPOSAL_COVERAGE_ASKS` | 1 | extra stage-1 asks for uncovered answers | ≥ 0 (0 turns it off) |
-| `INTEL_SUGGESTION_RESEARCH_ROUNDS` | 4 | research rounds per suggestion run (owner, 2026-10-10) | ≥ 0 (0 turns it off) |
-| `INTEL_RESEARCH_SEARCHES_PER_ANSWER` | 2 | searches per unbacked answer per round | ≥ 1 |
+| web searches in one stage-1 source-proposal call | 25 (env) | `INTEL_MAX_SOURCE_PROPOSAL_SEARCHES` | 40 |
+| token ceiling of that call | 16000 (`_SOURCE_PROPOSAL_MAX_TOKENS`) | `INTEL_SOURCE_PROPOSAL_MAX_TOKENS` | 24000 |
+| sources stage 1 keeps per answer | 5 (`MAX_PROPOSED_SOURCES_PER_OPTION`) | `INTEL_MAX_PROPOSED_SOURCES_PER_ANSWER` | 8 |
+| of those, saved searches | 2 (`MAX_PROPOSED_SEARCHES_PER_OPTION`) | `INTEL_MAX_PROPOSED_SEARCHES_PER_ANSWER` | 3 |
+| web searches in one saved-search read | 5 (code default, never set) | `INTEL_MAX_WEB_SEARCHES_PER_RUN` | 10 |
+| token ceiling of a saved-search read and its choose step | 8000 (`_MAX_TOKENS`) | `INTEL_SEARCH_READ_MAX_TOKENS` | 16000 |
+| pages a saved-search read keeps from its results | 5–8 (`DISCOVERY_MIN/MAX_RESULT_PAGES`) | `INTEL_DISCOVERY_MIN_RESULT_PAGES` / `INTEL_DISCOVERY_MAX_RESULT_PAGES` | 5 / 12 |
+| web searches in one stage-3 validation of a search | 1 (`_VALIDATION_SEARCHES`) | `INTEL_VALIDATION_SEARCHES` | 3 |
+| result pages fetched before a validation search counts as empty | 5 (`MAX_SEARCH_RESULTS_CHECKED`) | `INTEL_VALIDATION_RESULT_PAGES` | 8 |
+| extra stage-1 asks for uncovered answers (new, §2.1) | — | `INTEL_SOURCE_PROPOSAL_COVERAGE_ASKS` | 2 |
+| searches per unbacked answer per research round (new, §2.2) | — | `INTEL_RESEARCH_SEARCHES_PER_ANSWER` | 3 |
+| research rounds (new, §2.2; owner's number) | — | `INTEL_SUGGESTION_RESEARCH_ROUNDS` | 4 |
+
+These are the values in both environments' task definitions and in `.env.example`; the code holds
+none of them. The two coverage and research keys are ≥ 0 (0 turns the feature off); every other
+key is ≥ 1, and `INTEL_DISCOVERY_MIN_RESULT_PAGES` must not exceed `INTEL_DISCOVERY_MAX_RESULT_PAGES`
+(boot refuses). Prompts that state a cap (`source_proposal_request`'s per-answer count) read the
+key. The `sources-v3` and `suggest-v2` prompt versions cover the changed numbers.
+
+The other kinds of call keep their token ceiling (`_MAX_TOKENS`, extraction and generation); they
+make no searches, so a search limit does not bear on them.
 
 ## 6. Cost and time
 
 A round costs one suggestion call (about $0.4–0.7 measured; budgeted at `claude_intel`'s
 `cost_per_call_usd`) plus one discovery read per search (several minutes each, read side by side
-by free worker slots). With two unbacked answers and the starting values, a question can add up to
-4 × (1 + 2 × 2) = 20 metered calls and several waits of a few minutes. Every call passes the
+by free worker slots). With two unbacked answers and the §5.1 values, a question can add up to
+4 × (1 + 2 × 3) = 28 metered calls and several waits of a few minutes. The larger search limits
+make each search call longer and larger (more results read into it), not more numerous; the
+`cost_per_call_usd` budget estimate of 2.00 (migration 0051) already sits above the largest call
+measured, and is re-checked against dev's first runs. Every call passes the
 provider gate (daily budget, breaker, kill switch), and prod's `claude_intel` is still disabled,
 so none of this spends anything on prod until the owner enables it.
 
 ## 7. Tests
 
-- Stage 1: an uncovered answer triggers exactly one coverage ask (with the key at 1), naming only
-  the uncovered answers; a still-uncovered answer is `uncovered: true` and the run completes; with
+- Stage 1: an uncovered answer triggers coverage asks up to the key's value (one with the key at
+  1), each naming only the answers still uncovered; a still-uncovered answer is `uncovered: true` and the run completes; with
   the key at 0 no ask is made; a gate refusal during an ask keeps the first call's sources.
 - Stage 4:
   - An unbacked answer starts a round: research sources are registered (`origin 'research'`,
@@ -213,7 +244,10 @@ so none of this spends anything on prod until the owner enables it.
     plus `research_round` read from the row).
 - Prompts: no fixture answer text appears in the fixed text of `sources-v3` or `suggest-v2`.
 - Migration 0053 up/down, and the down's refusal.
-- Config: each key missing refuses boot; a negative value refuses boot.
+- Config: each §5.1 key missing refuses boot; a negative value, or 0 where ≥ 1 is required,
+  refuses boot; a discovery minimum above its maximum refuses boot. A repo-wide test asserts that
+  `bounds.py` and `model.py` no longer define any of the moved constants, and that every key is
+  present in both task definitions and `.env.example`.
 
 ## 8. Rollout
 
