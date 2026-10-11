@@ -1,4 +1,4 @@
-# Suggest points also drafts the score page's words — design
+# The AI also drafts the score page's words — design
 
 Date: 2026-10-11. Owner request, showing the funnel's result screen (quiz.imageshield.com): the
 cards "The primary risk factors that determined your initial score" and "General recommendations"
@@ -8,8 +8,8 @@ things. These two sections should be written by our AI."
 This is the services half of two coordinated changes. The backend half,
 `image_backend/docs/superpowers/specs/2026-10-11-researched-score-insights-design.md`, stores the
 words an operator applies, checks them again, and serves them on the score response. This half
-only makes the AI **draft** them. It adds no proposal kind, no run kind, no table, no migration
-and no `svc` view.
+only makes the AI **draft** them: in Suggest points (§2) and, for threats, in the propose stage
+(§2.2). It adds no proposal kind, no run kind, no table, no migration and no `svc` view.
 
 ## 1. What the owner decided
 
@@ -22,8 +22,16 @@ and no `svc` view.
   per-answer steps and over live findings). A short list, identical for every visitor.
 - **No new dimension.** Asked whether this adds a fifth kind beside weight changes, threats,
   protections and coverage gaps: it does not. The words are fields on the Suggest points result the
-  AI already writes per question. The owner's reminder: "these are just read-only for the user in
-  the web app". They move no score and need no lifecycle.
+  AI already writes per question, plus one field on the threat proposals it already writes. The
+  owner's reminder: "these are just read-only for the user in the web app". They move no score and
+  need no lifecycle.
+- **Live threats rank beside quiz answers on the risk-factors card; protections never appear.**
+  The owner first removed both ("I did not ask for live threat and protection to be in this
+  thing"). They then asked whether adding them would improve the experience, and were told threats
+  yes, protections no. A tag-matched threat takes as many points as an answer from the first score,
+  while a protection raises the score. The owner: "then add that". A threat's existing body can
+  run to 400 characters, against the card's "small", so a threat appears only with a short card
+  line drafted for it (§2.2).
 
 ## 2. What the AI drafts (`suggest-v2` → `suggest-v3`)
 
@@ -65,16 +73,34 @@ steers it).
 
 `SUGGEST_PROMPT_VERSION = "suggest-v3"`, pinned by the existing test.
 
+### 2.2 A threat's card line (`propose-v9` → `propose-v10`)
+
+`ProposedThreatEvent` gains **`card_line`**: one sentence of at most 160 characters, saying what
+the incident is in plain words. It is shown beside the threat's title on the risk-factors card of
+everyone the threat charges.
+
+- **The same rules as `factor_line`** (§2.1): figures in digits and copied from a cited quote, the
+  word list, no names, no links, and never anything of the reader's found. It describes the
+  incident, never the reader ("this is about a wider incident" is the existing body's stance).
+- The propose request's evidence gains the same **`quotes`** field (§2.1), because the figure
+  check (§4.2) needs it.
+- **Protection proposals gain nothing.** They are not on the card.
+
+`PROPOSE_PROMPT_VERSION = "propose-v10"`, pinned by the existing test.
+
 ## 3. Unchanged
 
 - Deductions, rationale, tags, `research_searches` and research rounds behave exactly as today.
 - Nothing about a person crosses. The request is still the draft question, its evidence and the
   tag registry, never a person and never an answer (INVARIANTS #48). The lines describe the
   quiz's own options.
-- Threat and protection proposals are untouched, and they do not appear on these cards (owner,
-  2026-10-11: "I did not ask for live threat and protection to be in this thing").
+- Threat proposals change only by `card_line` (§2.2): their title, body, severity, action and
+  every existing rule are as today. Protection proposals are untouched.
+- **Services store no card line on the event.** `threat_events` and `svc.v_active_scoped_events`
+  are unchanged. The backend stores the line from `decided` at approval, as it already does with a
+  drafted action (backend 0056).
 
-## 4. Code checks (`validate_suggestion`)
+## 4. Code checks (`validate_suggestion`, and `_threat_event` for threats)
 
 Each check is counted into `counts`, as every drop already is. Text is never truncated.
 
@@ -95,6 +121,12 @@ or no surviving cited signal (`recommendation_dropped_*`). Its link follows the 
 characters, and its `url_hash` is a cited signal's `document_key`. Otherwise the link and its label
 are dropped (`recommendation_link_not_cited`) and the recommendation is kept. `link_label` (at most
 60 characters) needs a link.
+
+**A threat's card line** is checked in `generation.py` `_threat_event`, following `_event_body`.
+It is masked and normalised. Over 160 characters, a word-list match, or a figure in no excerpt of
+the threat's cited signals each make it `""`, counted as `card_line_too_long`,
+`card_line_forbidden_words` and `card_line_figure_not_quoted`; an empty one counts
+`card_line_missing`. **The threat is always kept**: a missing card line only keeps it off the card.
 
 ### 4.1 The word list
 
@@ -132,7 +164,13 @@ Running it here as well means the console never shows drafted words the backend 
   `{title, body, link_url, link_label, signal_ids, corroborated, why_not}` or null. `corroborated`
   and `why_not` are computed at read time with the same rule options use (two independent
   publishers unless a cited signal is `listed`).
-- `PROXY_INTEGRATION.md` S7 (`SuggestionOption`) is amended with the fields.
+- **A threat's card line.** `ThreatEventSuggested` (`proposal_models.py`) gains `card_line`,
+  defaulting to `""` and at most 160 characters, so older rows parse. A decision's `Values` gains
+  `card_line`, so the operator can edit it at approval. Like `body`, values merge over `suggested`,
+  and `decided` carries the result. Nothing inserts it into `threat_events`; the backend reads it
+  from the decision's answer (§3).
+- `PROXY_INTEGRATION.md` is amended with the fields: S7 (`SuggestionOption`), the threat proposal
+  shapes and the decision `values`.
 
 ## 6. Tests
 
@@ -147,6 +185,12 @@ Running it here as well means the console never shows drafted words the backend 
   recommendation with no surviving cited signal is dropped.
 - A pre-v3 proposal row parses and reads with empty factor fields and `recommendation: null`.
 - Across research rounds, a kept option's words come from its kept pass.
+- The prompt is `propose-v10`. It asks every threat for a `card_line`, shows `quotes`, and still
+  names no steering case (the existing propose-v9 test).
+- Each card-line drop reason empties the line, counts once and keeps the threat with its title,
+  body, severity and action unchanged. A protection proposal carries no `card_line`.
+- An operator's `values.card_line` replaces the drafted one in `decided`. `threat_events` and the
+  scoped view are unchanged by an approval with a card line.
 
 ## 7. Deploy and cost
 
@@ -155,6 +199,8 @@ Running it here as well means the console never shows drafted words the backend 
 - Rollback is the previous image. A v3 proposal's extra fields are ignored by v2 code.
 - Cost: each request grows by the evidence quotes, which are up to 600 characters each and a few
   per signal. Each answer gains up to 200 output characters. Suggest points runs on an operator's
-  press, so the cost scales with presses, not with users.
+  press, so its cost scales with presses, not with users. The propose stage runs after source reads,
+  the daily news watch included, so the quotes add to every propose call. That cost scales with
+  sources and stays under the existing daily cap.
 - **Prod:** the `claude_intel` provider is still off on prod, so nothing is drafted there until it
   is enabled. That is the operator's switch, not part of this change.
