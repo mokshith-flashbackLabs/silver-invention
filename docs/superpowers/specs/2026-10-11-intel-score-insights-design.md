@@ -71,8 +71,8 @@ steers it).
 - Nothing about a person crosses. The request is still the draft question, its evidence and the
   tag registry, never a person and never an answer (INVARIANTS #48). The lines describe the
   quiz's own options.
-- Threat and protection proposals are untouched. Their `body` ("what it means for you") already
-  exists, and the backend shows it on the same card.
+- Threat and protection proposals are untouched, and they do not appear on these cards (owner,
+  2026-10-11: "I did not ask for live threat and protection to be in this thing").
 
 ## 4. Code checks (`validate_suggestion`)
 
