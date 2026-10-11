@@ -1378,7 +1378,7 @@ async def test_a_backed_question_runs_no_research(intel_pool: AsyncConnectionPoo
     assert target["options"][0]["research"] == {"rounds": 0, "searches": [], "exhausted": False}
 
 
-async def test_a_model_that_gives_no_searches_ends_research_and_writes(
+async def test_a_model_that_gives_no_searches_ends_research_without_calling_it_researched(
     intel_pool: AsyncConnectionPool,
 ) -> None:
     await seed_quiz_vocabulary(intel_pool)
@@ -1392,7 +1392,8 @@ async def test_a_model_that_gives_no_searches_ends_research_and_writes(
     )
     assert result.status == "completed" and model.suggest_calls == 1
     target = await _proposal_target(intel_pool, queued.run_id)
-    assert target["options"][1]["research"] == {"rounds": 0, "searches": [], "exhausted": True}
+    # Nothing was searched for Bumble, so it is not "researched, nothing found" (final review I2).
+    assert target["options"][1]["research"] == {"rounds": 0, "searches": [], "exhausted": False}
 
 
 async def test_rounds_zero_researches_nothing_and_exhausts_nothing(
@@ -1514,3 +1515,155 @@ def test_a_research_source_left_unread_is_one_the_suggestion_reads() -> None:
         }
     )
     assert _unread(source)
+
+
+# ── final review fixes (2026-10-11) ──
+
+
+async def test_an_answer_a_round_backed_stays_backed_when_a_later_pass_drops_it(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """C1: research evidence can crowd an answer's evidence out of the context; the answer an
+    earlier pass backed is written from that pass, not lost."""
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+
+    def instagram_lost(payload: dict[str, Any]) -> SuggestionOutput:
+        return SuggestionOutput(
+            options=[
+                SuggestedOptionWeight(option="Instagram", rationale="cannot see it now"),
+                SuggestedOptionWeight(option="Bumble", rationale="still nothing"),
+            ]
+        )
+
+    model = _research_model(
+        _instagram_backed_bumble_searches("round one query"), instagram_lost
+    )
+    limits = replace(TEST_LIMITS, suggestion_research_rounds=1, research_searches_per_answer=1)
+    fetcher = FakeFetcher({ARTICLE: make_page(POLICY, ARTICLE)})
+    deps = make_deps(intel_pool, fetcher, model, limits=limits)
+    for _ in range(4):
+        result = await run_once(intel_pool, deps)
+        if await _proposal_target(intel_pool, queued.run_id) is not None:
+            break
+    assert model.suggest_calls == 2
+    instagram, bumble = (await _proposal_target(intel_pool, queued.run_id))["options"]
+    assert instagram["deduction"] == 4 and instagram["research"]["exhausted"] is False
+    assert bumble["research"]["exhausted"] is True
+    assert result.outcome["research_kept_backed_answer"] == 1
+
+
+async def test_a_reused_search_already_read_is_not_read_again_and_the_run_resumes_at_once(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """I4: no second paid read of a search already read; with nothing to read the run is
+    claimable at once and answers from what exists."""
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    store = PostgresIntelStore(intel_pool)
+    read = await store.create_source(
+        kind="search_query", source_url=None, query_text="already read query", tags=(),
+        check_every_hours=168, terms_note=None, operator="alice",
+    )
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE intel_sources SET last_checked_at = now(), last_run_status = 'checked'"
+            " WHERE source_id = %s",
+            (read.source_id,),
+        )
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = _research_model(
+        _instagram_backed_bumble_searches("Already read query"),
+        _instagram_backed_bumble_searches("never asked"),
+    )
+    limits = replace(TEST_LIMITS, suggestion_research_rounds=1, research_searches_per_answer=1)
+    deps = make_deps(intel_pool, FakeFetcher({}), model, limits=limits)
+    assert (await run_once(intel_pool, deps)).status == "waiting"
+    assert await _open_runs(intel_pool, read.source_id) == []  # no second read queued
+    ((awaiting,),) = await _rows(
+        intel_pool, "SELECT awaiting_source_ids FROM intel_runs WHERE run_id = %s", queued.run_id
+    )
+    assert awaiting == []
+    resumed = await run_once(intel_pool, deps)  # claimable at once
+    assert resumed.status == "completed" and model.suggest_calls == 2
+
+
+async def test_a_reused_search_an_operator_switched_off_is_never_read(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    store = PostgresIntelStore(intel_pool)
+    off = await store.create_source(
+        kind="search_query", source_url=None, query_text="switched off query", tags=(),
+        check_every_hours=168, terms_note=None, operator="alice",
+    )
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE intel_sources SET enabled = false WHERE source_id = %s", (off.source_id,)
+        )
+    await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    model = _research_model(_instagram_backed_bumble_searches("switched off query"))
+    limits = replace(TEST_LIMITS, suggestion_research_rounds=1, research_searches_per_answer=1)
+    await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model, limits=limits))
+    assert await _open_runs(intel_pool, off.source_id) == []
+
+
+async def test_an_operator_choosing_a_research_search_switches_it_on_as_theirs(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """I5: stage 4 reusing a read-once research row makes it the operator's scheduled source."""
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresQuestionStore(intel_pool)
+    earlier = await store.register_and_queue_suggestion(SUGGEST_REQUEST, [], operator="ann")
+    (research_id,) = await store.register_research_sources(
+        earlier.run_id,
+        question_key="platforms",
+        searches=[ResearchSourceRequest(option="Bumble", query=SAVED_SEARCH, tags=())],
+    )
+    queued = await store.register_and_queue_suggestion(
+        SUGGEST_REQUEST, [_chosen_search()], operator="ann"
+    )
+    assert queued.reused == (research_id,)
+    ((origin, enabled, reason, tags, every),) = await _rows(
+        intel_pool,
+        "SELECT origin, enabled, disabled_reason, tags, check_every_hours FROM intel_sources"
+        " WHERE source_id = %s",
+        research_id,
+    )
+    assert (origin, enabled, reason, tags, every) == (
+        "suggested", True, None, ["instagram"], 168
+    )
+    audits = await _rows(
+        intel_pool, "SELECT 1 FROM audit_log WHERE action = 'intel.research_source_promoted'"
+    )
+    assert len(audits) == 1
+
+
+async def test_a_new_press_reads_every_earlier_research_search_of_its_question(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """I3: a page a new search finds again is skipped as recently fetched and stays linked to the
+    earlier search; the question's earlier research searches are read too."""
+    await seed_quiz_vocabulary(intel_pool)
+    store = PostgresQuestionStore(intel_pool)
+    earlier = await store.register_and_queue_suggestion(SUGGEST_REQUEST, [], operator="ann")
+    ids = await store.register_research_sources(
+        earlier.run_id,
+        question_key="platforms",
+        searches=[ResearchSourceRequest(option="Bumble", query="earlier research", tags=())],
+    )
+    other = await store.register_research_sources(
+        earlier.run_id,
+        question_key="age",
+        searches=[ResearchSourceRequest(option="18-24", query="another question", tags=())],
+    )
+    assert await store.research_sources_for("platforms") == ids
+    assert other[0] not in await store.research_sources_for("platforms")

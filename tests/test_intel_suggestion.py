@@ -21,6 +21,7 @@ from imageshield.intel.suggestion import (
     SuggestionCandidates,
     attach_research,
     is_backed,
+    keep_backed,
     mentions,
     plan_research,
     render_suggestion,
@@ -381,6 +382,14 @@ def test_attach_research_counts_rounds_and_marks_unbacked_answers_exhausted() ->
     }
 
 
+def test_an_answer_never_searched_for_is_not_exhausted() -> None:
+    """Final review I2 (2026-10-11): nothing found means nothing found after a search ran."""
+    (only,) = attach_research(
+        [_answer("A", None)], backed={"A": False}, searched={}, researching=True
+    )
+    assert only.research == OptionResearch(rounds=0, searches=(), exhausted=False)
+
+
 def test_with_research_off_nothing_is_exhausted() -> None:
     (only,) = attach_research(
         [_answer("A", None)], backed={"A": False}, searched={}, researching=False
@@ -453,3 +462,57 @@ def test_the_payload_asks_for_research_only_while_rounds_remain() -> None:
     assert research(4, 4) == {"round": 4, "max_rounds": 4, "searches_per_answer": 3}
     assert research(5, 4) is None  # the last pass: no more searches to ask for
     assert research(1, 0) is None  # research off
+
+
+# ── final review fixes (2026-10-11) ──
+
+
+def test_research_evidence_is_taken_before_the_other_classes() -> None:
+    """C1: research evidence has its own class, taken first, so it reaches the model."""
+    research = [_signal(tags=("r",)) for _ in range(3)]
+    chosen = [_signal(tags=("c",)) for _ in range(3)]
+    context = select_context(
+        SuggestionCandidates(from_sources=tuple(chosen), from_research=tuple(research)),
+        options=["A"],
+        limit=4,
+    )
+    assert [s.signal_id for s in context] == [s.signal_id for s in research] + [chosen[0].signal_id]
+
+
+def test_keep_backed_keeps_an_answer_an_earlier_pass_backed() -> None:
+    """C1: a later pass never loses an answer an earlier pass backed."""
+    listed = _signal(trust="listed")
+    earlier = [_answer("A", 4, (listed.signal_id,)), _answer("B", None)]
+    later = [_answer("A", None), _answer("B", 2, (listed.signal_id,))]
+    counts: Counter[str] = Counter()
+    merged, backed = keep_backed(
+        later,
+        backed={"A": False, "B": True},
+        kept=[o.as_json() for o in earlier],
+        kept_backed={"A": True, "B": False},
+        counts=counts,
+    )
+    assert [(o.option, o.deduction) for o in merged] == [("A", 4), ("B", 2)]
+    assert backed == {"A": True, "B": True}
+    assert counts["research_kept_backed_answer"] == 1
+
+
+def test_keep_backed_without_a_kept_pass_changes_nothing() -> None:
+    later = [_answer("A", None)]
+    merged, backed = keep_backed(
+        later, backed={"A": False}, kept=None, kept_backed={}, counts=Counter()
+    )
+    assert merged == later and backed == {"A": False}
+
+
+def test_the_validation_search_states_its_budget() -> None:
+    """I6: the validation search's count comes from config, not 'exactly one'."""
+    system, user = prompts.validation_search_request("q", searches=3)
+    assert json.loads(user) == {"query": "q", "max_searches": 3}
+    assert "exactly one" not in system and "max_searches" in system
+
+
+def test_the_suggest_prompt_asks_for_a_search_for_every_unbacked_answer() -> None:
+    """I2: an unbacked answer gets at least one search; 'give none' is gone."""
+    assert "Give none when no search could help" not in prompts._SUGGEST_SYSTEM
+    assert "at least one" in prompts._SUGGEST_SYSTEM

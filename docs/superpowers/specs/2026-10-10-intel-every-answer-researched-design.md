@@ -113,6 +113,20 @@ A suggestion pass that leaves answers unbacked now leads to another round instea
    runs (1). An awaited read that timed out counts as read-and-empty for that round.
 6. **One suggestion call per round,** outside the reading cap as today. The rounds' reads are
    their own discovery runs, under their own caps and the provider gate.
+6b. *Amended at review, 2026-10-11:*
+   - **Research evidence has its own retrieval class, taken first.** It no longer shares the
+     request's sources class, where one round's evidence could fill the 80-signal context and
+     push the operator's sources out.
+   - **That class reads every research search registered for the question, by any run.** A page a
+     new search finds again is skipped as recently fetched and stays linked to the earlier search.
+   - **An answer an earlier pass backed stays backed.** A later pass that leaves it unbacked gets
+     the earlier entry back (`keep_backed`), and it is never researched again.
+   - **A round queues reads only for searches still unread** (`_unread`): a reused search that was
+     already read needs no second paid read, and one an operator switched off is left alone. With
+     nothing to read, the run is claimable at once.
+   - **Stage 4 switches on a reused research search as the operator's.** When an operator's chosen
+     search matches a research search's query, the row gets the operator's origin, interval and
+     tags, `enabled`, and an audit row.
 7. **The pass that starts a round is kept on the run** (`intel_runs.research_pass`, the validated
    options and the model id), because a resumed run starts with a fresh context.
 8. **A gate refusal or an unusable answer ends the research, never the suggestion.** If a round's
@@ -139,6 +153,10 @@ Every option entry in `target.options`, and so every per-answer read (`suggestio
 - `exhausted`: **true when the answer is still unbacked after its research ended**: the configured
   rounds ran out, the model gave no further searches, or the gate stopped the run. False for a
   backed answer. The backend reads this flag and never re-derives it.
+  *Amended at review, 2026-10-11:* `exhausted` is true only for an answer at least one search ran
+  for (`rounds ≥ 1`). An answer nothing was searched for is not "researched, nothing found" (§1.3:
+  the owner accepts nothing found "only after the research really ran"), and suggest-v2 now asks
+  for at least one search for every answer the model cannot back.
 
 The poll (`render_suggestion`) gains `research_round` (the round in progress, 0 before the first)
 while the run is queued, waiting or running.
@@ -206,7 +224,7 @@ becomes a required key with no code default, raised as follows:
 | web searches in one saved-search read | 5 (code default, never set) | `INTEL_MAX_WEB_SEARCHES_PER_RUN` | 10 |
 | output ceiling of a saved-search read, its choose step and a validation search, in tokens | 8000 (`_MAX_TOKENS`) | `INTEL_SEARCH_READ_MAX_OUTPUT` | 16000 |
 | pages a saved-search read keeps from its results | 5–8 (`DISCOVERY_MIN/MAX_RESULT_PAGES`) | `INTEL_DISCOVERY_MIN_RESULT_PAGES` / `INTEL_DISCOVERY_MAX_RESULT_PAGES` | 5 / 12 |
-| web searches in one stage-3 validation of a search | 1 (`_VALIDATION_SEARCHES`) | `INTEL_VALIDATION_SEARCHES` | 3 |
+| web searches in one stage-3 validation of a search (the prompt states it from the payload since review, 2026-10-11) | 1 (`_VALIDATION_SEARCHES`) | `INTEL_VALIDATION_SEARCHES` | 3 |
 | result pages fetched before a validation search counts as empty | 5 (`MAX_SEARCH_RESULTS_CHECKED`) | `INTEL_VALIDATION_RESULT_PAGES` | 8 |
 | extra stage-1 asks for uncovered answers (new, §2.1) | — | `INTEL_SOURCE_PROPOSAL_COVERAGE_ASKS` | 2 |
 | searches per unbacked answer per research round (new, §2.2) | — | `INTEL_RESEARCH_SEARCHES_PER_ANSWER` | 3 |

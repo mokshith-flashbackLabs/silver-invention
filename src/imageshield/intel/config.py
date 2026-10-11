@@ -170,6 +170,7 @@ class IntelConfig(BaseSettings):
             proposed_searches_per_answer=self.intel_max_proposed_searches_per_answer,
             discovery_min_result_pages=self.intel_discovery_min_result_pages,
             discovery_max_result_pages=self.intel_discovery_max_result_pages,
+            validation_searches=self.intel_validation_searches,
             validation_result_pages=self.intel_validation_result_pages,
             source_proposal_coverage_asks=self.intel_source_proposal_coverage_asks,
             suggestion_research_rounds=self.intel_suggestion_research_rounds,

@@ -222,15 +222,19 @@ def source_proposal_request(
     return _SOURCE_PROPOSAL_SYSTEM, json.dumps(payload, ensure_ascii=False)
 
 
-_VALIDATION_SEARCH_SYSTEM = """Run exactly one web search for the query below, then list the https
-pages that search returned, each with a one-line reason. List only pages the search returned; add
-nothing from memory. Leave out any page that hosts explicit or abusive content."""
+_VALIDATION_SEARCH_SYSTEM = """Run up to max_searches web searches for the query below, starting
+with the query as given, then list the https pages those searches returned, each with a one-line
+reason. List only pages the searches returned; add nothing from memory. Leave out any page that
+hosts explicit or abusive content."""
 
 
-def validation_search_request(query: str) -> tuple[str, str]:
-    """spec §4.10 stage 3: a search_query candidate's one test search. The pages it lists are
-    then judged by code, never by the model."""
-    return _VALIDATION_SEARCH_SYSTEM, json.dumps({"query": query}, ensure_ascii=False)
+def validation_search_request(query: str, *, searches: int) -> tuple[str, str]:
+    """spec §4.10 stage 3: a search_query candidate's test search, up to INTEL_VALIDATION_SEARCHES
+    searches (final review I6, 2026-10-11: the prompt said "exactly one" after the limit became
+    configuration). The pages it lists are then judged by code, never by the model."""
+    return _VALIDATION_SEARCH_SYSTEM, json.dumps(
+        {"query": query, "max_searches": searches}, ensure_ascii=False
+    )
 
 
 SUGGEST_PROMPT_VERSION = "suggest-v2"
@@ -273,7 +277,7 @@ For EVERY option of the question, return exactly one entry:
   searches that would find evidence about THIS option. In research.round 1, search for direct
   evidence. From round 2 on, search for the closest evidence and say in the query what angle it
   takes. Never repeat a search listed in the option's "searched", and never name a private
-  individual. Give none when no search could help.
+  individual. Give at least one for every option you cannot back.
 
 If no evidence speaks to an option directly, you may back it with the closest evidence, saying in
 its rationale how that evidence applies. The corroboration rule still applies.

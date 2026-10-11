@@ -299,6 +299,7 @@ TEST_LIMITS = SearchLimits(
     proposed_searches_per_answer=2,
     discovery_min_result_pages=5,
     discovery_max_result_pages=8,
+    validation_searches=1,
     validation_result_pages=5,
     source_proposal_coverage_asks=0,
     suggestion_research_rounds=0,

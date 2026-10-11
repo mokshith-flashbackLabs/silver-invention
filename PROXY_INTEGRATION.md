@@ -986,7 +986,8 @@ new_tag: {slug, label, kind} \| null, corroborated: bool, why_not: 'no_evidence'
 *Amended 2026-10-10 (spec `docs/superpowers/specs/2026-10-10-intel-every-answer-researched-design.md` §2.3):* each
 `SuggestionOption` also carries `research: {rounds: int, searches: [{round: int, query}], exhausted: bool} \| null`
 (null on a suggestion written before 2026-10-10). `exhausted` is true when the answer is still not corroborated
-after its research ended; the backend reads it and never re-derives it.
+after its research ended and at least one search ran for it (`rounds ≥ 1`, since review 2026-10-11); the backend
+reads it and never re-derives it.
 
 **Stage-3 `reason` codes (S4), the closed set:**
 - verdicts about the source: `known_hit_location`, `not_https`, `unreachable`, `unsupported_type`,

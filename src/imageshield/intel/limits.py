@@ -17,7 +17,9 @@ class SearchLimits:
     # A saved-search read keeps at least / at most this many of its searches' result pages.
     discovery_min_result_pages: int
     discovery_max_result_pages: int
-    # Stage 3: result pages fetched before a validation search counts as empty.
+    # Stage 3: a validation search's searches, and the result pages fetched before it counts as
+    # empty.
+    validation_searches: int
     validation_result_pages: int
     # Stage 1: extra asks for answers no source is aimed at (0: off).
     source_proposal_coverage_asks: int

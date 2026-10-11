@@ -168,8 +168,15 @@ class QuestionStore(Protocol):
         self, run_id: UUID, *, question_key: str, searches: Sequence[ResearchSourceRequest]
     ) -> list[UUID]: ...
     async def suggestion_candidates(
-        self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int
+        self,
+        *,
+        source_ids: Sequence[UUID],
+        tags: Sequence[str],
+        since: datetime,
+        limit: int,
+        research_source_ids: Sequence[UUID] = (),
     ) -> SuggestionCandidates: ...
+    async def research_sources_for(self, question_key: str) -> list[UUID]: ...
     async def suggestion_written(self, run_id: UUID) -> bool: ...
     async def write_suggestion(
         self,
@@ -364,6 +371,36 @@ class PostgresQuestionStore:
             )
         return Registered(run_id=run_id, registered=tuple(registered), reused=tuple(reused))
 
+    async def _promote_research(
+        self,
+        conn: AsyncConnection[tuple[Any, ...]],
+        source_id: UUID,
+        source: NewSource,
+        operator: str,
+    ) -> None:
+        cur = await conn.execute(
+            "UPDATE intel_sources SET enabled = true, disabled_reason = NULL, origin = %(origin)s,"
+            " tags = %(tags)s, check_every_hours = %(every)s,"
+            " next_check_at = now() + make_interval(hours => %(every)s), updated_at = now()"
+            " WHERE source_id = %(id)s AND origin = 'research' RETURNING 1",
+            {
+                "origin": source.origin,
+                "tags": list(source.tags),
+                "every": source.check_every_hours,
+                "id": source_id,
+            },
+        )
+        if await cur.fetchone() is not None:
+            await conn.execute(
+                _AUDIT_SQL,
+                {
+                    "actor_type": "operator",
+                    "action": "intel.research_source_promoted",
+                    "resource_id": source_id,
+                    "metadata": Jsonb({"operator": operator, "origin": source.origin}),
+                },
+            )
+
     async def _register(
         self,
         conn: AsyncConnection[tuple[Any, ...]],
@@ -371,10 +408,13 @@ class PostgresQuestionStore:
         queries: dict[str, UUID],
         operator: str,
     ) -> tuple[UUID, bool]:
-        """(source_id, created): reuse by identity first, insert otherwise."""
+        """(source_id, created): reuse by identity first, insert otherwise. A reused research
+        search (read once, disabled) that an operator now chose is switched on as theirs (final
+        review I5, 2026-10-11): their interval and tags apply, and it is checked on schedule."""
         if source.query_text is not None:
             existing = queries.get(query_key(source.query_text))
             if existing is not None:
+                await self._promote_research(conn, existing, source, operator)
                 return existing, False
         else:
             found = await self._by_url_hash(conn, source.source_url or "")
@@ -515,13 +555,21 @@ class PostgresQuestionStore:
         return ids
 
     async def suggestion_candidates(
-        self, *, source_ids: Sequence[UUID], tags: Sequence[str], since: datetime, limit: int
+        self,
+        *,
+        source_ids: Sequence[UUID],
+        tags: Sequence[str],
+        since: datetime,
+        limit: int,
+        research_source_ids: Sequence[UUID] = (),
     ) -> SuggestionCandidates:
-        """Each class: active signals since ``since``, newest first, at most ``limit``."""
+        """Each class: active signals since ``since``, newest first, at most ``limit``. The
+        research searches' evidence is its own class (final review C1, 2026-10-11)."""
         params = {
             "since": since,
             "limit": limit,
             "sources": list(source_ids),
+            "research": list(research_source_ids),
             "tags": list(tags),
             "categories": sorted(CATEGORY_CLASS),
         }
@@ -537,7 +585,33 @@ class PostgresQuestionStore:
                 )
                 found.append(tuple(_context(row) for row in await cur.fetchall()))
         from_sources, by_tag, with_subjects, by_category = found
-        return SuggestionCandidates(from_sources, by_tag, with_subjects, by_category)
+        from_research: tuple[ContextSignal, ...] = ()
+        if research_source_ids:
+            async with self._pool.connection() as conn:
+                cur = conn.cursor(row_factory=dict_row)
+                await cur.execute(
+                    f"SELECT {_CONTEXT_COLUMNS} FROM {_CONTEXT_FROM}"
+                    " WHERE s.status = 'active' AND s.created_at >= %(since)s"
+                    " AND d.source_id = ANY(%(research)s::uuid[])"
+                    " ORDER BY s.created_at DESC, s.signal_id DESC LIMIT %(limit)s",
+                    params,
+                )
+                from_research = tuple(_context(row) for row in await cur.fetchall())
+        return SuggestionCandidates(
+            from_sources, by_tag, with_subjects, by_category, from_research=from_research
+        )
+
+    async def research_sources_for(self, question_key: str) -> list[UUID]:
+        """Every research search registered for this question, by any run (final review I3,
+        2026-10-11): a page a later search finds again is skipped as recently fetched and linked
+        to the earlier search's source only, so a new press reads the earlier ones too."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT source_id FROM intel_sources WHERE origin = 'research'"
+                " AND proposed_for ->> 'question_key' = %s ORDER BY created_at",
+                (question_key,),
+            )
+            return [row[0] for row in await cur.fetchall()]
 
     async def suggestion_written(self, run_id: UUID) -> bool:
         async with self._pool.connection() as conn:

@@ -151,6 +151,10 @@ class SuggestionCandidates:
     by_tag: tuple[ContextSignal, ...] = ()
     with_subjects: tuple[ContextSignal, ...] = ()
     by_category: tuple[ContextSignal, ...] = ()
+    # The question's research searches' evidence (spec 2026-10-10 §2.2; final review C1,
+    # 2026-10-11): its own class, taken FIRST, so research evidence reaches the model however much
+    # else there is, and never displaces the operator's sources by sharing their class.
+    from_research: tuple[ContextSignal, ...] = ()
 
 
 def _terms(option_key: str) -> set[str]:
@@ -191,6 +195,7 @@ def select_context(
             if signal.status == "active":
                 chosen.setdefault(signal.signal_id, signal)
 
+    take(candidates.from_research)
     take(candidates.from_sources)
     take(candidates.by_tag)
     take(
@@ -375,6 +380,31 @@ def plan_research(
     return planned
 
 
+def keep_backed(
+    options: Sequence[OptionSuggestion],
+    *,
+    backed: Mapping[str, bool],
+    kept: Sequence[Mapping[str, Any]] | None,
+    kept_backed: Mapping[str, bool],
+    counts: Counter[str],
+) -> tuple[list[OptionSuggestion], dict[str, bool]]:
+    """An answer an earlier pass backed stays backed (final review C1, 2026-10-11): a later pass
+    that leaves it unbacked -- its evidence crowded out of the context by research -- gets the
+    earlier entry back, and it is never researched again."""
+    merged = list(options)
+    now = dict(backed)
+    if kept is None:
+        return merged, now
+    earlier = {str(o.get("option")): o for o in kept}
+    for index, option in enumerate(merged):
+        entry = earlier.get(option.option)
+        if not now.get(option.option) and kept_backed.get(option.option) and entry is not None:
+            merged[index] = OptionSuggestion.from_json(entry)
+            now[option.option] = True
+            counts["research_kept_backed_answer"] += 1
+    return merged, now
+
+
 def attach_research(
     options: Sequence[OptionSuggestion],
     *,
@@ -397,7 +427,11 @@ def attach_research(
                 research=OptionResearch(
                     rounds=len({s.round for s in entries}),
                     searches=entries,
-                    exhausted=researching and not backed.get(option.option, False),
+                    # Only after a search ran for it (final review I2, 2026-10-11): an
+                    # answer nothing was searched for is not "researched, nothing found".
+                    exhausted=researching
+                    and bool(entries)
+                    and not backed.get(option.option, False),
                 ),
             )
         )

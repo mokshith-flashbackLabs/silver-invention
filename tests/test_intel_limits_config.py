@@ -98,6 +98,7 @@ def test_search_limits_carries_the_configured_values(env: pytest.MonkeyPatch) ->
         proposed_searches_per_answer=3,
         discovery_min_result_pages=5,
         discovery_max_result_pages=12,
+        validation_searches=3,
         validation_result_pages=8,
         source_proposal_coverage_asks=2,
         suggestion_research_rounds=4,

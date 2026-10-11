@@ -83,6 +83,7 @@ from imageshield.intel.suggestion import (
     SuggestionRunRequest,
     attach_research,
     is_backed,
+    keep_backed,
     plan_research,
     prompt_suggestion_question,
     select_context,
@@ -362,7 +363,7 @@ async def _validate_search(ctx: _Ctx, query: str, refused: _Refused) -> str | No
         return "query_names_a_person"
     if refused.reason is not None:
         return refused.reason
-    system, user = validation_search_request(query)
+    system, user = validation_search_request(query, searches=ctx.deps.limits.validation_searches)
     try:
         call = await _call_model(ctx, lambda: ctx.deps.model.search_once(system, user))
     except _Stop as stop:
@@ -629,12 +630,20 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> _SuggestStep:
         for option in request.options
     }
     option_tag_set = {t for tags in tags_by_option.values() for t in tags}
+    # The research searches' evidence, as its own class taken first (final review C1): this
+    # run's, and every earlier research search for the question (I3), whose pages a new search
+    # would skip as recently fetched.
+    research_ids = list(
+        dict.fromkeys(
+            [*research.source_ids, *await questions.research_sources_for(request.question_key)]
+        )
+    )
     candidates = await questions.suggestion_candidates(
-        # The research searches' evidence is the request's own first class (spec 2026-10-10 §2.2).
-        source_ids=list(dict.fromkeys([*request.source_ids, *research.source_ids])),
+        source_ids=request.source_ids,
         tags=sorted(option_tag_set | slugs_named_by(request.options, vocabulary)),
         since=now - timedelta(days=SUGGESTION_CONTEXT_DAYS),
         limit=SUGGESTION_POOL_MAX,
+        research_source_ids=research_ids,
     )
     context = select_context(
         candidates, options=request.options, limit=SUGGESTION_CONTEXT_MAX_SIGNALS
@@ -681,7 +690,15 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> _SuggestStep:
         vocabulary=vocabulary,
         counts=ctx.counts,
     )
-    backed = {o.option: is_backed(o, by_id) for o in options}
+    kept_options = research.kept.get("options") if research.kept is not None else None
+    kept_backed = research.kept.get("backed", {}) if research.kept is not None else {}
+    options, backed = keep_backed(
+        options,
+        backed={o.option: is_backed(o, by_id) for o in options},
+        kept=kept_options if isinstance(kept_options, list) else None,
+        kept_backed={str(k): bool(v) for k, v in dict(kept_backed).items()},
+        counts=ctx.counts,
+    )
     unbacked = [o for o in options if not backed[o.option]]
     if unbacked and research.round < limits.suggestion_research_rounds:
         planned = plan_research(
@@ -725,7 +742,12 @@ async def _start_round(
             for query in queries
         ],
     )
-    await ctx.deps.questions.queue_source_reads(ids, now=now)
+    # Read only what is still unread (final review I4, 2026-10-11): a reused search already read
+    # needs no second paid read, and one an operator switched off is left alone (``_unread``).
+    # Its evidence is retrieved either way. With nothing to read, the run is claimable at once.
+    registered = await ctx.deps.questions.sources_by_ids(ids)
+    to_read = [s.source_id for s in registered if _unread(s)]
+    await ctx.deps.questions.queue_source_reads(to_read, now=now)
     next_round = research.round + 1
     searched = {k: list(v) for k, v in research.searched.items()}
     for option, queries in planned.items():
@@ -741,7 +763,7 @@ async def _start_round(
     return _SuggestStep(
         "waiting",
         wait=RunWait(
-            awaiting=tuple(ids),
+            awaiting=tuple(to_read),
             deadline=now + timedelta(seconds=SUGGESTION_WAIT_MAX_SECONDS),
             research=ResearchWait(
                 round=next_round,
