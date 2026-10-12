@@ -282,6 +282,7 @@ def test_the_poll_has_no_options_until_a_suggestion_is_written() -> None:
         "proposal_id": None,
         "error_code": None,
         "options": None,
+        "recommendation": None,
         "sources_deferred": 0,
         "research_round": 0,
         "awaiting_sources": 0,
@@ -290,7 +291,7 @@ def test_the_poll_has_no_options_until_a_suggestion_is_written() -> None:
     done = _suggestion_run("completed", {"sources_deferred": 2, "model_calls": 5})
     proposal_id = uuid4()
     options = [{"option": "Instagram", "corroborated": True, "why_not": None}]
-    body = render_suggestion(done, (proposal_id, options))
+    body = render_suggestion(done, (proposal_id, options, None))
     assert (body["proposal_id"], body["options"], body["sources_deferred"]) == (
         proposal_id,
         options,

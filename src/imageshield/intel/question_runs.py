@@ -79,6 +79,7 @@ from imageshield.intel.source_choice import (
     url_verdict,
 )
 from imageshield.intel.suggestion import (
+    GeneralRecommendation,
     OptionSuggestion,
     SuggestionRunRequest,
     attach_research,
@@ -88,6 +89,7 @@ from imageshield.intel.suggestion import (
     prompt_suggestion_question,
     select_context,
     slugs_named_by,
+    validate_recommendation,
     validate_suggestion,
 )
 from imageshield.intel.text import normalise
@@ -690,6 +692,17 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> _SuggestStep:
         vocabulary=vocabulary,
         counts=ctx.counts,
     )
+    kept_recommendation = (
+        GeneralRecommendation.from_json(research.kept.get("recommendation"))
+        if research.kept is not None
+        else None
+    )
+    # The last valid recommendation across passes (spec 2026-10-11-intel-score-insights §5): a later
+    # pass that drafts none never loses an earlier one.
+    recommendation = (
+        validate_recommendation(call.output.recommendation, context=by_id, counts=ctx.counts)
+        or kept_recommendation
+    )
     kept_options = research.kept.get("options") if research.kept is not None else None
     kept_backed = research.kept.get("backed", {}) if research.kept is not None else {}
     options, backed = keep_backed(
@@ -709,7 +722,15 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> _SuggestStep:
         )
         if planned:
             return await _start_round(
-                ctx, request, research, tags_by_option, planned, options, backed, call.answered_by
+                ctx,
+                request,
+                research,
+                tags_by_option,
+                planned,
+                options,
+                backed,
+                call.answered_by,
+                recommendation,
             )
     final = attach_research(
         options,
@@ -717,7 +738,14 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> _SuggestStep:
         searched=research.searched,
         researching=limits.suggestion_research_rounds > 0,
     )
-    return await _write(ctx, request, vocabulary, final, model_id=call.answered_by)
+    return await _write(
+        ctx,
+        request,
+        vocabulary,
+        final,
+        model_id=call.answered_by,
+        recommendation=recommendation,
+    )
 
 
 async def _start_round(
@@ -729,6 +757,7 @@ async def _start_round(
     options: Sequence[OptionSuggestion],
     backed: Mapping[str, bool],
     model_id: str,
+    recommendation: GeneralRecommendation | None,
 ) -> _SuggestStep:
     """Register each planned search as a read-once research source, queue its read, keep this
     pass, and wait (spec 2026-10-10 §2.2.4-§2.2.7)."""
@@ -759,6 +788,7 @@ async def _start_round(
         "options": [o.as_json() for o in options],
         "backed": dict(backed),
         "searches": searched,
+        "recommendation": recommendation.as_json() if recommendation is not None else None,
     }
     return _SuggestStep(
         "waiting",
@@ -788,7 +818,10 @@ async def _write_kept(
     backed = {str(k): bool(v) for k, v in dict(research.kept.get("backed", {})).items()}
     final = attach_research(options, backed=backed, searched=research.searched, researching=True)
     model_id = str(research.kept.get("model_id", ""))
-    return await _write(ctx, request, vocabulary, final, model_id=model_id)
+    recommendation = GeneralRecommendation.from_json(research.kept.get("recommendation"))
+    return await _write(
+        ctx, request, vocabulary, final, model_id=model_id, recommendation=recommendation
+    )
 
 
 async def _write(
@@ -798,6 +831,7 @@ async def _write(
     options: Sequence[OptionSuggestion],
     *,
     model_id: str,
+    recommendation: GeneralRecommendation | None = None,
 ) -> _SuggestStep:
     exhausted = sum(1 for o in options if o.research is not None and o.research.exhausted)
     if exhausted:
@@ -810,6 +844,7 @@ async def _write(
         against_release_no=vocabulary.release_no,
         model_id=model_id,
         prompt_version=SUGGEST_PROMPT_VERSION,
+        recommendation=recommendation,
     )
     if written is None:
         ctx.counts["suggestion_already_written"] += 1

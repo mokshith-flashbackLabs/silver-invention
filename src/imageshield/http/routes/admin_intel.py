@@ -495,7 +495,11 @@ async def get_proposal(
         # spec §4.6: the per-option read. The question store is looked up only here, so every
         # other kind's detail reads exactly as step 2 built it.
         questions = get_question_store(request)
-        row = {**row, "options": await questions.options_of_suggestion(proposal_id)}
+        row = {
+            **row,
+            "options": await questions.options_of_suggestion(proposal_id),
+            "recommendation": await questions.recommendation_of_suggestion(proposal_id),
+        }
     return row
 
 

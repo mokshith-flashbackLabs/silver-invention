@@ -688,7 +688,9 @@ def prompt_suggestion_question(
     )
 
 
-def render_suggestion(run: Run, found: tuple[UUID, list[dict[str, Any]]] | None) -> dict[str, Any]:
+def render_suggestion(
+    run: Run, found: tuple[UUID, list[dict[str, Any]], dict[str, Any] | None] | None
+) -> dict[str, Any]:
     """GET /weight-suggestions/{run_id} (spec §4.6, §4.10). ``proposal_id`` and ``options`` are
     null until the run wrote a suggestion (``found``, from the store); ``sources_deferred``
     counts the sources this run could not read itself.
@@ -704,6 +706,8 @@ def render_suggestion(run: Run, found: tuple[UUID, list[dict[str, Any]]] | None)
         "proposal_id": found[0] if found is not None else None,
         "error_code": run.error_code,
         "options": found[1] if found is not None else None,
+        # The drafted general recommendation (spec 2026-10-11-intel-score-insights §5), or None.
+        "recommendation": found[2] if found is not None else None,
         "sources_deferred": deferred if isinstance(deferred, int) else 0,
         "research_round": run.research_round,
         "awaiting_sources": len(run.awaiting_source_ids or []) if waiting else 0,

@@ -84,7 +84,9 @@ class FakeQuestionStore:
     def __init__(self) -> None:
         self.queued: list[tuple[str, dict[str, Any], str]] = []
         self.runs: dict[UUID, Run] = {}
-        self.suggestions: dict[UUID, tuple[UUID, list[dict[str, Any]]]] = {}
+        self.suggestions: dict[
+            UUID, tuple[UUID, list[dict[str, Any]], dict[str, Any] | None]
+        ] = {}
         self.sources: dict[UUID, Source] = {}
         self.validation_records: dict[UUID, Validation] = {}
         self.proposed: frozenset[str] = frozenset()
@@ -101,11 +103,16 @@ class FakeQuestionStore:
     async def get_run(self, run_id: UUID) -> Run | None:
         return self.runs.get(run_id)
 
-    async def suggestion_of_run(self, run_id: UUID) -> tuple[UUID, list[dict[str, Any]]] | None:
+    async def suggestion_of_run(
+        self, run_id: UUID
+    ) -> tuple[UUID, list[dict[str, Any]], dict[str, Any] | None] | None:
         return self.suggestions.get(run_id)
 
     async def options_of_suggestion(self, proposal_id: UUID) -> list[dict[str, Any]]:
-        return next((o for pid, o in self.suggestions.values() if pid == proposal_id), [])
+        return next((o for pid, o, _ in self.suggestions.values() if pid == proposal_id), [])
+
+    async def recommendation_of_suggestion(self, proposal_id: UUID) -> dict[str, Any] | None:
+        return next((r for pid, _, r in self.suggestions.values() if pid == proposal_id), None)
 
     async def sources_by_ids(self, source_ids: Any) -> list[Source]:
         return [self.sources[i] for i in source_ids if i in self.sources]
@@ -672,7 +679,7 @@ def test_the_suggestion_poll_answers_options_once_written_and_counts_deferred_so
     done = _run("weight_suggestion", outcome={"sources_deferred": 3})
     proposal_id = uuid4()
     questions.runs[done.run_id] = done
-    questions.suggestions[done.run_id] = (proposal_id, OPTIONS)
+    questions.suggestions[done.run_id] = (proposal_id, OPTIONS, None)
     body = client.get(f"/v1/admin/intel/weight-suggestions/{done.run_id}", headers=ADMIN).json()
     assert body["proposal_id"] == str(proposal_id) and body["options"] == OPTIONS
     assert (body["status"], body["error_code"], body["sources_deferred"]) == ("completed", None, 3)
@@ -680,6 +687,30 @@ def test_the_suggestion_poll_answers_options_once_written_and_counts_deferred_so
     questions.runs[other.run_id] = other
     r = client.get(f"/v1/admin/intel/weight-suggestions/{other.run_id}", headers=ADMIN)
     assert r.status_code == 404
+
+
+REC = {
+    "title": "Set accounts to private",
+    "body": "Private accounts are scraped less.",
+    "link_url": None,
+    "link_label": None,
+    "signal_ids": [],
+    "corroborated": False,
+    "why_not": "no_evidence",
+}
+
+
+def test_the_poll_serves_the_drafted_recommendation() -> None:
+    client, questions = _client()
+    done = _run("weight_suggestion")
+    questions.runs[done.run_id] = done
+    questions.suggestions[done.run_id] = (uuid4(), OPTIONS, REC)
+    body = client.get(f"/v1/admin/intel/weight-suggestions/{done.run_id}", headers=ADMIN).json()
+    assert body["recommendation"] == REC
+    waiting = _run("weight_suggestion", status="queued")
+    questions.runs[waiting.run_id] = waiting
+    body = client.get(f"/v1/admin/intel/weight-suggestions/{waiting.run_id}", headers=ADMIN).json()
+    assert body["recommendation"] is None
 
 
 class FakeProposals:
@@ -695,11 +726,13 @@ def test_a_suggestions_detail_carries_its_options_and_other_kinds_do_not() -> No
     change = {"proposal_id": uuid4(), "kind": "weight_change", "status": "pending"}
     app = create_app(config=make_config())
     questions = FakeQuestionStore()
-    questions.suggestions[uuid4()] = (suggestion["proposal_id"], OPTIONS)
+    questions.suggestions[uuid4()] = (suggestion["proposal_id"], OPTIONS, REC)
     app.state.proposal_store = FakeProposals([suggestion, change])
     app.state.question_store = questions
     client = TestClient(app)
     detail = client.get(f"/v1/admin/intel/proposals/{suggestion['proposal_id']}", headers=ADMIN)
     assert detail.status_code == 200 and detail.json()["options"] == OPTIONS
+    assert detail.json()["recommendation"] == REC
     other = client.get(f"/v1/admin/intel/proposals/{change['proposal_id']}", headers=ADMIN)
     assert other.status_code == 200 and "options" not in other.json()
+    assert "recommendation" not in other.json()

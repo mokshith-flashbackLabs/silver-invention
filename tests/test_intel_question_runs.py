@@ -29,6 +29,7 @@ from imageshield.intel.schemas import (
     ProposedSource,
     SourceProposalOutput,
     SuggestedOptionWeight,
+    SuggestedRecommendation,
     SuggestionOutput,
 )
 from imageshield.intel.source_choice import NewSource
@@ -1349,6 +1350,46 @@ async def test_research_ends_at_the_configured_rounds_and_writes_once_with_exhau
     payloads = [json.loads(u) for u in model.suggestion_users]
     assert payloads[1]["question"]["options"][1]["searched"] == ["round one query"]
     assert payloads[2]["research"] is None  # the last pass asks for no more searches
+
+
+async def test_the_last_valid_recommendation_across_passes_is_written(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """spec 2026-10-11-intel-score-insights section 5: a later pass that drafts no recommendation
+    never loses the one an earlier pass drafted."""
+    await seed_quiz_vocabulary(intel_pool)
+    await _seed_listed_instagram(intel_pool)
+    queued = await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [], operator="ann"
+    )
+    first = _instagram_backed_bumble_searches("round one query")
+
+    def with_recommendation(payload: dict[str, Any]) -> SuggestionOutput:
+        listed = [e["signal_id"] for e in payload["evidence"] if e["trust"] == "listed"]
+        return first(payload).model_copy(
+            update={
+                "recommendation": SuggestedRecommendation(
+                    title="Set accounts to private",
+                    body="Private accounts are scraped less.",
+                    signal_ids=listed[:1],
+                )
+            }
+        )
+
+    model = _research_model(
+        with_recommendation,
+        _instagram_backed_bumble_searches("round two query"),
+        _instagram_backed_bumble_searches("round three query"),
+    )
+    deps = _research_deps(intel_pool, model)
+    for _ in range(8):  # suggestion, read, suggestion, read, final suggestion
+        await run_once(intel_pool, deps)
+        if await _proposal_target(intel_pool, queued.run_id) is not None:
+            break
+    assert model.suggest_calls == 3
+    target = await _proposal_target(intel_pool, queued.run_id)
+    assert target["recommendation"]["title"] == "Set accounts to private"
+    assert target["recommendation"]["link_url"] is None
 
 
 async def test_a_backed_question_runs_no_research(intel_pool: AsyncConnectionPool) -> None:

@@ -14,7 +14,7 @@ from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.question_store import PostgresQuestionStore
 from imageshield.intel.source_choice import NewSource, candidate_key, identity
 from imageshield.intel.store import PostgresIntelStore
-from imageshield.intel.suggestion import OptionSuggestion
+from imageshield.intel.suggestion import GeneralRecommendation, OptionSuggestion
 from tests.intel_fakes import seed_signal
 from tests.question_fakes import QUESTION
 
@@ -415,10 +415,22 @@ async def test_a_suggestion_reads_back_per_option_by_run_and_by_proposal(
         run_id,
         question_key="platforms",
         options=[
-            OptionSuggestion("Instagram", 3, "r", (listed,), ("instagram",), None),
+            OptionSuggestion(
+                "Instagram",
+                3,
+                "r",
+                (listed,),
+                ("instagram",),
+                None,
+                factor_title="Public profiles",
+                factor_line="Public profiles are scraped more often.",
+            ),
             OptionSuggestion("Bumble", None, "", (web,), (), None),
             OptionSuggestion("Hinge", None, "", (), (), None),
         ],
+        recommendation=GeneralRecommendation(
+            "Set accounts to private", "Private accounts are scraped less.", None, None, (listed,)
+        ),
         **META,
     )
     assert written is not None
@@ -431,6 +443,10 @@ async def test_a_suggestion_reads_back_per_option_by_run_and_by_proposal(
         ("Hinge", None, False, "no_evidence"),
     ]
     assert await store.options_of_suggestion(proposal_id) == found[1]
+    assert found[1][0]["factor_line"] == "Public profiles are scraped more often."
+    assert found[2] is not None and found[2]["title"] == "Set accounts to private"
+    assert found[2]["corroborated"] is True
+    assert await store.recommendation_of_suggestion(proposal_id) == found[2]
     assert await store.suggestion_of_run(await _suggestion_run(intel_pool)) is None
     # The per-option read is computed now, not stored: a later retraction shows at once.
     await PostgresEvidenceStore(intel_pool).retract_signal(listed, operator="ann", reason="wrong")

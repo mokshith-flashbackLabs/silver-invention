@@ -41,9 +41,11 @@ from imageshield.intel.source_choice import (
 from imageshield.intel.store import RUN_COLUMNS, SOURCE_COLUMNS
 from imageshield.intel.suggestion import (
     CATEGORY_CLASS,
+    GeneralRecommendation,
     OptionSuggestion,
     SuggestionCandidates,
     suggestion_options,
+    suggestion_recommendation,
 )
 from imageshield.intel.text import normalise
 from imageshield.search.urlhash import NORMALISATION_VERSION, url_hash
@@ -148,8 +150,11 @@ class QuestionStore(Protocol):
     async def queue_source_proposal(self, request: dict[str, Any], *, operator: str) -> UUID: ...
     async def queue_source_validation(self, request: dict[str, Any], *, operator: str) -> UUID: ...
     async def get_run(self, run_id: UUID) -> Run | None: ...
-    async def suggestion_of_run(self, run_id: UUID) -> tuple[UUID, list[dict[str, Any]]] | None: ...
+    async def suggestion_of_run(
+        self, run_id: UUID
+    ) -> tuple[UUID, list[dict[str, Any]], dict[str, Any] | None] | None: ...
     async def options_of_suggestion(self, proposal_id: UUID) -> list[dict[str, Any]]: ...
+    async def recommendation_of_suggestion(self, proposal_id: UUID) -> dict[str, Any] | None: ...
     async def sources_by_ids(self, source_ids: Sequence[UUID]) -> list[Source]: ...
     async def sources_with_tags(self, tags: Sequence[str]) -> list[Source]: ...
     async def known_hits(self, url_hashes: Sequence[str]) -> frozenset[str]: ...
@@ -188,6 +193,7 @@ class QuestionStore(Protocol):
         against_release_no: int,
         model_id: str,
         prompt_version: str,
+        recommendation: GeneralRecommendation | None = None,
     ) -> WriteResult | None: ...
 
 
@@ -631,6 +637,7 @@ class PostgresQuestionStore:
         against_release_no: int,
         model_id: str,
         prompt_version: str,
+        recommendation: GeneralRecommendation | None = None,
     ) -> WriteResult | None:
         """spec §3.6: born 'delivered', superseding the older delivered suggestion for the same
         question_key, in ONE transaction with its signal links and its audit row. The links are
@@ -642,6 +649,8 @@ class PostgresQuestionStore:
         signal_ids: list[UUID] = []
         for option in options:
             signal_ids += [s for s in option.signal_ids if s not in signal_ids]
+        if recommendation is not None:
+            signal_ids += [s for s in recommendation.signal_ids if s not in signal_ids]
         async with self._pool.connection() as conn, conn.transaction():
             await conn.execute(
                 "SELECT pg_advisory_xact_lock("
@@ -661,7 +670,12 @@ class PostgresQuestionStore:
             if not outrun:
                 cur = await conn.execute(_SUPERSEDE_SUGGESTION_SQL, keys)
                 superseded = [r[0] for r in await cur.fetchall()]
-            target = {"question_key": question_key, "options": [o.as_json() for o in options]}
+            target: dict[str, Any] = {
+                "question_key": question_key,
+                "options": [o.as_json() for o in options],
+            }
+            if recommendation is not None:
+                target["recommendation"] = recommendation.as_json()
             cur = await conn.execute(
                 _INSERT_SUGGESTION_SQL,
                 {
@@ -702,9 +716,12 @@ class PostgresQuestionStore:
             )
         return WriteResult((proposal_id,), tuple(superseded))
 
-    async def suggestion_of_run(self, run_id: UUID) -> tuple[UUID, list[dict[str, Any]]] | None:
-        """The weight_suggestion a run wrote, as ``(proposal_id, per-option read)``; None until
-        it wrote one. The read is computed from the links now, never stored."""
+    async def suggestion_of_run(
+        self, run_id: UUID
+    ) -> tuple[UUID, list[dict[str, Any]], dict[str, Any] | None] | None:
+        """The weight_suggestion a run wrote, as ``(proposal_id, per-option read, recommendation
+        read)``; None until it wrote one. The reads are computed from the links now, never
+        stored."""
         async with self._pool.connection() as conn:
             cur = await conn.execute(
                 "SELECT proposal_id, target FROM intel_proposals"
@@ -715,7 +732,7 @@ class PostgresQuestionStore:
             if row is None:
                 return None
             linked = (await fetch_linked_signals(conn, [row[0]]))[row[0]]
-        return row[0], suggestion_options(row[1], linked)
+        return row[0], suggestion_options(row[1], linked), suggestion_recommendation(row[1], linked)
 
     async def options_of_suggestion(self, proposal_id: UUID) -> list[dict[str, Any]]:
         """The per-option read of one weight_suggestion, for GET /proposals/{id} (S7)."""
@@ -730,3 +747,17 @@ class PostgresQuestionStore:
                 return []
             linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
         return suggestion_options(row[0], linked)
+
+    async def recommendation_of_suggestion(self, proposal_id: UUID) -> dict[str, Any] | None:
+        """The general-recommendation read of one weight_suggestion, for GET /proposals/{id}."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT target FROM intel_proposals"
+                " WHERE proposal_id = %s AND kind = 'weight_suggestion'",
+                (proposal_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
+        return suggestion_recommendation(row[0], linked)
