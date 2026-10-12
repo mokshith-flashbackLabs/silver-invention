@@ -629,6 +629,7 @@ THREAT_SUGGESTED: dict[str, Any] = {
     "kind": "leak",
     "title": "Instagram breach exposes private photos",
     "body": "Photos some Instagram users kept private were exposed in a breach.",
+    "card_line": "",
     "severity": 3,
     "expires_in_days": 30,
     "action": None,
