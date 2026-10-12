@@ -44,6 +44,7 @@ from imageshield.intel.bounds import (
     MAX_ACTION_STEPS,
     MAX_ACTION_TITLE_CHARS,
     MAX_ACTION_WHY_CHARS,
+    MAX_CARD_LINE_CHARS,
     MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
     MAX_GAP_SUBJECT_CHARS,
@@ -103,6 +104,7 @@ from imageshield.intel.schemas import (
 )
 from imageshield.intel.tags import is_well_formed, membership_problems
 from imageshield.intel.text import normalise
+from imageshield.intel.user_copy import copy_problems, unquoted_figures
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject
 from imageshield.search.urlhash import url_hash
 
@@ -311,6 +313,29 @@ def _event_body(raw: str, counts: Counter[str], *, limit: int = MAX_EVENT_BODY_C
         return ""
     if len(text) > limit:
         counts["event_body_too_long"] += 1
+        return ""
+    return text
+
+
+def _card_line(raw: str, cited: Sequence[ContextSignal], counts: Counter[str]) -> str:
+    """A threat's card line (spec 2026-10-11-intel-score-insights §2.2, §4): masked and normalised,
+    and left out ("", counted), never truncated. A missing line keeps the threat off the score
+    page's card. It never drops the threat."""
+    masked, masks = mask(raw)
+    if masks:
+        counts["pii_masked_card_line"] += 1
+    text = normalise(masked)
+    if not text:
+        counts["card_line_missing"] += 1
+        return ""
+    if len(text) > MAX_CARD_LINE_CHARS:
+        counts["card_line_too_long"] += 1
+        return ""
+    if copy_problems(text):
+        counts["card_line_forbidden_words"] += 1
+        return ""
+    if unquoted_figures(text, [quote for signal in cited for quote in signal.excerpts]):
+        counts["card_line_figure_not_quoted"] += 1
         return ""
     return text
 
@@ -572,6 +597,7 @@ def _threat_event(
                 kind=item.kind,
                 title=title,
                 body=_event_body(item.body, counts),
+                card_line=_card_line(item.card_line, [context[i] for i in signal_ids], counts),
                 severity=item.severity,
                 expires_in_days=item.expires_in_days,
             ).model_dump(mode="json", exclude={"action"}),

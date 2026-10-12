@@ -151,6 +151,9 @@ class ProposedThreatEvent(_Out):
     kind: Literal["leak", "deepfake_wave", "platform_incident", "other"]
     title: str
     body: str
+    # propose-v10 (spec 2026-10-11-intel-score-insights §2.2): one short sentence for the score
+    # page's risk-factor card. Optional so one missing line never makes the answer unparseable.
+    card_line: str = ""
     severity: int
     expires_in_days: int
     tags: list[str] = Field(default_factory=list)

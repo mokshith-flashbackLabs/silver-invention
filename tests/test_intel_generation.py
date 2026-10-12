@@ -290,6 +290,7 @@ def _threat(*signals: ContextSignal, **kw: object) -> ProposedThreatEvent:
         "kind": "leak",
         "title": "Instagram breach exposes private photos",
         "body": "Photos some Instagram users kept private were exposed in a breach.",
+        "card_line": "Private photos on one platform were exposed in a breach.",
         "severity": 3,
         "expires_in_days": 30,
         "tags": ["instagram"],
@@ -636,7 +637,7 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
     assert "Propose only threat_events, protection_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v9"
+    assert PROPOSE_PROMPT_VERSION == "propose-v10"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -681,7 +682,7 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
     assert payload["live_protections"] == [live] and payload["live_events"] == []
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
-    assert PROPOSE_PROMPT_VERSION == "propose-v9"
+    assert PROPOSE_PROMPT_VERSION == "propose-v10"
 
 
 def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
@@ -860,7 +861,7 @@ def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v9"
+    assert PROPOSE_PROMPT_VERSION == "propose-v10"
     assert "published within threat_recency_days days of today" in flat
     assert "has ended" in flat and "is not a threat" in flat
     assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in flat
@@ -936,7 +937,7 @@ def test_propose_v5_asks_for_a_body_on_both_event_kinds_and_never_a_finding() ->
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v9"
+    assert PROPOSE_PROMPT_VERSION == "propose-v10"
     assert flat.count("- body: what this") == 2
     assert "what this incident means for a person it concerns" in flat
     assert "what this protection means for a person it reaches" in flat
@@ -971,7 +972,7 @@ def test_propose_v6_asks_for_a_reason_that_names_no_platform_or_answer() -> None
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v9"
+    assert PROPOSE_PROMPT_VERSION == "propose-v10"
     assert "the reason for the change in ONE short plain sentence of at most 200 characters" in flat
     assert "Never name a platform, app, service, website, quiz question or quiz answer" in flat
 
@@ -1063,7 +1064,7 @@ def test_propose_v7_asks_for_an_action_only_with_a_real_step_and_a_cited_link() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v9"
+    assert PROPOSE_PROMPT_VERSION == "propose-v10"
     assert "Give one only when the evidence names a real step" in flat
     assert "the url of ONE of the evidence items this proposal cites" in flat
     assert "Never write any other address" in flat
@@ -1077,3 +1078,56 @@ def test_each_prompt_signal_carries_its_page_url_or_empty() -> None:
 def test_the_model_is_shown_each_signal_s_verbatim_quotes() -> None:
     s = replace(_sig(tags=("instagram",)), excerpts=("Of 1200 reports, 96% involved women.",))
     assert prompt_signal(s)["quotes"] == ["Of 1200 reports, 96% involved women."]
+
+
+# -- A threat's card line (spec 2026-10-11-intel-score-insights section 2.2) --
+
+QUOTE = "Of 1200 reports, 96% involved women aged 19 to 35."
+
+
+def test_propose_v10_asks_every_threat_for_a_short_card_line() -> None:
+    system, _ = proposal_request(
+        [],
+        [],
+        quiz=prompt_quiz(V),
+        registry_tags=prompt_registry(V, set()),
+        mapped_tags=sorted(V.mapped_tags),
+        today="2026-10-11",
+        threat_recency_days=90,
+    )
+    flat = " ".join(system.split())
+    assert PROPOSE_PROMPT_VERSION == "propose-v10"
+    assert (
+        "- card_line: what the incident is, in ONE short plain sentence of at most 160 characters"
+        in flat
+    )
+    assert 'copied exactly as it appears in a "quotes" entry' in flat
+
+
+def test_a_quoted_card_line_is_kept_with_the_threat() -> None:
+    s = replace(_sig(tags=("instagram",)), excerpts=(QUOTE,))
+    line = "Fake intimate images of 1200 people circulated on a platform."
+    batch, _ = _validate(ProposalOutput(threat_events=[_threat(s, card_line=line)]), [s])
+    (threat,) = batch.threat_events
+    assert threat.suggested["card_line"] == line
+
+
+@pytest.mark.parametrize(
+    ("line", "counter"),
+    [
+        ("", "card_line_missing"),
+        ("x" * 161, "card_line_too_long"),
+        ("Your photos were found in a leak.", "card_line_forbidden_words"),
+        ("75% of accounts were affected.", "card_line_figure_not_quoted"),
+    ],
+)
+def test_a_bad_card_line_is_left_out_and_the_threat_kept(line: str, counter: str) -> None:
+    s = replace(_sig(tags=("instagram",)), excerpts=(QUOTE,))
+    batch, counts = _validate(ProposalOutput(threat_events=[_threat(s, card_line=line)]), [s])
+    (threat,) = batch.threat_events
+    assert threat.suggested["card_line"] == "" and counts[counter] == 1
+    assert threat.suggested["title"] == "Instagram breach exposes private photos"
+
+
+def test_a_protection_proposal_carries_no_card_line() -> None:
+    assert "card_line" not in ProposedProtectionEvent.model_fields

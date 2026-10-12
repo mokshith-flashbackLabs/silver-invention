@@ -31,6 +31,7 @@ from imageshield.intel.bounds import (
     MAX_ACTION_STEPS,
     MAX_ACTION_TITLE_CHARS,
     MAX_ACTION_WHY_CHARS,
+    MAX_CARD_LINE_CHARS,
     MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
     MAX_WEIGHT_REASON_CHARS,
@@ -164,6 +165,9 @@ class ThreatEventSuggested(_Stored):
     kind: ThreatKind
     title: str = Field(min_length=1, max_length=MAX_EVENT_TITLE_CHARS)
     body: str = Field(default="", max_length=MAX_EVENT_BODY_CHARS)
+    # A short line for the score page's risk-factor card (spec 2026-10-11-intel-score-insights
+    # §2.2): "" on every proposal written before it, and on one whose drafted line was left out.
+    card_line: str = Field(default="", max_length=MAX_CARD_LINE_CHARS)
     severity: StrictInt = Field(ge=THREAT_SEVERITY_MIN, le=THREAT_SEVERITY_MAX)
     expires_in_days: StrictInt = Field(ge=THREAT_EXPIRES_MIN_DAYS, le=THREAT_EXPIRES_MAX_DAYS)
     # The model's drafted recommended action, or none (spec 2026-10-06-intel-threat-action).
@@ -176,7 +180,7 @@ class ThreatEventSuggested(_Stored):
             raise ValueError("title must not be blank")
         return value
 
-    @field_validator("body")
+    @field_validator("body", "card_line")
     @classmethod
     def _trimmed(cls, value: str) -> str:
         return value.strip()
@@ -204,6 +208,7 @@ class ThreatEventValues(_Stored):
     kind: ThreatKind | None = None
     title: str | None = None
     body: str | None = None
+    card_line: str | None = None
     # The whole action, replaced as one (2026-10-06); an explicit null removes it.
     action: ThreatActionSuggested | None = None
     severity: StrictInt | None = None

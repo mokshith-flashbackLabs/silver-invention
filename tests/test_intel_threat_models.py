@@ -21,6 +21,7 @@ GOOD: dict[str, Any] = {
     "kind": "leak",
     "title": "Instagram breach exposes private photos",
     "body": "Photos some Instagram users kept private were exposed in a breach.",
+    "card_line": "",
     "severity": 3,
     "expires_in_days": 30,
     "tags": ["instagram"],
@@ -127,3 +128,39 @@ def test_a_tag_refusal_carries_its_slugs() -> None:
     refused = DecisionRefused("unknown_tag", "a tag is not registered", slugs=("tiktok",))
     assert (refused.code, refused.slugs) == ("unknown_tag", ("tiktok",))
     assert DecisionRefused("proposal_not_found", "no").slugs == ()
+
+
+# -- A threat's card line (spec 2026-10-11-intel-score-insights section 2.2) --
+
+
+def test_a_partial_edit_keeps_the_drafted_card_line() -> None:
+    suggested = ThreatEventSuggested(
+        kind="leak", title="T", body="", severity=3, expires_in_days=30, card_line="A short line."
+    ).model_dump(mode="json")
+    edit = ThreatEventValues.model_validate({"severity": 4})
+    decided = ThreatEventDecided.model_validate(
+        {**suggested, "tags": ["instagram"], **edit.model_dump(exclude_unset=True)}
+    )
+    assert decided.card_line == "A short line." and decided.severity == 4
+    replaced = ThreatEventValues.model_validate({"card_line": "Another line."})
+    redecided = ThreatEventDecided.model_validate(
+        {**suggested, "tags": ["instagram"], **replaced.model_dump(exclude_unset=True)}
+    )
+    assert redecided.card_line == "Another line."
+
+
+def test_an_old_threat_proposal_without_a_card_line_still_parses() -> None:
+    old = ThreatEventSuggested(kind="leak", title="T", severity=3, expires_in_days=30)
+    assert old.card_line == ""
+
+
+def test_a_card_line_over_160_characters_is_refused_as_a_decided_value() -> None:
+    with pytest.raises(ValidationError):
+        ThreatEventDecided(
+            kind="leak",
+            title="T",
+            severity=3,
+            expires_in_days=30,
+            tags=("instagram",),
+            card_line="x" * 161,
+        )

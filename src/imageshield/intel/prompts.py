@@ -12,7 +12,8 @@ from typing import Any, TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v3"
-PROPOSE_PROMPT_VERSION = "propose-v9"
+# propose-v10 (spec 2026-10-11-intel-score-insights §2.2): a threat's card line.
+PROPOSE_PROMPT_VERSION = "propose-v10"
 
 
 class RegistryTag(TypedDict):
@@ -468,6 +469,12 @@ a new incident. For each threat give:
   operator approves it. Never say that their photos or anything of theirs was found, leaked or
   affected -- nobody knows that -- never name a private individual, and never give contact
   details or links.
+- card_line: what the incident is, in ONE short plain sentence of at most 160 characters, for a
+  short card beside the title. Describe the incident, never the reader. Write any figure in
+  digits, copied exactly as it appears in a "quotes" entry of evidence this proposal cites, with
+  its unit; never round, combine or work one out. Never say anyone is safe, protected or in the
+  clear, never that anything of the reader's was found, detected or matched, name no private
+  individual, and put no contact details, link or web address in it.
 - severity: a whole number from 1 (minor) to 5 (severe).
 - expires_in_days: a whole number from 1 to 90: how long the incident plausibly keeps raising
   the risk. For an ongoing abuse, how long it plausibly continues without a fresh report.
