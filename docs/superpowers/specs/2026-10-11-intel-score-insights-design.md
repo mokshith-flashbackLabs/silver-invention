@@ -197,6 +197,17 @@ Running it here as well means the console never shows drafted words the backend 
 - **Deploy services first.** The backend's readers are passthrough, so an older backend ignores
   the fields, and the backend's apply routes need them to exist. No migration and no task-def key.
 - Rollback is the previous image. A v3 proposal's extra fields are ignored by v2 code.
+  *Corrected at final review, 2026-10-12: that holds for weight suggestions (`from_json` ignores unknown keys) but
+  NOT for threat proposals.* `_Stored` models are `extra="forbid"`, so the image before propose-v10 refuses a
+  `suggested` carrying `card_line`, and approving a propose-v10 threat answers `422 values_out_of_bounds` after a
+  rollback. Reject such proposals or roll forward. From the fix pass on, `_threat_decided` and `_protection_decided`
+  merge only the suggested keys their decided model knows (`_known`), so the NEXT field a release adds no longer has
+  this hazard.
+- *Final review, 2026-10-12:* the prompts became `suggest-v4` / `propose-v11`. They name the banned words, ask for a
+  percentage with `%` (a quote's "percent" still matches), and ask for a span of years in words ("from 2023 to
+  2024"): the PII mask reads "2023-2024" as phone-shaped and the line would be dropped. The word list gained the
+  reader's photo, image or picture, and figures written in words ("nine in ten", "half of", "twice as"). A drafted
+  link label is held to the same rules and dropped (link kept) when it breaks one.
 - Cost: each request grows by the evidence quotes, which are up to 600 characters each and a few
   per signal. Each answer gains up to 200 output characters. Suggest points runs on an operator's
   press, so its cost scales with presses, not with users. The propose stage runs after source reads,

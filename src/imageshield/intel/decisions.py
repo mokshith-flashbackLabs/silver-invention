@@ -55,7 +55,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from imageshield.intel.approvable import (
     APPROVABLE_KINDS,
@@ -196,6 +196,13 @@ _APPLIED_SQL = """
 """
 
 
+def _known(suggested: dict[str, Any], model: type[BaseModel]) -> dict[str, Any]:
+    """The suggested keys this release's decided model knows (final review I4, 2026-10-12). A key a
+    newer release added (as card_line was) would otherwise make an older image refuse the whole
+    decision as out of bounds, so a rollback could not approve proposals the newer one wrote."""
+    return {k: v for k, v in suggested.items() if k in model.model_fields}
+
+
 def _refuse(code: DecisionRefusal) -> DecisionRefused:
     return DecisionRefused(code, _MESSAGES[code])
 
@@ -215,7 +222,7 @@ def _threat_decided(
         edit = ThreatEventValues.model_validate(values or {})
         decided = ThreatEventDecided.model_validate(
             {
-                **proposal.suggested,
+                **_known(proposal.suggested, ThreatEventDecided),
                 "tags": list(target.tags),
                 **edit.model_dump(exclude_unset=True),
             }
@@ -277,7 +284,7 @@ def _protection_decided(
         edit = ProtectionEventValues.model_validate(values or {})
         decided = ProtectionEventDecided.model_validate(
             {
-                **proposal.suggested,
+                **_known(proposal.suggested, ProtectionEventDecided),
                 "tags": list(target.tags),
                 "is_global": target.is_global,
                 **edit.model_dump(exclude_unset=True),

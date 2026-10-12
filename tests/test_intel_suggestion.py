@@ -451,7 +451,7 @@ def test_no_fixture_answer_or_example_appears_in_the_fixed_prompt_text() -> None
     for answer in QUESTION["options"]:
         assert answer not in fixed
     assert "by gender" not in fixed and "by age" not in fixed
-    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v3"
+    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v4"
 
 
 def _question() -> prompts.PromptSuggestionQuestion:
@@ -532,7 +532,7 @@ def test_the_suggest_prompt_asks_for_a_search_for_every_unbacked_answer() -> Non
 
 def test_suggest_v3_asks_for_the_score_page_words_and_reads_figures_only_from_quotes() -> None:
     flat = " ".join(prompts._SUGGEST_SYSTEM.split())
-    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v3"
+    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v4"
     assert "factor_title and factor_line: ONLY for an option whose deduction is above 0" in flat
     assert "recommendation: at most one for the whole question, or null" in flat
     assert 'copied exactly as it appears in a "quotes" entry' in flat
@@ -741,3 +741,63 @@ def test_the_option_read_carries_the_words_and_defaults_them_on_old_rows() -> No
     assert (row["factor_title"], row["factor_line"]) == ("Age", "L")
     (old,) = suggestion_options({"options": [{"option": "A", "signal_ids": []}]}, [])
     assert (old["factor_title"], old["factor_line"]) == ("", "")
+
+
+# -- final review (2026-10-12): prompts name the banned words, year ranges, the link label --
+
+
+def test_suggest_v4_names_the_banned_words_and_asks_for_percent_signs_and_year_words() -> None:
+    flat = " ".join(prompts._SUGGEST_SYSTEM.split())
+    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v4"
+    words = ("safe", "found", "detected", "match", "hit", "your photo", "you answered", "percent")
+    for word in words:
+        assert word in flat
+    assert 'with "%"' in flat
+    assert "from 2023 to 2024" in flat
+
+
+def test_a_year_range_written_as_words_survives_the_real_path() -> None:
+    s = replace(_quoted(), excerpts=("Reports rose from 2023 to 2024 across platforms.",))
+    kept, counts = _one(
+        {
+            "option": "Female",
+            "deduction": 4,
+            "signal_ids": [str(s.signal_id)],
+            "factor_title": "Gender",
+            "factor_line": "Reports rose from 2023 to 2024.",
+        },
+        [s],
+    )
+    assert kept.factor_line == "Reports rose from 2023 to 2024."
+    assert not counts["pii_masked_suggestion_words"]
+
+
+def test_a_dashed_year_range_is_masked_and_drops_the_pair() -> None:
+    s = replace(_quoted(), excerpts=("Reports rose in 2023 and 2024.",))
+    kept, counts = _one(
+        {
+            "option": "Female",
+            "deduction": 4,
+            "signal_ids": [str(s.signal_id)],
+            "factor_title": "Gender",
+            "factor_line": "Reports rose between 2023-2024.",
+        },
+        [s],
+    )
+    assert kept.factor_line == "" and counts["factor_line_forbidden_words"] == 1
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["Stay safe online", "www.example.org help", "Help for 75% of users", "x" * 61],
+)
+def test_a_bad_link_label_is_dropped_and_the_link_kept(label: str) -> None:
+    s = _page_signal()
+    counts: Counter[str] = Counter()
+    kept = validate_recommendation(
+        _rec(signal_ids=[str(s.signal_id)], link_label=label),
+        context={s.signal_id: s},
+        counts=counts,
+    )
+    assert kept is not None and kept.link_url == HELP_PAGE and kept.link_label is None
+    assert counts["recommendation_link_label_dropped"] == 1

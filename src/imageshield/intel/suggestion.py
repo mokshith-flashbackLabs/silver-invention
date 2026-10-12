@@ -417,8 +417,17 @@ def validate_recommendation(
             and url_hash(raw_link) in pages
         ):
             link = raw_link
+            # The label is shown beside the link, so it is held to the same rules (final review I3,
+            # 2026-10-12). A bad label is dropped and counted; the link stays.
             text = _words(raw.link_label or "", counts)
-            label = text if text and len(text) <= MAX_RECOMMENDATION_LINK_LABEL_CHARS else None
+            if text and (
+                len(text) > MAX_RECOMMENDATION_LINK_LABEL_CHARS
+                or copy_problems(text)
+                or unquoted_figures(text, _quotes(cited))
+            ):
+                counts["recommendation_link_label_dropped"] += 1
+                text = ""
+            label = text or None
         else:
             counts["recommendation_link_not_cited"] += 1
     return GeneralRecommendation(title, body, link, label, signal_ids)

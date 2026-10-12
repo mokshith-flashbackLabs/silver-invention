@@ -12,8 +12,9 @@ from typing import Any, TypedDict
 
 EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v3"
-# propose-v10 (spec 2026-10-11-intel-score-insights §2.2): a threat's card line.
-PROPOSE_PROMPT_VERSION = "propose-v10"
+# propose-v10 (spec 2026-10-11-intel-score-insights §2.2): a threat's card line. propose-v11 (final
+# review 2026-10-12): the card line's banned words named, % and year spans as suggest-v4.
+PROPOSE_PROMPT_VERSION = "propose-v11"
 
 
 class RegistryTag(TypedDict):
@@ -238,8 +239,9 @@ def validation_search_request(query: str, *, searches: int) -> tuple[str, str]:
     )
 
 
-# suggest-v3 (spec 2026-10-11-intel-score-insights §2): the score page's words.
-SUGGEST_PROMPT_VERSION = "suggest-v3"
+# suggest-v3 (spec 2026-10-11-intel-score-insights §2): the score page's words. suggest-v4 (final
+# review 2026-10-12): the banned words named, percentages with %, year spans in words.
+SUGGEST_PROMPT_VERSION = "suggest-v4"
 
 
 class PromptSuggestionOption(TypedDict):
@@ -302,6 +304,11 @@ Rules for every factor_title, factor_line and recommendation text:
 - Never say anyone is safe, protected or in the clear, and never that anything of the reader's was
   found, detected or matched. Name no private individual, give no contact details, and put no link
   or web address in the text.
+- Never use these words, in any sense: safe, all-clear, guarantee, found, detected, match,
+  hit, your photo, your image, your picture, you answered, your answer, percent. Never write a
+  figure in words ("nine in ten", "half of", "twice as"): write digits. Write a percentage with "%",
+  even when the quote spells it out. Write a span of years as "from 2023 to 2024", never with a
+  dash between the years.
 
 If no evidence speaks to an option directly, you may back it with the closest evidence, saying in
 its rationale how that evidence applies. The corroboration rule still applies.
@@ -474,7 +481,11 @@ a new incident. For each threat give:
   digits, copied exactly as it appears in a "quotes" entry of evidence this proposal cites, with
   its unit; never round, combine or work one out. Never say anyone is safe, protected or in the
   clear, never that anything of the reader's was found, detected or matched, name no private
-  individual, and put no contact details, link or web address in it.
+  individual, and put no contact details, link or web address in it. Never use these words, in
+  any sense: safe, all-clear, guarantee, found, detected, match, hit, your photo, your image, your
+  picture, percent. Never write a figure in words ("nine in ten", "half of", "twice as"): write
+  digits. Write a percentage with "%", even when the quote spells it out. Write a span of years
+  as "from 2023 to 2024", never with a dash between the years.
 - severity: a whole number from 1 (minor) to 5 (severe).
 - expires_in_days: a whole number from 1 to 90: how long the incident plausibly keeps raising
   the risk. For an ongoing abuse, how long it plausibly continues without a fresh report.

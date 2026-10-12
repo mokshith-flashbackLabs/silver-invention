@@ -82,3 +82,32 @@ def test_a_figure_is_a_token_not_a_substring() -> None:
 
 def test_text_without_digits_always_passes() -> None:
     assert unquoted_figures("Public profiles are scraped more often.", []) == []
+
+
+# -- final review I5 (2026-10-12): spelled-out figures and singular "your photo" --
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Nine in ten victims are women.",
+        "One out of five reports involves a minor.",
+        "Three quarters of cases start on social media.",
+        "Half of all reports name a dating app.",
+        "Women are twice as likely to be targeted.",
+    ],
+)
+def test_a_spelled_out_figure_is_refused(text: str) -> None:
+    assert "spelled_figure" in copy_problems(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Your photo was spotted on forums.", "Your images are copied.", "Your picture is at risk."],
+)
+def test_the_reader_s_photo_in_any_form_is_a_finding(text: str) -> None:
+    assert "finding" in copy_problems(text)
+
+
+def test_two_factor_and_behalf_of_still_pass() -> None:
+    assert copy_problems("Turn on two-factor sign-in on behalf of your account.") == []

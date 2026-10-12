@@ -164,3 +164,27 @@ def test_a_card_line_over_160_characters_is_refused_as_a_decided_value() -> None
             tags=("instagram",),
             card_line="x" * 161,
         )
+
+
+# -- final review I4 (2026-10-12): a decision ignores suggested keys this release does not know --
+
+
+def test_a_threat_decision_ignores_a_suggested_key_from_a_newer_release() -> None:
+    from datetime import UTC, datetime
+
+    from imageshield.intel.decisions import _threat_decided
+    from imageshield.intel.proposal_models import ProposalRecord
+    from tests.intel_fakes import scoring
+
+    proposal = ProposalRecord(
+        proposal_id=uuid4(),
+        kind="threat_event",
+        status="pending",
+        target={"tags": ["instagram"]},
+        suggested={**{k: v for k, v in GOOD.items() if k != "tags"}, "future_field": "x"},
+        decided=None,
+        against_release_no=None,
+        created_at=datetime.now(UTC),
+    )
+    decided = _threat_decided(proposal, scoring(), None)
+    assert "future_field" not in decided and decided["title"] == GOOD["title"]
