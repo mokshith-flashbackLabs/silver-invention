@@ -714,6 +714,7 @@ def prompt_signal(signal: ContextSignal) -> PromptSignal:
         url=signal.document_url or "",
         trust=signal.trust,
         published=published,
+        quotes=list(signal.excerpts),
     )
 
 

@@ -89,6 +89,18 @@ class SourceProposalOutput(_Out):
     options: list[ProposedOptionSources] = Field(default_factory=list)
 
 
+class SuggestedRecommendation(_Out):
+    """suggest-v3 (spec 2026-10-11-intel-score-insights §2): one general step any adult can take
+    to lower the risk the question measures. No bounds here, for the §4.5 reason:
+    intel/suggestion.py checks them and drops the recommendation, never the suggestion."""
+
+    title: str
+    body: str
+    link_url: str | None = None
+    link_label: str | None = None
+    signal_ids: list[str] = Field(default_factory=list)
+
+
 class SuggestedOptionWeight(_Out):
     option: str
     deduction: int | None = None
@@ -99,10 +111,15 @@ class SuggestedOptionWeight(_Out):
     # suggest-v2 (spec 2026-10-10-intel-every-answer-researched §2.2.3): web searches that could
     # back an option the model cannot back yet. Filtered in code (intel/suggestion.plan_research).
     research_searches: list[str] = Field(default_factory=list)
+    # suggest-v3 (spec 2026-10-11-intel-score-insights §2): the risk-factor title and line a
+    # visitor reads for this answer. Bounded and checked in code (intel/suggestion.py).
+    factor_title: str = ""
+    factor_line: str = ""
 
 
 class SuggestionOutput(_Out):
     options: list[SuggestedOptionWeight] = Field(default_factory=list)
+    recommendation: SuggestedRecommendation | None = None
 
 
 class ProposedCoverageGap(_Out):

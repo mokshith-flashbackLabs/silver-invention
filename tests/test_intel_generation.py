@@ -1072,3 +1072,8 @@ def test_propose_v7_asks_for_an_action_only_with_a_real_step_and_a_cited_link() 
 def test_each_prompt_signal_carries_its_page_url_or_empty() -> None:
     assert prompt_signal(replace(_sig(), document_url=HELP))["url"] == HELP
     assert prompt_signal(_sig())["url"] == ""
+
+
+def test_the_model_is_shown_each_signal_s_verbatim_quotes() -> None:
+    s = replace(_sig(tags=("instagram",)), excerpts=("Of 1200 reports, 96% involved women.",))
+    assert prompt_signal(s)["quotes"] == ["Of 1200 reports, 96% involved women."]

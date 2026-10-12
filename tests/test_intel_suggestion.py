@@ -439,7 +439,7 @@ def test_no_fixture_answer_or_example_appears_in_the_fixed_prompt_text() -> None
     for answer in QUESTION["options"]:
         assert answer not in fixed
     assert "by gender" not in fixed and "by age" not in fixed
-    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v2"
+    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v3"
 
 
 def _question() -> prompts.PromptSuggestionQuestion:
@@ -516,3 +516,26 @@ def test_the_suggest_prompt_asks_for_a_search_for_every_unbacked_answer() -> Non
     """I2: an unbacked answer gets at least one search; 'give none' is gone."""
     assert "Give none when no search could help" not in prompts._SUGGEST_SYSTEM
     assert "at least one" in prompts._SUGGEST_SYSTEM
+
+
+def test_suggest_v3_asks_for_the_score_page_words_and_reads_figures_only_from_quotes() -> None:
+    flat = " ".join(prompts._SUGGEST_SYSTEM.split())
+    assert prompts.SUGGEST_PROMPT_VERSION == "suggest-v3"
+    assert "factor_title and factor_line: ONLY for an option whose deduction is above 0" in flat
+    assert "recommendation: at most one for the whole question, or null" in flat
+    assert 'copied exactly as it appears in a "quotes" entry' in flat
+    assert "never the reader's own answer" in flat
+    assert "Never say anyone is safe, protected or in the clear" in flat
+
+
+def test_suggestion_output_parses_the_new_fields_and_defaults_them() -> None:
+    parsed = SuggestionOutput.model_validate(
+        {
+            "options": [{"option": "A", "factor_title": "Age", "factor_line": "L"}],
+            "recommendation": {"title": "T", "body": "B", "signal_ids": []},
+        }
+    )
+    assert parsed.options[0].factor_title == "Age" and parsed.options[0].factor_line == "L"
+    assert parsed.recommendation is not None and parsed.recommendation.link_url is None
+    bare = SuggestionOutput.model_validate({"options": [{"option": "A"}]})
+    assert bare.options[0].factor_line == "" and bare.recommendation is None

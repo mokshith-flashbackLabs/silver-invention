@@ -101,6 +101,17 @@ MAX_ACTION_LINK_LABEL_CHARS = 60
 # when the change moves their score (spec 2026-10-06-intel-weight-reason). It names no platform,
 # answer or person. Left out past it, never truncated, and the proposal is kept.
 MAX_WEIGHT_REASON_CHARS = 200
+# The score page's words (spec 2026-10-11-intel-score-insights §2, §2.2): a risk-factor title and
+# line per answer that costs points, at most one general recommendation per question, and a
+# threat's card line. Left out past them, never truncated. The backend's src/config/insights.ts
+# carries the same numbers.
+MAX_FACTOR_TITLE_CHARS = 40
+MAX_FACTOR_LINE_CHARS = 160
+MAX_RECOMMENDATION_TITLE_CHARS = 80
+MAX_RECOMMENDATION_BODY_CHARS = 200
+MAX_RECOMMENDATION_LINK_CHARS = 500
+MAX_RECOMMENDATION_LINK_LABEL_CHARS = 60
+MAX_CARD_LINE_CHARS = 160
 # Pending event proposals and live threat events a generation call is shown (spec §4.3).
 PROPOSAL_CONTEXT_MAX_EVENTS = 40
 # A regeneration refused or failed without writing proposals is queued again after this many
