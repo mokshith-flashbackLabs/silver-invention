@@ -38,7 +38,13 @@ from pydantic import BaseModel, ConfigDict
 from imageshield.intel.bounds import (
     DEDUCTION_MAX,
     DEDUCTION_MIN,
+    MAX_FACTOR_LINE_CHARS,
+    MAX_FACTOR_TITLE_CHARS,
     MAX_RATIONALE_CHARS,
+    MAX_RECOMMENDATION_BODY_CHARS,
+    MAX_RECOMMENDATION_LINK_CHARS,
+    MAX_RECOMMENDATION_LINK_LABEL_CHARS,
+    MAX_RECOMMENDATION_TITLE_CHARS,
     MAX_TAG_LABEL_CHARS,
 )
 from imageshield.intel.corroboration import uncorroborated
@@ -46,11 +52,18 @@ from imageshield.intel.models import Run
 from imageshield.intel.pii import contains_pii, mask
 from imageshield.intel.prompts import PromptSuggestionOption, PromptSuggestionQuestion
 from imageshield.intel.proposal_models import ContextSignal, SuggestedTag
-from imageshield.intel.schemas import ProposedTag, SuggestedOptionWeight, SuggestionOutput
+from imageshield.intel.schemas import (
+    ProposedTag,
+    SuggestedOptionWeight,
+    SuggestedRecommendation,
+    SuggestionOutput,
+)
 from imageshield.intel.source_choice import query_key
 from imageshield.intel.tags import TagRegistry, is_well_formed
 from imageshield.intel.text import normalise
+from imageshield.intel.user_copy import copy_problems, unquoted_figures
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject
+from imageshield.search.urlhash import url_hash
 
 SuggestionWhyNot = Literal["no_evidence", "evidence_retracted", "uncorroborated"]
 _MIN_TERM_CHARS = 4
@@ -114,6 +127,9 @@ class OptionSuggestion:
     research_searches: tuple[str, ...] = ()
     # What research did for it, attached before the write (spec 2026-10-10 §2.3).
     research: OptionResearch | None = None
+    # suggest-v3 (spec 2026-10-11-intel-score-insights §2): the risk-factor words, "" when none.
+    factor_title: str = ""
+    factor_line: str = ""
 
     def as_json(self) -> dict[str, Any]:
         """One entry of the proposal's ``target.options`` (spec §3.6)."""
@@ -124,6 +140,8 @@ class OptionSuggestion:
             "signal_ids": [str(s) for s in self.signal_ids],
             "suggested_tags": list(self.suggested_tags),
             "new_tag": self.new_tag.model_dump() if self.new_tag is not None else None,
+            "factor_title": self.factor_title,
+            "factor_line": self.factor_line,
         }
         if self.research is not None:
             out["research"] = self.research.as_json()
@@ -140,6 +158,41 @@ class OptionSuggestion:
             signal_ids=tuple(UUID(str(s)) for s in raw.get("signal_ids") or ()),
             suggested_tags=tuple(str(t) for t in raw.get("suggested_tags") or ()),
             new_tag=SuggestedTag(**new_tag) if isinstance(new_tag, dict) else None,
+            factor_title=str(raw.get("factor_title", "")),
+            factor_line=str(raw.get("factor_line", "")),
+        )
+
+
+@dataclass(frozen=True)
+class GeneralRecommendation:
+    """A question's drafted general recommendation (spec 2026-10-11-intel-score-insights §2), as
+    stored in ``target.recommendation``."""
+
+    title: str
+    body: str
+    link_url: str | None
+    link_label: str | None
+    signal_ids: tuple[UUID, ...]
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "body": self.body,
+            "link_url": self.link_url,
+            "link_label": self.link_label,
+            "signal_ids": [str(s) for s in self.signal_ids],
+        }
+
+    @classmethod
+    def from_json(cls, raw: Mapping[str, Any] | None) -> GeneralRecommendation | None:
+        if not isinstance(raw, Mapping):
+            return None
+        return cls(
+            title=str(raw["title"]),
+            body=str(raw["body"]),
+            link_url=raw.get("link_url"),
+            link_label=raw.get("link_label"),
+            signal_ids=tuple(UUID(str(s)) for s in raw.get("signal_ids") or ()),
         )
 
 
@@ -281,6 +334,96 @@ def _new_tag(
     return SuggestedTag(slug=raw.slug, label=label, kind=raw.kind)
 
 
+def _words(raw: str, counts: Counter[str]) -> str:
+    masked, masks = mask(raw)
+    if masks:
+        counts["pii_masked_suggestion_words"] += 1
+    return normalise(masked)
+
+
+def _quotes(cited: Iterable[ContextSignal]) -> list[str]:
+    return [quote for signal in cited for quote in signal.excerpts]
+
+
+def _factor_pair(
+    chosen: SuggestedOptionWeight,
+    *,
+    deduction: int | None,
+    cited: Sequence[ContextSignal],
+    counts: Counter[str],
+) -> tuple[str, str]:
+    """The risk-factor words (spec 2026-10-11-intel-score-insights §4), kept or dropped as a pair.
+    The option itself is always kept."""
+    if not deduction:
+        if chosen.factor_title or chosen.factor_line:
+            counts["factor_line_no_deduction"] += 1
+        return "", ""
+    if not chosen.factor_title and not chosen.factor_line:
+        return "", ""  # nothing drafted: an answer without words, not a dropped pair
+    title, line = _words(chosen.factor_title, counts), _words(chosen.factor_line, counts)
+    if not title or not line:
+        counts["factor_line_missing"] += 1
+        return "", ""
+    if len(title) > MAX_FACTOR_TITLE_CHARS or len(line) > MAX_FACTOR_LINE_CHARS:
+        counts["factor_line_too_long"] += 1
+        return "", ""
+    if copy_problems(title) or copy_problems(line):
+        counts["factor_line_forbidden_words"] += 1
+        return "", ""
+    if unquoted_figures(f"{title} {line}", _quotes(cited)):
+        counts["factor_line_figure_not_quoted"] += 1
+        return "", ""
+    return title, line
+
+
+def validate_recommendation(
+    raw: SuggestedRecommendation | None,
+    *,
+    context: Mapping[UUID, ContextSignal],
+    counts: Counter[str],
+) -> GeneralRecommendation | None:
+    """A question's drafted general recommendation (spec 2026-10-11-intel-score-insights §4), or
+    None. The link follows the threat-action rule: kept only when https and a cited page."""
+    if raw is None:
+        return None
+    signal_ids = _cited(raw.signal_ids, context, counts)
+    if not signal_ids:
+        counts["recommendation_dropped_no_evidence"] += 1
+        return None
+    title, body = _words(raw.title, counts), _words(raw.body, counts)
+    if (
+        not title
+        or not body
+        or len(title) > MAX_RECOMMENDATION_TITLE_CHARS
+        or len(body) > MAX_RECOMMENDATION_BODY_CHARS
+    ):
+        counts["recommendation_dropped_out_of_bounds"] += 1
+        return None
+    if copy_problems(title) or copy_problems(body):
+        counts["recommendation_dropped_forbidden_words"] += 1
+        return None
+    cited = [context[i] for i in signal_ids]
+    if unquoted_figures(f"{title} {body}", _quotes(cited)):
+        counts["recommendation_dropped_figure_not_quoted"] += 1
+        return None
+    link: str | None = None
+    label: str | None = None
+    raw_link = (raw.link_url or "").strip()
+    if raw_link:
+        pages = {s.document_key for s in cited if s.document_key is not None}
+        if (
+            raw_link.startswith("https://")
+            and len(raw_link) <= MAX_RECOMMENDATION_LINK_CHARS
+            and url_hash(raw_link) in pages
+        ):
+            link = raw_link
+            text = _words(raw.link_label or "", counts)
+            label = text if text and len(text) <= MAX_RECOMMENDATION_LINK_LABEL_CHARS else None
+        else:
+            counts["recommendation_link_not_cited"] += 1
+    return GeneralRecommendation(title, body, link, label, signal_ids)
+
+
 def validate_suggestion(
     output: SuggestionOutput,
     *,
@@ -311,12 +454,16 @@ def validate_suggestion(
             continue
         signal_ids = _cited(chosen.signal_ids, context, counts)
         tags = _tags(chosen.suggested_tags, registry, counts)
+        deduction = _deduction(
+            chosen.deduction, cap=cap, has_evidence=bool(signal_ids), counts=counts
+        )
+        factor_title, factor_line = _factor_pair(
+            chosen, deduction=deduction, cited=[context[i] for i in signal_ids], counts=counts
+        )
         suggestions.append(
             OptionSuggestion(
                 option=option,
-                deduction=_deduction(
-                    chosen.deduction, cap=cap, has_evidence=bool(signal_ids), counts=counts
-                ),
+                deduction=deduction,
                 rationale=_text(
                     chosen.rationale,
                     field_name="rationale",
@@ -329,6 +476,8 @@ def validate_suggestion(
                     chosen.new_tag, fits=bool(tags), registered=registered, counts=counts
                 ),
                 research_searches=tuple(chosen.research_searches),
+                factor_title=factor_title,
+                factor_line=factor_line,
             )
         )
     return suggestions
@@ -445,6 +594,20 @@ def _uuid(value: object) -> UUID | None:
         return None
 
 
+def _why_not(
+    raw_ids: Iterable[object], by_id: Mapping[UUID, ContextSignal]
+) -> tuple[list[UUID], SuggestionWhyNot | None]:
+    cited = [i for value in raw_ids if (i := _uuid(value)) is not None]
+    active = [by_id[i] for i in cited if i in by_id and by_id[i].status == "active"]
+    if not cited:
+        return cited, "no_evidence"
+    if not active:
+        return cited, "evidence_retracted"
+    if uncorroborated(active):
+        return cited, "uncorroborated"
+    return cited, None
+
+
 def suggestion_options(
     target: Mapping[str, Any], linked: Sequence[ContextSignal]
 ) -> list[dict[str, Any]]:
@@ -455,17 +618,7 @@ def suggestion_options(
     for raw in target.get("options") or []:
         if not isinstance(raw, dict):
             continue
-        cited = [i for value in raw.get("signal_ids") or [] if (i := _uuid(value)) is not None]
-        active = [by_id[i] for i in cited if i in by_id and by_id[i].status == "active"]
-        why: SuggestionWhyNot | None
-        if not cited:
-            why = "no_evidence"
-        elif not active:
-            why = "evidence_retracted"
-        elif uncorroborated(active):
-            why = "uncorroborated"
-        else:
-            why = None
+        cited, why = _why_not(raw.get("signal_ids") or [], by_id)
         rows.append(
             {
                 "option": raw.get("option"),
@@ -478,9 +631,33 @@ def suggestion_options(
                 "why_not": why,
                 # What research did for this answer (spec 2026-10-10 §2.3); absent before it.
                 "research": raw.get("research"),
+                # The risk-factor words (spec 2026-10-11-intel-score-insights §5); "" before them.
+                "factor_title": raw.get("factor_title", ""),
+                "factor_line": raw.get("factor_line", ""),
             }
         )
     return rows
+
+
+def suggestion_recommendation(
+    target: Mapping[str, Any], linked: Sequence[ContextSignal]
+) -> dict[str, Any] | None:
+    """The read of a stored suggestion's general recommendation (spec
+    2026-10-11-intel-score-insights §5), judged on its own cited signals with the options' rule, or
+    None when it has none."""
+    raw = target.get("recommendation")
+    if not isinstance(raw, dict):
+        return None
+    cited, why = _why_not(raw.get("signal_ids") or [], {s.signal_id: s for s in linked})
+    return {
+        "title": raw.get("title"),
+        "body": raw.get("body"),
+        "link_url": raw.get("link_url"),
+        "link_label": raw.get("link_label"),
+        "signal_ids": [str(i) for i in cited],
+        "corroborated": why is None,
+        "why_not": why,
+    }
 
 
 def prompt_suggestion_question(

@@ -5,16 +5,25 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from uuid import uuid4
+
+import pytest
 
 from imageshield.intel import approvable, prompts
 from imageshield.intel.models import Run
 from imageshield.intel.proposal_models import ContextSignal, ProposalRecord, SuggestedTag
 from imageshield.intel.recency import Recency
-from imageshield.intel.schemas import ProposedTag, SuggestedOptionWeight, SuggestionOutput
+from imageshield.intel.schemas import (
+    ProposedTag,
+    SuggestedOptionWeight,
+    SuggestedRecommendation,
+    SuggestionOutput,
+)
 from imageshield.intel.suggestion import (
+    GeneralRecommendation,
     OptionResearch,
     OptionSuggestion,
     ResearchSearch,
@@ -28,6 +37,8 @@ from imageshield.intel.suggestion import (
     select_context,
     slugs_named_by,
     suggestion_options,
+    suggestion_recommendation,
+    validate_recommendation,
     validate_suggestion,
 )
 from tests.intel_fakes import scoring
@@ -539,3 +550,193 @@ def test_suggestion_output_parses_the_new_fields_and_defaults_them() -> None:
     assert parsed.recommendation is not None and parsed.recommendation.link_url is None
     bare = SuggestionOutput.model_validate({"options": [{"option": "A"}]})
     assert bare.options[0].factor_line == "" and bare.recommendation is None
+
+
+# -- The score page's words (spec 2026-10-11-intel-score-insights section 4) --
+
+QUOTE = "Of 1200 reports, 96% involved women aged 19 to 35."
+
+
+def _quoted(**kw: object) -> ContextSignal:
+    return replace(_signal(**kw), excerpts=(QUOTE,))  # type: ignore[arg-type]
+
+
+def _one(
+    option: dict[str, object], context: list[ContextSignal]
+) -> tuple[OptionSuggestion, Counter[str]]:
+    counts: Counter[str] = Counter()
+    (kept,) = validate_suggestion(
+        SuggestionOutput.model_validate({"options": [option]}),
+        options=[str(option["option"])],
+        cap=None,
+        context={s.signal_id: s for s in context},
+        vocabulary=scoring(),
+        counts=counts,
+    )
+    return kept, counts
+
+
+def test_a_quoted_factor_pair_is_kept_beside_a_deduction() -> None:
+    s = _quoted()
+    kept, _ = _one(
+        {
+            "option": "Female",
+            "deduction": 4,
+            "signal_ids": [str(s.signal_id)],
+            "factor_title": "Gender",
+            "factor_line": "96% of reported cases involved women.",
+        },
+        [s],
+    )
+    assert (kept.factor_title, kept.factor_line) == (
+        "Gender",
+        "96% of reported cases involved women.",
+    )
+    assert kept.as_json()["factor_line"] == "96% of reported cases involved women."
+    assert OptionSuggestion.from_json(kept.as_json()).factor_title == "Gender"
+
+
+@pytest.mark.parametrize(
+    ("over", "counter"),
+    [
+        ({"deduction": 0}, "factor_line_no_deduction"),
+        ({"deduction": None}, "factor_line_no_deduction"),
+        ({"factor_line": ""}, "factor_line_missing"),
+        ({"factor_title": "x" * 41}, "factor_line_too_long"),
+        ({"factor_line": "x" * 161}, "factor_line_too_long"),
+        ({"factor_line": "You are safe if you stop posting."}, "factor_line_forbidden_words"),
+        ({"factor_line": "75% of reported cases involved women."}, "factor_line_figure_not_quoted"),
+    ],
+)
+def test_a_bad_factor_pair_is_dropped_and_the_option_kept(
+    over: dict[str, object], counter: str
+) -> None:
+    s = _quoted()
+    option: dict[str, object] = {
+        "option": "Female",
+        "deduction": 4,
+        "rationale": "kept",
+        "signal_ids": [str(s.signal_id)],
+        "factor_title": "Gender",
+        "factor_line": "96% of reported cases involved women.",
+        **over,
+    }
+    kept, counts = _one(option, [s])
+    assert (kept.factor_title, kept.factor_line) == ("", "")
+    assert kept.rationale == "kept" and counts[counter] == 1
+
+
+def test_a_figure_only_in_a_summary_drops_the_pair() -> None:
+    s = _signal(summary="Reports say 75% of victims are women.")
+    kept, counts = _one(
+        {
+            "option": "Female",
+            "deduction": 4,
+            "signal_ids": [str(s.signal_id)],
+            "factor_title": "Gender",
+            "factor_line": "75% of victims are women.",
+        },
+        [s],
+    )
+    assert kept.factor_line == "" and counts["factor_line_figure_not_quoted"] == 1
+
+
+def test_a_figure_in_an_uncited_signal_s_quote_does_not_count() -> None:
+    cited, other = _signal(), _quoted()
+    kept, counts = _one(
+        {
+            "option": "Female",
+            "deduction": 4,
+            "signal_ids": [str(cited.signal_id)],
+            "factor_title": "Gender",
+            "factor_line": "96% of reported cases involved women.",
+        },
+        [cited, other],
+    )
+    assert kept.factor_line == "" and counts["factor_line_figure_not_quoted"] == 1
+
+
+HELP_PAGE = "https://help.example.org/opt-out"
+
+
+def _rec(**over: object) -> SuggestedRecommendation:
+    fields: dict[str, object] = {
+        "title": "Turn on your platform's likeness alerts",
+        "body": "Alerts tell you when a video uses your face, so you can report it early.",
+        "link_url": HELP_PAGE,
+        "link_label": "Help page",
+        "signal_ids": [],
+    }
+    fields.update(over)
+    return SuggestedRecommendation.model_validate(fields)
+
+
+def _page_signal(publisher: str = "p.example") -> ContextSignal:
+    from imageshield.search.urlhash import url_hash
+
+    return replace(_quoted(publisher=publisher), document_key=url_hash(HELP_PAGE))
+
+
+def test_a_cited_recommendation_keeps_its_cited_link() -> None:
+    s = _page_signal()
+    counts: Counter[str] = Counter()
+    kept = validate_recommendation(
+        _rec(signal_ids=[str(s.signal_id)]), context={s.signal_id: s}, counts=counts
+    )
+    assert kept == GeneralRecommendation(
+        "Turn on your platform's likeness alerts",
+        "Alerts tell you when a video uses your face, so you can report it early.",
+        HELP_PAGE,
+        "Help page",
+        (s.signal_id,),
+    )
+    assert GeneralRecommendation.from_json(kept.as_json()) == kept
+
+
+def test_an_uncited_link_is_dropped_and_the_recommendation_kept() -> None:
+    s = _quoted()
+    counts: Counter[str] = Counter()
+    kept = validate_recommendation(
+        _rec(signal_ids=[str(s.signal_id)]), context={s.signal_id: s}, counts=counts
+    )
+    assert kept is not None and kept.link_url is None and kept.link_label is None
+    assert counts["recommendation_link_not_cited"] == 1
+
+
+@pytest.mark.parametrize(
+    ("over", "counter"),
+    [
+        ({"signal_ids": []}, "recommendation_dropped_no_evidence"),
+        ({"title": "x" * 81}, "recommendation_dropped_out_of_bounds"),
+        ({"body": ""}, "recommendation_dropped_out_of_bounds"),
+        ({"body": "This keeps you safe."}, "recommendation_dropped_forbidden_words"),
+        ({"body": "75% of people never do this."}, "recommendation_dropped_figure_not_quoted"),
+    ],
+)
+def test_a_bad_recommendation_is_dropped(over: dict[str, object], counter: str) -> None:
+    s = _page_signal()
+    fields: dict[str, object] = {"signal_ids": [str(s.signal_id)], **over}
+    counts: Counter[str] = Counter()
+    assert validate_recommendation(_rec(**fields), context={s.signal_id: s}, counts=counts) is None
+    assert counts[counter] == 1
+
+
+def test_the_recommendation_read_is_judged_on_its_own_cited_signals() -> None:
+    a, b = _page_signal("a.example"), _page_signal("b.example")
+    both = GeneralRecommendation("T", "B", None, None, (a.signal_id, b.signal_id))
+    read = suggestion_recommendation({"options": [], "recommendation": both.as_json()}, [a, b])
+    assert read is not None and read["corroborated"] is True and read["why_not"] is None
+    assert suggestion_recommendation({"options": []}, []) is None
+    lone = GeneralRecommendation("T", "B", None, None, (a.signal_id,))
+    read = suggestion_recommendation({"recommendation": lone.as_json()}, [replace(a, trust="web")])
+    assert read is not None and read["why_not"] == "uncorroborated"
+
+
+def test_the_option_read_carries_the_words_and_defaults_them_on_old_rows() -> None:
+    (row,) = suggestion_options(
+        {"options": [{"option": "A", "factor_title": "Age", "factor_line": "L", "signal_ids": []}]},
+        [],
+    )
+    assert (row["factor_title"], row["factor_line"]) == ("Age", "L")
+    (old,) = suggestion_options({"options": [{"option": "A", "signal_ids": []}]}, [])
+    assert (old["factor_title"], old["factor_line"]) == ("", "")
