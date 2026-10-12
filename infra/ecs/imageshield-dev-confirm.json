@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "confirm-worker",
-      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:ddd1adb",
+      "image": "225989356895.dkr.ecr.ap-south-1.amazonaws.com/imageshield/services:7fdcac5",
       "essential": true,
       "memory": 192,
       "command": [
