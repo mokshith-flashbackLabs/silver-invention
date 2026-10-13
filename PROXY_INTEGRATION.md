@@ -1252,6 +1252,42 @@ task definitions (every dev and prod container that loads either settings class 
 `INTEL_THREAT_RECENCY_DAYS`). The backend relays the new fields as they come, so it needs only the new code mapped. On
 the way down: services' code first, then 0048's down, which relabels `covered_by_decision` rows `newer_proposal`.
 
+### Likeness intel — the AI proposes quiz questions (2026-10-13)
+
+**Owner request, 2026-10-13** (spec `docs/superpowers/specs/2026-10-13-intel-quiz-questions-design.md`): a sixth
+proposal kind, **`quiz_question`**. No route is added and no `svc` view changes. Migration 0054. The backend publishes
+approved questions as a new quiz version (its spec `2026-10-13-ai-proposed-quiz-questions-design.md`); everyone then
+retakes the quiz, the existing lifecycle.
+
+**The kind on the existing routes:**
+- `GET /v1/admin/intel/proposals`: `kind` also takes `quiz_question`. Omitting `kind` includes it.
+- A `quiz_question` Proposal carries `target: {question_key, subject, research_run_id}`, `suggested: {prompt, multi,
+  options: [{option, tags, new_tag: {slug, label, kind} | null}]}` and, approved, `decided: {prompt, multi, cap,
+  options: [{option, deduction, tags}], suggestion_proposal_id}`. Both reads add **`research: {run_id, status,
+  suggestion_proposal_id}`** on a question (absent on every other kind): the research run's status and the newest
+  delivered `weight_suggestion` for its key, whose per-answer read (`GET /proposals/{suggestion_proposal_id}`) has the
+  numbers, citations and research rounds.
+- `why_not` gains **`research_pending`**, last in the fixed order, while the research run is `queued` or `running`.
+- **The decision** (`POST /proposals/{id}/decision`) approves a question to `approved` (waiting for your publish).
+  `values` is optional and partial: `{prompt?, multi?, cap?, options?: [{option?, deduction?, tags?}]}`, `options` by
+  position and exactly as many as the proposal has. Each answer's `deduction` defaults to the suggestion's number for
+  it. New refusals, map each by name: **`422 question_incomplete`** (an answer with no number, or `multi: true` with no
+  `cap`), **`409 question_key_taken`** (the live quiz has the key). `409 proposal_not_decidable` with "Research for this
+  question is still running." while `research_pending`. Tags follow `unknown_tag` / `tag_retired` with `slugs`, for
+  every tag on the question. A rejection works from `pending` (dismiss) or `approved` (withdraw), and a withdrawal is
+  `409 proposal_not_pending` once the live quiz has the key.
+- **`POST /proposals/applied`** moves approved questions too, with the release's `scoring_version` as `applied_ref`:
+  send their ids in the same call as any weight changes the release carried.
+- **Reconcile:** a pending question whose key the pushed quiz has is superseded `resolved_by_quiz`.
+
+**What services do alone:** a question is proposed only by a source check, an ad-hoc URL or a discovery read of a
+source that is not a research search, at most `INTEL_QUESTION_MAX_PENDING` open at once, never repeating a live key or
+an open or recently dismissed one. Writing it queues its research: an ordinary `weight_suggestion` run for the new key,
+`requested_by: "system:intel"`, visible in `GET /runs` and its run log like any other.
+
+**Deploy order:** services first (0054, then services and services-worker with the six `INTEL_QUESTION_*` keys); then
+the backend. On the way down, the backend first, then 0054's down, which deletes `quiz_question` proposals.
+
 ---
 
 ## 5. Object storage — the proxy mints, we PUT and discard

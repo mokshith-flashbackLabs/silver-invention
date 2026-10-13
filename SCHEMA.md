@@ -1448,6 +1448,23 @@ A research source is registered `enabled = false`, `disabled_reason = 'research_
 run columns. The down relabels research sources as disabled `suggested` sources with no reason (evidence kept) and
 drops the rest.
 
+## 2n. Likeness intel — quiz questions (migration 0054)
+
+Spec `2026-10-13-intel-quiz-questions-design.md` §2, §8. A sixth proposal kind, no new table:
+
+```sql
+-- intel_proposals
+kind  -- intel_proposals_kind_check gains 'quiz_question'
+-- intel_proposals_decided_check: an approved or applied quiz_question carries `decided`, as the three kinds that
+-- apply something do
+```
+
+A question's `target` is `{question_key, subject, research_run_id}`, `suggested` the model's question, `decided` the
+approved question with every answer's points, and `applied_ref` the backend release's `scoring_version`. Its research
+run is an ordinary `weight_suggestion` row in `intel_runs` (`requested_by = 'system:intel'`, `request.for_question`).
+0039 wrote both CHECKs unnamed; 0054 finds them by definition (0048's precedent) and names them. The down deletes the
+`quiz_question` proposals and their signal links, then restores both CHECKs.
+
 ## 3. Adjudication service
 
 ⚠ **This section is the original match-module-era sketch and was never built as written.** It predates

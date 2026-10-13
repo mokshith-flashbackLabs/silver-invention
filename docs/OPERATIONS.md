@@ -340,6 +340,20 @@ at least a budget outage will not also relax everyone's cadence.
   key refuses boot naming it. Raising a search or output limit makes each call longer and larger, not more numerous;
   `claude_intel`'s `cost_per_call_usd` (2.00, migration 0051) is the budget estimate per call.
 
+**AI-proposed quiz questions (2026-10-13, spec `docs/superpowers/specs/2026-10-13-intel-quiz-questions-design.md`).**
+- **A question costs a research run.** Each `quiz_question` written queues one `weight_suggestion` run for its key
+  (`requested_by: system:intel`), with its research rounds. `INTEL_QUESTION_MAX_PENDING` (3) bounds how many are open
+  at once, so it bounds that cost too; **0 closes question proposals** without a deploy of code.
+- **The evidence bar** (`INTEL_QUESTION_MIN_SIGNALS` 3, `INTEL_QUESTION_MIN_PUBLISHERS` 2, within
+  `INTEL_QUESTION_WINDOW_DAYS` 90) is counted over the signals a question cites. Answers per question:
+  `INTEL_QUESTION_MAX_OPTIONS` (8). A dismissed question is shown to the model, and refused again, for
+  `INTEL_QUESTION_DISMISSED_DAYS` (90).
+- **Outcome counters:** `question_research_queued`, `questions_closed_at_cap`, `proposal_dropped_questions_closed`,
+  `proposal_dropped_question_*` (key malformed or taken, subject taken, below threshold, option count, options repeat,
+  cap, at write), `proposal_dropped_question_forbidden_words` / `..._option_forbidden_words`,
+  `proposal_dropped_new_tag_invalid`.
+- **Publishing is the backend's.** An approved question waits for its publish, which makes everyone retake the quiz.
+
 **Throughput (2026-10-03, spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`).**
 - **Several runs at once.** Each `intel-worker` keeps up to `INTEL_RUN_CONCURRENCY` (3) runs in flight, and one run
   reads up to `INTEL_SOURCE_READ_CONCURRENCY` (4) sources or pages at once. The `claude_intel` daily budget can
