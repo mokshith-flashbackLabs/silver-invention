@@ -392,6 +392,25 @@ def _question_decided(
     return decided.model_dump(mode="json")
 
 
+def _question_published(
+    proposal: ProposalRecord, vocabulary: ScoringVocabulary | None
+) -> bool:
+    """The live quiz carries exactly this approved question: its key, its answers in order, and
+    each answer's decided points. Like a weight change's ``published_unacknowledged``."""
+    if vocabulary is None or proposal.decided is None:
+        return False
+    live = vocabulary.questions.get(str(proposal.target.get("question_key", "")))
+    if live is None:
+        return False
+    try:
+        decided = QuizQuestionDecided.model_validate(proposal.decided)
+    except ValidationError:
+        return False
+    return tuple(o.option for o in decided.options) == tuple(live.options) and all(
+        live.deductions.get(o.option) == o.deduction for o in decided.options
+    )
+
+
 def _renews_of(proposal: ProposalRecord) -> UUID | None:
     """The credit a protection proposal renews, or None. A target that does not parse renews
     nothing here: the approval refuses it as values_out_of_bounds."""
@@ -514,9 +533,10 @@ def _rejection_from(proposal: ProposalRecord, vocabulary: ScoringVocabulary | No
         return "pending"
     if proposal.status == "approved" and proposal.kind == "quiz_question":
         # Published, the acknowledgement not yet here: a question in the live quiz is never
-        # recorded as withdrawn (spec 2026-10-13-intel-quiz-questions §5).
-        key = proposal.target.get("question_key")
-        if vocabulary is not None and key in vocabulary.questions:
+        # recorded as withdrawn (spec 2026-10-13-intel-quiz-questions §5). "Published" is THIS
+        # question live -- its answers and their points -- not merely its key: a key the quiz
+        # editor took by hand leaves the approved question withdrawable (final review, 2026-10-13).
+        if _question_published(proposal, vocabulary):
             raise _refuse("proposal_not_pending")
         return "approved"
     if proposal.status == "approved" and proposal.kind == "weight_change":

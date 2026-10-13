@@ -72,8 +72,9 @@ from imageshield.intel.bounds import (
     THREAT_SEVERITY_MIN,
 )
 from imageshield.intel.cells import cell_problem
+from imageshield.intel.corroboration import uncorroborated
 from imageshield.intel.limits import QuestionLimits
-from imageshield.intel.pii import mask
+from imageshield.intel.pii import contains_pii, mask
 from imageshield.intel.prompts import (
     PromptLiveEvent,
     PromptLiveProtection,
@@ -631,6 +632,10 @@ def _quiz_question(
     if item.question_key in taken_keys:
         counts["proposal_dropped_question_key_taken"] += 1
         return None
+    if contains_pii(item.question_key):
+        # A key is stored and published as the quiz's own; it is never masked, so it is refused.
+        counts["proposal_dropped_question_key_pii"] += 1
+        return None
     subject = _free_text(
         item.subject, field_name="subject", limit=MAX_QUESTION_SUBJECT_CHARS, counts=counts
     )
@@ -688,6 +693,11 @@ def _quiz_question(
         or len({s.publisher_domain for s in recent}) < limits.min_publishers
     ):
         counts["proposal_dropped_question_below_threshold"] += 1
+        return None
+    if uncorroborated([context[i] for i in signal_ids]):
+        # The decision's own predicate (echoes and a company's own domains collapse): a question
+        # it would refuse is never written, so no research run is spent on it (final review).
+        counts["proposal_dropped_question_uncorroborated"] += 1
         return None
     rationale = _free_text(
         item.rationale, field_name="rationale", limit=MAX_RATIONALE_CHARS, counts=counts

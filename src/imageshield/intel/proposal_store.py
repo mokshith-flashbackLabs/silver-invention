@@ -257,13 +257,15 @@ def _open_question(row: dict[str, Any]) -> OpenQuestion:
 
 
 async def read_question_context(
-    conn: AsyncConnection[Any], *, dismissed_since: datetime, lock: bool = False
+    conn: AsyncConnection[Any], *, dismissed_since: datetime
 ) -> QuestionContext:
     """The open (pending and approved) and the recently dismissed questions (spec
-    2026-10-13-intel-quiz-questions §3.1). ``lock`` takes them FOR UPDATE: the write's re-check."""
+    2026-10-13-intel-quiz-questions §3.1). No row lock: every writer that ADDS to the open set holds
+    PROPOSAL_WRITE_LOCK, and the applied acknowledgement, which takes row locks without it, only
+    shrinks the set (final review 2026-10-13: a FOR UPDATE here could deadlock with it)."""
     cur = conn.cursor(row_factory=dict_row)
     await cur.execute(
-        _QUESTION_CONTEXT_SQL + (" FOR UPDATE" if lock else ""),
+        _QUESTION_CONTEXT_SQL,
         {"dismissed_since": dismissed_since, "limit": _QUESTION_CONTEXT_MAX},
     )
     rows = [_open_question(r) for r in await cur.fetchall()]
@@ -282,6 +284,10 @@ async def question_research(
     questions = [r for r in rows if r["kind"] == "quiz_question"]
     if not questions:
         return {}
+    # Final review 2026-10-13: a suggestion written BEFORE the question (a key proposed again after
+    # its dismissal window) never supplies its points, and neither does an answer whose evidence has
+    # since been retracted.
+    asked_at = {r["proposal_id"]: r["created_at"] for r in questions}
     run_of: dict[UUID, UUID | None] = {}
     for row in questions:
         raw = (row["target"] or {}).get("research_run_id")
@@ -295,23 +301,26 @@ async def question_research(
         statuses = {r[0]: r[1] for r in await cur.fetchall()}
     keys = sorted({str((r["target"] or {}).get("question_key", "")) for r in questions})
     cur = await conn.execute(
-        "SELECT DISTINCT ON (target->>'question_key') target->>'question_key', proposal_id, target"
-        " FROM intel_proposals WHERE kind = 'weight_suggestion' AND status = 'delivered'"
+        "SELECT DISTINCT ON (target->>'question_key') target->>'question_key', proposal_id, target,"
+        " created_at FROM intel_proposals WHERE kind = 'weight_suggestion' AND status = 'delivered'"
         " AND target->>'question_key' = ANY(%s::text[])"
         " ORDER BY target->>'question_key', created_at DESC, proposal_id DESC",
         (keys,),
     )
-    newest = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
-    linked = await fetch_linked_signals(conn, [pid for pid, _ in newest.values()])
-    numbers: dict[str, tuple[UUID, dict[str, int | None]]] = {}
-    for key, (pid, target) in newest.items():
+    newest = {r[0]: (r[1], r[2], r[3]) for r in await cur.fetchall()}
+    linked = await fetch_linked_signals(conn, [pid for pid, _, _ in newest.values()])
+    numbers: dict[str, tuple[UUID, datetime, dict[str, int | None]]] = {}
+    for key, (pid, target, written_at) in newest.items():
         read = suggestion_options(target, linked[pid])
         numbers[key] = (
             pid,
+            written_at,
             {
                 str(o["option"]): (
                     o["deduction"]
-                    if isinstance(o.get("deduction"), int) and not isinstance(o["deduction"], bool)
+                    if isinstance(o.get("deduction"), int)
+                    and not isinstance(o["deduction"], bool)
+                    and o.get("why_not") != "evidence_retracted"
                     else None
                 )
                 for o in read
@@ -321,7 +330,12 @@ async def question_research(
     for row in questions:
         key = str((row["target"] or {}).get("question_key", ""))
         run_id = run_of[row["proposal_id"]]
-        suggestion = numbers.get(key)
+        found = numbers.get(key)
+        suggestion = (
+            (found[0], found[2])
+            if found is not None and found[1] >= asked_at[row["proposal_id"]]
+            else None
+        )
         result[row["proposal_id"]] = QuestionResearch(
             run_id=run_id,
             status=statuses.get(run_id) if run_id is not None else None,
@@ -770,11 +784,15 @@ class PostgresProposalStore:
                             conn,
                             dismissed_since=self._clock()
                             - timedelta(days=question_limits.dismissed_days),
-                            lock=True,
                         )
                         seen = (*questions.open, *questions.dismissed)
                         question_keys = {q.question_key for q in seen}
                         question_subjects = {normalise_subject(q.subject) for q in seen}
+                        # The live quiz as it is NOW, not as the run loaded it: a key the quiz took
+                        # since is never written (final review 2026-10-13).
+                        live = await load_scoring_vocabulary(conn)
+                        if live is not None:
+                            question_keys |= set(live.questions)
                     key = str(proposal.target["question_key"])
                     subject = normalise_subject(str(proposal.target["subject"]))
                     if (

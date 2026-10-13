@@ -50,6 +50,7 @@ from imageshield.intel.bounds import (
     THREAT_SEVERITY_MIN,
 )
 from imageshield.intel.tags import is_well_formed
+from imageshield.intel.text import normalise
 from imageshield.intel.user_copy import question_copy_problems
 
 # ``covered_by_decision`` (2026-10-04, migration 0048): an operator approved a proposal this one
@@ -330,7 +331,9 @@ class QuestionOptionSuggested(_Stored):
 
 
 def _question_text(value: str) -> str:
-    text = value.strip()
+    # Normalised as generation normalises the model's text (NFC, whitespace collapsed): an
+    # operator's double space or non-breaking space is never published (final review 2026-10-13).
+    text = normalise(value)
     if not text:
         raise ValueError("must not be blank")
     if question_copy_problems(text):

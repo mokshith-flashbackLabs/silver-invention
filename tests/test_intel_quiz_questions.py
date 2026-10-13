@@ -9,6 +9,7 @@ import contextlib
 import json
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -673,14 +674,9 @@ async def test_a_multi_select_with_a_cap_is_approved(intel_pool: AsyncConnection
     assert (decided.decided["multi"], decided.decided["cap"]) == (True, 6)
 
 
-async def test_a_key_the_live_quiz_took_is_refused(intel_pool: AsyncConnectionPool) -> None:
-    pid = await _question_with_research(
-        intel_pool, numbers={"All of them": 5, "None of them": 0}, key="dating"
-    )
-    assert await _refused(intel_pool, pid) == "question_key_taken"
-
-
-def _live(document: dict[str, Any], key: str) -> dict[str, Any]:
+def _live(
+    document: dict[str, Any], key: str, deductions: dict[str, int] | None = None
+) -> dict[str, Any]:
     return {
         **document,
         "questions": [
@@ -690,26 +686,42 @@ def _live(document: dict[str, Any], key: str) -> dict[str, Any]:
                 "prompt": "Q?",
                 "type": "mutable",
                 "options": ["All of them", "None of them"],
-                "deductions": {"All of them": 5, "None of them": 0},
+                "deductions": deductions or {"All of them": 5, "None of them": 0},
                 "cap": None,
             },
         ],
     }
 
 
-async def test_a_withdrawal_works_until_the_question_is_live(
+async def test_a_key_the_live_quiz_took_is_refused(intel_pool: AsyncConnectionPool) -> None:
+    pid = await _question_with_research(
+        intel_pool, numbers={"All of them": 5, "None of them": 0}, key="taken_later"
+    )
+    await seed_quiz_vocabulary(
+        intel_pool, release_no=3, document=_live(quiz_document(), "taken_later")
+    )
+    assert await _refused(intel_pool, pid) == "question_key_taken"
+
+
+async def test_a_withdrawal_works_until_this_question_is_live(
     intel_pool: AsyncConnectionPool,
 ) -> None:
+    """Final review 2026-10-13: "live" is THIS question -- its answers and their points -- so a key
+    the quiz editor took by hand leaves the approved question withdrawable, never stuck."""
     numbers = {"All of them": 5, "None of them": 0}
     pid = await _question_with_research(intel_pool, numbers=numbers)
     await _decide(intel_pool, pid)
     assert (await _decide(intel_pool, pid, "rejected")).status == "rejected"
     live = await _question_with_research(intel_pool, numbers=numbers, key="second_key")
+    hand = await _question_with_research(intel_pool, numbers=numbers, key="hand_added")
     await _decide(intel_pool, live)
-    await seed_quiz_vocabulary(
-        intel_pool, release_no=3, document=_live(quiz_document(), "second_key")
+    await _decide(intel_pool, hand)
+    document = _live(
+        _live(quiz_document(), "second_key"), "hand_added", {"All of them": 9, "None of them": 0}
     )
+    await seed_quiz_vocabulary(intel_pool, release_no=3, document=document)
     assert await _refused(intel_pool, live, decision="rejected") == "proposal_not_pending"
+    assert (await _decide(intel_pool, hand, "rejected")).status == "rejected"
 
 
 async def test_the_acknowledgement_moves_approved_questions_with_weight_changes(
@@ -717,11 +729,17 @@ async def test_the_acknowledgement_moves_approved_questions_with_weight_changes(
 ) -> None:
     pid = await _question_with_research(intel_pool, numbers={"All of them": 5, "None of them": 0})
     await _decide(intel_pool, pid)
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    weight = await seed_proposal(
+        intel_pool, signal_ids=[sid], status="approved", decided={"delta": 1, "body": ""}
+    )
     store = PostgresDecisionStore(intel_pool, threat_recency_days=90)
+    first = await store.mark_applied(
+        scoring_version="likeness-score-v9", proposal_ids=[pid, weight]
+    )
+    assert set(first.applied) == {pid, weight}
     first = await store.mark_applied(scoring_version="likeness-score-v9", proposal_ids=[pid])
-    assert first.applied == (pid,)
-    again = await store.mark_applied(scoring_version="likeness-score-v9", proposal_ids=[pid])
-    assert again.already_applied == (pid,)
+    assert first.already_applied == (pid,)
     assert (
         await _one(
             intel_pool, "SELECT applied_ref FROM intel_proposals WHERE proposal_id = %s", pid
@@ -936,3 +954,215 @@ def test_env_example_names_every_question_key() -> None:
     text = (REPO / ".env.example").read_text()
     for key, value in QUESTION_KEYS.items():
         assert f"\n{key}={value}\n" in text, key
+
+
+# ── final review fixes (2026-10-13) ───────────────────────────────────────────
+
+
+def test_a_key_carrying_personal_data_is_dropped() -> None:
+    signals = _three()
+    batch, counts = _validate([_question(signals, question_key="q_4155552671")], signals)
+    assert batch.quiz_questions == []
+    assert counts["proposal_dropped_question_key_pii"] == 1
+
+
+ECHOED = (
+    "Public profiles are scraped far more often than private ones by the tools that collect"
+    " photos of people for training image models."
+)
+
+
+def test_echoes_of_one_source_are_not_corroboration_for_a_question() -> None:
+    """The bar counts publishers; the decision collapses echoed excerpts. A question resting on one
+    text quoted by two outlets is never written, so no research run is spent on it."""
+    echoed = [replace(s, excerpts=(ECHOED,)) for s in _three()]
+    batch, counts = _validate([_question(echoed)], echoed)
+    assert batch.quiz_questions == []
+    assert counts["proposal_dropped_question_uncorroborated"] == 1
+
+
+async def test_the_write_never_writes_a_key_the_live_quiz_has(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    result = await _write(intel_pool, [_new_proposal([sid], key="dating", subject="dating apps")])
+    assert result.written == () and result.dropped_questions == 1
+
+
+async def test_a_suggestion_older_than_the_question_never_supplies_its_points(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    await seed_quiz_vocabulary(intel_pool)
+    sid = await seed_signal(intel_pool, tags=("instagram",))
+    await seed_proposal(
+        intel_pool,
+        signal_ids=[sid],
+        kind="weight_suggestion",
+        status="delivered",
+        target={
+            "question_key": "old_key",
+            "options": [
+                {"option": "All of them", "deduction": 5, "signal_ids": [str(sid)]},
+                {"option": "None of them", "deduction": 0, "signal_ids": [str(sid)]},
+            ],
+        },
+        created_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    result = await _write(intel_pool, [_new_proposal([sid], key="old_key", subject="old key")])
+    (pid,) = result.written
+    (run_id,) = result.research_runs
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "UPDATE intel_runs SET status = 'completed' WHERE run_id = %s", (run_id,)
+        )
+    assert await _refused(intel_pool, pid) == "question_incomplete"
+
+
+async def test_an_answer_whose_evidence_was_retracted_gets_no_default_points(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    from imageshield.intel.evidence_store import PostgresEvidenceStore
+
+    pid = await _question_with_research(intel_pool, numbers=None)
+    retracted = await seed_signal(intel_pool, tags=("instagram",))
+    kept = await seed_signal(intel_pool, tags=("instagram",))
+    await seed_proposal(
+        intel_pool,
+        signal_ids=[retracted, kept],
+        kind="weight_suggestion",
+        status="delivered",
+        target={
+            "question_key": "public_profiles",
+            "options": [
+                {"option": "All of them", "deduction": 5, "signal_ids": [str(retracted)]},
+                {"option": "None of them", "deduction": 0, "signal_ids": [str(kept)]},
+            ],
+        },
+    )
+    await PostgresEvidenceStore(intel_pool).retract_signal(retracted, operator="a", reason="wrong")
+    assert await _refused(intel_pool, pid) == "question_incomplete"
+    decided = await _decide(intel_pool, pid, values={"options": [{"deduction": 3}, {}]})
+    assert decided.decided is not None
+    assert [o["deduction"] for o in decided.decided["options"]] == [3, 0]
+
+
+async def test_text_an_operator_types_is_stored_normalised(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    pid = await _question_with_research(intel_pool, numbers={"All of them": 5, "None of them": 0})
+    decided = await _decide(
+        intel_pool,
+        pid,
+        values={
+            "prompt": "Are  the accounts" + chr(160) + "you post on public?",
+            "options": [{}, {"option": " None "}],
+        },
+    )
+    assert decided.decided is not None
+    assert decided.decided["prompt"] == "Are the accounts you post on public?"
+    assert decided.decided["options"][1]["option"] == "None"
+
+
+async def test_a_weight_suggestion_run_never_opens_questions(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The loop guard: a Suggest points run, a question's own research among them, generates over
+    what it read with questions closed, and drops any question the model returns anyway."""
+    from tests.question_fakes import FakeQuestionModel
+    from tests.test_intel_question_runs import NEW_TERMS, SUGGEST_REQUEST, _chosen, _cite_everything
+
+    await seed_quiz_vocabulary(intel_pool)
+    await PostgresQuestionStore(intel_pool).register_and_queue_suggestion(
+        SUGGEST_REQUEST, [_chosen()], operator="Ann Operator"
+    )
+    model = FakeQuestionModel(
+        make_signal(tags=["instagram"]), suggest_with=_cite_everything(), propose_with=_ask
+    )
+    fetcher = FakeFetcher({NEW_TERMS: make_page(POLICY, NEW_TERMS)})
+    result = await run_once(intel_pool, make_deps(intel_pool, fetcher, model))
+    assert result.status == "completed", result
+    assert model.propose_calls == 1
+    assert json.loads(model.proposal_users[0])["questions_open"] is False
+    assert result.outcome["proposal_dropped_questions_closed"] == 1
+    count = "SELECT count(*) FROM intel_proposals WHERE kind = 'quiz_question'"
+    assert await _one(intel_pool, count) == 0
+
+
+async def test_a_gap_regeneration_never_opens_questions(intel_pool: AsyncConnectionPool) -> None:
+    from tests.test_intel_question_runs import _done_run
+
+    await seed_quiz_vocabulary(intel_pool)
+    done = await _done_run(intel_pool)
+    sid = await seed_signal(intel_pool, run_id=done, subjects=("Telegram",))
+    request = {"coverage_gap_id": str(uuid4()), "tag": "instagram", "signal_ids": [str(sid)]}
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO intel_runs (kind, request, requested_by)"
+            " VALUES ('gap_regenerate', %s, 'x')",
+            (Jsonb(request),),
+        )
+    model = FakeModel(propose_with=_ask)
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert model.propose_calls == 1
+    assert json.loads(model.proposal_users[0])["questions_open"] is False
+    assert result.outcome["proposal_dropped_questions_closed"] == 1
+
+
+async def test_at_the_open_question_cap_a_run_proposes_none(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    from tests.test_intel_question_runs import _done_run
+
+    await seed_quiz_vocabulary(intel_pool)
+    sid = await seed_signal(intel_pool, run_id=await _done_run(intel_pool), tags=("instagram",))
+    for n in range(3):
+        await seed_proposal(
+            intel_pool,
+            signal_ids=[sid],
+            kind="quiz_question",
+            target={"question_key": f"open_{n}", "subject": f"open {n}"},
+            suggested={"prompt": "Q?", "multi": False, "options": []},
+        )
+    await PostgresIntelStore(intel_pool).queue_adhoc(URL, operator="a")
+    model = FakeModel(make_signal(tags=["instagram"]), propose_with=_ask)
+    result = await run_once(
+        intel_pool, make_deps(intel_pool, FakeFetcher({URL: make_page(POLICY, URL)}), model)
+    )
+    assert json.loads(model.proposal_users[0])["questions_open"] is False
+    assert result.outcome["questions_closed_at_cap"] == 1
+    assert result.outcome["proposal_dropped_questions_closed"] == 1
+
+
+async def test_an_ordinary_searchs_discovery_opens_questions(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    from imageshield.intel.pipeline import _Ctx, _discovery
+
+    await seed_quiz_vocabulary(intel_pool)
+    async with intel_pool.connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO intel_sources (kind, query_text, tags, check_every_hours, next_check_at,"
+            " enabled, created_by, origin) VALUES ('search_query', 'q', '{}', 168, now(), true,"
+            " 'ann', 'operator') RETURNING source_id"
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        cur = await conn.execute(
+            "INSERT INTO intel_runs (kind, source_id, requested_by) VALUES ('discovery', %s, 'x')"
+            " RETURNING run_id",
+            (row[0],),
+        )
+        run_row = await cur.fetchone()
+        assert run_row is not None
+    run = await PostgresQuestionStore(intel_pool).get_run(run_row[0])
+    assert run is not None
+    ctx = _Ctx(
+        run=run,
+        deps=make_deps(intel_pool, FakeFetcher({}), FakeModel()),
+        vocabulary=None,
+        registry=None,
+    )
+    with contextlib.suppress(Exception):  # only the flag matters here
+        await _discovery(ctx)
+    assert ctx.questions_open is True

@@ -351,7 +351,10 @@ at least a budget outage will not also relax everyone's cadence.
 - **Outcome counters:** `question_research_queued`, `questions_closed_at_cap`, `proposal_dropped_questions_closed`,
   `proposal_dropped_question_*` (key malformed or taken, subject taken, below threshold, option count, options repeat,
   cap, at write), `proposal_dropped_question_forbidden_words` / `..._option_forbidden_words`,
-  `proposal_dropped_new_tag_invalid`.
+  `proposal_dropped_new_tag_invalid`, and since the final review `proposal_dropped_question_uncorroborated` (the
+  decision's own corroboration rule, so no research run is spent on a question it would refuse) and
+  `proposal_dropped_question_key_pii`.
+- **Rolling back 0054** ends any research run still queued for a question as `failed` (`question_removed`).
 - **Publishing is the backend's.** An approved question waits for its publish, which makes everyone retake the quiz.
 
 **Throughput (2026-10-03, spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`).**

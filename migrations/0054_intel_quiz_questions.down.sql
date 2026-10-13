@@ -2,6 +2,10 @@
 -- published quiz, which this does not touch, and their audit rows stay. Deleted rather than
 -- refused, so a rollback needs no hand-deletion and the test suite can migrate every database
 -- down between tests (0053's precedent). Their evidence links go with them; the signals stay.
+-- A question's research run still queued would otherwise run after the rollback for a key nothing
+-- will publish, spending budget (final review 2026-10-13): it ends failed, with its reason.
+UPDATE intel_runs SET status = 'failed', error_code = 'question_removed', completed_at = now()
+ WHERE kind = 'weight_suggestion' AND status IN ('queued', 'running') AND request ? 'for_question';
 DELETE FROM intel_proposal_signals
  WHERE proposal_id IN (SELECT proposal_id FROM intel_proposals WHERE kind = 'quiz_question');
 DELETE FROM intel_proposals WHERE kind = 'quiz_question';

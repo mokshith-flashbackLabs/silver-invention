@@ -835,6 +835,11 @@ override lane) and `::test_a_subject_cannot_overturn_a_machine_confirm`.
   nothing, cannot be approved, and may cite no evidence. Check:
   `tests/test_intel_question_runs.py::test_a_source_proposal_lists_existing_sources_first_and_registers_nothing` and
   `tests/test_admin_intel_question_routes.py::test_a_source_that_is_not_validated_is_refused_and_nothing_registered`.
+- *Quiz questions, 2026-10-13:* the propose pass may write a `quiz_question` proposal, and in the same transaction
+  queues ONE `weight_suggestion` run for it (`requested_by = 'system:intel'`) to research its answers' points. That
+  run is the one `intel_runs` row a model's output causes, and it spends budget without an operator, bounded by
+  `INTEL_QUESTION_MAX_PENDING` (0 closes question proposals). A question changes the quiz only through the backend's
+  publish of an operator's `decided`. Check: `tests/test_intel_quiz_questions.py`.
 - There is no timeout, confidence level or source trust that auto-approves.
 - A known hit location is never fetched for it.
 - An operator query must not name an individual. That is policy, and the PII-shape refusal is its only enforcement.

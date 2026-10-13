@@ -106,6 +106,9 @@ A question failing any rule is dropped whole, counted on the run's outcome, neve
   domains. (A gap recounts from a pool of unregistered subjects; a question may be about something
   already tagged, so it counts what it cites.)
 - `rationale` as every kind's.
+- *(Final review, 2026-10-13)* the cited signals also pass `uncorroborated()`, the decision's own predicate (echoes and
+  a company's own domains collapse), so no research run is spent on a question the decision would refuse; and a key
+  shaped like personal data (`contains_pii`) is refused, because a key is never masked.
 
 The write (`write_generated`) re-checks the key, the subject and the cap under its lock against
 every pending and approved question, so two runs cannot both add one.
@@ -162,7 +165,11 @@ The usual predicates run first: `evidence_retracted`, `uncorroborated`, and `res
 
 **Reject** from `pending` (a dismissal), or from `approved` (a withdrawal before publish). An
 approved question the live quiz already shows (published, acknowledgement not yet arrived) is
-never withdrawn: `409 proposal_not_pending`, the weight-change rule.
+never withdrawn: `409 proposal_not_pending`, the weight-change rule. *(Final review:)* "shows" is
+THIS question -- its key, its answers in order and their decided points -- not merely its key, so
+one whose key the quiz editor took by hand stays withdrawable. Defaults come only from a suggestion
+written after the question, never from an answer whose evidence was retracted, and operator text is
+stored normalised.
 
 **Applied.** `POST /v1/admin/intel/proposals/applied` moves approved `quiz_question` proposals to
 `applied` with the release's `scoring_version`, exactly as it does weight changes. Its answer
@@ -187,16 +194,18 @@ hardcode anything"), set in `.env.example` and both environments' task definitio
 | `INTEL_QUESTION_MAX_PENDING` | 3 | ≥ 0 (0 closes question proposals) |
 | `INTEL_QUESTION_DISMISSED_DAYS` | 90 | ≥ 0 |
 
-They reach the pipeline as `QuestionLimits` (`intel/limits.py`), and `INTEL_QUESTION_MAX_OPTIONS`
-reaches the decision store too.
+They reach the pipeline as `QuestionLimits` (`intel/limits.py`). The decision needs none of them: it fixes the
+answer count to the proposal's.
 
 ## 8. Migration 0054
 
 `0054_intel_quiz_questions.up.sql`: the kind CHECK gains `quiz_question`, and the "approved needs
 `decided`" CHECK includes it. Both 0039 CHECKs are unnamed and are found by definition (0048's
-precedent). The down deletes `quiz_question` proposals (their links and audit rows stay; the
+precedent). The down deletes `quiz_question` proposals (their audit rows stay; the
 published quiz lives in the backend and is untouched), then restores both CHECKs. No new table, no
-grant, no `svc` view.
+grant, no `svc` view. *(Corrected at the final review:)* the down also deletes the questions' evidence links (the
+foreign key requires it; the signals stay) and ends any research run still queued for a question as `failed`
+(`question_removed`).
 
 ## 9. What this does not do
 

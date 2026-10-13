@@ -1275,18 +1275,24 @@ retakes the quiz, the existing lifecycle.
   `cap`), **`409 question_key_taken`** (the live quiz has the key). `409 proposal_not_decidable` with "Research for this
   question is still running." while `research_pending`. Tags follow `unknown_tag` / `tag_retired` with `slugs`, for
   every tag on the question. A rejection works from `pending` (dismiss) or `approved` (withdraw), and a withdrawal is
-  `409 proposal_not_pending` once the live quiz has the key.
+  `409 proposal_not_pending` once the live quiz carries THIS question (its key, its answers in order and their decided
+  points). A key the quiz editor took by hand leaves it withdrawable *(final review, 2026-10-13)*.
+- **Default points** come only from a suggestion for the key written after the question, and never from an answer
+  whose evidence has since been retracted *(final review)*. Operator-typed text is stored normalised (NFC, one space).
 - **`POST /proposals/applied`** moves approved questions too, with the release's `scoring_version` as `applied_ref`:
   send their ids in the same call as any weight changes the release carried.
 - **Reconcile:** a pending question whose key the pushed quiz has is superseded `resolved_by_quiz`.
 
 **What services do alone:** a question is proposed only by a source check, an ad-hoc URL or a discovery read of a
 source that is not a research search, at most `INTEL_QUESTION_MAX_PENDING` open at once, never repeating a live key or
-an open or recently dismissed one. Writing it queues its research: an ordinary `weight_suggestion` run for the new key,
-`requested_by: "system:intel"`, visible in `GET /runs` and its run log like any other.
+an open or recently dismissed one, nor a key the live quiz has when it is written. Its cited evidence must also pass
+the decision's own corroboration predicate, and a key shaped like personal data is refused *(final review)*. Writing
+it queues its research: an ordinary `weight_suggestion` run for the new key, `requested_by: "system:intel"`, visible in
+`GET /runs` and its run log like any other.
 
 **Deploy order:** services first (0054, then services and services-worker with the six `INTEL_QUESTION_*` keys); then
-the backend. On the way down, the backend first, then 0054's down, which deletes `quiz_question` proposals.
+the backend. On the way down, the backend first, then 0054's down, which deletes `quiz_question` proposals and ends
+any research run still queued for one as `failed` (`question_removed`).
 
 ---
 
