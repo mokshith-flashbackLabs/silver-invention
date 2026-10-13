@@ -40,6 +40,12 @@ the generation write and the reconcile do, so two approvals that overlap each ot
 The acknowledgement (``mark_applied``) is the second system write (spec §4.7). It moves only
 approved weight changes, keeps the approval's decided_by, decided_at and decision_reason, and
 is audited only for rows that actually move.
+
+*2026-10-13 (spec 2026-10-13-intel-quiz-questions §5).* A quiz_question is approved like a weight
+change -- to 'approved', waiting for the backend to publish it -- once its research run has ended.
+Each answer's points default to the newest delivered suggestion for its key; an answer with no
+number from either is ``question_incomplete``. The acknowledgement moves approved questions too,
+and an approved question the live quiz already shows is never withdrawn.
 """
 
 from __future__ import annotations
@@ -75,6 +81,11 @@ from imageshield.intel.proposal_models import (
     ProtectionEventDecided,
     ProtectionEventTarget,
     ProtectionEventValues,
+    QuestionResearch,
+    QuizQuestionDecided,
+    QuizQuestionSuggested,
+    QuizQuestionTarget,
+    QuizQuestionValues,
     ThreatEventDecided,
     ThreatEventTarget,
     ThreatEventValues,
@@ -88,6 +99,7 @@ from imageshield.intel.proposal_store import (
     fetch_linked_signals,
     load_scoring_vocabulary,
     overlap_pool,
+    question_research,
     record_of,
 )
 from imageshield.intel.recency import Recency
@@ -118,7 +130,14 @@ _MESSAGES: dict[DecisionRefusal, str] = {
     "values_out_of_bounds": "These values fall outside the bounds for this option.",
     "unknown_tag": "A tag this approval adds is not registered.",
     "tag_retired": "A retired tag cannot be added.",
+    "question_incomplete": (
+        "Every answer needs points from 0 to 10, and a question that takes several answers needs a"
+        " cap."
+    ),
+    "question_key_taken": "The live quiz already has a question with this key.",
 }
+
+_RESEARCH_RUNNING = "Research for this question is still running."
 
 _RENEWAL_ENDED = "The protection this renews has been retracted or has reached its review date."
 
@@ -191,7 +210,8 @@ _COVERED_SQL = """
 
 _APPLIED_SQL = """
     UPDATE intel_proposals SET status = 'applied', applied_ref = %(scoring_version)s
-     WHERE proposal_id = ANY(%(ids)s::uuid[]) AND kind = 'weight_change' AND status = 'approved'
+     WHERE proposal_id = ANY(%(ids)s::uuid[]) AND kind IN ('weight_change', 'quiz_question')
+       AND status = 'approved'
     RETURNING proposal_id
 """
 
@@ -307,6 +327,71 @@ def _protection_decided(
     return decided.model_dump(mode="json")
 
 
+def _question_decided(
+    proposal: ProposalRecord,
+    vocabulary: ScoringVocabulary | None,
+    values: dict[str, Any] | None,
+    research: QuestionResearch | None,
+) -> dict[str, Any]:
+    """The exact question an approval stores (spec 2026-10-13-intel-quiz-questions §5): the
+    operator's ``values`` merged over ``suggested``, answer by answer, each answer's points
+    defaulting to the newest delivered suggestion's number for it. An answer with no number, or a
+    multi-select with no cap, is question_incomplete; every tag must be registered and live; and the
+    key must still be free in the live quiz."""
+    try:
+        target = QuizQuestionTarget.model_validate(proposal.target)
+        suggested = QuizQuestionSuggested.model_validate(proposal.suggested)
+        edit = QuizQuestionValues.model_validate(values or {})
+    except ValidationError as exc:
+        raise _refuse("values_out_of_bounds") from exc
+    if edit.options is not None and len(edit.options) != len(suggested.options):
+        raise _refuse("values_out_of_bounds")
+    numbers = research.deductions if research is not None else {}
+    options: list[dict[str, Any]] = []
+    for index, base in enumerate(suggested.options):
+        change = edit.options[index] if edit.options is not None else None
+        deduction = (
+            change.deduction
+            if change is not None and change.deduction is not None
+            else numbers.get(base.option)
+        )
+        if deduction is None:
+            raise _refuse("question_incomplete")
+        text = change.option if change is not None and change.option is not None else base.option
+        tags = change.tags if change is not None and change.tags is not None else base.tags
+        options.append({"option": text, "deduction": deduction, "tags": list(tags)})
+    multi = edit.multi if edit.multi is not None else suggested.multi
+    cap = edit.cap if "cap" in edit.model_fields_set else None
+    if multi and cap is None:
+        raise _refuse("question_incomplete")
+    try:
+        decided = QuizQuestionDecided.model_validate(
+            {
+                "prompt": edit.prompt if edit.prompt is not None else suggested.prompt,
+                "multi": multi,
+                "cap": cap,
+                "options": options,
+                "suggestion_proposal_id": research.suggestion_proposal_id
+                if research is not None
+                else None,
+            }
+        )
+    except ValidationError as exc:
+        raise _refuse("values_out_of_bounds") from exc
+    registry = (
+        vocabulary.registry() if vocabulary is not None else TagRegistry(frozenset(), frozenset())
+    )
+    every = list(dict.fromkeys(t for o in decided.options for t in o.tags))
+    unknown, retired = membership_problems(every, registry)
+    if unknown:
+        raise DecisionRefused("unknown_tag", _MESSAGES["unknown_tag"], slugs=tuple(unknown))
+    if retired:
+        raise DecisionRefused("tag_retired", _MESSAGES["tag_retired"], slugs=tuple(retired))
+    if vocabulary is not None and target.question_key in vocabulary.questions:
+        raise _refuse("question_key_taken")
+    return decided.model_dump(mode="json")
+
+
 def _renews_of(proposal: ProposalRecord) -> UUID | None:
     """The credit a protection proposal renews, or None. A target that does not parse renews
     nothing here: the approval refuses it as values_out_of_bounds."""
@@ -373,6 +458,7 @@ def _approval_decided(
     recency: Recency,
     attested: bool | None = None,
     renewed_credit_ended: bool = False,
+    research: QuestionResearch | None = None,
 ) -> dict[str, Any]:
     """The exact values an approval stores, or a refusal."""
     if proposal.kind not in APPROVABLE_KINDS:
@@ -380,12 +466,21 @@ def _approval_decided(
     if proposal.status != "pending":
         raise _refuse("proposal_not_pending")
     reason = why_not(
-        proposal, active, vocabulary, recency=recency, renewed_credit_ended=renewed_credit_ended
+        proposal,
+        active,
+        vocabulary,
+        recency=recency,
+        renewed_credit_ended=renewed_credit_ended,
+        research_pending=research is not None and research.pending,
     )
     if reason == "renewed_credit_ended":
         raise DecisionRefused("proposal_not_pending", _RENEWAL_ENDED)
+    if reason == "research_pending":
+        raise DecisionRefused("proposal_not_decidable", _RESEARCH_RUNNING)
     if reason is not None:
         raise _refuse(_WHY_NOT_REFUSAL[reason])
+    if proposal.kind == "quiz_question":
+        return _question_decided(proposal, vocabulary, values, research)
     if proposal.kind == "threat_event":
         return _threat_decided(proposal, vocabulary, values)
     if proposal.kind == "protection_event":
@@ -417,6 +512,13 @@ def _rejection_from(proposal: ProposalRecord, vocabulary: ScoringVocabulary | No
         raise _refuse("proposal_not_decidable")
     if proposal.status == "pending":
         return "pending"
+    if proposal.status == "approved" and proposal.kind == "quiz_question":
+        # Published, the acknowledgement not yet here: a question in the live quiz is never
+        # recorded as withdrawn (spec 2026-10-13-intel-quiz-questions §5).
+        key = proposal.target.get("question_key")
+        if vocabulary is not None and key in vocabulary.questions:
+            raise _refuse("proposal_not_pending")
+        return "approved"
     if proposal.status == "approved" and proposal.kind == "weight_change":
         if vocabulary is not None and proposal.decided is not None:
             target = WeightChangeTarget.model_validate(proposal.target)
@@ -499,6 +601,7 @@ class PostgresDecisionStore:
                     starts = await _renewed_review_by(conn, renews) if renews else None
                     linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
                     active = [s for s in linked if s.status == "active"]
+                    research = (await question_research(conn, [row])).get(proposal_id)
                     decided = _approval_decided(
                         proposal,
                         active,
@@ -507,6 +610,7 @@ class PostgresDecisionStore:
                         recency=Recency(self._clock(), self._recency_days),
                         attested=applies_regardless_of_location,
                         renewed_credit_ended=renews is not None and starts is None,
+                        research=research,
                     )
                     from_status = "pending"
                     if proposal.kind == "threat_event":
@@ -629,7 +733,7 @@ class PostgresDecisionStore:
             moved = [r[0] for r in await cur.fetchall()]
             cur = await conn.execute(
                 "SELECT proposal_id FROM intel_proposals WHERE proposal_id = ANY(%s::uuid[])"
-                " AND kind = 'weight_change' AND status = 'applied'",
+                " AND kind IN ('weight_change', 'quiz_question') AND status = 'applied'",
                 (ids,),
             )
             applied_now = {r[0] for r in await cur.fetchall()}

@@ -460,6 +460,9 @@ _REFUSAL_STATUS: dict[str, int] = {
     "values_out_of_bounds": 422,
     "unknown_tag": 422,
     "tag_retired": 422,
+    # A quiz question (spec 2026-10-13-intel-quiz-questions §5).
+    "question_incomplete": 422,
+    "question_key_taken": 409,
 }
 
 

@@ -14,7 +14,9 @@ EXTRACT_PROMPT_VERSION = "extract-v2"
 DISCOVER_PROMPT_VERSION = "discover-v3"
 # propose-v10 (spec 2026-10-11-intel-score-insights §2.2): a threat's card line. propose-v11 (final
 # review 2026-10-12): the card line's banned words named, % and year spans as suggest-v4.
-PROPOSE_PROMPT_VERSION = "propose-v11"
+# propose-v12 (spec 2026-10-13-intel-quiz-questions §3.1): quiz_questions, questions_open and the
+# open and dismissed questions.
+PROPOSE_PROMPT_VERSION = "propose-v12"
 
 
 class RegistryTag(TypedDict):
@@ -405,6 +407,17 @@ class PromptPendingWeightChange(TypedDict):
     signal_ids: list[str]
 
 
+class PromptOpenQuestion(TypedDict):
+    """A pending, approved or recently dismissed quiz question (propose-v12): shown so the model
+    proposes none of them again."""
+
+    proposal_id: str
+    status: str
+    question_key: str
+    subject: str
+    prompt: str
+
+
 class PromptLiveEvent(TypedDict):
     event_id: str
     kind: str
@@ -429,7 +442,7 @@ _PROPOSE_SYSTEM = """You review evidence gathered by a likeness-protection servi
 changes for a human operator to review. You never decide anything: every proposal waits for a
 named operator, who approves or rejects exact values.
 
-You may propose four kinds of change, and attach new evidence to a pending proposal.
+You may propose five kinds of change, and attach new evidence to a pending proposal.
 
 Every piece of evidence carries "published": the date its document was published, or "undated".
 "today" is today's date. Dates matter: an old story is not news.
@@ -548,6 +561,30 @@ Name it as subject. Optionally suggest a tag (slug: lowercase letters, digits an
 starting with a letter; label; kind: platform, service or practice) and a quiz question that
 would cover it.
 
+quiz_questions -- only when questions_open is true; otherwise return it empty. Several pieces of
+evidence, from at least two different publishers, show that how exposed a person is to misuse of
+their photos and likeness depends on something the quiz below does not ask about: a platform,
+service, setting or practice. Propose a NEW question that asks about it. Never propose one that a
+question in the quiz, in pending_questions or in dismissed_questions already asks. For each give:
+- question_key: lowercase letters, digits and underscores, starting with a letter, 2 to 40
+  characters, used by no question in the quiz, pending_questions or dismissed_questions.
+- subject: what the question is about, in a few words.
+- prompt: the question, ONE short plain sentence of at most 300 characters, asked of the person
+  as "you".
+- multi: true only when a person may pick more than one answer.
+- options: 2 to max_question_options answers, each at most 200 characters, that together let
+  every person pick one. For each answer give tags: the slugs from the tag registry that choosing
+  it exposes a person to, or none; and new_tag (slug, label, kind) only when no registered tag
+  fits, otherwise null.
+Ask only about exposure: where and how a person's photos and likeness can be seen, collected or
+misused, such as which services they use, what they share and their settings. Never ask about
+ethnicity, religion, beliefs, politics, health, sex life or sexual orientation; never ask about
+children; and never ask a question whose answer would suggest the person did something wrong or
+caused any misuse. Never name a private individual, never give contact details or links, and
+never use these words, in any sense: safe, all-clear, guarantee, found, detected, match, hit,
+your photo, your image, your picture, your answer. Give no points: they are researched
+separately once an operator reviews the question.
+
 attach -- for a proposal in pending_events that new evidence supports: its proposal_id, and
 signal_ids naming evidence from new_evidence only.
 
@@ -565,7 +602,7 @@ _EVENTS_ONLY = """
 This run re-reads evidence about a subject the quiz has just started to cover: its tag is now
 mapped.
 Propose only threat_events, protection_events and attach.
-Return weight_changes and coverage_gaps empty."""
+Return weight_changes, coverage_gaps and quiz_questions empty."""
 
 
 def proposal_request(
@@ -582,11 +619,17 @@ def proposal_request(
     live_events: Sequence[PromptLiveEvent] = (),
     live_protections: Sequence[PromptLiveProtection] = (),
     events_only: bool = False,
+    questions_open: bool = False,
+    max_question_options: int = 0,
+    pending_questions: Sequence[PromptOpenQuestion] = (),
+    dismissed_questions: Sequence[PromptOpenQuestion] = (),
 ) -> tuple[str, str]:
     """Signals, the public quiz with its weights, the tag registry, the pending proposals (event
     proposals, and from propose-v4 weight changes), and the live threat events and protection
     credits whose tags overlap (every live global credit too), with today's date and the threat
-    recency window. Never a person, and never a quiz answer (INVARIANTS #48)."""
+    recency window. Never a person, and never a quiz answer (INVARIANTS #48). From propose-v12,
+    whether this pass may propose quiz questions, how many answers one may have, and the open and
+    recently dismissed questions (spec 2026-10-13-intel-quiz-questions §3.1)."""
     user = json.dumps(
         {
             "today": today,
@@ -600,6 +643,10 @@ def proposal_request(
             "pending_weight_changes": list(pending_weight_changes),
             "live_events": list(live_events),
             "live_protections": list(live_protections),
+            "questions_open": questions_open and not events_only,
+            "max_question_options": max_question_options,
+            "pending_questions": list(pending_questions),
+            "dismissed_questions": list(dismissed_questions),
         },
         ensure_ascii=False,
     )

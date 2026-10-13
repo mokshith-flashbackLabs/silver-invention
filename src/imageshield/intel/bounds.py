@@ -75,6 +75,15 @@ MAX_RATIONALE_CHARS = 2000
 MAX_GAP_SUBJECT_CHARS = 120
 MAX_SUGGESTED_QUESTION_CHARS = 300
 
+# ── quiz questions (spec 2026-10-13-intel-quiz-questions §3.3) ────────────────
+# The backend quiz editor's own validator bounds (image_backend src/quiz/cms/validate.ts): a key,
+# a question's text and an answer's text the backend could not publish are never proposed. Safety
+# bounds, not tunables; the tunables are QuestionLimits (intel/limits.py).
+QUESTION_KEY_PATTERN = r"^[a-z][a-z0-9_]{1,39}$"
+MAX_QUESTION_SUBJECT_CHARS = 120
+MAX_QUESTION_PROMPT_CHARS = 300
+MAX_QUESTION_OPTION_CHARS = 200
+
 # ── threat events (step 3, spec §4.5) ─────────────────────────────────────────
 THREAT_SEVERITY_MIN = 1
 THREAT_SEVERITY_MAX = 5

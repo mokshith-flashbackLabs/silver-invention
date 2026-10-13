@@ -24,10 +24,16 @@ threat, and the decision would refuse it.
 The model may not make a protection credit global: it cannot know that a protection applies
 wherever a person lives (spec §4.5). Such a proposal is dropped (global_not_proposable); a global
 credit exists only by an operator's edit on approval.
+
+*2026-10-13 (spec 2026-10-13-intel-quiz-questions §3.3):* a quiz_question is written only by a pass
+that was given a QuestionContext (``questions``); any other pass drops what the model returns
+(``questions_closed``). Its evidence bar is recounted here over the signals it cites, and it never
+repeats a live key, nor the key or subject of an open or recently dismissed question.
 """
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -49,6 +55,9 @@ from imageshield.intel.bounds import (
     MAX_EVENT_TITLE_CHARS,
     MAX_GAP_SUBJECT_CHARS,
     MAX_PROMPT_TAGS,
+    MAX_QUESTION_OPTION_CHARS,
+    MAX_QUESTION_PROMPT_CHARS,
+    MAX_QUESTION_SUBJECT_CHARS,
     MAX_RATIONALE_CHARS,
     MAX_SUGGESTED_QUESTION_CHARS,
     MAX_WEIGHT_REASON_CHARS,
@@ -56,16 +65,19 @@ from imageshield.intel.bounds import (
     PROTECTION_REVIEW_MIN_DAYS,
     PROTECTION_STRENGTH_MAX,
     PROTECTION_STRENGTH_MIN,
+    QUESTION_KEY_PATTERN,
     THREAT_EXPIRES_MAX_DAYS,
     THREAT_EXPIRES_MIN_DAYS,
     THREAT_SEVERITY_MAX,
     THREAT_SEVERITY_MIN,
 )
 from imageshield.intel.cells import cell_problem
+from imageshield.intel.limits import QuestionLimits
 from imageshield.intel.pii import mask
 from imageshield.intel.prompts import (
     PromptLiveEvent,
     PromptLiveProtection,
+    PromptOpenQuestion,
     PromptOption,
     PromptPendingEvent,
     PromptPendingWeightChange,
@@ -80,10 +92,15 @@ from imageshield.intel.proposal_models import (
     LiveEvent,
     LiveProtection,
     NewProposal,
+    OpenQuestion,
     PendingEvent,
     PendingWeightChange,
     ProtectionEventSuggested,
     ProtectionEventTarget,
+    QuestionContext,
+    QuestionOptionSuggested,
+    QuizQuestionSuggested,
+    QuizQuestionTarget,
     SuggestedTag,
     ThreatActionSuggested,
     ThreatEventSuggested,
@@ -97,6 +114,7 @@ from imageshield.intel.schemas import (
     ProposedAttach,
     ProposedCoverageGap,
     ProposedProtectionEvent,
+    ProposedQuizQuestion,
     ProposedTag,
     ProposedThreatAction,
     ProposedThreatEvent,
@@ -104,7 +122,11 @@ from imageshield.intel.schemas import (
 )
 from imageshield.intel.tags import is_well_formed, membership_problems
 from imageshield.intel.text import normalise
-from imageshield.intel.user_copy import copy_problems, unquoted_figures
+from imageshield.intel.user_copy import (
+    copy_problems,
+    question_copy_problems,
+    unquoted_figures,
+)
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject
 from imageshield.search.urlhash import url_hash
 
@@ -115,6 +137,7 @@ class GeneratedBatch:
     coverage_gaps: list[NewProposal] = field(default_factory=list)
     threat_events: list[NewProposal] = field(default_factory=list)
     protection_events: list[NewProposal] = field(default_factory=list)
+    quiz_questions: list[NewProposal] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
 
     @property
@@ -124,6 +147,7 @@ class GeneratedBatch:
             *self.coverage_gaps,
             *self.threat_events,
             *self.protection_events,
+            *self.quiz_questions,
         ]
 
 
@@ -139,13 +163,44 @@ def validate_proposals(
     pending_events: Mapping[UUID, PendingEvent] | None = None,
     new_signal_ids: Collection[UUID] = (),
     events_only: bool = False,
+    questions: QuestionContext | None = None,
+    question_limits: QuestionLimits | None = None,
 ) -> GeneratedBatch:
     """``pending_events`` are the pending event proposals of both kinds the run loaded (those the
     prompt showed): attach targets and duplicate candidates. ``new_signal_ids`` are the run's own
     new evidence, the only signals an attachment may add. ``events_only`` is a gap_regenerate
     run, which writes event proposals and attachments and nothing else (spec §4.9). ``recency``
-    is ``INTEL_THREAT_RECENCY_DAYS`` now: a threat whose evidence is all older is dropped."""
+    is ``INTEL_THREAT_RECENCY_DAYS`` now: a threat whose evidence is all older is dropped.
+    ``questions`` (2026-10-13) is set only for a pass that may propose quiz questions, with
+    ``question_limits``; without it every proposed question is dropped (``questions_closed``)."""
     batch = GeneratedBatch()
+    if questions is None or question_limits is None or events_only:
+        if output.quiz_questions:
+            counts["proposal_dropped_questions_closed"] += len(output.quiz_questions)
+    else:
+        seen = (*questions.open, *questions.dismissed)
+        taken_keys = {q.question_key for q in seen} | set(vocabulary.questions)
+        taken_subjects = {normalise_subject(q.subject) for q in seen}
+        room = max(0, question_limits.max_pending - len(questions.open))
+        for proposed in output.quiz_questions:
+            question = _quiz_question(
+                proposed,
+                context,
+                vocabulary,
+                question_limits,
+                now,
+                counts,
+                taken_keys,
+                taken_subjects,
+            )
+            if question is None:
+                continue
+            if len(batch.quiz_questions) >= room:
+                counts["proposal_dropped_question_cap"] += 1
+                continue
+            taken_keys.add(question.target["question_key"])
+            taken_subjects.add(normalise_subject(question.target["subject"]))
+            batch.quiz_questions.append(question)
     if events_only:
         dropped = len(output.weight_changes) + len(output.coverage_gaps)
         if dropped:
@@ -543,6 +598,134 @@ def _coverage_gap(
     )
 
 
+def _question_text(
+    raw: str, *, field_name: str, limit: int, counts: Counter[str]
+) -> str | None:
+    """A question's or an answer's text: ``_free_text``, and the question word rules (no figure
+    check: a question quotes nothing, and "18-24" is a fine answer)."""
+    text = _free_text(raw, field_name=field_name, limit=limit, counts=counts)
+    if text is None:
+        return None
+    if question_copy_problems(text):
+        counts[f"proposal_dropped_{field_name}_forbidden_words"] += 1
+        return None
+    return text
+
+
+def _quiz_question(
+    item: ProposedQuizQuestion,
+    context: Mapping[UUID, ContextSignal],
+    vocabulary: ScoringVocabulary,
+    limits: QuestionLimits,
+    now: datetime,
+    counts: Counter[str],
+    taken_keys: Collection[str],
+    taken_subjects: Collection[str],
+) -> NewProposal | None:
+    """spec 2026-10-13-intel-quiz-questions §3.3. ``taken_keys`` are the live quiz's keys and those
+    of every open, recently dismissed or earlier-in-batch question; ``taken_subjects`` their
+    normalised subjects. Any failure drops the whole question, counted, never fixed up."""
+    if not re.fullmatch(QUESTION_KEY_PATTERN, item.question_key):
+        counts["proposal_dropped_question_key_malformed"] += 1
+        return None
+    if item.question_key in taken_keys:
+        counts["proposal_dropped_question_key_taken"] += 1
+        return None
+    subject = _free_text(
+        item.subject, field_name="subject", limit=MAX_QUESTION_SUBJECT_CHARS, counts=counts
+    )
+    if subject is None:
+        return None
+    subject_key = normalise_subject(subject)
+    if not subject_key:
+        counts["proposal_dropped_empty_subject"] += 1
+        return None
+    if subject_key in taken_subjects:
+        counts["proposal_dropped_question_subject_taken"] += 1
+        return None
+    prompt = _question_text(
+        item.prompt, field_name="question", limit=MAX_QUESTION_PROMPT_CHARS, counts=counts
+    )
+    if prompt is None:
+        return None
+    if not 2 <= len(item.options) <= limits.max_options:
+        counts["proposal_dropped_question_option_count"] += 1
+        return None
+    options: list[QuestionOptionSuggested] = []
+    registry = vocabulary.registry()
+    for raw in item.options:
+        text = _question_text(
+            raw.option, field_name="option", limit=MAX_QUESTION_OPTION_CHARS, counts=counts
+        )
+        if text is None:
+            return None
+        if any(not is_well_formed(t) for t in raw.tags) or len(set(raw.tags)) != len(raw.tags):
+            counts["proposal_dropped_tag_malformed"] += 1
+            return None
+        unknown, retired = membership_problems(raw.tags, registry)
+        if unknown:
+            counts["proposal_dropped_unknown_tag"] += 1
+            return None
+        if retired:
+            counts["proposal_dropped_tag_retired"] += 1
+            return None
+        new_tag: SuggestedTag | None = None
+        if raw.new_tag is not None:
+            new_tag = _new_tag(raw.new_tag, vocabulary, counts)
+            if new_tag is None:
+                return None
+        options.append(QuestionOptionSuggested(option=text, tags=tuple(raw.tags), new_tag=new_tag))
+    if len({o.option.casefold() for o in options}) != len(options):
+        counts["proposal_dropped_question_options_repeat"] += 1
+        return None
+    signal_ids = _cited(item.signal_ids, context, counts)
+    if signal_ids is None:
+        return None
+    since = now - timedelta(days=limits.window_days)
+    recent = [context[i] for i in signal_ids if context[i].created_at >= since]
+    if (
+        len(recent) < limits.min_signals
+        or len({s.publisher_domain for s in recent}) < limits.min_publishers
+    ):
+        counts["proposal_dropped_question_below_threshold"] += 1
+        return None
+    rationale = _free_text(
+        item.rationale, field_name="rationale", limit=MAX_RATIONALE_CHARS, counts=counts
+    )
+    if rationale is None:
+        return None
+    documents = tuple(
+        dict.fromkeys(d for i in signal_ids if (d := context[i].document_key) is not None)
+    )
+    return NewProposal(
+        kind="quiz_question",
+        target=QuizQuestionTarget(question_key=item.question_key, subject=subject).model_dump(
+            mode="json", exclude_none=True
+        ),
+        suggested=QuizQuestionSuggested(
+            prompt=prompt, multi=item.multi, options=tuple(options)
+        ).model_dump(mode="json"),
+        rationale=rationale,
+        signal_ids=signal_ids,
+        document_keys=documents,
+    )
+
+
+def _new_tag(
+    item: ProposedTag, vocabulary: ScoringVocabulary, counts: Counter[str]
+) -> SuggestedTag | None:
+    """An answer's proposed new tag: well-formed, NOT registered (a registered one belongs in
+    ``tags``), with a label. Registering it stays an operator's action in the backend."""
+    masked, masks = mask(item.label)
+    if masks:
+        counts["pii_masked_suggested_tag"] += 1
+    label = normalise(masked)
+    if not is_well_formed(item.slug) or item.slug in vocabulary.tags or not label:
+        counts["proposal_dropped_new_tag_invalid"] += 1
+        return None
+    return SuggestedTag(slug=item.slug, label=label, kind=item.kind)
+
+
 def _threat_event(
     item: ProposedThreatEvent,
     context: Mapping[UUID, ContextSignal],
@@ -786,6 +969,16 @@ def prompt_live_protection(event: LiveProtection) -> PromptLiveProtection:
         is_global=event.is_global,
         review_by=event.review_by.isoformat(),
         signal_ids=[str(i) for i in event.signal_ids],
+    )
+
+
+def prompt_open_question(question: OpenQuestion) -> PromptOpenQuestion:
+    return PromptOpenQuestion(
+        proposal_id=str(question.proposal_id),
+        status=question.status,
+        question_key=question.question_key,
+        subject=question.subject,
+        prompt=question.prompt,
     )
 
 

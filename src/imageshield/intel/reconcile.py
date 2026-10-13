@@ -11,6 +11,10 @@ Deterministic and idempotent; no model runs here. ``plan_reconcile`` is pure, an
 now, because pairs reconciled before it shipped are already recorded here. A pending gap the live
 quiz now covers is superseded resolved_by_quiz in the same transaction that queues the
 gap_regenerate run re-proposing its evidence; a regeneration the gate refused is queued again.
+
+*2026-10-13 (spec 2026-10-13-intel-quiz-questions §6):* a PENDING quiz_question whose key the new
+pair's quiz has is superseded resolved_by_quiz. An approved one is left alone: with its key live it
+was published, and the acknowledgement moves it.
 """
 
 from __future__ import annotations
@@ -174,6 +178,14 @@ def plan_reconcile(
     return ReconcilePlan(retarget=retarget, supersede=tuple(supersede))
 
 
+def plan_question_resolution(
+    pending: Sequence[tuple[UUID, str]], vocabulary: ScoringVocabulary
+) -> tuple[UUID, ...]:
+    """The pending quiz questions, given as ``(proposal_id, question_key)``, whose key the live
+    quiz now has: resolved_by_quiz (spec 2026-10-13-intel-quiz-questions §6)."""
+    return tuple(pid for pid, key in pending if key in vocabulary.questions)
+
+
 @dataclass(frozen=True)
 class PendingGap:
     proposal_id: UUID
@@ -304,6 +316,24 @@ class PostgresReconciler:
             plan = plan_reconcile(
                 pending, vocabulary, reconciled_release_no=row["reconciled_release_no"]
             )
+            await cur.execute(
+                "SELECT proposal_id, target FROM intel_proposals"
+                " WHERE kind = 'quiz_question' AND status = 'pending' FOR UPDATE"
+            )
+            resolved = plan_question_resolution(
+                [
+                    (q["proposal_id"], str((q["target"] or {}).get("question_key", "")))
+                    for q in await cur.fetchall()
+                ],
+                vocabulary,
+            )
+            for proposal_id in resolved:
+                await conn.execute(
+                    "UPDATE intel_proposals SET status = 'superseded',"
+                    " supersede_reason = 'resolved_by_quiz'"
+                    " WHERE proposal_id = %s AND status = 'pending'",
+                    (proposal_id,),
+                )
             for proposal_id, _old, new in plan.retarget:
                 await conn.execute(
                     "UPDATE intel_proposals SET target = jsonb_set(target, '{option}',"
@@ -321,7 +351,7 @@ class PostgresReconciler:
                 " reconciled_map_version = %s WHERE id = 1",
                 (row["release_no"], row["map_version"]),
             )
-            if not plan.empty:
+            if not plan.empty or resolved:
                 await conn.execute(
                     _AUDIT_SQL,
                     {
@@ -337,8 +367,14 @@ class PostgresReconciler:
                                     for pid, old, new in plan.retarget
                                 ],
                                 "superseded": [
-                                    {"proposal_id": str(pid), "reason": reason}
-                                    for pid, reason in plan.supersede
+                                    *(
+                                        {"proposal_id": str(pid), "reason": reason}
+                                        for pid, reason in plan.supersede
+                                    ),
+                                    *(
+                                        {"proposal_id": str(pid), "reason": "resolved_by_quiz"}
+                                        for pid in resolved
+                                    ),
                                 ],
                             }
                         ),
@@ -348,7 +384,7 @@ class PostgresReconciler:
             release_no=row["release_no"],
             map_version=row["map_version"],
             retargeted=len(plan.retarget),
-            superseded=len(plan.supersede),
+            superseded=len(plan.supersede) + len(resolved),
         )
         log.info(
             "intel.vocabulary_reconciled",

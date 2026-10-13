@@ -18,7 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from imageshield.config import SENTINEL_VALUES, ConfigError
 from imageshield.db.dsn import compose_database_url
 from imageshield.env import load_dotenv_local
-from imageshield.intel.limits import SearchLimits
+from imageshield.intel.limits import QuestionLimits, SearchLimits
 
 
 class IntelConfig(BaseSettings):
@@ -70,6 +70,14 @@ class IntelConfig(BaseSettings):
     # 0 turns the feature off.
     intel_source_proposal_coverage_asks: int
     intel_suggestion_research_rounds: int
+    # AI-proposed quiz questions (spec 2026-10-13-intel-quiz-questions §7). Required, no default.
+    intel_question_min_signals: int
+    intel_question_min_publishers: int
+    intel_question_window_days: int
+    intel_question_max_options: int
+    # 0 closes question proposals.
+    intel_question_max_pending: int
+    intel_question_dismissed_days: int
     # A weight suggestion's first read of the sources it registered is legitimately larger than a
     # weekly check (§4.10), so it has its own call cap.
     intel_max_calls_per_suggestion_run: int = 60
@@ -133,6 +141,9 @@ class IntelConfig(BaseSettings):
         "intel_validation_searches",
         "intel_validation_result_pages",
         "intel_research_searches_per_answer",
+        "intel_question_min_signals",
+        "intel_question_min_publishers",
+        "intel_question_window_days",
         "intel_max_calls_per_suggestion_run",
         "intel_run_concurrency",
         "intel_source_read_concurrency",
@@ -156,11 +167,23 @@ class IntelConfig(BaseSettings):
             raise ValueError("must be a positive number")
         return value
 
-    @field_validator("intel_source_proposal_coverage_asks", "intel_suggestion_research_rounds")
+    @field_validator(
+        "intel_source_proposal_coverage_asks",
+        "intel_suggestion_research_rounds",
+        "intel_question_max_pending",
+        "intel_question_dismissed_days",
+    )
     @classmethod
     def _non_negative(cls, value: int) -> int:
         if value < 0:
             raise ValueError("must be zero or a positive integer")
+        return value
+
+    @field_validator("intel_question_max_options")
+    @classmethod
+    def _at_least_two(cls, value: int) -> int:
+        if value < 2:
+            raise ValueError("must be at least 2: a question needs two answers")
         return value
 
     def search_limits(self) -> SearchLimits:
@@ -175,6 +198,17 @@ class IntelConfig(BaseSettings):
             source_proposal_coverage_asks=self.intel_source_proposal_coverage_asks,
             suggestion_research_rounds=self.intel_suggestion_research_rounds,
             research_searches_per_answer=self.intel_research_searches_per_answer,
+        )
+
+    def question_limits(self) -> QuestionLimits:
+        """The run code's view of the quiz-question limits (``PipelineDeps.question_limits``)."""
+        return QuestionLimits(
+            min_signals=self.intel_question_min_signals,
+            min_publishers=self.intel_question_min_publishers,
+            window_days=self.intel_question_window_days,
+            max_options=self.intel_question_max_options,
+            max_pending=self.intel_question_max_pending,
+            dismissed_days=self.intel_question_dismissed_days,
         )
 
     def pool_size_needed(self) -> int:

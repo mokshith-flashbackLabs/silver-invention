@@ -82,6 +82,7 @@ from imageshield.intel.generation import (
     GeneratedBatch,
     prompt_live_event,
     prompt_live_protection,
+    prompt_open_question,
     prompt_pending_event,
     prompt_pending_weight_change,
     prompt_quiz,
@@ -89,7 +90,7 @@ from imageshield.intel.generation import (
     prompt_signal,
     validate_proposals,
 )
-from imageshield.intel.limits import SearchLimits
+from imageshield.intel.limits import QuestionLimits, SearchLimits
 from imageshield.intel.metering import metered
 from imageshield.intel.model import IntelModel, ModelCall, WebResult
 from imageshield.intel.models import Run, Source, Vocabulary
@@ -103,7 +104,12 @@ from imageshield.intel.prompts import (
     extraction_request,
     proposal_request,
 )
-from imageshield.intel.proposal_models import ContextSignal, GapRegenerateRequest, RenewalRequest
+from imageshield.intel.proposal_models import (
+    ContextSignal,
+    GapRegenerateRequest,
+    QuestionContext,
+    RenewalRequest,
+)
 from imageshield.intel.proposal_store import ProposalStore
 from imageshield.intel.protection_store import (
     RENEWAL_EVIDENCE_GONE,
@@ -166,7 +172,8 @@ class PipelineDeps:
     2026-10-04-intel-evidence-quality §3): the window the generation prompt states and the
     generation-time staleness check applies, with no default for the same reason.
     ``limits`` is ``IntelConfig.search_limits()`` (spec 2026-10-10-intel-every-answer-researched
-    §5.1), with no default for the same reason."""
+    §5.1), with no default for the same reason. ``question_limits`` is
+    ``IntelConfig.question_limits()`` (spec 2026-10-13-intel-quiz-questions §7), likewise."""
 
     store: IntelStore
     evidence: EvidenceStore
@@ -184,6 +191,7 @@ class PipelineDeps:
     source_read_concurrency: int
     threat_recency_days: int
     limits: SearchLimits
+    question_limits: QuestionLimits
 
 
 @dataclass(frozen=True)
@@ -249,6 +257,11 @@ class _Ctx:
     # Sources a feed or a saved search read only in part (the call cap left items for its next
     # check). Keyed by source, so reads running side by side cannot mistake one another's.
     partly_read: set[UUID] = field(default_factory=set)
+    # Whether this run's generation may propose quiz questions (spec 2026-10-13-intel-quiz-questions
+    # §3.2): a source check, an ad-hoc URL, or a discovery read of a source that is not a research
+    # search. Never a weight suggestion -- a question's own research included -- nor a gap
+    # regeneration, so a question's research can never propose a question.
+    questions_open: bool = False
 
     def calls_left(self) -> bool:
         """The reading cap: a weight suggestion's first read of the sources it registered has its
@@ -298,6 +311,7 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
         deps=deps,
         vocabulary=vocabulary,
         registry=vocabulary.registry() if vocabulary is not None else None,
+        questions_open=claimed.kind in ("source_check", "adhoc_url"),
     )
     if claimed.kind in _QUESTION_RUN_KINDS:
         # A question run reads no source by itself and returns its own result (spec §4.10).
@@ -542,6 +556,9 @@ async def _feed(ctx: _Ctx, source: Source, fetched: TextFetch) -> None:
 async def _discovery(ctx: _Ctx) -> None:
     assert ctx.run.source_id is not None  # intel_runs CHECK: discovery has a source
     source = await ctx.deps.store.get_source(ctx.run.source_id)
+    # A research search's read never proposes a question (spec 2026-10-13 §3.2): it reads for a
+    # weight suggestion, a question's own research among them.
+    ctx.questions_open = source is not None and source.origin != "research"
     if source is None or source.query_text is None:
         ctx.counts["source_missing"] += 1
         return
@@ -1009,6 +1026,16 @@ async def _generate(ctx: _Ctx) -> None:
         tags=tags, limit=PROPOSAL_CONTEXT_MAX_EVENTS
     )
     relevant = set(tags) | {t for s in related for t in s.tags} | set(vocabulary.mapped_tags)
+    question_limits = ctx.deps.question_limits
+    questions: QuestionContext | None = None
+    if ctx.questions_open and regenerate is None and question_limits.max_pending > 0:
+        open_questions = await store.question_context(
+            dismissed_since=now - timedelta(days=question_limits.dismissed_days)
+        )
+        if len(open_questions.open) < question_limits.max_pending:
+            questions = open_questions
+        else:
+            ctx.counts["questions_closed_at_cap"] += 1
     system, user = proposal_request(
         [prompt_signal(s) for s in new],
         [prompt_signal(s) for s in related],
@@ -1022,6 +1049,12 @@ async def _generate(ctx: _Ctx) -> None:
         live_events=[prompt_live_event(e) for e in live_events],
         live_protections=[prompt_live_protection(e) for e in live_protections],
         events_only=regenerate is not None,
+        questions_open=questions is not None,
+        max_question_options=question_limits.max_options,
+        pending_questions=[prompt_open_question(q) for q in questions.open] if questions else [],
+        dismissed_questions=(
+            [prompt_open_question(q) for q in questions.dismissed] if questions else []
+        ),
     )
     call = await _call_model(ctx, lambda: ctx.deps.model.propose(system, user), capped=False)
     batch = GeneratedBatch()
@@ -1039,6 +1072,8 @@ async def _generate(ctx: _Ctx) -> None:
             pending_events={e.proposal_id: e for e in pending_events},
             new_signal_ids=frozenset(s.signal_id for s in new),
             events_only=regenerate is not None,
+            questions=questions,
+            question_limits=question_limits,
         )
     result = await store.write_generated(
         ctx.run.run_id,
@@ -1048,10 +1083,15 @@ async def _generate(ctx: _Ctx) -> None:
         model_id=call.answered_by,
         prompt_version=PROPOSE_PROMPT_VERSION,
         attachments=batch.attachments,
+        question_limits=question_limits,
     )
     if result is None:
         ctx.counts["proposals_already_written"] += 1
         return
+    if result.dropped_questions:
+        ctx.counts["proposal_dropped_question_at_write"] += result.dropped_questions
+    if result.research_runs:
+        ctx.counts["question_research_queued"] += len(result.research_runs)
     ctx.counts["proposals_written"] += len(result.written)
     ctx.counts["proposals_superseded"] += len(result.superseded)
     if result.attached:

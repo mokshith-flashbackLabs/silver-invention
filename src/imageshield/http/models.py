@@ -1086,7 +1086,12 @@ class IntelVocabularyRequest(ServiceModel):
 
 
 IntelProposalKind = Literal[
-    "weight_change", "threat_event", "protection_event", "weight_suggestion", "coverage_gap"
+    "weight_change",
+    "threat_event",
+    "protection_event",
+    "weight_suggestion",
+    "coverage_gap",
+    "quiz_question",
 ]
 IntelProposalStatus = Literal[
     "pending", "approved", "rejected", "superseded", "applied", "delivered"

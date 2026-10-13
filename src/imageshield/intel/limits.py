@@ -27,3 +27,21 @@ class SearchLimits:
     # per round.
     suggestion_research_rounds: int
     research_searches_per_answer: int
+
+
+@dataclass(frozen=True)
+class QuestionLimits:
+    """The AI-proposed quiz question's limits (spec 2026-10-13-intel-quiz-questions §7). Required
+    IntelConfig keys with no code default, like SearchLimits."""
+
+    # The evidence bar, recounted in code over the signals a question cites: at least this many,
+    # created within this many days, from at least this many distinct publishers.
+    min_signals: int
+    min_publishers: int
+    window_days: int
+    # Answers per proposed question.
+    max_options: int
+    # Pending plus approved questions at once (0 closes question proposals).
+    max_pending: int
+    # How long a dismissed question is shown to the model and refused again.
+    dismissed_days: int

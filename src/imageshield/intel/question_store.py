@@ -180,6 +180,7 @@ class QuestionStore(Protocol):
         since: datetime,
         limit: int,
         research_source_ids: Sequence[UUID] = (),
+        signal_ids: Sequence[UUID] = (),
     ) -> SuggestionCandidates: ...
     async def research_sources_for(self, question_key: str) -> list[UUID]: ...
     async def suggestion_written(self, run_id: UUID) -> bool: ...
@@ -568,9 +569,13 @@ class PostgresQuestionStore:
         since: datetime,
         limit: int,
         research_source_ids: Sequence[UUID] = (),
+        signal_ids: Sequence[UUID] = (),
     ) -> SuggestionCandidates:
         """Each class: active signals since ``since``, newest first, at most ``limit``. The
-        research searches' evidence is its own class (final review C1, 2026-10-11)."""
+        research searches' evidence is its own class (final review C1, 2026-10-11). ``signal_ids``
+        (2026-10-13) are a quiz question's own cited signals: active ones join that first class
+        ahead of the research searches', whatever their age, because they are why the question
+        exists (spec 2026-10-13-intel-quiz-questions §4)."""
         params = {
             "since": since,
             "limit": limit,
@@ -578,6 +583,7 @@ class PostgresQuestionStore:
             "research": list(research_source_ids),
             "tags": list(tags),
             "categories": sorted(CATEGORY_CLASS),
+            "signal_ids": list(signal_ids),
         }
         found: list[tuple[ContextSignal, ...]] = []
         async with self._pool.connection() as conn:
@@ -592,6 +598,16 @@ class PostgresQuestionStore:
                 found.append(tuple(_context(row) for row in await cur.fetchall()))
         from_sources, by_tag, with_subjects, by_category = found
         from_research: tuple[ContextSignal, ...] = ()
+        if signal_ids:
+            async with self._pool.connection() as conn:
+                cur = conn.cursor(row_factory=dict_row)
+                await cur.execute(
+                    f"SELECT {_CONTEXT_COLUMNS} FROM {_CONTEXT_FROM}"
+                    " WHERE s.status = 'active' AND s.signal_id = ANY(%(signal_ids)s::uuid[])"
+                    " ORDER BY s.created_at DESC, s.signal_id DESC LIMIT %(limit)s",
+                    params,
+                )
+                from_research = tuple(_context(row) for row in await cur.fetchall())
         if research_source_ids:
             async with self._pool.connection() as conn:
                 cur = conn.cursor(row_factory=dict_row)
@@ -602,7 +618,7 @@ class PostgresQuestionStore:
                     " ORDER BY s.created_at DESC, s.signal_id DESC LIMIT %(limit)s",
                     params,
                 )
-                from_research = tuple(_context(row) for row in await cur.fetchall())
+                from_research += tuple(_context(row) for row in await cur.fetchall())
         return SuggestionCandidates(
             from_sources, by_tag, with_subjects, by_category, from_research=from_research
         )

@@ -26,7 +26,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.evidence_store import DocumentRecord, PostgresEvidenceStore, SignalRecord
 from imageshield.intel.fetch_client import FetchFailure, TextFetch
-from imageshield.intel.limits import SearchLimits
+from imageshield.intel.limits import QuestionLimits, SearchLimits
 from imageshield.intel.model import ModelCall, ModelUnavailable, WebResult
 from imageshield.intel.models import Run, Vocabulary
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
@@ -306,6 +306,17 @@ TEST_LIMITS = SearchLimits(
     research_searches_per_answer=2,
 )
 
+# Quiz questions (spec 2026-10-13-intel-quiz-questions §7) with a one-signal evidence bar, so a
+# single seeded page can back one: a test of the bar itself passes its own QuestionLimits.
+TEST_QUESTION_LIMITS = QuestionLimits(
+    min_signals=1,
+    min_publishers=1,
+    window_days=90,
+    max_options=8,
+    max_pending=3,
+    dismissed_days=90,
+)
+
 
 def make_deps(
     pool: AsyncConnectionPool,
@@ -318,6 +329,7 @@ def make_deps(
     clock: Callable[[], datetime] | None = None,
     source_read_concurrency: int = 1,
     limits: SearchLimits = TEST_LIMITS,
+    question_limits: QuestionLimits = TEST_QUESTION_LIMITS,
 ) -> PipelineDeps:
     control = PostgresProviderControlStore(
         pool,
@@ -345,6 +357,7 @@ def make_deps(
         source_read_concurrency=source_read_concurrency,
         threat_recency_days=90,
         limits=limits,
+        question_limits=question_limits,
     )
 
 

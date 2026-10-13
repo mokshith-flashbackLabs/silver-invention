@@ -86,6 +86,10 @@ class SuggestionRunRequest(BaseModel):
     tags: dict[str, tuple[str, ...]] | None = None
     new_source_ids: tuple[UUID, ...] = ()
     source_ids: tuple[UUID, ...] = ()
+    # A quiz question's own research (spec 2026-10-13-intel-quiz-questions §4): the question
+    # proposal it researches, and that question's cited signals, which join the evidence first.
+    for_question: UUID | None = None
+    signal_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -48,12 +48,15 @@ WhyNot = Literal[
     "evidence_stale",
     "uncorroborated",
     "tags_unmapped",
+    "research_pending",
 ]
 
-APPROVABLE_KINDS: frozenset[str] = frozenset({"weight_change", "threat_event", "protection_event"})
+APPROVABLE_KINDS: frozenset[str] = frozenset(
+    {"weight_change", "threat_event", "protection_event", "quiz_question"}
+)
 # A coverage_gap can only be dismissed (§4.7); a weight_suggestion is never decidable.
 REJECTABLE_KINDS: frozenset[str] = frozenset(
-    {"weight_change", "coverage_gap", "threat_event", "protection_event"}
+    {"weight_change", "coverage_gap", "threat_event", "protection_event", "quiz_question"}
 )
 EVENT_KINDS: frozenset[str] = frozenset({"threat_event", "protection_event"})
 
@@ -89,6 +92,7 @@ def why_not(
     *,
     recency: Recency,
     renewed_credit_ended: bool = False,
+    research_pending: bool = False,
 ) -> WhyNot | None:
     """``renewed_credit_ended`` is the caller's read of the credit a pending renewal continues:
     the reads take it from ``proposal_store.ended_renewals`` and the decision from the credit
@@ -106,6 +110,10 @@ def why_not(
         return "uncorroborated"
     if proposal.kind in EVENT_KINDS and all_tags_unmapped(proposal.target, vocabulary):
         return "tags_unmapped"
+    # A quiz question waits for its own research run (spec 2026-10-13-intel-quiz-questions §4):
+    # ``research_pending`` is the caller's read of that run.
+    if proposal.kind == "quiz_question" and research_pending:
+        return "research_pending"
     return None
 
 
@@ -116,6 +124,7 @@ def read_flags(
     *,
     recency: Recency,
     renewed_credit_ended: bool = False,
+    research_pending: bool = False,
 ) -> dict[str, Any]:
     """The read-time fields of both proposal reads.
 
@@ -129,7 +138,12 @@ def read_flags(
     """
     active = [s for s in linked_signals if s.status == "active"]
     why = why_not(
-        proposal, active, vocabulary, recency=recency, renewed_credit_ended=renewed_credit_ended
+        proposal,
+        active,
+        vocabulary,
+        recency=recency,
+        renewed_credit_ended=renewed_credit_ended,
+        research_pending=research_pending,
     )
     why_stale: StaleReason | None = None
     pending_ack = False

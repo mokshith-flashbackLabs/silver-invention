@@ -431,6 +431,7 @@ async def run_forever(config: IntelConfig) -> None:
         max_calls_per_suggestion_run=config.intel_max_calls_per_suggestion_run,
         source_read_concurrency=config.intel_source_read_concurrency,
         limits=config.search_limits(),
+        question_limits=config.question_limits(),
     )
     log.info(
         "intel.started",

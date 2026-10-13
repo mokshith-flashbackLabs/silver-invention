@@ -186,6 +186,26 @@ class ProposedProtectionEvent(_Out):
     signal_ids: list[str] = Field(default_factory=list)
 
 
+class ProposedQuestionOption(_Out):
+    option: str
+    tags: list[str] = Field(default_factory=list)
+    new_tag: ProposedTag | None = None
+
+
+class ProposedQuizQuestion(_Out):
+    """propose-v12 (spec 2026-10-13-intel-quiz-questions §3): a new quiz question. No bounds here,
+    for ProposedWeightChange's reason; intel/generation.py checks them and drops the question. No
+    points: its answers' points are researched by the weight_suggestion run it starts (§4)."""
+
+    question_key: str
+    subject: str
+    prompt: str
+    multi: bool = False
+    options: list[ProposedQuestionOption] = Field(default_factory=list)
+    rationale: str
+    signal_ids: list[str] = Field(default_factory=list)
+
+
 class ProposalOutput(_Out):
     """Step 2's kinds as two typed lists rather than one list keyed by ``kind``, so each
     kind's shape is closed. Step 3 adds threat_events and attach; step 4 adds
@@ -196,3 +216,5 @@ class ProposalOutput(_Out):
     threat_events: list[ProposedThreatEvent] = Field(default_factory=list)
     attach: list[ProposedAttach] = Field(default_factory=list)
     protection_events: list[ProposedProtectionEvent] = Field(default_factory=list)
+    # propose-v12: optional, so an answer without it still parses.
+    quiz_questions: list[ProposedQuizQuestion] = Field(default_factory=list)

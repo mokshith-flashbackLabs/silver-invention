@@ -646,6 +646,7 @@ async def _suggest(ctx: _Ctx, request: SuggestionRunRequest) -> _SuggestStep:
         since=now - timedelta(days=SUGGESTION_CONTEXT_DAYS),
         limit=SUGGESTION_POOL_MAX,
         research_source_ids=research_ids,
+        signal_ids=request.signal_ids,
     )
     context = select_context(
         candidates, options=request.options, limit=SUGGESTION_CONTEXT_MAX_SIGNALS

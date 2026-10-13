@@ -61,6 +61,14 @@ def copy_problems(text: str) -> list[CopyRule]:
     return [rule for rule, pattern in WORD_RULES if pattern.search(text)]
 
 
+def question_copy_problems(text: str) -> list[CopyRule]:
+    """The rules a quiz question's text and its answers must pass (spec
+    2026-10-13-intel-quiz-questions §3.3): every word rule but the spelled-figure one, because an
+    answer may legitimately read "18-24" or "More than once a week", and no figure check, because a
+    question quotes nothing. The backend runs the same rule on what it publishes."""
+    return [rule for rule in copy_problems(text) if rule != "spelled_figure"]
+
+
 def figures(text: str) -> list[Figure]:
     return [
         Figure(m.group(0).strip(), m.group(1).replace(",", ""), m.group(2) is not None)

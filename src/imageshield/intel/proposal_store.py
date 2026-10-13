@@ -24,12 +24,19 @@ detection" protection was written on dev on 2026-10-03: the run cited an older r
 ``youtube`` while its own new signals carried no ``youtube`` tag, so the pending one was never
 loaded. Both reads name, for a pending proposal, the pending proposals it OVERLAPS
 (``overlaps``, intel/overlap.py).
+
+*2026-10-13 (spec 2026-10-13-intel-quiz-questions §3.3, §4).* A quiz_question is re-checked here
+under the lock against every open (pending or approved) and recently dismissed question -- its key,
+its subject, and the open-question cap -- and the same transaction queues its research: an
+ordinary weight_suggestion run for the new key (``requested_by = 'system:intel'``), whose id it
+stores as ``target.research_run_id``. Both reads add, on a question, ``research``: that run's
+status and the newest delivered suggestion for its key.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -42,6 +49,7 @@ from psycopg_pool import AsyncConnectionPool
 from imageshield.intel.approvable import EVENT_KINDS, read_flags
 from imageshield.intel.bounds import OVERLAP_POOL_MAX, PROPOSAL_CONTEXT_MAX_EVENTS
 from imageshield.intel.generation import duplicate_of
+from imageshield.intel.limits import QuestionLimits
 from imageshield.intel.models import Vocabulary
 from imageshield.intel.overlap import OVERLAP_KINDS, OverlapCandidate, overlaps_of, pool_of
 from imageshield.intel.proposal_models import (
@@ -50,12 +58,17 @@ from imageshield.intel.proposal_models import (
     LiveEvent,
     LiveProtection,
     NewProposal,
+    OpenQuestion,
     PendingEvent,
     PendingWeightChange,
     ProposalRecord,
+    QuestionContext,
+    QuestionResearch,
+    QuizQuestionSuggested,
     WriteResult,
 )
 from imageshield.intel.recency import Recency
+from imageshield.intel.suggestion import suggestion_options
 from imageshield.intel.vocabulary import ScoringVocabulary, normalise_subject, parse_vocabulary
 
 log = structlog.get_logger("imageshield.intel")
@@ -66,7 +79,22 @@ ALL_KINDS: tuple[str, ...] = (
     "protection_event",
     "weight_suggestion",
     "coverage_gap",
+    "quiz_question",
 )
+
+# Who queues a question's research run (spec 2026-10-13-intel-quiz-questions §4): no operator.
+QUESTION_RESEARCH_REQUESTER = "system:intel"
+# The open and dismissed questions one read carries: far above any sane INTEL_QUESTION_MAX_PENDING.
+_QUESTION_CONTEXT_MAX = 500
+
+_QUESTION_CONTEXT_SQL = """
+    SELECT proposal_id, status, target, suggested FROM intel_proposals
+     WHERE kind = 'quiz_question'
+       AND (status IN ('pending', 'approved')
+            OR (status = 'rejected' AND decided_at >= %(dismissed_since)s))
+     ORDER BY created_at DESC, proposal_id DESC
+     LIMIT %(limit)s
+"""
 
 PROPOSAL_COLUMNS = """proposal_id, kind, status, supersede_reason, target, suggested, decided,
     rationale, against_scoring_version, against_release_no, run_id, model_id, prompt_version,
@@ -215,6 +243,111 @@ def _context(row: dict[str, Any]) -> ContextSignal:
         excerpts=tuple(row["excerpts"] or ()),
         document_url=row.get("document_url"),
     )
+
+
+def _open_question(row: dict[str, Any]) -> OpenQuestion:
+    target, suggested = row["target"] or {}, row["suggested"] or {}
+    return OpenQuestion(
+        proposal_id=row["proposal_id"],
+        status=row["status"],
+        question_key=str(target.get("question_key", "")),
+        subject=str(target.get("subject", "")),
+        prompt=str(suggested.get("prompt", "")),
+    )
+
+
+async def read_question_context(
+    conn: AsyncConnection[Any], *, dismissed_since: datetime, lock: bool = False
+) -> QuestionContext:
+    """The open (pending and approved) and the recently dismissed questions (spec
+    2026-10-13-intel-quiz-questions §3.1). ``lock`` takes them FOR UPDATE: the write's re-check."""
+    cur = conn.cursor(row_factory=dict_row)
+    await cur.execute(
+        _QUESTION_CONTEXT_SQL + (" FOR UPDATE" if lock else ""),
+        {"dismissed_since": dismissed_since, "limit": _QUESTION_CONTEXT_MAX},
+    )
+    rows = [_open_question(r) for r in await cur.fetchall()]
+    return QuestionContext(
+        open=tuple(q for q in rows if q.status in ("pending", "approved")),
+        dismissed=tuple(q for q in rows if q.status == "rejected"),
+    )
+
+
+async def question_research(
+    conn: AsyncConnection[Any], rows: Sequence[dict[str, Any]]
+) -> dict[UUID, QuestionResearch]:
+    """Every quiz_question row's research (spec 2026-10-13-intel-quiz-questions §4): its research
+    run's status, and the newest DELIVERED suggestion for its key, whoever pressed for it, with each
+    answer's number. Other kinds are absent from the result."""
+    questions = [r for r in rows if r["kind"] == "quiz_question"]
+    if not questions:
+        return {}
+    run_of: dict[UUID, UUID | None] = {}
+    for row in questions:
+        raw = (row["target"] or {}).get("research_run_id")
+        run_of[row["proposal_id"]] = UUID(str(raw)) if raw else None
+    statuses: dict[UUID, str] = {}
+    run_ids = [r for r in run_of.values() if r is not None]
+    if run_ids:
+        cur = await conn.execute(
+            "SELECT run_id, status FROM intel_runs WHERE run_id = ANY(%s::uuid[])", (run_ids,)
+        )
+        statuses = {r[0]: r[1] for r in await cur.fetchall()}
+    keys = sorted({str((r["target"] or {}).get("question_key", "")) for r in questions})
+    cur = await conn.execute(
+        "SELECT DISTINCT ON (target->>'question_key') target->>'question_key', proposal_id, target"
+        " FROM intel_proposals WHERE kind = 'weight_suggestion' AND status = 'delivered'"
+        " AND target->>'question_key' = ANY(%s::text[])"
+        " ORDER BY target->>'question_key', created_at DESC, proposal_id DESC",
+        (keys,),
+    )
+    newest = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+    linked = await fetch_linked_signals(conn, [pid for pid, _ in newest.values()])
+    numbers: dict[str, tuple[UUID, dict[str, int | None]]] = {}
+    for key, (pid, target) in newest.items():
+        read = suggestion_options(target, linked[pid])
+        numbers[key] = (
+            pid,
+            {
+                str(o["option"]): (
+                    o["deduction"]
+                    if isinstance(o.get("deduction"), int) and not isinstance(o["deduction"], bool)
+                    else None
+                )
+                for o in read
+            },
+        )
+    result: dict[UUID, QuestionResearch] = {}
+    for row in questions:
+        key = str((row["target"] or {}).get("question_key", ""))
+        run_id = run_of[row["proposal_id"]]
+        suggestion = numbers.get(key)
+        result[row["proposal_id"]] = QuestionResearch(
+            run_id=run_id,
+            status=statuses.get(run_id) if run_id is not None else None,
+            suggestion_proposal_id=suggestion[0] if suggestion else None,
+            deductions=suggestion[1] if suggestion else {},
+        )
+    return result
+
+
+def _research_request(proposal_id: UUID, proposal: NewProposal) -> dict[str, Any]:
+    """The research run's request (spec 2026-10-13-intel-quiz-questions §4): the ordinary
+    suggestion request for the not-yet-live question, with the question's own cited signals as
+    evidence and its proposal id."""
+    question = QuizQuestionSuggested.model_validate(proposal.suggested)
+    return {
+        "question_key": proposal.target["question_key"],
+        "prompt": question.prompt,
+        "type": "mutable",
+        "options": [o.option for o in question.options],
+        "cap": None,
+        "tags": {o.option: list(o.tags) for o in question.options},
+        "new_source_ids": [],
+        "source_ids": [],
+        "for_question": str(proposal_id),
+        "signal_ids": [str(i) for i in proposal.signal_ids],
+    }
 
 
 def record_of(row: dict[str, Any]) -> ProposalRecord:
@@ -425,7 +558,9 @@ class ProposalStore(Protocol):
         model_id: str,
         prompt_version: str,
         attachments: Sequence[Attachment] = (),
+        question_limits: QuestionLimits | None = None,
     ) -> WriteResult | None: ...
+    async def question_context(self, *, dismissed_since: datetime) -> QuestionContext: ...
     async def list_proposals(
         self,
         *,
@@ -598,16 +733,20 @@ class PostgresProposalStore:
         model_id: str,
         prompt_version: str,
         attachments: Sequence[Attachment] = (),
+        question_limits: QuestionLimits | None = None,
     ) -> WriteResult | None:
         """All of a run's proposals and their supersession, in ONE transaction with
         ``proposals_written_at``. Returns None when that is already set: a reclaimed run never
         generates twice (spec §4.3). An empty ``proposals`` still sets it, which is how a
-        consumed model verdict (refusal, max_tokens) is recorded."""
+        consumed model verdict (refusal, max_tokens) is recorded. A quiz_question needs
+        ``question_limits`` (its re-check); without them one is dropped, never written unchecked."""
         written: list[UUID] = []
         superseded: list[UUID] = []
         attached: list[UUID] = []
+        research_runs: list[UUID] = []
         converted = 0
         dropped_duplicate = 0
+        dropped_questions = 0
         async with self._pool.connection() as conn, conn.transaction():
             await conn.execute(PROPOSAL_WRITE_LOCK)
             cur = await conn.execute(
@@ -618,7 +757,35 @@ class PostgresProposalStore:
             if await cur.fetchone() is None:
                 return None
             pending_gaps: list[tuple[UUID, dict[str, Any]]] | None = None
+            questions: QuestionContext | None = None
+            question_keys: set[str] = set()
+            question_subjects: set[str] = set()
             for proposal in proposals:
+                if proposal.kind == "quiz_question":
+                    if question_limits is None:
+                        dropped_questions += 1
+                        continue
+                    if questions is None:
+                        questions = await read_question_context(
+                            conn,
+                            dismissed_since=self._clock()
+                            - timedelta(days=question_limits.dismissed_days),
+                            lock=True,
+                        )
+                        seen = (*questions.open, *questions.dismissed)
+                        question_keys = {q.question_key for q in seen}
+                        question_subjects = {normalise_subject(q.subject) for q in seen}
+                    key = str(proposal.target["question_key"])
+                    subject = normalise_subject(str(proposal.target["subject"]))
+                    if (
+                        key in question_keys
+                        or subject in question_subjects
+                        or len(questions.open) + len(research_runs) >= question_limits.max_pending
+                    ):
+                        dropped_questions += 1
+                        continue
+                    question_keys.add(key)
+                    question_subjects.add(subject)
                 # A weight change and a coverage gap supersede their pending twin. An event
                 # proposal of either kind supersedes nothing: a repeat of a pending one becomes an
                 # attachment (spec §4.3) -- at generation for the proposals the run loaded, and
@@ -684,6 +851,10 @@ class PostgresProposalStore:
                     (proposal_id, list(proposal.signal_ids)),
                 )
                 written.append(proposal_id)
+                if proposal.kind == "quiz_question":
+                    research_runs.append(
+                        await _queue_question_research(conn, proposal_id, proposal)
+                    )
             attach_dropped = 0
             if attachments:
                 # spec §4.3, re-checked under lock: the target must STILL be a pending event
@@ -729,7 +900,13 @@ class PostgresProposalStore:
             attach_dropped,
             converted=converted,
             dropped_duplicate=dropped_duplicate,
+            dropped_questions=dropped_questions,
+            research_runs=tuple(research_runs),
         )
+
+    async def question_context(self, *, dismissed_since: datetime) -> QuestionContext:
+        async with self._pool.connection() as conn:
+            return await read_question_context(conn, dismissed_since=dismissed_since)
 
     async def list_proposals(
         self,
@@ -763,6 +940,7 @@ class PostgresProposalStore:
             vocabulary = await load_scoring_vocabulary(conn)
             linked = await fetch_linked_signals(conn, [r["proposal_id"] for r in rows])
             ended = await ended_renewals(conn, rows)
+            research = await question_research(conn, rows)
             pending = [r for r in rows if r["status"] == "pending"]
             overlaps = (
                 overlaps_of(
@@ -781,6 +959,7 @@ class PostgresProposalStore:
                     vocabulary,
                     recency,
                     row["proposal_id"] in ended,
+                    research.get(row["proposal_id"]),
                 ),
                 "overlaps": overlaps.get(row["proposal_id"], []),
             }
@@ -800,6 +979,7 @@ class PostgresProposalStore:
             vocabulary = await load_scoring_vocabulary(conn)
             linked = (await fetch_linked_signals(conn, [proposal_id]))[proposal_id]
             ended = await ended_renewals(conn, [row])
+            research = (await question_research(conn, [row])).get(proposal_id)
             overlaps: list[dict[str, Any]] = []
             if row["status"] == "pending":
                 pool = await overlap_pool(conn, vocabulary, extra=[row])
@@ -849,7 +1029,9 @@ class PostgresProposalStore:
         for excerpt in excerpts:
             by_signal.setdefault(excerpt.pop("signal_id"), []).append(excerpt)
         return {
-            **_annotated(row, linked, vocabulary, self._recency(), proposal_id in ended),
+            **_annotated(
+                row, linked, vocabulary, self._recency(), proposal_id in ended, research
+            ),
             "overlaps": overlaps,
             "related_events": related,
             "signals": [
@@ -879,21 +1061,60 @@ async def _pending_duplicate(conn: AsyncConnection[Any], proposal: NewProposal) 
     return duplicate_of(proposal, [_pending_event(r) for r in await cur.fetchall()])
 
 
+async def _queue_question_research(
+    conn: AsyncConnection[Any], proposal_id: UUID, proposal: NewProposal
+) -> UUID:
+    """The question's research run, in the write's transaction (spec
+    2026-10-13-intel-quiz-questions §4), recorded on the proposal's target and audited."""
+    cur = await conn.execute(
+        "INSERT INTO intel_runs (kind, request, requested_by)"
+        " VALUES ('weight_suggestion', %s, %s) RETURNING run_id",
+        (Jsonb(_research_request(proposal_id, proposal)), QUESTION_RESEARCH_REQUESTER),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    run_id: UUID = row[0]
+    await conn.execute(
+        "UPDATE intel_proposals SET target = target || %s WHERE proposal_id = %s",
+        (Jsonb({"research_run_id": str(run_id)}), proposal_id),
+    )
+    await conn.execute(
+        _AUDIT_SQL,
+        {
+            "actor_type": "service",
+            "action": "intel.question_research_queued",
+            "resource_id": proposal_id,
+            "metadata": Jsonb(
+                {"run_id": str(run_id), "question_key": proposal.target["question_key"]}
+            ),
+        },
+    )
+    return run_id
+
+
 def _annotated(
     row: dict[str, Any],
     linked: list[ContextSignal],
     vocabulary: ScoringVocabulary | None,
     recency: Recency,
     renewed_credit_ended: bool = False,
+    research: QuestionResearch | None = None,
 ) -> dict[str, Any]:
+    """``research`` (2026-10-13) is a quiz_question's, and only a question row carries the key."""
     return {
         **row,
         "signal_ids": [s.signal_id for s in linked],
+        **(
+            {"research": research.as_json() if research is not None else None}
+            if row["kind"] == "quiz_question"
+            else {}
+        ),
         **read_flags(
             record_of(row),
             linked,
             vocabulary,
             recency=recency,
             renewed_credit_ended=renewed_credit_ended,
+            research_pending=research is not None and research.pending,
         ),
     }

@@ -9,6 +9,7 @@ convention.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -34,17 +35,22 @@ from imageshield.intel.bounds import (
     MAX_CARD_LINE_CHARS,
     MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
+    MAX_QUESTION_OPTION_CHARS,
+    MAX_QUESTION_PROMPT_CHARS,
+    MAX_QUESTION_SUBJECT_CHARS,
     MAX_WEIGHT_REASON_CHARS,
     PROTECTION_REVIEW_MAX_DAYS,
     PROTECTION_REVIEW_MIN_DAYS,
     PROTECTION_STRENGTH_MAX,
     PROTECTION_STRENGTH_MIN,
+    QUESTION_KEY_PATTERN,
     THREAT_EXPIRES_MAX_DAYS,
     THREAT_EXPIRES_MIN_DAYS,
     THREAT_SEVERITY_MAX,
     THREAT_SEVERITY_MIN,
 )
 from imageshield.intel.tags import is_well_formed
+from imageshield.intel.user_copy import question_copy_problems
 
 # ``covered_by_decision`` (2026-10-04, migration 0048): an operator approved a proposal this one
 # overlaps -- the same body of evidence on an overlapping tag (intel/overlap.py).
@@ -301,6 +307,167 @@ class ProtectionEventValues(_Stored):
     is_global: StrictBool | None = None
 
 
+class QuizQuestionTarget(_Stored):
+    """What a quiz_question is about (spec 2026-10-13-intel-quiz-questions §2): the key it will be
+    published under, a short subject that recognises a repeat, and the weight_suggestion run that
+    researches its answers' points (None only between the proposal's insert and the run's, inside
+    one transaction)."""
+
+    question_key: str = Field(pattern=QUESTION_KEY_PATTERN)
+    subject: str = Field(min_length=1, max_length=MAX_QUESTION_SUBJECT_CHARS)
+    research_run_id: UUID | None = None
+
+
+class QuestionOptionSuggested(_Stored):
+    option: str = Field(min_length=1, max_length=MAX_QUESTION_OPTION_CHARS)
+    tags: tuple[str, ...] = ()
+    new_tag: SuggestedTag | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _distinct_slugs(value)
+
+
+def _question_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        raise ValueError("must not be blank")
+    if question_copy_problems(text):
+        raise ValueError("uses words a question shown to a person may not use")
+    return text
+
+
+def _distinct_options(options: tuple[str, ...]) -> None:
+    if len({o.casefold() for o in options}) != len(options):
+        raise ValueError("answers must be distinct")
+
+
+class QuizQuestionSuggested(_Stored):
+    """A quiz_question's ``suggested``: the model's question, kept forever. Points are never here:
+    they come from the research run's suggestion (§4)."""
+
+    prompt: str = Field(min_length=1, max_length=MAX_QUESTION_PROMPT_CHARS)
+    multi: StrictBool = False
+    options: tuple[QuestionOptionSuggested, ...] = Field(min_length=2)
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt(cls, value: str) -> str:
+        return _question_text(value)
+
+    @model_validator(mode="after")
+    def _answers(self) -> QuizQuestionSuggested:
+        for option in self.options:
+            _question_text(option.option)
+        _distinct_options(tuple(o.option for o in self.options))
+        return self
+
+
+class QuestionOptionDecided(_Stored):
+    option: str = Field(min_length=1, max_length=MAX_QUESTION_OPTION_CHARS)
+    deduction: StrictInt = Field(ge=0, le=10)
+    tags: tuple[str, ...] = ()
+
+    @field_validator("option")
+    @classmethod
+    def _option(cls, value: str) -> str:
+        return _question_text(value)
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _distinct_slugs(value)
+
+
+class QuizQuestionDecided(_Stored):
+    """The exact question an approval stores (§5) and the backend publishes: every answer with its
+    points, a cap exactly when several answers may be picked, and the suggestion the default points
+    came from (None when there was none, so every number was typed)."""
+
+    prompt: str = Field(min_length=1, max_length=MAX_QUESTION_PROMPT_CHARS)
+    multi: StrictBool
+    cap: StrictInt | None = Field(default=None, ge=0, le=10)
+    options: tuple[QuestionOptionDecided, ...] = Field(min_length=2)
+    suggestion_proposal_id: UUID | None = None
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt(cls, value: str) -> str:
+        return _question_text(value)
+
+    @model_validator(mode="after")
+    def _shape(self) -> QuizQuestionDecided:
+        _distinct_options(tuple(o.option for o in self.options))
+        if not self.multi and self.cap is not None:
+            raise ValueError("a single-choice question has no cap")
+        return self
+
+
+class QuestionOptionValues(_Stored):
+    """One answer's edit, by position: any subset of its text, points and tags."""
+
+    option: str | None = None
+    deduction: StrictInt | None = None
+    tags: tuple[str, ...] | None = None
+
+
+class QuizQuestionValues(_Stored):
+    """An operator's edit of a question approval: any subset of ``{prompt, multi, cap, options}``.
+    ``options`` lists every answer by position, never more or fewer than the proposal has. Types
+    only here; the bounds are QuizQuestionDecided's."""
+
+    prompt: str | None = None
+    multi: StrictBool | None = None
+    cap: StrictInt | None = None
+    options: tuple[QuestionOptionValues, ...] | None = None
+
+
+@dataclass(frozen=True)
+class OpenQuestion:
+    """A pending, approved or recently dismissed quiz_question, as generation reads it: for the
+    prompt and for the repeat rules (§3.3)."""
+
+    proposal_id: UUID
+    status: str
+    question_key: str
+    subject: str
+    prompt: str
+
+
+@dataclass(frozen=True)
+class QuestionContext:
+    """What a pass needs to propose questions (§3.2): the open (pending and approved) and the
+    recently dismissed questions. A pass with no QuestionContext proposes none."""
+
+    open: tuple[OpenQuestion, ...]
+    dismissed: tuple[OpenQuestion, ...]
+
+
+@dataclass(frozen=True)
+class QuestionResearch:
+    """A quiz_question's research as both reads and the decision see it (spec
+    2026-10-13-intel-quiz-questions §4): its research run and that run's status, and the newest
+    delivered suggestion for its key with each answer's number (None: the suggestion gave none).
+    The decision defaults an answer's points from ``deductions``."""
+
+    run_id: UUID | None
+    status: str | None
+    suggestion_proposal_id: UUID | None
+    deductions: Mapping[str, int | None]
+
+    @property
+    def pending(self) -> bool:
+        return self.status in ("queued", "running", "waiting")
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "status": self.status,
+            "suggestion_proposal_id": self.suggestion_proposal_id,
+        }
+
+
 @dataclass(frozen=True)
 class ContextSignal:
     """An active-or-retracted signal with the provenance the predicates need. ``trust`` and
@@ -340,7 +507,9 @@ class NewProposal:
     what the write attaches to a pending proposal it finds this one duplicates, under its lock
     (intel/proposal_store.py), when the generation-time check could not see that proposal."""
 
-    kind: Literal["weight_change", "coverage_gap", "threat_event", "protection_event"]
+    kind: Literal[
+        "weight_change", "coverage_gap", "threat_event", "protection_event", "quiz_question"
+    ]
     target: dict[str, Any]
     suggested: dict[str, Any]
     rationale: str
@@ -490,6 +659,11 @@ class WriteResult:
     attach_dropped: int = 0
     converted: int = 0
     dropped_duplicate: int = 0
+    # quiz_question proposals the write's own re-check dropped under its lock (2026-10-13): a key
+    # or subject another run opened since, or the open-question cap reached.
+    dropped_questions: int = 0
+    # The research run queued for each question written, in order.
+    research_runs: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -517,6 +691,8 @@ DecisionRefusal = Literal[
     "values_out_of_bounds",
     "unknown_tag",
     "tag_retired",
+    "question_incomplete",
+    "question_key_taken",
 ]
 
 
