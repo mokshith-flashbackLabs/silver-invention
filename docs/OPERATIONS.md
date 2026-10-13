@@ -355,6 +355,15 @@ at least a budget outage will not also relax everyone's cadence.
   decision's own corroboration rule, so no research run is spent on a question it would refuse) and
   `proposal_dropped_question_key_pii`.
 - **Rolling back 0054** ends any research run still queued for a question as `failed` (`question_removed`).
+- **The proposal step is TWO model calls since `propose-v13` (2026-10-13).** One structured-output schema for every
+  kind stopped compiling ("The compiled grammar is too large", HTTP 400): measured on dev, 5,504 characters of
+  transformed schema compiled and 5,864 did not, and the score-page card line (2026-10-12) had already crossed it, so
+  from that deploy every run failed with `proposals_deferred_error`. The quiz half (`weight_changes`, `coverage_gaps`,
+  `quiz_questions`) goes first; the events half (`threat_events`, `protection_events`, `attach`) second, shown the
+  quiz half's weight changes as pending. A gap regeneration makes the events call alone. The run log shows two "Asked
+  claude-opus-5-5" steps; the step is still metered as one call (cost summed), so `call_count` undercounts by one per
+  proposal step. `tests/test_intel_model.py` holds each half under 4,800 characters: if it fails, split again, never
+  raise the bound.
 - **Publishing is the backend's.** An approved question waits for its publish, which makes everyone retake the quiz.
 
 **Throughput (2026-10-03, spec `docs/superpowers/specs/2026-10-03-intel-throughput-design.md`).**

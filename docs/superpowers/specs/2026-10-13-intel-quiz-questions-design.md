@@ -51,6 +51,13 @@ ProposedQuizQuestion { question_key, subject, prompt, multi = false,
 No bounds in the schema, for §4.5's reason (one bad proposal must not make the answer unparseable);
 code bounds them.
 
+*Amended the same day (`propose-v13`), found by the live test on dev:* the API refused the combined schema ("The
+compiled grammar is too large"), and so did the one before this change, because the 2026-10-12 card line had already
+pushed it past the ceiling (about 5,500 characters of transformed schema). The proposal step is now two structured
+calls inside `ClaudeIntelModel.propose`: `ProposalQuizOutput` (weight changes, coverage gaps, quiz questions) first,
+then `ProposalEventsOutput` (threats, protections, attach), shown the first call's weight changes as pending. The
+pipeline sees one merged `ProposalOutput`, unchanged.
+
 ### 3.1 The prompt
 
 Generic, by the owner's 2026-10-09 rule: no platform, product or case is named.

@@ -52,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from decimal import Decimal
 from typing import Any, Generic, Literal, Protocol, TypeVar
 
@@ -63,6 +63,11 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from imageshield.intel.config import IntelConfig
 from imageshield.intel.pricing import Usage, cost_of
+from imageshield.intel.prompts import (
+    PROPOSE_EVENTS_PART,
+    PROPOSE_QUIZ_PART,
+    with_proposed_weight_changes,
+)
 from imageshield.intel.run_log import (
     MAX_FAILURE_MESSAGE_CHARS,
     StreamTranslator,
@@ -73,7 +78,9 @@ from imageshield.intel.run_log import (
 from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractionOutput,
+    ProposalEventsOutput,
     ProposalOutput,
+    ProposalQuizOutput,
     SourceProposalOutput,
     SuggestionOutput,
 )
@@ -225,7 +232,9 @@ def _max_searches(tools: object) -> int | None:
 class IntelModel(Protocol):
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]: ...
     async def discover(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
-    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]: ...
+    async def propose(
+        self, system: str, user: str, *, events_only: bool = False
+    ) -> ModelCall[ProposalOutput]: ...
     async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]: ...
     async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
     async def suggest_weights(self, system: str, user: str) -> ModelCall[SuggestionOutput]: ...
@@ -241,6 +250,33 @@ def _usage(raw: Any) -> Usage:
         cache_read_input_tokens=getattr(raw, "cache_read_input_tokens", 0) or 0,
         web_search_requests=(getattr(tool, "web_search_requests", 0) or 0) if tool else 0,
     )
+
+
+def merged_proposal(
+    quiz: ModelCall[ProposalQuizOutput] | None, events: ModelCall[ProposalEventsOutput]
+) -> ModelCall[ProposalOutput]:
+    """The proposal step's two calls as one: each half's lists (empty when that half gave no
+    output), usage, cost and latency summed. No output only when neither half gave one, with the
+    events call's outcome. The events call is the answering model and stop reason of record."""
+    halves: list[ModelCall[Any]] = [c for c in (quiz, events) if c is not None]
+    usage = Usage(*(sum(getattr(c.usage, f.name) for c in halves) for f in fields(Usage)))
+    cost = sum((c.cost_usd for c in halves), Decimal("0"))
+    latency = sum(c.latency_ms for c in halves)
+    quiz_out = quiz.output if quiz is not None else None
+    events_out = events.output
+    if quiz_out is None and events_out is None:
+        return ModelCall(
+            None, events.outcome, events.answered_by, events.stop_reason, usage, cost, latency
+        )
+    output = ProposalOutput(
+        weight_changes=quiz_out.weight_changes if quiz_out is not None else [],
+        coverage_gaps=quiz_out.coverage_gaps if quiz_out is not None else [],
+        quiz_questions=quiz_out.quiz_questions if quiz_out is not None else [],
+        threat_events=events_out.threat_events if events_out is not None else [],
+        attach=events_out.attach if events_out is not None else [],
+        protection_events=events_out.protection_events if events_out is not None else [],
+    )
+    return ModelCall(output, "ok", events.answered_by, events.stop_reason, usage, cost, latency)
 
 
 def _output_config(output_format: type[BaseModel]) -> dict[str, Any]:
@@ -511,14 +547,35 @@ class ClaudeIntelModel:
             max_tokens=self._config.intel_search_read_max_output,
         )
 
-    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
-        return await self._send(
-            ProposalOutput,
+    async def propose(
+        self, system: str, user: str, *, events_only: bool = False
+    ) -> ModelCall[ProposalOutput]:
+        """The proposal step, as TWO structured calls (propose-v13, 2026-10-13): one schema for
+        every kind no longer compiles (intel/schemas.py ProposalQuizOutput). The quiz half goes
+        first; the events half is shown its weight changes as pending, so one body of evidence
+        still yields one kind of proposal. ``events_only`` (a gap regeneration) makes the second
+        call alone. Returned as ONE call -- outputs merged, usage and cost summed -- so the
+        pipeline meters and validates the step exactly as before."""
+        quiz: ModelCall[ProposalQuizOutput] | None = None
+        events_user = user
+        if not events_only:
+            quiz = await self._send(
+                ProposalQuizOutput,
+                model=self._config.intel_proposal_model,
+                effort=_PROPOSAL_EFFORT,
+                system=system + PROPOSE_QUIZ_PART,
+                messages=[{"role": "user", "content": user}],
+            )
+            if quiz.output is not None and quiz.output.weight_changes:
+                events_user = with_proposed_weight_changes(user, quiz.output.weight_changes)
+        events = await self._send(
+            ProposalEventsOutput,
             model=self._config.intel_proposal_model,
             effort=_PROPOSAL_EFFORT,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+            system=system + PROPOSE_EVENTS_PART,
+            messages=[{"role": "user", "content": events_user}],
         )
+        return merged_proposal(quiz, events)
 
     async def suggest_weights(self, system: str, user: str) -> ModelCall[SuggestionOutput]:
         return await self._send(

@@ -1056,7 +1056,12 @@ async def _generate(ctx: _Ctx) -> None:
             [prompt_open_question(q) for q in questions.dismissed] if questions else []
         ),
     )
-    call = await _call_model(ctx, lambda: ctx.deps.model.propose(system, user), capped=False)
+    # Two API calls behind one metered step since propose-v13 (ClaudeIntelModel.propose).
+    call = await _call_model(
+        ctx,
+        lambda: ctx.deps.model.propose(system, user, events_only=regenerate is not None),
+        capped=False,
+    )
     batch = GeneratedBatch()
     if call.output is None:
         ctx.counts[f"proposal_model_{call.outcome}"] += 1  # a verdict, not an outage: consumed

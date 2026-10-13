@@ -1290,6 +1290,10 @@ the decision's own corroboration predicate, and a key shaped like personal data 
 it queues its research: an ordinary `weight_suggestion` run for the new key, `requested_by: "system:intel"`, visible in
 `GET /runs` and its run log like any other.
 
+*Amended the same day (`propose-v13`):* the proposal step is two model calls (quiz half, then events half), because
+one schema for every kind no longer compiles. A run's log therefore shows two "Asked claude-opus-5-5" steps; nothing
+else on this surface changes.
+
 **Deploy order:** services first (0054, then services and services-worker with the six `INTEL_QUESTION_*` keys); then
 the backend. On the way down, the backend first, then 0054's down, which deletes `quiz_question` proposals and ends
 any research run still queued for one as `failed` (`question_removed`).

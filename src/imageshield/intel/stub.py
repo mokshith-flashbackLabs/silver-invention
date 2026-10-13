@@ -31,7 +31,9 @@ class StubIntelModel:
             DiscoveryOutput(candidates=[]), "ok", "stub", "end_turn", _ZERO, Decimal("0"), 0
         )
 
-    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
+    async def propose(
+        self, system: str, user: str, *, events_only: bool = False
+    ) -> ModelCall[ProposalOutput]:
         return ModelCall(ProposalOutput(), "ok", "stub", "end_turn", _ZERO, Decimal("0"), 0)
 
     async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]:

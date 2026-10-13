@@ -27,8 +27,10 @@ import anthropic
 import httpx2
 import pytest
 from anthropic._models import construct_type
+from anthropic.lib._parse._transform import transform_schema
 from anthropic.lib.streaming import AsyncMessageStreamManager
 from anthropic.types import RawMessageStreamEvent
+from pydantic import TypeAdapter
 
 from imageshield.intel import prompts
 from imageshield.intel.config import IntelConfig
@@ -40,9 +42,13 @@ from imageshield.intel.schemas import (
     DiscoveryCandidate,
     DiscoveryOutput,
     ExtractionOutput,
+    ProposalEventsOutput,
     ProposalOutput,
+    ProposalQuizOutput,
     ProposedOptionSources,
     ProposedSource,
+    ProposedThreatEvent,
+    ProposedWeightChange,
     SourceProposalOutput,
     SuggestionOutput,
 )
@@ -405,26 +411,122 @@ async def test_discover_never_exceeds_the_cap_for_any_cap_value(
     assert call.pause_turns == 0 and len(fake.calls) == 1
 
 
+def _answer(output: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        model="claude-opus-5-5",
+        stop_reason="end_turn",
+        usage=_usage(),
+        content=[_text_block(output.model_dump_json())],
+    )
+
+
 async def test_propose_uses_the_proposal_model_with_explicit_effort(
     clean_env: pytest.MonkeyPatch,
 ) -> None:
     """spec §4.3: Opus 5.5 defaults to effort medium, so the proposal call sets it.
-    Priced by the REQUESTED proposal model, never the answering id."""
-    response = SimpleNamespace(
-        model="claude-opus-5-5",
-        stop_reason="end_turn",
-        usage=_usage(),
-        content=[_text_block(ProposalOutput().model_dump_json())],
+    Priced by the REQUESTED proposal model, never the answering id. Since propose-v13 the step is
+    two calls (quiz half, then events half), returned as one with their usage and cost summed."""
+    model, fake = _model(
+        [_answer(ProposalQuizOutput()), _answer(ProposalEventsOutput())], clean_env
     )
-    model, fake = _model([response], clean_env)
-    call = await model.propose("sys", "user")
+    call = await model.propose("sys", json.dumps({"pending_weight_changes": []}))
     assert call.outcome == "ok" and call.output == ProposalOutput()
-    sent = fake.calls[0]
-    assert sent["model"] == "claude-opus-5-5"
-    assert sent["output_config"]["effort"] == "high"
-    # The run log shows Claude's reasoning summary (spec 2026-10-03 §2).
-    assert sent["thinking"] == {"type": "adaptive", "display": "summarized"}
-    assert call.cost_usd == cost_of("claude-opus-5-5", Usage(1000, 100, 0, 0, 0))
+    assert len(fake.calls) == 2
+    for sent in fake.calls:
+        assert sent["model"] == "claude-opus-5-5"
+        assert sent["output_config"]["effort"] == "high"
+        # The run log shows Claude's reasoning summary (spec 2026-10-03 §2).
+        assert sent["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert call.cost_usd == 2 * cost_of("claude-opus-5-5", Usage(1000, 100, 0, 0, 0))
+    assert call.usage == Usage(2000, 200, 0, 0, 0)
+
+
+def _schema_title(sent: dict[str, Any]) -> str:
+    return str(sent["output_config"]["format"]["schema"].get("title"))
+
+
+async def test_the_proposal_step_is_a_quiz_call_then_an_events_call(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """propose-v13 (2026-10-13): one schema for every kind no longer compiles, so the quiz half is
+    asked first and the events half second, shown the quiz half's weight changes as pending (one
+    body of evidence, one kind of proposal). The outputs merge into one ProposalOutput."""
+    change = ProposedWeightChange(
+        question_key="platforms",
+        option="Instagram",
+        current=3,
+        delta=1,
+        body="Photos shared publicly online now train AI models by default.",
+        rationale="r",
+        signal_ids=["s1"],
+    )
+    threat = ProposedThreatEvent(
+        kind="leak", title="t", body="b", severity=2, expires_in_days=10, rationale="r"
+    )
+    model, fake = _model(
+        [
+            _answer(ProposalQuizOutput(weight_changes=[change])),
+            _answer(ProposalEventsOutput(threat_events=[threat])),
+        ],
+        clean_env,
+    )
+    call = await model.propose("SYSTEM", json.dumps({"pending_weight_changes": []}))
+    quiz, events = fake.calls
+    assert _schema_title(quiz) == "ProposalQuizOutput"
+    assert _schema_title(events) == "ProposalEventsOutput"
+    assert quiz["system"].startswith("SYSTEM") and quiz["system"].endswith(
+        prompts.PROPOSE_QUIZ_PART
+    )
+    assert events["system"].endswith(prompts.PROPOSE_EVENTS_PART)
+    pending = json.loads(events["messages"][0]["content"])["pending_weight_changes"]
+    assert pending == [
+        {
+            "proposal_id": "proposed in this run",
+            "question_key": "platforms",
+            "option": "Instagram",
+            "delta": 1,
+            "signal_ids": ["s1"],
+        }
+    ]
+    assert call.output is not None
+    assert call.output.weight_changes == [change] and call.output.threat_events == [threat]
+
+
+async def test_a_gap_regeneration_makes_the_events_call_alone(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    model, fake = _model([_answer(ProposalEventsOutput())], clean_env)
+    call = await model.propose("sys", "{}", events_only=True)
+    assert len(fake.calls) == 1 and _schema_title(fake.calls[0]) == "ProposalEventsOutput"
+    assert call.output == ProposalOutput()
+
+
+async def test_one_half_without_an_answer_still_returns_the_other(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    refused = SimpleNamespace(
+        model="claude-opus-5-5", stop_reason="refusal", usage=_usage(), content=[]
+    )
+    threat = ProposedThreatEvent(
+        kind="leak", title="t", body="b", severity=2, expires_in_days=10, rationale="r"
+    )
+    model, _ = _model([refused, _answer(ProposalEventsOutput(threat_events=[threat]))], clean_env)
+    call = await model.propose("sys", "{}")
+    assert call.outcome == "ok" and call.output is not None
+    assert call.output.threat_events == [threat] and call.output.weight_changes == []
+    model, _ = _model([refused, refused], clean_env)
+    call = await model.propose("sys", "{}")
+    assert call.output is None and call.outcome == "refusal"
+
+
+@pytest.mark.parametrize("half", [ProposalQuizOutput, ProposalEventsOutput])
+def test_each_proposal_half_stays_well_under_the_grammar_ceiling(half: type[Any]) -> None:
+    """The Claude API refuses a structured-output schema whose compiled grammar is too large. On
+    2026-10-13 a 5,504-character transformed proposal schema compiled and a 5,864-character one did
+    not (dev probe), which stopped every proposal for a day. Each half is held to 4,800 characters,
+    so a field added later fails here first. Splitting further is the remedy, not raising this."""
+    schema = transform_schema(TypeAdapter(half).json_schema())
+    assert len(json.dumps(schema)) < 4800
 
 
 async def test_extraction_keeps_its_model_and_sets_no_effort(
@@ -818,11 +920,11 @@ async def test_a_call_without_the_search_tool_is_announced_without_a_limit(
     run_log, store = bound_log
     raw = [
         _message_start("claude-opus-5-5"),
-        *_text(0, ProposalOutput().model_dump_json()),
+        *_text(0, ProposalEventsOutput().model_dump_json()),
         *_message_end(),
     ]
     model, fake = _model([sdk_stream(raw)], clean_env)
-    await model.propose("sys", "user")
+    await model.propose("sys", "user", events_only=True)  # one call: the run log of one question
     (started, writing) = store.events(run_log.run_id)
     assert started["text"] == "Asked claude-opus-5-5"
     assert started["detail"] == {"model": "claude-opus-5-5", "max_searches": None}
@@ -1078,7 +1180,8 @@ async def test_no_other_call_carries_the_search_read_effort(clean_env: pytest.Mo
         [
             answer(SourceProposalOutput()),
             answer(ExtractionOutput(signals=[])),
-            answer(ProposalOutput()),
+            answer(ProposalQuizOutput()),
+            answer(ProposalEventsOutput()),
             answer(SuggestionOutput()),
         ],
         clean_env,
@@ -1089,4 +1192,4 @@ async def test_no_other_call_carries_the_search_read_effort(clean_env: pytest.Mo
     await model.propose("sys", "user")
     await model.suggest_weights("sys", "user")
     efforts = [sent["output_config"].get("effort") for sent in fake.calls]
-    assert efforts == [None, None, "high", "high"]
+    assert efforts == [None, None, "high", "high", "high"]  # the proposal step is two calls

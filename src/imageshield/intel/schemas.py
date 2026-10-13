@@ -206,10 +206,33 @@ class ProposedQuizQuestion(_Out):
     signal_ids: list[str] = Field(default_factory=list)
 
 
+class ProposalQuizOutput(_Out):
+    """propose-v13 (2026-10-13): the quiz half of the proposal step, its own structured call.
+
+    One schema for every kind compiled past the API's grammar ceiling ("The compiled grammar is
+    too large"; measured on 2026-10-13: 5,504 characters of transformed schema compiled, 5,864 did
+    not). The step is therefore two calls, this one first, each well under it.
+    tests/test_intel_model.py pins both halves' sizes so a field added later fails CI, not prod."""
+
+    weight_changes: list[ProposedWeightChange] = Field(default_factory=list)
+    coverage_gaps: list[ProposedCoverageGap] = Field(default_factory=list)
+    quiz_questions: list[ProposedQuizQuestion] = Field(default_factory=list)
+
+
+class ProposalEventsOutput(_Out):
+    """propose-v13: the events half of the proposal step, the second call. It is shown the quiz
+    half's weight changes as pending, so one body of evidence still yields one kind of proposal."""
+
+    threat_events: list[ProposedThreatEvent] = Field(default_factory=list)
+    attach: list[ProposedAttach] = Field(default_factory=list)
+    protection_events: list[ProposedProtectionEvent] = Field(default_factory=list)
+
+
 class ProposalOutput(_Out):
     """Step 2's kinds as two typed lists rather than one list keyed by ``kind``, so each
     kind's shape is closed. Step 3 adds threat_events and attach; step 4 adds
-    protection_events."""
+    protection_events. Since propose-v13 it is the MERGE of ProposalQuizOutput and
+    ProposalEventsOutput, never itself sent as a schema (it is too large to compile)."""
 
     weight_changes: list[ProposedWeightChange] = Field(default_factory=list)
     coverage_gaps: list[ProposedCoverageGap] = Field(default_factory=list)

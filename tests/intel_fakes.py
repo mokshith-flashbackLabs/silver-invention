@@ -226,7 +226,9 @@ class FakeModel:
             1,
         )
 
-    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
+    async def propose(
+        self, system: str, user: str, *, events_only: bool = False
+    ) -> ModelCall[ProposalOutput]:
         """``propose_with`` receives the parsed user payload, so a test can cite the ids of
         signals the run under test just wrote."""
         self.propose_calls += 1

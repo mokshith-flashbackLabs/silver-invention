@@ -533,7 +533,9 @@ class _DismissesWhileAnswering(FakeModel):
         self._pool = pool
         self._target = target
 
-    async def propose(self, system: str, user: str) -> ModelCall[ProposalOutput]:
+    async def propose(
+        self, system: str, user: str, *, events_only: bool = False
+    ) -> ModelCall[ProposalOutput]:
         answer = await super().propose(system, user)
         async with self._pool.connection() as conn:
             await conn.execute(

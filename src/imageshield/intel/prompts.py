@@ -15,8 +15,10 @@ DISCOVER_PROMPT_VERSION = "discover-v3"
 # propose-v10 (spec 2026-10-11-intel-score-insights §2.2): a threat's card line. propose-v11 (final
 # review 2026-10-12): the card line's banned words named, % and year spans as suggest-v4.
 # propose-v12 (spec 2026-10-13-intel-quiz-questions §3.1): quiz_questions, questions_open and the
-# open and dismissed questions.
-PROPOSE_PROMPT_VERSION = "propose-v12"
+# open and dismissed questions. propose-v13 (2026-10-13): the step is two calls, each told which
+# lists it returns (PROPOSE_QUIZ_PART, PROPOSE_EVENTS_PART), because one schema for every kind no
+# longer compiles (intel/schemas.py ProposalQuizOutput).
+PROPOSE_PROMPT_VERSION = "propose-v13"
 
 
 class RegistryTag(TypedDict):
@@ -603,6 +605,42 @@ This run re-reads evidence about a subject the quiz has just started to cover: i
 mapped.
 Propose only threat_events, protection_events and attach.
 Return weight_changes, coverage_gaps and quiz_questions empty."""
+
+
+# Appended to the proposal system prompt for each of the step's two calls (propose-v13). The
+# instructions above describe every kind, so each call reads the same rules and returns its half.
+PROPOSE_QUIZ_PART = """
+
+This call returns weight_changes, coverage_gaps and quiz_questions only. threat_events,
+protection_events and attach are asked for in a separate call, which will see the weight changes
+you propose here."""
+
+PROPOSE_EVENTS_PART = """
+
+This call returns threat_events, protection_events and attach only. weight_changes,
+coverage_gaps and quiz_questions were asked for in a separate call; any weight change it proposed
+is listed in pending_weight_changes with proposal_id "proposed in this run"."""
+
+
+def with_proposed_weight_changes(user: str, changes: Sequence[Any]) -> str:
+    """The proposal payload with the quiz call's weight changes added to pending_weight_changes,
+    for the events call: one body of evidence, one kind of proposal (propose-v13). ``changes``
+    are ProposedWeightChange values, not yet validated (generation validates the merged output)."""
+    payload = json.loads(user)
+    payload["pending_weight_changes"] = [
+        *payload.get("pending_weight_changes", []),
+        *(
+            {
+                "proposal_id": "proposed in this run",
+                "question_key": change.question_key,
+                "option": change.option,
+                "delta": change.delta,
+                "signal_ids": list(change.signal_ids),
+            }
+            for change in changes
+        ),
+    ]
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def proposal_request(
