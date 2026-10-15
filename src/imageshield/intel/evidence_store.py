@@ -29,6 +29,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.bounds import MAX_SOURCE_CONSECUTIVE_FAILURES
+from imageshield.intel.lesson_store import recompute_after_retraction
 from imageshield.intel.verify import VerifiedQuote
 from imageshield.search.urlhash import NORMALISATION_VERSION
 
@@ -449,6 +450,9 @@ class PostgresEvidenceStore:
             )
             updated = await cur.fetchone() is not None
             if updated:
+                # The weekly report's evidence (spec 2026-10-15 §6): every published owner citing
+                # this signal is recounted in this transaction.
+                await recompute_after_retraction(conn, signal_id)
                 await conn.execute(
                     _AUDIT_SQL,
                     {

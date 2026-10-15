@@ -126,3 +126,31 @@ async def snapshot_evidence(
         " WHERE ps.proposal_id = %s ON CONFLICT DO NOTHING",
         (owner_kind, owner_id, proposal_id),
     )
+
+
+async def recompute_after_retraction(conn: AsyncConnection[Any], signal_id: UUID) -> int:
+    """Every owner citing a just-retracted signal gets its independence count recomputed from its
+    proposal's still-active evidence, in the retraction's transaction (spec §6). The rows stay;
+    svc.v_evidence drops them because it joins active signals only. Returns the owners updated."""
+    # Imported here: proposal_store is the heavier module and nothing it imports needs this one.
+    from imageshield.intel.proposal_store import fetch_linked_signals
+
+    cur = await conn.execute(
+        "SELECT DISTINCT o.owner_kind, o.owner_id, o.proposal_id FROM intel_published_evidence pe"
+        " JOIN intel_published_owners o"
+        "   ON o.owner_kind = pe.owner_kind AND o.owner_id = pe.owner_id"
+        " WHERE pe.signal_id = %s",
+        (signal_id,),
+    )
+    owners = await cur.fetchall()
+    if not owners:
+        return 0
+    linked = await fetch_linked_signals(conn, list({row[2] for row in owners}))
+    for kind, owner, proposal in owners:
+        active = [s for s in linked[proposal] if s.status == "active"]
+        await conn.execute(
+            "UPDATE intel_published_owners SET independent_sources = %s"
+            " WHERE owner_kind = %s AND owner_id = %s",
+            (independent_sources(active), kind, owner),
+        )
+    return len(owners)
