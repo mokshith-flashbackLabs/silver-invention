@@ -64,6 +64,7 @@ from imageshield.intel.bounds import (
     DISCOVERY_DEDUP_DAYS,
     FEED_MAX_ITEM_AGE_DAYS,
     FEED_MAX_ITEMS_PER_RUN,
+    MAX_PROMPT_LESSON_TOPICS,
     MAX_PROMPT_TAGS,
     MIN_POLICY_TEXT_CHARS,
     PROPOSAL_CONTEXT_DAYS,
@@ -1036,6 +1037,8 @@ async def _generate(ctx: _Ctx) -> None:
             questions = open_questions
         else:
             ctx.counts["questions_closed_at_cap"] += 1
+    # Topics a general lesson may not take (spec 2026-10-15-intel-lessons-and-evidence §5).
+    open_topics = await store.open_lesson_topics(limit=MAX_PROMPT_LESSON_TOPICS)
     system, user = proposal_request(
         [prompt_signal(s) for s in new],
         [prompt_signal(s) for s in related],
@@ -1055,8 +1058,9 @@ async def _generate(ctx: _Ctx) -> None:
         dismissed_questions=(
             [prompt_open_question(q) for q in questions.dismissed] if questions else []
         ),
+        open_lesson_topics=open_topics,
     )
-    # Two API calls behind one metered step since propose-v13 (ClaudeIntelModel.propose).
+    # Three API calls behind one metered step since propose-v14 (ClaudeIntelModel.propose).
     call = await _call_model(
         ctx,
         lambda: ctx.deps.model.propose(system, user, events_only=regenerate is not None),
@@ -1079,6 +1083,7 @@ async def _generate(ctx: _Ctx) -> None:
             events_only=regenerate is not None,
             questions=questions,
             question_limits=question_limits,
+            open_lesson_topics=open_topics,
         )
     result = await store.write_generated(
         ctx.run.run_id,
@@ -1095,6 +1100,8 @@ async def _generate(ctx: _Ctx) -> None:
         return
     if result.dropped_questions:
         ctx.counts["proposal_dropped_question_at_write"] += result.dropped_questions
+    if result.dropped_lessons:
+        ctx.counts["proposal_dropped_lesson_at_write"] += result.dropped_lessons
     if result.research_runs:
         ctx.counts["question_research_queued"] += len(result.research_runs)
     ctx.counts["proposals_written"] += len(result.written)

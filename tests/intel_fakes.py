@@ -39,6 +39,7 @@ from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractedSignal,
     ExtractionOutput,
+    ProposalLessonsOutput,
     ProposalOutput,
 )
 from imageshield.intel.store import PostgresIntelStore
@@ -147,6 +148,7 @@ class FakeModel:
         extract_delay: float = 0.0,
         search_results: tuple[WebResult, ...] = (),
         choice: DiscoveryOutput | None = None,
+        lessons_with: Callable[[dict[str, Any]], ProposalLessonsOutput] | None = None,
     ) -> None:
         self.extraction = extraction
         # What a discovery's web search returned, with each result's page_age.
@@ -173,6 +175,11 @@ class FakeModel:
         self.propose_calls = 0
         self.proposal_users: list[str] = []
         self.proposal_systems: list[str] = []
+        # A lesson_draft run's call (spec 2026-10-15-intel-lessons-and-evidence §5):
+        # ``lessons_with`` receives the parsed user payload, so a test can key a lesson by an
+        # event it just seeded.
+        self.lessons_with = lessons_with
+        self.lesson_users: list[str] = []
 
     async def extract(self, system: str, user: str) -> ModelCall[ExtractionOutput]:
         self.extract_calls += 1
@@ -252,6 +259,15 @@ class FakeModel:
             Usage(1, 1, 0, 0, 0),
             Decimal("0.05"),
             1,
+        )
+
+    async def draft_lessons(self, system: str, user: str) -> ModelCall[ProposalLessonsOutput]:
+        self.lesson_users.append(user)
+        output = (
+            self.lessons_with(json.loads(user)) if self.lessons_with else ProposalLessonsOutput()
+        )
+        return ModelCall(
+            output, "ok", "claude-opus-5-5", "end_turn", Usage(1, 1, 0, 0, 0), Decimal("0.05"), 1
         )
 
 

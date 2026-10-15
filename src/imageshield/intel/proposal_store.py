@@ -575,6 +575,7 @@ class ProposalStore(Protocol):
         question_limits: QuestionLimits | None = None,
     ) -> WriteResult | None: ...
     async def question_context(self, *, dismissed_since: datetime) -> QuestionContext: ...
+    async def open_lesson_topics(self, *, limit: int) -> list[str]: ...
     async def list_proposals(
         self,
         *,
@@ -761,6 +762,7 @@ class PostgresProposalStore:
         converted = 0
         dropped_duplicate = 0
         dropped_questions = 0
+        dropped_lessons = 0
         async with self._pool.connection() as conn, conn.transaction():
             await conn.execute(PROPOSAL_WRITE_LOCK)
             cur = await conn.execute(
@@ -775,6 +777,21 @@ class PostgresProposalStore:
             question_keys: set[str] = set()
             question_subjects: set[str] = set()
             for proposal in proposals:
+                if proposal.kind == "lesson" and "topic" in proposal.target:
+                    # Re-checked under the lock (spec 2026-10-15-intel-lessons-and-evidence §5): a
+                    # topic another run opened since, or a live lesson's, is never written twice.
+                    topic = str(proposal.target["topic"])
+                    taken = await conn.execute(
+                        "SELECT 1 FROM intel_proposals WHERE kind = 'lesson'"
+                        " AND status IN ('pending', 'approved', 'applied')"
+                        " AND target->>'topic' = %s"
+                        " UNION ALL SELECT 1 FROM intel_lessons"
+                        " WHERE topic = %s AND retired_at IS NULL LIMIT 1",
+                        (topic, topic),
+                    )
+                    if await taken.fetchone() is not None:
+                        dropped_lessons += 1
+                        continue
                 if proposal.kind == "quiz_question":
                     if question_limits is None:
                         dropped_questions += 1
@@ -920,11 +937,28 @@ class PostgresProposalStore:
             dropped_duplicate=dropped_duplicate,
             dropped_questions=dropped_questions,
             research_runs=tuple(research_runs),
+            dropped_lessons=dropped_lessons,
         )
 
     async def question_context(self, *, dismissed_since: datetime) -> QuestionContext:
         async with self._pool.connection() as conn:
             return await read_question_context(conn, dismissed_since=dismissed_since)
+
+    async def open_lesson_topics(self, *, limit: int) -> list[str]:
+        """Topics a new general lesson may not take (spec 2026-10-15 §5): pending, approved or
+        applied lesson proposals, and live lessons. Newest first, for the prompt."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT topic FROM ("
+                "  SELECT target->>'topic' AS topic, created_at AS at FROM intel_proposals"
+                "   WHERE kind = 'lesson' AND status IN ('pending', 'approved', 'applied')"
+                "     AND target ? 'topic'"
+                "  UNION ALL SELECT topic, approved_at FROM intel_lessons"
+                "   WHERE topic IS NOT NULL AND retired_at IS NULL"
+                ") t GROUP BY topic ORDER BY max(at) DESC LIMIT %s",
+                (limit,),
+            )
+            return [row[0] for row in await cur.fetchall()]
 
     async def list_proposals(
         self,

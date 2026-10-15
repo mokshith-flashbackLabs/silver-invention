@@ -65,7 +65,9 @@ from imageshield.intel.config import IntelConfig
 from imageshield.intel.pricing import Usage, cost_of
 from imageshield.intel.prompts import (
     PROPOSE_EVENTS_PART,
+    PROPOSE_LESSONS_PART,
     PROPOSE_QUIZ_PART,
+    with_proposed_events,
     with_proposed_weight_changes,
 )
 from imageshield.intel.run_log import (
@@ -79,6 +81,7 @@ from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractionOutput,
     ProposalEventsOutput,
+    ProposalLessonsOutput,
     ProposalOutput,
     ProposalQuizOutput,
     SourceProposalOutput,
@@ -236,6 +239,7 @@ class IntelModel(Protocol):
         self, system: str, user: str, *, events_only: bool = False
     ) -> ModelCall[ProposalOutput]: ...
     async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]: ...
+    async def draft_lessons(self, system: str, user: str) -> ModelCall[ProposalLessonsOutput]: ...
     async def search_once(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
     async def suggest_weights(self, system: str, user: str) -> ModelCall[SuggestionOutput]: ...
     async def choose_results(self, system: str, user: str) -> ModelCall[DiscoveryOutput]: ...
@@ -253,18 +257,22 @@ def _usage(raw: Any) -> Usage:
 
 
 def merged_proposal(
-    quiz: ModelCall[ProposalQuizOutput] | None, events: ModelCall[ProposalEventsOutput]
+    quiz: ModelCall[ProposalQuizOutput] | None,
+    events: ModelCall[ProposalEventsOutput],
+    lessons: ModelCall[ProposalLessonsOutput] | None = None,
 ) -> ModelCall[ProposalOutput]:
-    """The proposal step's two calls as one: each half's lists (empty when that half gave no
-    output), usage, cost and latency summed. No output only when neither half gave one, with the
-    events call's outcome. The events call is the answering model and stop reason of record."""
-    halves: list[ModelCall[Any]] = [c for c in (quiz, events) if c is not None]
+    """The proposal step's calls as one: each call's lists (empty when that call gave no output),
+    usage, cost and latency summed. No output only when no call gave one, with the events call's
+    outcome. The events call is the answering model and stop reason of record. propose-v14 adds the
+    lessons call (spec 2026-10-15-intel-lessons-and-evidence §4)."""
+    halves: list[ModelCall[Any]] = [c for c in (quiz, events, lessons) if c is not None]
     usage = Usage(*(sum(getattr(c.usage, f.name) for c in halves) for f in fields(Usage)))
     cost = sum((c.cost_usd for c in halves), Decimal("0"))
     latency = sum(c.latency_ms for c in halves)
     quiz_out = quiz.output if quiz is not None else None
     events_out = events.output
-    if quiz_out is None and events_out is None:
+    lessons_out = lessons.output if lessons is not None else None
+    if quiz_out is None and events_out is None and lessons_out is None:
         return ModelCall(
             None, events.outcome, events.answered_by, events.stop_reason, usage, cost, latency
         )
@@ -275,6 +283,8 @@ def merged_proposal(
         threat_events=events_out.threat_events if events_out is not None else [],
         attach=events_out.attach if events_out is not None else [],
         protection_events=events_out.protection_events if events_out is not None else [],
+        event_lessons=lessons_out.event_lessons if lessons_out is not None else [],
+        lessons=lessons_out.lessons if lessons_out is not None else [],
     )
     return ModelCall(output, "ok", events.answered_by, events.stop_reason, usage, cost, latency)
 
@@ -550,12 +560,13 @@ class ClaudeIntelModel:
     async def propose(
         self, system: str, user: str, *, events_only: bool = False
     ) -> ModelCall[ProposalOutput]:
-        """The proposal step, as TWO structured calls (propose-v13, 2026-10-13): one schema for
-        every kind no longer compiles (intel/schemas.py ProposalQuizOutput). The quiz half goes
-        first; the events half is shown its weight changes as pending, so one body of evidence
-        still yields one kind of proposal. ``events_only`` (a gap regeneration) makes the second
-        call alone. Returned as ONE call -- outputs merged, usage and cost summed -- so the
-        pipeline meters and validates the step exactly as before."""
+        """The proposal step, as THREE structured calls: one schema for every kind no longer
+        compiles (intel/schemas.py ProposalQuizOutput), so propose-v13 made it two and propose-v14
+        adds the lessons call. The quiz half goes first; the events half is shown its weight
+        changes as pending, so one body of evidence still yields one kind of proposal; the lessons
+        call is shown the events just proposed. ``events_only`` (a gap regeneration) skips the quiz
+        half. Returned as ONE call -- outputs merged, usage and cost summed -- so the pipeline
+        meters and validates the step exactly as before."""
         quiz: ModelCall[ProposalQuizOutput] | None = None
         events_user = user
         if not events_only:
@@ -575,7 +586,32 @@ class ClaudeIntelModel:
             system=system + PROPOSE_EVENTS_PART,
             messages=[{"role": "user", "content": events_user}],
         )
-        return merged_proposal(quiz, events)
+        # propose-v14: the lessons call, shown the events just proposed (keyed T1.../P1...). It
+        # runs even when the events call proposed nothing: general lessons need no event.
+        proposed = events.output
+        lessons_user = (
+            with_proposed_events(events_user, proposed)
+            if proposed is not None and (proposed.threat_events or proposed.protection_events)
+            else events_user
+        )
+        lessons = await self._send(
+            ProposalLessonsOutput,
+            model=self._config.intel_proposal_model,
+            effort=_PROPOSAL_EFFORT,
+            system=system + PROPOSE_LESSONS_PART,
+            messages=[{"role": "user", "content": lessons_user}],
+        )
+        return merged_proposal(quiz, events, lessons)
+
+    async def draft_lessons(self, system: str, user: str) -> ModelCall[ProposalLessonsOutput]:
+        """A lesson_draft run's one call (spec 2026-10-15-intel-lessons-and-evidence §5)."""
+        return await self._send(
+            ProposalLessonsOutput,
+            model=self._config.intel_proposal_model,
+            effort=_PROPOSAL_EFFORT,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
 
     async def suggest_weights(self, system: str, user: str) -> ModelCall[SuggestionOutput]:
         return await self._send(

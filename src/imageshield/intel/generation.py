@@ -73,6 +73,7 @@ from imageshield.intel.bounds import (
 )
 from imageshield.intel.cells import cell_problem
 from imageshield.intel.corroboration import uncorroborated
+from imageshield.intel.lessons import general_lesson, lesson_from
 from imageshield.intel.limits import QuestionLimits
 from imageshield.intel.pii import contains_pii, mask
 from imageshield.intel.prompts import (
@@ -114,6 +115,7 @@ from imageshield.intel.schemas import (
     ProposalOutput,
     ProposedAttach,
     ProposedCoverageGap,
+    ProposedLesson,
     ProposedProtectionEvent,
     ProposedQuizQuestion,
     ProposedTag,
@@ -139,6 +141,9 @@ class GeneratedBatch:
     threat_events: list[NewProposal] = field(default_factory=list)
     protection_events: list[NewProposal] = field(default_factory=list)
     quiz_questions: list[NewProposal] = field(default_factory=list)
+    # General lessons (spec 2026-10-15-intel-lessons-and-evidence §5); an event's own lesson rides
+    # on its proposal's suggested.lesson.
+    lessons: list[NewProposal] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
 
     @property
@@ -149,6 +154,7 @@ class GeneratedBatch:
             *self.threat_events,
             *self.protection_events,
             *self.quiz_questions,
+            *self.lessons,
         ]
 
 
@@ -166,6 +172,7 @@ def validate_proposals(
     events_only: bool = False,
     questions: QuestionContext | None = None,
     question_limits: QuestionLimits | None = None,
+    open_lesson_topics: Collection[str] = (),
 ) -> GeneratedBatch:
     """``pending_events`` are the pending event proposals of both kinds the run loaded (those the
     prompt showed): attach targets and duplicate candidates. ``new_signal_ids`` are the run's own
@@ -230,14 +237,39 @@ def validate_proposals(
             subjects.add(key)
             batch.coverage_gaps.append(proposal)
     pending = pending_events or {}
-    for event in output.threat_events:
-        proposal = _threat_event(event, context, vocabulary, counts, recency)
+    # propose-v14 (spec 2026-10-15-intel-lessons-and-evidence §4): an event's lesson is keyed by its
+    # position in the events call's answer, T1... for threats and P1... for protections.
+    event_lessons = {item.event: item.lesson for item in output.event_lessons}
+    keys = {f"T{i}" for i in range(1, len(output.threat_events) + 1)} | {
+        f"P{i}" for i in range(1, len(output.protection_events) + 1)
+    }
+    unknown_keys = [key for key in event_lessons if key not in keys]
+    if unknown_keys:
+        counts["lesson_event_unknown"] += len(unknown_keys)
+    for index, event in enumerate(output.threat_events, start=1):
+        proposal = _threat_event(
+            event, context, vocabulary, counts, recency, lesson=event_lessons.get(f"T{index}")
+        )
         if proposal is not None:
             _keep_event(proposal, batch.threat_events, batch, pending, new_signal_ids, counts)
-    for credit in output.protection_events:
-        proposal = _protection_event(credit, context, vocabulary, counts)
+    for index, credit in enumerate(output.protection_events, start=1):
+        proposal = _protection_event(
+            credit, context, vocabulary, counts, lesson=event_lessons.get(f"P{index}")
+        )
         if proposal is not None:
             _keep_event(proposal, batch.protection_events, batch, pending, new_signal_ids, counts)
+    if events_only:
+        if output.lessons:
+            counts["proposal_dropped_not_an_event"] += len(output.lessons)
+    else:
+        topics = set(open_lesson_topics)
+        for general in output.lessons:
+            lesson = general_lesson(
+                general, context, vocabulary, counts, taken_topics=topics, recency=recency
+            )
+            if lesson is not None:
+                topics.add(lesson.target["topic"])
+                batch.lessons.append(lesson)
     for attach in output.attach:
         attachment = _attachment(attach, pending, context, new_signal_ids, counts)
         if attachment is not None:
@@ -742,6 +774,8 @@ def _threat_event(
     vocabulary: ScoringVocabulary,
     counts: Counter[str],
     recency: Recency,
+    *,
+    lesson: ProposedLesson | None = None,
 ) -> NewProposal | None:
     """§4.5 for threat_event. Every tag must be a registered, non-retired slug, and a miss is
     dropped, never fixed up. A proposal whose tags are all UNMAPPED is kept: it is written
@@ -793,8 +827,9 @@ def _threat_event(
                 card_line=_card_line(item.card_line, [context[i] for i in signal_ids], counts),
                 severity=item.severity,
                 expires_in_days=item.expires_in_days,
-            ).model_dump(mode="json", exclude={"action"}),
+            ).model_dump(mode="json", exclude={"action", "lesson"}),
             "action": _threat_action(item.action, [context[i] for i in signal_ids], counts),
+            "lesson": lesson_from(lesson, [context[i] for i in signal_ids], counts),
         },
         rationale=rationale,
         signal_ids=signal_ids,
@@ -807,6 +842,8 @@ def _protection_event(
     context: Mapping[UUID, ContextSignal],
     vocabulary: ScoringVocabulary,
     counts: Counter[str],
+    *,
+    lesson: ProposedLesson | None = None,
 ) -> NewProposal | None:
     """§4.5 for protection_event. A global proposal is dropped first (global_not_proposable).
     Then the threat rules: every tag a registered, non-retired slug, dropped never fixed up; a
@@ -852,12 +889,15 @@ def _protection_event(
         target=ProtectionEventTarget(tags=tuple(item.tags)).model_dump(
             mode="json", exclude_none=True
         ),
-        suggested=ProtectionEventSuggested(
-            title=title,
-            body=_event_body(item.body, counts),
-            strength=item.strength,
-            review_in_days=item.review_in_days,
-        ).model_dump(mode="json"),
+        suggested={
+            **ProtectionEventSuggested(
+                title=title,
+                body=_event_body(item.body, counts),
+                strength=item.strength,
+                review_in_days=item.review_in_days,
+            ).model_dump(mode="json", exclude={"lesson"}),
+            "lesson": lesson_from(lesson, [context[i] for i in signal_ids], counts),
+        },
         rationale=rationale,
         signal_ids=signal_ids,
         document_keys=documents,

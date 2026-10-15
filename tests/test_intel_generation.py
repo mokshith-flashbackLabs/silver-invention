@@ -362,7 +362,8 @@ def test_a_threat_event_on_a_bound_is_kept(kw: dict[str, object]) -> None:
     or one-day incident."""
     s = _sig(tags=("instagram",))
     batch, counts = _validate(ProposalOutput(threat_events=[_threat(s, **kw)]), [s])
-    assert len(batch.threat_events) == 1 and not counts
+    # Every threat counts its missing lesson (propose-v14); nothing else is counted.
+    assert len(batch.threat_events) == 1 and counts == Counter({"lesson_missing": 1})
 
 
 def test_a_threat_on_registered_but_unmapped_tags_is_kept_to_wait() -> None:
@@ -450,7 +451,7 @@ def test_incidents_that_differ_in_tags_or_in_page_are_all_kept_in_one_batch() ->
         ]
     )
     batch, counts = _validate(out, [both, elsewhere, unhashed])
-    assert len(batch.threat_events) == 4 and not counts
+    assert len(batch.threat_events) == 4 and counts == Counter({"lesson_missing": 4})
 
 
 def test_duplicate_of_needs_kind_tag_set_and_a_page_and_the_first_match_wins() -> None:
@@ -637,7 +638,7 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
     assert "Propose only threat_events, protection_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -682,7 +683,7 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
     assert payload["live_protections"] == [live] and payload["live_events"] == []
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
 
 
 def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
@@ -861,7 +862,7 @@ def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
     assert "published within threat_recency_days days of today" in flat
     assert "has ended" in flat and "is not a threat" in flat
     assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in flat
@@ -937,7 +938,7 @@ def test_propose_v5_asks_for_a_body_on_both_event_kinds_and_never_a_finding() ->
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
     assert flat.count("- body: what this") == 2
     assert "what this incident means for a person it concerns" in flat
     assert "what this protection means for a person it reaches" in flat
@@ -972,7 +973,7 @@ def test_propose_v6_asks_for_a_reason_that_names_no_platform_or_answer() -> None
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
     assert "the reason for the change in ONE short plain sentence of at most 200 characters" in flat
     assert "Never name a platform, app, service, website, quiz question or quiz answer" in flat
 
@@ -1064,7 +1065,7 @@ def test_propose_v7_asks_for_an_action_only_with_a_real_step_and_a_cited_link() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
     assert "Give one only when the evidence names a real step" in flat
     assert "the url of ONE of the evidence items this proposal cites" in flat
     assert "Never write any other address" in flat
@@ -1096,7 +1097,7 @@ def test_propose_v10_asks_every_threat_for_a_short_card_line() -> None:
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
     assert (
         "- card_line: what the incident is, in ONE short plain sentence of at most 160 characters"
         in flat

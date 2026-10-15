@@ -790,6 +790,9 @@ class WriteResult:
     dropped_questions: int = 0
     # The research run queued for each question written, in order.
     research_runs: tuple[UUID, ...] = ()
+    # General lessons the write's own re-check dropped under its lock (2026-10-15): a topic another
+    # run opened since, or a live lesson's.
+    dropped_lessons: int = 0
 
 
 @dataclass(frozen=True)

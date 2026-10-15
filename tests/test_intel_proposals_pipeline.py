@@ -260,7 +260,9 @@ async def test_a_run_proposes_a_threat_event_from_its_new_evidence(
     )
     assert result.status == "completed" and result.outcome["proposals_written"] == 1
     rows = await _rows(intel_pool, "SELECT kind, status, target, suggested FROM intel_proposals")
-    assert rows == [("threat_event", "pending", {"tags": ["instagram"]}, THREAT_SUGGESTED)]
+    # propose-v14: every event proposal stores its lesson, None when none was drafted.
+    expected = {**THREAT_SUGGESTED, "lesson": None}
+    assert rows == [("threat_event", "pending", {"tags": ["instagram"]}, expected)]
     payload = json.loads(model.proposal_users[0])
     assert payload["pending_events"] == [] and payload["live_events"] == []
 
@@ -867,7 +869,11 @@ async def test_a_run_proposes_a_protection_and_is_shown_the_live_credits_on_its_
         "SELECT kind, target, suggested FROM intel_proposals WHERE status = 'pending'",
     )
     assert rows == [
-        ("protection_event", {"tags": ["instagram"], "is_global": False}, PROTECTION_SUGGESTED)
+        (
+            "protection_event",
+            {"tags": ["instagram"], "is_global": False},
+            {**PROTECTION_SUGGESTED, "lesson": None},
+        )
     ]
 
 

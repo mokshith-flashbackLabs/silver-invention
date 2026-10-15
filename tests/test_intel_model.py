@@ -43,8 +43,11 @@ from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractionOutput,
     ProposalEventsOutput,
+    ProposalLessonsOutput,
     ProposalOutput,
     ProposalQuizOutput,
+    ProposedEventLesson,
+    ProposedLesson,
     ProposedOptionSources,
     ProposedSource,
     ProposedThreatEvent,
@@ -425,20 +428,26 @@ async def test_propose_uses_the_proposal_model_with_explicit_effort(
 ) -> None:
     """spec §4.3: Opus 5.5 defaults to effort medium, so the proposal call sets it.
     Priced by the REQUESTED proposal model, never the answering id. Since propose-v13 the step is
-    two calls (quiz half, then events half), returned as one with their usage and cost summed."""
+    two calls (quiz half, then events half), and since propose-v14 three (the lessons call third),
+    returned as one with their usage and cost summed."""
     model, fake = _model(
-        [_answer(ProposalQuizOutput()), _answer(ProposalEventsOutput())], clean_env
+        [
+            _answer(ProposalQuizOutput()),
+            _answer(ProposalEventsOutput()),
+            _answer(ProposalLessonsOutput()),
+        ],
+        clean_env,
     )
     call = await model.propose("sys", json.dumps({"pending_weight_changes": []}))
     assert call.outcome == "ok" and call.output == ProposalOutput()
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 3
     for sent in fake.calls:
         assert sent["model"] == "claude-opus-5-5"
         assert sent["output_config"]["effort"] == "high"
         # The run log shows Claude's reasoning summary (spec 2026-10-03 §2).
         assert sent["thinking"] == {"type": "adaptive", "display": "summarized"}
-    assert call.cost_usd == 2 * cost_of("claude-opus-5-5", Usage(1000, 100, 0, 0, 0))
-    assert call.usage == Usage(2000, 200, 0, 0, 0)
+    assert call.cost_usd == 3 * cost_of("claude-opus-5-5", Usage(1000, 100, 0, 0, 0))
+    assert call.usage == Usage(3000, 300, 0, 0, 0)
 
 
 def _schema_title(sent: dict[str, Any]) -> str:
@@ -467,11 +476,12 @@ async def test_the_proposal_step_is_a_quiz_call_then_an_events_call(
         [
             _answer(ProposalQuizOutput(weight_changes=[change])),
             _answer(ProposalEventsOutput(threat_events=[threat])),
+            _answer(ProposalLessonsOutput()),
         ],
         clean_env,
     )
     call = await model.propose("SYSTEM", json.dumps({"pending_weight_changes": []}))
-    quiz, events = fake.calls
+    quiz, events, _lessons = fake.calls
     assert _schema_title(quiz) == "ProposalQuizOutput"
     assert _schema_title(events) == "ProposalEventsOutput"
     assert quiz["system"].startswith("SYSTEM") and quiz["system"].endswith(
@@ -492,12 +502,18 @@ async def test_the_proposal_step_is_a_quiz_call_then_an_events_call(
     assert call.output.weight_changes == [change] and call.output.threat_events == [threat]
 
 
-async def test_a_gap_regeneration_makes_the_events_call_alone(
+async def test_a_gap_regeneration_makes_the_events_call_then_the_lessons_call(
     clean_env: pytest.MonkeyPatch,
 ) -> None:
-    model, fake = _model([_answer(ProposalEventsOutput())], clean_env)
+    """A regeneration proposes events only, and its events get lessons too (propose-v14)."""
+    model, fake = _model(
+        [_answer(ProposalEventsOutput()), _answer(ProposalLessonsOutput())], clean_env
+    )
     call = await model.propose("sys", "{}", events_only=True)
-    assert len(fake.calls) == 1 and _schema_title(fake.calls[0]) == "ProposalEventsOutput"
+    assert [_schema_title(c) for c in fake.calls] == [
+        "ProposalEventsOutput",
+        "ProposalLessonsOutput",
+    ]
     assert call.output == ProposalOutput()
 
 
@@ -510,16 +526,71 @@ async def test_one_half_without_an_answer_still_returns_the_other(
     threat = ProposedThreatEvent(
         kind="leak", title="t", body="b", severity=2, expires_in_days=10, rationale="r"
     )
-    model, _ = _model([refused, _answer(ProposalEventsOutput(threat_events=[threat]))], clean_env)
+    model, _ = _model(
+        [refused, _answer(ProposalEventsOutput(threat_events=[threat])), refused], clean_env
+    )
     call = await model.propose("sys", "{}")
     assert call.outcome == "ok" and call.output is not None
     assert call.output.threat_events == [threat] and call.output.weight_changes == []
-    model, _ = _model([refused, refused], clean_env)
+    model, _ = _model([refused, refused, refused], clean_env)
     call = await model.propose("sys", "{}")
     assert call.output is None and call.outcome == "refusal"
 
 
-@pytest.mark.parametrize("half", [ProposalQuizOutput, ProposalEventsOutput])
+async def test_propose_makes_three_calls_and_merges_the_lessons(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """propose-v14 (spec 2026-10-15-intel-lessons-and-evidence §4): the lessons call is shown the
+    events half's threats and protections keyed T1/P1, and its lists merge into the one output."""
+    threat = ProposedThreatEvent(
+        kind="leak", title="Fake offers", body="b", severity=2, expires_in_days=10, rationale="r"
+    )
+    lesson = ProposedEventLesson(event="T1", lesson=ProposedLesson(title="t", intro="i"))
+    model, fake = _model(
+        [
+            _answer(ProposalQuizOutput()),
+            _answer(ProposalEventsOutput(threat_events=[threat])),
+            _answer(ProposalLessonsOutput(event_lessons=[lesson])),
+        ],
+        clean_env,
+    )
+    call = await model.propose("SYSTEM", json.dumps({"new_evidence": []}))
+    assert [_schema_title(c) for c in fake.calls] == [
+        "ProposalQuizOutput",
+        "ProposalEventsOutput",
+        "ProposalLessonsOutput",
+    ]
+    third = fake.calls[2]
+    assert third["system"].endswith(prompts.PROPOSE_LESSONS_PART)
+    shown = json.loads(third["messages"][0]["content"])["proposed_events"]
+    assert shown[0]["key"] == "T1" and shown[0]["title"] == "Fake offers"
+    assert call.output is not None and call.output.event_lessons == [lesson]
+
+
+async def test_the_lessons_call_runs_when_the_events_half_answered_nothing(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    refused = SimpleNamespace(
+        model="claude-opus-5-5", stop_reason="refusal", usage=_usage(), content=[]
+    )
+    model, fake = _model(
+        [_answer(ProposalQuizOutput()), refused, _answer(ProposalLessonsOutput())], clean_env
+    )
+    await model.propose("sys", json.dumps({"new_evidence": []}))
+    assert len(fake.calls) == 3
+    assert "proposed_events" not in json.loads(fake.calls[2]["messages"][0]["content"])
+
+
+async def test_draft_lessons_is_one_lessons_call(clean_env: pytest.MonkeyPatch) -> None:
+    model, fake = _model([_answer(ProposalLessonsOutput())], clean_env)
+    call = await model.draft_lessons("SYSTEM", "{}")
+    assert len(fake.calls) == 1 and _schema_title(fake.calls[0]) == "ProposalLessonsOutput"
+    assert call.output == ProposalLessonsOutput()
+
+
+@pytest.mark.parametrize(
+    "half", [ProposalQuizOutput, ProposalEventsOutput, ProposalLessonsOutput]
+)
 def test_each_proposal_half_stays_well_under_the_grammar_ceiling(half: type[Any]) -> None:
     """The Claude API refuses a structured-output schema whose compiled grammar is too large. On
     2026-10-13 a 5,504-character transformed proposal schema compiled and a 5,864-character one did
@@ -920,11 +991,11 @@ async def test_a_call_without_the_search_tool_is_announced_without_a_limit(
     run_log, store = bound_log
     raw = [
         _message_start("claude-opus-5-5"),
-        *_text(0, ProposalEventsOutput().model_dump_json()),
+        *_text(0, ProposalLessonsOutput().model_dump_json()),
         *_message_end(),
     ]
     model, fake = _model([sdk_stream(raw)], clean_env)
-    await model.propose("sys", "user", events_only=True)  # one call: the run log of one question
+    await model.draft_lessons("sys", "user")  # one call: the run log of one question
     (started, writing) = store.events(run_log.run_id)
     assert started["text"] == "Asked claude-opus-5-5"
     assert started["detail"] == {"model": "claude-opus-5-5", "max_searches": None}
@@ -1182,6 +1253,7 @@ async def test_no_other_call_carries_the_search_read_effort(clean_env: pytest.Mo
             answer(ExtractionOutput(signals=[])),
             answer(ProposalQuizOutput()),
             answer(ProposalEventsOutput()),
+            answer(ProposalLessonsOutput()),
             answer(SuggestionOutput()),
         ],
         clean_env,
@@ -1192,4 +1264,4 @@ async def test_no_other_call_carries_the_search_read_effort(clean_env: pytest.Mo
     await model.propose("sys", "user")
     await model.suggest_weights("sys", "user")
     efforts = [sent["output_config"].get("effort") for sent in fake.calls]
-    assert efforts == [None, None, "high", "high", "high"]  # the proposal step is two calls
+    assert efforts == [None, None, "high", "high", "high", "high"]  # the proposal step: three

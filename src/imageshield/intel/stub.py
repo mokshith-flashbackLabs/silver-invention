@@ -12,6 +12,7 @@ from imageshield.intel.pricing import Usage
 from imageshield.intel.schemas import (
     DiscoveryOutput,
     ExtractionOutput,
+    ProposalLessonsOutput,
     ProposalOutput,
     SourceProposalOutput,
     SuggestionOutput,
@@ -38,6 +39,9 @@ class StubIntelModel:
 
     async def propose_sources(self, system: str, user: str) -> ModelCall[SourceProposalOutput]:
         return ModelCall(SourceProposalOutput(), "ok", "stub", "end_turn", _ZERO, Decimal("0"), 0)
+
+    async def draft_lessons(self, system: str, user: str) -> ModelCall[ProposalLessonsOutput]:
+        return ModelCall(ProposalLessonsOutput(), "ok", "stub", "end_turn", _ZERO, Decimal("0"), 0)
 
     async def choose_results(self, system: str, user: str) -> ModelCall[DiscoveryOutput]:
         return ModelCall(

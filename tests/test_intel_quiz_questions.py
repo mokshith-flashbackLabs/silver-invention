@@ -139,7 +139,7 @@ def _validate(
 
 
 def test_the_prompt_is_propose_v13_and_an_answer_without_questions_still_parses() -> None:
-    assert PROPOSE_PROMPT_VERSION == "propose-v13"
+    assert PROPOSE_PROMPT_VERSION == "propose-v14"
     assert ProposalOutput.model_validate({}).quiz_questions == []
 
 
