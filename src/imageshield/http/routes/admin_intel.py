@@ -463,6 +463,9 @@ _REFUSAL_STATUS: dict[str, int] = {
     # A quiz question (spec 2026-10-13-intel-quiz-questions §5).
     "question_incomplete": 422,
     "question_key_taken": 409,
+    # A lesson that breaks a rule (spec 2026-10-15-intel-lessons-and-evidence §3), naming each
+    # field and rule in ``problems``.
+    "lesson_invalid": 422,
 }
 
 
@@ -548,7 +551,13 @@ async def decide_proposal(
             refused.code,
             refused.message,
             retryable=False,
-            extra={"slugs": list(refused.slugs)} if refused.slugs else None,
+            extra=(
+                {"slugs": list(refused.slugs)}
+                if refused.slugs
+                else {"problems": list(refused.problems)}
+                if refused.problems
+                else None
+            ),
         ) from refused
     log.info(
         "intel.proposal_decided_via_admin",

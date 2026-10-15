@@ -766,6 +766,8 @@ def protection_decided(
         "tags": list(tags),
         "is_global": is_global,
         "applies_regardless_of_location": True,
+        # Every decided credit carries its lesson, None when none (spec 2026-10-15 §4).
+        "lesson": None,
         **values,
     }
 

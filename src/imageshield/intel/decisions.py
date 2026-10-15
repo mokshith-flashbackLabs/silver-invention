@@ -70,6 +70,13 @@ from imageshield.intel.approvable import (
     why_not,
 )
 from imageshield.intel.cells import cell_problem, published_unacknowledged
+from imageshield.intel.lesson_store import (
+    carry_lesson,
+    event_kind,
+    insert_lesson,
+    snapshot_evidence,
+)
+from imageshield.intel.lessons import lesson_problems
 from imageshield.intel.overlap import overlaps_of
 from imageshield.intel.proposal_models import (
     AppliedResult,
@@ -77,6 +84,10 @@ from imageshield.intel.proposal_models import (
     Decided,
     DecisionRefusal,
     DecisionRefused,
+    LessonDecided,
+    LessonDraft,
+    LessonTarget,
+    LessonValues,
     ProposalRecord,
     ProtectionEventDecided,
     ProtectionEventTarget,
@@ -135,6 +146,7 @@ _MESSAGES: dict[DecisionRefusal, str] = {
         " cap."
     ),
     "question_key_taken": "The live quiz already has a question with this key.",
+    "lesson_invalid": "This lesson breaks a rule: see problems.",
 }
 
 _RESEARCH_RUNNING = "Research for this question is still running."
@@ -227,10 +239,24 @@ def _refuse(code: DecisionRefusal) -> DecisionRefused:
     return DecisionRefused(code, _MESSAGES[code])
 
 
+def _check_lesson(raw: dict[str, Any] | None, active: Sequence[ContextSignal]) -> None:
+    """A decided lesson must pass every rule against the evidence it was approved on (spec
+    2026-10-15-intel-lessons-and-evidence §3): the word rules, every figure quoted, and a link only
+    to a cited vetted page."""
+    if raw is None:
+        return
+    problems = lesson_problems(LessonDraft.model_validate(raw), active)
+    if problems:
+        raise DecisionRefused(
+            "lesson_invalid", _MESSAGES["lesson_invalid"], problems=tuple(problems)
+        )
+
+
 def _threat_decided(
     proposal: ProposalRecord,
     vocabulary: ScoringVocabulary | None,
     values: dict[str, Any] | None,
+    active: Sequence[ContextSignal],
 ) -> dict[str, Any]:
     """The exact values a threat approval stores: the operator's ``values`` merged over
     ``suggested`` and the proposal's own ``target.tags`` (spec note 2026-09-30), re-checked
@@ -260,7 +286,9 @@ def _threat_decided(
         raise DecisionRefused("tag_retired", _MESSAGES["tag_retired"], slugs=tuple(retired))
     if all_tags_unmapped({"tags": list(decided.tags)}, vocabulary):
         raise _refuse("proposal_tags_unmapped")
-    return decided.model_dump(mode="json")
+    dumped = decided.model_dump(mode="json")
+    _check_lesson(dumped.get("lesson"), active)
+    return dumped
 
 
 async def _insert_threat_event(
@@ -290,6 +318,7 @@ def _protection_decided(
     vocabulary: ScoringVocabulary | None,
     values: dict[str, Any] | None,
     attested: bool | None,
+    active: Sequence[ContextSignal],
 ) -> dict[str, Any]:
     """The exact values a protection approval stores (spec §3.6, §4.7 as amended 2026-09-30):
     the operator's ``values`` merged over ``suggested`` and the target's own scope, re-checked
@@ -324,7 +353,41 @@ def _protection_decided(
         raise DecisionRefused("tag_retired", _MESSAGES["tag_retired"], slugs=tuple(retired))
     if all_tags_unmapped({"tags": list(decided.tags), "is_global": decided.is_global}, vocabulary):
         raise _refuse("proposal_tags_unmapped")
-    return decided.model_dump(mode="json")
+    dumped = decided.model_dump(mode="json")
+    _check_lesson(dumped.get("lesson"), active)
+    return dumped
+
+
+def _lesson_decided(
+    proposal: ProposalRecord,
+    vocabulary: ScoringVocabulary | None,
+    values: dict[str, Any] | None,
+    active: Sequence[ContextSignal],
+) -> dict[str, Any]:
+    """The exact lesson an approval stores (spec 2026-10-15-intel-lessons-and-evidence §5): the
+    edit merged over ``suggested``; every tag registered and live; a general lesson reaches
+    somebody (tags or global); and the lesson passes every rule against its own evidence."""
+    try:
+        target = LessonTarget.model_validate(proposal.target)
+        edit = LessonValues.model_validate(values or {})
+        decided = LessonDecided.model_validate(
+            {**_known(proposal.suggested, LessonDecided), **edit.model_dump(exclude_unset=True)}
+        )
+    except ValidationError as exc:
+        raise _refuse("values_out_of_bounds") from exc
+    registry = (
+        vocabulary.registry() if vocabulary is not None else TagRegistry(frozenset(), frozenset())
+    )
+    unknown, retired = membership_problems(list(decided.tags), registry)
+    if unknown:
+        raise DecisionRefused("unknown_tag", _MESSAGES["unknown_tag"], slugs=tuple(unknown))
+    if retired:
+        raise DecisionRefused("tag_retired", _MESSAGES["tag_retired"], slugs=tuple(retired))
+    if target.topic is not None and not decided.tags and not decided.is_global:
+        raise _refuse("values_out_of_bounds")
+    dumped = decided.model_dump(mode="json")
+    _check_lesson(dumped["lesson"], active)
+    return dumped
 
 
 def _question_decided(
@@ -409,6 +472,38 @@ def _question_published(
     return tuple(o.option for o in decided.options) == tuple(live.options) and all(
         live.deductions.get(o.option) == o.deduction for o in decided.options
     )
+
+
+async def _publish_event(
+    conn: AsyncConnection[Any],
+    proposal_id: UUID,
+    event_id: UUID,
+    kind: Literal["threat", "protection"],
+    decided: dict[str, Any],
+    operator: str,
+    active: Sequence[ContextSignal],
+) -> UUID | None:
+    """An approved event's evidence snapshot, and its lesson with its own snapshot when the
+    decision carries one (spec 2026-10-15-intel-lessons-and-evidence §4, §6). In the decision's
+    transaction. Returns the lesson id, or None."""
+    await snapshot_evidence(
+        conn, owner_kind="event", owner_id=event_id, proposal_id=proposal_id, active=active
+    )
+    if decided.get("lesson") is None:
+        return None
+    lesson_id = await insert_lesson(
+        conn,
+        proposal_id=proposal_id,
+        event_id=event_id,
+        kind=kind,
+        topic=None,
+        decided=decided,
+        operator=operator,
+    )
+    await snapshot_evidence(
+        conn, owner_kind="lesson", owner_id=lesson_id, proposal_id=proposal_id, active=active
+    )
+    return lesson_id
 
 
 def _renews_of(proposal: ProposalRecord) -> UUID | None:
@@ -500,10 +595,12 @@ def _approval_decided(
         raise _refuse(_WHY_NOT_REFUSAL[reason])
     if proposal.kind == "quiz_question":
         return _question_decided(proposal, vocabulary, values, research)
+    if proposal.kind == "lesson":
+        return _lesson_decided(proposal, vocabulary, values, active)
     if proposal.kind == "threat_event":
-        return _threat_decided(proposal, vocabulary, values)
+        return _threat_decided(proposal, vocabulary, values, active)
     if proposal.kind == "protection_event":
-        return _protection_decided(proposal, vocabulary, values, attested)
+        return _protection_decided(proposal, vocabulary, values, attested, active)
     try:
         target = WeightChangeTarget.model_validate(proposal.target)
         # MERGED over ``suggested`` (2026-10-06), as a threat's and a protection's edit is: an
@@ -598,6 +695,7 @@ class PostgresDecisionStore:
         applies_regardless_of_location: bool | None = None,
     ) -> Decided:
         event_id: UUID | None = None
+        lesson_id: UUID | None = None
         renews: UUID | None = None
         superseded: list[UUID] = []
         try:
@@ -635,6 +733,9 @@ class PostgresDecisionStore:
                     from_status = "pending"
                     if proposal.kind == "threat_event":
                         event_id = await _insert_threat_event(conn, proposal_id, decided, operator)
+                        lesson_id = await _publish_event(
+                            conn, proposal_id, event_id, "threat", decided, operator, active
+                        )
                         await cur.execute(
                             _APPLY_EVENT_SQL,
                             {
@@ -649,12 +750,72 @@ class PostgresDecisionStore:
                         event_id = await _insert_protection_event(
                             conn, proposal_id, decided, operator, renews=renews, starts=starts
                         )
+                        lesson_id = await _publish_event(
+                            conn, proposal_id, event_id, "protection", decided, operator, active
+                        )
+                        if (
+                            lesson_id is None
+                            and renews is not None
+                            and "lesson" not in (values or {})
+                        ):
+                            # A renewal keeps the lesson it continues unless the decision named
+                            # one, a null included (spec 2026-10-15 §4).
+                            lesson_id = await carry_lesson(
+                                conn,
+                                from_event_id=renews,
+                                to_event_id=event_id,
+                                proposal_id=proposal_id,
+                                operator=operator,
+                            )
+                            if lesson_id is not None:
+                                await snapshot_evidence(
+                                    conn,
+                                    owner_kind="lesson",
+                                    owner_id=lesson_id,
+                                    proposal_id=proposal_id,
+                                    active=active,
+                                )
                         await cur.execute(
                             _APPLY_EVENT_SQL,
                             {
                                 "proposal_id": proposal_id,
                                 "decided": Jsonb(decided),
                                 "applied_ref": str(event_id),
+                                "operator": operator,
+                                "reason": reason,
+                            },
+                        )
+                    elif proposal.kind == "lesson":
+                        lesson_target = LessonTarget.model_validate(proposal.target)
+                        kind = (
+                            "general"
+                            if lesson_target.event_id is None
+                            else await event_kind(conn, lesson_target.event_id)
+                        )
+                        if kind is None:
+                            raise _refuse("proposal_not_pending")  # its event is gone
+                        lesson_id = await insert_lesson(
+                            conn,
+                            proposal_id=proposal_id,
+                            event_id=lesson_target.event_id,
+                            kind=kind,
+                            topic=lesson_target.topic,
+                            decided=decided,
+                            operator=operator,
+                        )
+                        await snapshot_evidence(
+                            conn,
+                            owner_kind="lesson",
+                            owner_id=lesson_id,
+                            proposal_id=proposal_id,
+                            active=active,
+                        )
+                        await cur.execute(
+                            _APPLY_EVENT_SQL,
+                            {
+                                "proposal_id": proposal_id,
+                                "decided": Jsonb(decided),
+                                "applied_ref": str(lesson_id),
                                 "operator": operator,
                                 "reason": reason,
                             },
@@ -709,6 +870,11 @@ class PostgresDecisionStore:
                                 "decided": updated["decided"],
                                 "reason": reason,
                                 **({"event_id": str(event_id)} if event_id is not None else {}),
+                                **(
+                                    {"lesson_id": str(lesson_id)}
+                                    if lesson_id is not None
+                                    else {}
+                                ),
                                 **(
                                     {"superseded": [str(i) for i in superseded]}
                                     if superseded

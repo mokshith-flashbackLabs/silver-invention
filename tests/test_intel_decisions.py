@@ -412,7 +412,8 @@ async def test_approving_a_threat_creates_the_event_from_decided_in_one_transact
     pid = await _threat_approvable(intel_pool)
     decided = await _decide(intel_pool, pid)
     assert (decided.kind, decided.status) == ("threat_event", "applied")
-    assert decided.decided == {**THREAT_SUGGESTED, "tags": ["instagram"]}
+    # Every decided event carries its lesson, None when none was drafted (spec 2026-10-15 §4).
+    assert decided.decided == {**THREAT_SUGGESTED, "tags": ["instagram"], "lesson": None}
     assert decided.applied_ref is not None
     event_id = UUID(decided.applied_ref)
     async with intel_pool.connection() as conn:
@@ -501,6 +502,7 @@ async def test_a_partial_edit_changes_only_what_it_names_and_keeps_the_proposals
         "severity": 5,
         "title": "Edited title",
         "tags": ["instagram"],
+        "lesson": None,
     }
     assert await _scalar(
         intel_pool,

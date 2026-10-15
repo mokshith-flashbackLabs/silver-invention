@@ -52,11 +52,18 @@ WhyNot = Literal[
 ]
 
 APPROVABLE_KINDS: frozenset[str] = frozenset(
-    {"weight_change", "threat_event", "protection_event", "quiz_question"}
+    {"weight_change", "threat_event", "protection_event", "quiz_question", "lesson"}
 )
 # A coverage_gap can only be dismissed (§4.7); a weight_suggestion is never decidable.
 REJECTABLE_KINDS: frozenset[str] = frozenset(
-    {"weight_change", "coverage_gap", "threat_event", "protection_event", "quiz_question"}
+    {
+        "weight_change",
+        "coverage_gap",
+        "threat_event",
+        "protection_event",
+        "quiz_question",
+        "lesson",
+    }
 )
 EVENT_KINDS: frozenset[str] = frozenset({"threat_event", "protection_event"})
 
