@@ -26,6 +26,7 @@ from pydantic import (
 )
 
 from imageshield.intel.bounds import (
+    LESSON_TOPIC_PATTERN,
     MAX_ACTION_LINK_CHARS,
     MAX_ACTION_LINK_LABEL_CHARS,
     MAX_ACTION_STEP_CHARS,
@@ -35,6 +36,13 @@ from imageshield.intel.bounds import (
     MAX_CARD_LINE_CHARS,
     MAX_EVENT_BODY_CHARS,
     MAX_EVENT_TITLE_CHARS,
+    MAX_LESSON_INTRO_CHARS,
+    MAX_LESSON_ITEM_CHARS,
+    MAX_LESSON_ITEMS,
+    MAX_LESSON_LINK_CHARS,
+    MAX_LESSON_LINK_LABEL_CHARS,
+    MAX_LESSON_SECTIONS,
+    MAX_LESSON_TITLE_CHARS,
     MAX_QUESTION_OPTION_CHARS,
     MAX_QUESTION_PROMPT_CHARS,
     MAX_QUESTION_SUBJECT_CHARS,
@@ -160,6 +168,70 @@ class ThreatActionSuggested(_Stored):
         return self
 
 
+LessonSectionKind = Literal["warning_signs", "what_to_do", "how_to_use"]
+
+
+def _lesson_text(value: str, limit: int) -> str:
+    text = normalise(value)
+    if not text or len(text) > limit:
+        raise ValueError(f"must be 1 to {limit} characters")
+    return text
+
+
+class LessonSection(_Stored):
+    kind: LessonSectionKind
+    items: tuple[str, ...] = Field(min_length=1, max_length=MAX_LESSON_ITEMS)
+
+    @field_validator("items")
+    @classmethod
+    def _items(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_lesson_text(item, MAX_LESSON_ITEM_CHARS) for item in value)
+
+
+class LessonLink(_Stored):
+    url: str = Field(max_length=MAX_LESSON_LINK_CHARS)
+    label: str
+
+    @field_validator("url")
+    @classmethod
+    def _https(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("a link must be https")
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def _label(cls, value: str) -> str:
+        return _lesson_text(value, MAX_LESSON_LINK_LABEL_CHARS)
+
+
+class LessonDraft(_Stored):
+    """One lesson, wherever it comes from (spec 2026-10-15-intel-lessons-and-evidence §3). The
+    section headings are not stored here: the backend's playbook words them."""
+
+    title: str
+    intro: str
+    sections: tuple[LessonSection, ...] = Field(min_length=1, max_length=MAX_LESSON_SECTIONS)
+    link: LessonLink | None = None
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, value: str) -> str:
+        return _lesson_text(value, MAX_LESSON_TITLE_CHARS)
+
+    @field_validator("intro")
+    @classmethod
+    def _intro(cls, value: str) -> str:
+        return _lesson_text(value, MAX_LESSON_INTRO_CHARS)
+
+    @model_validator(mode="after")
+    def _distinct_sections(self) -> LessonDraft:
+        kinds = [s.kind for s in self.sections]
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("each section kind appears at most once")
+        return self
+
+
 class ThreatEventSuggested(_Stored):
     """A threat_event's ``suggested``: the model's numbers and text, kept forever (§3.6). The
     bounds are §4.5's, and they hold for an operator's final values too (ThreatEventDecided).
@@ -179,6 +251,8 @@ class ThreatEventSuggested(_Stored):
     expires_in_days: StrictInt = Field(ge=THREAT_EXPIRES_MIN_DAYS, le=THREAT_EXPIRES_MAX_DAYS)
     # The model's drafted recommended action, or none (spec 2026-10-06-intel-threat-action).
     action: ThreatActionSuggested | None = None
+    # The event's lesson (spec 2026-10-15-intel-lessons-and-evidence §4), or none.
+    lesson: LessonDraft | None = None
 
     @field_validator("title")
     @classmethod
@@ -221,6 +295,8 @@ class ThreatEventValues(_Stored):
     severity: StrictInt | None = None
     expires_in_days: StrictInt | None = None
     tags: tuple[str, ...] | None = None
+    # The whole lesson, replaced as one; an explicit null removes it (spec 2026-10-15 §4).
+    lesson: LessonDraft | None = None
 
 
 def _one_scope(tags: tuple[str, ...], is_global: bool) -> None:
@@ -259,6 +335,8 @@ class ProtectionEventSuggested(_Stored):
     body: str = Field(default="", max_length=MAX_EVENT_BODY_CHARS)
     strength: StrictInt = Field(ge=PROTECTION_STRENGTH_MIN, le=PROTECTION_STRENGTH_MAX)
     review_in_days: StrictInt = Field(ge=PROTECTION_REVIEW_MIN_DAYS, le=PROTECTION_REVIEW_MAX_DAYS)
+    # The protection's lesson (spec 2026-10-15-intel-lessons-and-evidence §4), or none.
+    lesson: LessonDraft | None = None
 
     @field_validator("title")
     @classmethod
@@ -306,6 +384,8 @@ class ProtectionEventValues(_Stored):
     review_in_days: StrictInt | None = None
     tags: tuple[str, ...] | None = None
     is_global: StrictBool | None = None
+    # The whole lesson, replaced as one; an explicit null removes it (spec 2026-10-15 §4).
+    lesson: LessonDraft | None = None
 
 
 class QuizQuestionTarget(_Stored):
@@ -426,6 +506,44 @@ class QuizQuestionValues(_Stored):
     options: tuple[QuestionOptionValues, ...] | None = None
 
 
+class LessonTarget(_Stored):
+    """What a lesson proposal is about (spec 2026-10-15 §5): a topic for a general lesson, or the
+    live event a ``lesson_draft`` run drafted it for. Exactly one."""
+
+    topic: str | None = Field(default=None, pattern=LESSON_TOPIC_PATTERN)
+    event_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> LessonTarget:
+        if (self.topic is None) == (self.event_id is None):
+            raise ValueError("a lesson is about a topic or an event, exactly one")
+        return self
+
+
+class LessonSuggested(_Stored):
+    lesson: LessonDraft
+    tags: tuple[str, ...] = ()
+    is_global: StrictBool = False
+
+    @field_validator("tags")
+    @classmethod
+    def _slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _distinct_slugs(value)
+
+
+class LessonDecided(LessonSuggested):
+    """The exact lesson an approval stores and inserts into intel_lessons."""
+
+
+class LessonValues(_Stored):
+    """An operator's edit of a lesson approval: any subset of ``{lesson, tags, is_global}``. The
+    lesson is replaced whole."""
+
+    lesson: LessonDraft | None = None
+    tags: tuple[str, ...] | None = None
+    is_global: StrictBool | None = None
+
+
 @dataclass(frozen=True)
 class OpenQuestion:
     """A pending, approved or recently dismissed quiz_question, as generation reads it: for the
@@ -511,7 +629,12 @@ class NewProposal:
     (intel/proposal_store.py), when the generation-time check could not see that proposal."""
 
     kind: Literal[
-        "weight_change", "coverage_gap", "threat_event", "protection_event", "quiz_question"
+        "weight_change",
+        "coverage_gap",
+        "threat_event",
+        "protection_event",
+        "quiz_question",
+        "lesson",
     ]
     target: dict[str, Any]
     suggested: dict[str, Any]
@@ -696,18 +819,28 @@ DecisionRefusal = Literal[
     "tag_retired",
     "question_incomplete",
     "question_key_taken",
+    "lesson_invalid",
 ]
 
 
 class DecisionRefused(Exception):
-    """A decision the transaction refused. ``code`` is the §4.7 error code, verbatim, and
-    ``slugs`` names the offending tags of ``unknown_tag`` / ``tag_retired`` (§3.1)."""
+    """A decision the transaction refused. ``code`` is the §4.7 error code, verbatim, ``slugs``
+    names the offending tags of ``unknown_tag`` / ``tag_retired`` (§3.1), and ``problems`` names
+    each field and rule of a ``lesson_invalid`` (spec 2026-10-15 §3)."""
 
-    def __init__(self, code: DecisionRefusal, message: str, *, slugs: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        code: DecisionRefusal,
+        message: str,
+        *,
+        slugs: tuple[str, ...] = (),
+        problems: tuple[dict[str, str], ...] = (),
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.slugs = slugs
+        self.problems = problems
 
 
 @dataclass(frozen=True)

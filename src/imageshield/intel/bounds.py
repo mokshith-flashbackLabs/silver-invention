@@ -187,3 +187,19 @@ PUBLISHER_ORGANISATIONS: dict[str, tuple[str, ...]] = {
 # compare a proposal against at most OVERLAP_POOL_MAX pending proposals, newest first.
 OVERLAP_MIN_SHARE = 0.5
 OVERLAP_POOL_MAX = 500
+
+# ── lessons (spec 2026-10-15-intel-lessons-and-evidence §3) ──────────────────
+# A lesson is user-facing copy once approved: dropped past a bound, never truncated. The backend's
+# lesson schema carries the same numbers (image_backend src/insights/copy.ts).
+MAX_LESSON_TITLE_CHARS = 60
+MAX_LESSON_INTRO_CHARS = 400
+MAX_LESSON_ITEM_CHARS = 160
+MAX_LESSON_ITEMS = 5
+MAX_LESSON_SECTIONS = 2
+MAX_LESSON_LINK_CHARS = 500
+MAX_LESSON_LINK_LABEL_CHARS = 40
+LESSON_TOPIC_PATTERN = r"^[a-z][a-z0-9_]{1,59}$"
+# Open lesson topics a generation call is shown, newest first. A prompt bound, never a rule.
+MAX_PROMPT_LESSON_TOPICS = 200
+# Events one lesson_draft run drafts for; a request naming more ids is refused at the route.
+MAX_LESSON_DRAFT_EVENTS = 20

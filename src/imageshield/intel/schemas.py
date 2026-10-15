@@ -206,6 +206,49 @@ class ProposedQuizQuestion(_Out):
     signal_ids: list[str] = Field(default_factory=list)
 
 
+class ProposedLessonSection(_Out):
+    kind: Literal["warning_signs", "what_to_do", "how_to_use"]
+    items: list[str] = Field(default_factory=list)
+
+
+class ProposedLesson(_Out):
+    """propose-v14 (spec 2026-10-15-intel-lessons-and-evidence §3): a lesson as the model drafts it.
+    No bounds here, for ProposedWeightChange's reason: intel/lessons.py checks them and drops the
+    lesson, never the event it belongs to."""
+
+    title: str
+    intro: str
+    sections: list[ProposedLessonSection] = Field(default_factory=list)
+    link_url: str | None = None
+    link_label: str | None = None
+
+
+class ProposedEventLesson(_Out):
+    """``event`` is the key the call was shown: T1, P1… for an event proposed in this run, or an
+    event id in a lesson_draft run."""
+
+    event: str
+    lesson: ProposedLesson
+
+
+class ProposedGeneralLesson(_Out):
+    topic: str
+    tags: list[str] = Field(default_factory=list)
+    is_global: bool = False
+    lesson: ProposedLesson
+    rationale: str
+    signal_ids: list[str] = Field(default_factory=list)
+
+
+class ProposalLessonsOutput(_Out):
+    """propose-v14: the lessons call, the proposal step's third (the two halves sit under the
+    grammar ceiling; splitting further is the remedy, tests/test_intel_model.py). Also the whole
+    answer of a lesson_draft run, which returns event_lessons only."""
+
+    event_lessons: list[ProposedEventLesson] = Field(default_factory=list)
+    lessons: list[ProposedGeneralLesson] = Field(default_factory=list)
+
+
 class ProposalQuizOutput(_Out):
     """propose-v13 (2026-10-13): the quiz half of the proposal step, its own structured call.
 
@@ -241,3 +284,6 @@ class ProposalOutput(_Out):
     protection_events: list[ProposedProtectionEvent] = Field(default_factory=list)
     # propose-v12: optional, so an answer without it still parses.
     quiz_questions: list[ProposedQuizQuestion] = Field(default_factory=list)
+    # propose-v14: optional, so an answer without them still parses.
+    event_lessons: list[ProposedEventLesson] = Field(default_factory=list)
+    lessons: list[ProposedGeneralLesson] = Field(default_factory=list)

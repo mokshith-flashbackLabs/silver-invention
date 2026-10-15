@@ -26,6 +26,7 @@ GOOD: dict[str, Any] = {
     "expires_in_days": 30,
     "tags": ["instagram"],
     "action": None,
+    "lesson": None,
 }
 
 

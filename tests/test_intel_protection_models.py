@@ -26,6 +26,7 @@ GOOD: dict[str, Any] = {
     "tags": ["instagram"],
     "is_global": False,
     "applies_regardless_of_location": True,
+    "lesson": None,
 }
 
 
@@ -73,7 +74,14 @@ def test_the_location_attestation_is_required() -> None:
 
 
 def test_suggested_is_the_title_body_strength_and_review_period_only() -> None:
-    fields = {"title": GOOD["title"], "body": GOOD["body"], "strength": 2, "review_in_days": 180}
+    # The lesson (spec 2026-10-15 §4) is part of every suggestion, None when none was drafted.
+    fields = {
+        "title": GOOD["title"],
+        "body": GOOD["body"],
+        "strength": 2,
+        "review_in_days": 180,
+        "lesson": None,
+    }
     assert ProtectionEventSuggested.model_validate(fields).model_dump() == fields
     with pytest.raises(ValidationError):
         ProtectionEventSuggested.model_validate({**fields, "tags": ["instagram"]})
