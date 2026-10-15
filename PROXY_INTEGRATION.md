@@ -1357,6 +1357,9 @@ feedback signal and a new `hit_status` value threaded through both `v_person_hit
 | `svc.v_person_recommendations` *(0023)* | `rec_id`, `person_ref`, `kind`, `params`, `status`, `source_event_id`, `created_at`, `completed_at`, `expires_at` — **granted, no longer written (2026-09-24)** |
 | `svc.v_person_threat_context` *(0023)* | `person_ref`, `event_id`, `kind`, `title`, `body`, `severity`, `starts_at`, `expires_at` — pre-filtered to `status = 'active' AND expires_at > now()`; a `draft` or `retracted` event never appears here |
 | `svc.v_articles` *(0026)* | `article_id`, `title`, `summary`, `body`, `images`, `sources`, `published_at`, `updated_at` — published rows only; operator content for every user, no person column |
+| `svc.v_evidence` *(0055)* | `owner_kind` (`event` \| `lesson`), `owner_id`, `document_id`, `publisher_domain`, `document_title`, `published_at` (nullable), `excerpt_id`, `quote`, `link_url` (the document's final URL when its source is vetted, `trust = 'listed'`; NULL for every web-search find), `independent_sources` (integer, snapshotted at approval, recomputed on a retraction), `approved_at`. One row per quoted excerpt of an approved event or lesson; a retracted signal's rows leave the view at once. Required by our `/readyz`; optional on yours |
+| `svc.v_lessons` *(0055)* | `lesson_id`, `event_id` (NULL for a general lesson), `kind` (`threat` \| `protection` \| `general`), `topic` (a general lesson's slug, else NULL), `title` (≤ 60), `intro` (≤ 400), `sections` (JSONB array of `{kind: warning_signs \| what_to_do \| how_to_use, items: string[1..5]}`, 1–2, each kind once), `link_url`, `link_label` (both NULL or both set; the link is a cited vetted page), `tags` (`text[]`), `is_global`, `approved_at`. Live lessons only: not retired, and an event's lesson only while its event is live. Required by our `/readyz`; optional on yours |
+| `svc.v_intel_weekly_totals` *(0055)* | `week_start` (DATE, a Monday, UTC), `documents_read`, `publishers`, `risks_found` (active `risk_up` signals), `proposed`, `approved`, `rejected` (threat, protection and lesson proposals). Counts only: no title, no URL, no operator. Required by our `/readyz`; optional on yours |
 | `svc.v_active_scoped_events` *(0042)* | `event_id`, `direction`, `kind`, `title`, `body`, `magnitude`, `tags`, `is_global`, `starts_at`, `ends_at` — **events, never people**: the threat half is active, started, unexpired threats carrying at least one tag; since 0044 (step 4) the protection half joins as a UNION: `direction` and `kind` `'protection'`, `magnitude` the strength, `ends_at` the review date, `tags` empty on a global credit, `body` always `''`. Required by our `/readyz`; optional on yours |
 
 **`v_person_score`, `v_person_score_events` and `v_person_recommendations` write no data since
@@ -1479,6 +1482,8 @@ GRANT SELECT ON svc.v_articles TO imageshield_proxy_ro;
 GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
 -- 0044 re-created the view with CREATE OR REPLACE and re-issued the grant:
 GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
+-- 0055 (2026-10-15), same role, same idiom:
+GRANT SELECT ON svc.v_evidence, svc.v_lessons, svc.v_intel_weekly_totals TO imageshield_proxy_ro;
 ```
 
 **`SELECT` on the ten views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A

@@ -52,7 +52,11 @@ and again at decision (`422 lesson_invalid`, `problems` naming the field and the
 
 - `ThreatEventSuggested` and `ProtectionEventSuggested` gain `lesson: LessonDraft | None`. The propose
   step drafts one for every threat and protection it proposes, from that proposal's own evidence;
-  `None` only when the model cannot back one, and the proposal read says so (`lesson_missing: true`).
+  `None` only when the model cannot back one. *Refined while planning:* the proposal read shows
+  `suggested.lesson: null`, which the console reads as no lesson drafted, and the run's outcome counts
+  it (`lesson_missing`). The propose step drafts lessons in a THIRD structured call
+  (`ProposalLessonsOutput`): the two existing halves sit under the API's grammar ceiling, and their
+  size pin says splitting further is the remedy.
 - **Decision**: the existing `POST /v1/admin/intel/proposals/{proposal_id}/decision` takes
   `values.lesson`: a whole lesson replaces the drafted one, `null` removes it, absent keeps it. The
   approved lesson is written to `intel_lessons` (§8) **in the decision's transaction**, beside the
@@ -103,8 +107,10 @@ one organisation), so it cannot be a view expression. So **the decision snapshot
 - **A retraction updates it.** `POST /v1/admin/intel/signals/{signal_id}/retract` removes that
   signal's rows from every owner that cites it and recomputes each owner's `independent_sources` in
   the same transaction, so a retracted article never reaches a report.
-- **Events approved before this change** get theirs from a one-off script,
-  `scripts/backfill_published_evidence.py` (idempotent), run once per environment after the migration.
+- **Events approved before this change** get theirs from a one-off CLI,
+  `python -m imageshield.intel.backfill_evidence` (idempotent), run once per environment after the
+  migration. *Corrected while planning:* this named `scripts/backfill_published_evidence.py`; this
+  repo keeps one-shot CLIs as modules, like `search/retention.py`.
 
 ## 7. The week's research totals
 
@@ -172,10 +178,11 @@ view.
    snapshot on decision). Then `scripts/backfill_published_evidence.py` once.
 2. Then the backend half.
 
-Rollback: the backend first, then services. 0055's down refuses while `intel_lessons` holds a row, the
-guard 0077's down uses on the backend for push units, so an approved lesson is never dropped by a
-routine rollback. Where lessons exist, rolling back the code is enough: the tables and views are
-inert without a reader.
+Rollback: the backend first, then services, then 0055's down. *Corrected 2026-10-15 while
+planning:* this said the down refuses while `intel_lessons` holds a row. It DELETES the lesson rows,
+the lesson proposals and the `lesson_draft` runs instead (0053/0054 precedent), detaching their
+`provider_calls` spend rows rather than deleting them: every DB test fixture migrates the shared
+database down, so a refusing down would fail the suite.
 
 ## 12. Not in this change
 

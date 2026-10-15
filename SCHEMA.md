@@ -872,6 +872,17 @@ raises `InsufficientPrivilege`.
   same predicate `LIVENESS_MAX_ATTEMPTS_24H` is enforced against in `liveness/store.py` — two clocks
   means the proxy's pre-check passes and our refusal fires.
 
+**The weekly report's views (0055, spec 2026-10-15-intel-lessons-and-evidence §8).**
+`svc.v_evidence` reads `intel_published_owners` (one row per approved event or lesson:
+`independent_sources`, snapshotted at approval because the count is Python, and recomputed by a
+retraction) and `intel_published_evidence` (one row per cited excerpt), joined to ACTIVE signals
+only, so a retracted article leaves the view at once; `link_url` is set only for a `trust = 'listed'`
+document. `svc.v_lessons` reads `intel_lessons` (an event's lesson or a general one, soft-retired,
+one live per event and per topic) and shows a lesson only while it is unretired and, for an event's,
+while its event is live. `svc.v_intel_weekly_totals` counts documents, publishers, active `risk_up`
+signals and threat/protection/lesson proposals per Mon–Sun week. All three: events and lessons,
+never people.
+
 **Open question, deliberately not decided here:** these views translate our vocabulary into the
 proxy's (`infringements` → `hits`, `attestations` → `matches`). Legitimate for a view, and it also
 freezes the split permanently. Worth a deliberate choice while there is no production data — put to
