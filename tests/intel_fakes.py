@@ -26,6 +26,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.evidence_store import DocumentRecord, PostgresEvidenceStore, SignalRecord
 from imageshield.intel.fetch_client import FetchFailure, TextFetch
+from imageshield.intel.lesson_store import PostgresLessonStore
 from imageshield.intel.limits import QuestionLimits, SearchLimits
 from imageshield.intel.model import ModelCall, ModelUnavailable, WebResult
 from imageshield.intel.models import Run, Vocabulary
@@ -369,6 +370,7 @@ def make_deps(
         max_calls_per_run=max_calls_per_run,
         max_document_chars=max_document_chars,
         questions=PostgresQuestionStore(pool),
+        lessons=PostgresLessonStore(pool),
         max_calls_per_suggestion_run=max_calls_per_suggestion_run,
         # One at a time unless a test asks for more: the tests written before reads ran side by
         # side pin the order pages are fetched in, which concurrency makes a race.

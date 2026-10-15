@@ -45,6 +45,7 @@ from imageshield.http.logging import configure_logging
 from imageshield.intel.config import IntelConfig, load_intel_config
 from imageshield.intel.evidence_store import PostgresEvidenceStore
 from imageshield.intel.fetch_client import HttpTextFetcher
+from imageshield.intel.lesson_store import PostgresLessonStore
 from imageshield.intel.model import ClaudeIntelModel, IntelModel
 from imageshield.intel.models import Run
 from imageshield.intel.pipeline import PipelineDeps, RunResult, run
@@ -428,6 +429,7 @@ async def run_forever(config: IntelConfig) -> None:
         threat_recency_days=config.intel_threat_recency_days,
         max_document_chars=config.intel_max_document_chars,
         questions=PostgresQuestionStore(pool),
+        lessons=PostgresLessonStore(pool),
         max_calls_per_suggestion_run=config.intel_max_calls_per_suggestion_run,
         source_read_concurrency=config.intel_source_read_concurrency,
         limits=config.search_limits(),

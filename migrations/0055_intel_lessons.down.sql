@@ -13,6 +13,9 @@ DELETE FROM intel_proposal_signals
 DELETE FROM intel_proposals WHERE kind = 'lesson';
 DELETE FROM intel_run_events
  WHERE run_id IN (SELECT run_id FROM intel_runs WHERE kind = 'lesson_draft');
+-- The spend of their model calls stays; only the link to the run goes (a call may name no run).
+UPDATE provider_calls SET intel_run_id = NULL
+ WHERE intel_run_id IN (SELECT run_id FROM intel_runs WHERE kind = 'lesson_draft');
 DELETE FROM intel_runs WHERE kind = 'lesson_draft';
 ALTER TABLE intel_runs DROP CONSTRAINT intel_runs_kind_valid;
 ALTER TABLE intel_runs ADD CONSTRAINT intel_runs_kind_valid

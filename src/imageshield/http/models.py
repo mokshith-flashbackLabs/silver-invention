@@ -28,6 +28,7 @@ from imageshield.enrolment.models import SENTINEL_CONSENT_REF
 from imageshield.intel.bounds import (
     DEDUCTION_MAX,
     DEDUCTION_MIN,
+    MAX_LESSON_DRAFT_EVENTS,
     MAX_QUERY_TEXT_CHARS,
     MAX_QUESTION_OPTIONS,
     MAX_SUGGESTION_SOURCES,
@@ -1018,6 +1019,17 @@ class IntelRetractRequest(ServiceModel):
     operator: str = Field(min_length=1, max_length=64)
 
 
+class IntelLessonDraftRequest(ServiceModel):
+    """``POST /v1/admin/intel/lesson-drafts`` (spec 2026-10-15-intel-lessons-and-evidence §5):
+    the live events to draft lessons for, or none for every live event that has no lesson."""
+
+    event_ids: list[UUID] = Field(default_factory=list, max_length=MAX_LESSON_DRAFT_EVENTS)
+    operator: str = Field(min_length=1, max_length=64)
+
+
+IntelLessonStatus = Literal["live", "retired"]
+
+
 class IntelVocabTag(ServiceModel):
     slug: str = Field(pattern=TAG_SLUG_RE.pattern)
     label: str
@@ -1092,6 +1104,7 @@ IntelProposalKind = Literal[
     "weight_suggestion",
     "coverage_gap",
     "quiz_question",
+    "lesson",
 ]
 IntelProposalStatus = Literal[
     "pending", "approved", "rejected", "superseded", "applied", "delivered"
@@ -1109,6 +1122,7 @@ IntelRunKind = Literal[
     "gap_regenerate",
     "source_proposal",
     "source_validation",
+    "lesson_draft",
 ]
 IntelRunStatus = Literal["queued", "running", "completed", "failed", "refused"]
 # The backend's questionParams regex: a quiz question key as the backend names it.

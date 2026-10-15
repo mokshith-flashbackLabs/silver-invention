@@ -53,6 +53,7 @@ from imageshield.http.routes.search import router as search_router
 from imageshield.http.routes.subjects import router as subjects_router
 from imageshield.intel.decisions import PostgresDecisionStore
 from imageshield.intel.evidence_store import PostgresEvidenceStore
+from imageshield.intel.lesson_store import PostgresLessonStore
 from imageshield.intel.proposal_store import PostgresProposalStore
 from imageshield.intel.protection_store import PostgresProtectionStore
 from imageshield.intel.question_store import PostgresQuestionStore
@@ -137,6 +138,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.intel_store = PostgresIntelStore(pool)
     if getattr(app.state, "protection_store", None) is None:
         app.state.protection_store = PostgresProtectionStore(pool)
+    if getattr(app.state, "lesson_store", None) is None:
+        app.state.lesson_store = PostgresLessonStore(pool)
     if getattr(app.state, "evidence_store", None) is None:
         app.state.evidence_store = PostgresEvidenceStore(pool)
     if getattr(app.state, "proposal_store", None) is None:

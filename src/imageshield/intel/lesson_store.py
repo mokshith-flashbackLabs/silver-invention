@@ -5,11 +5,15 @@ its evidence snapshot in ONE transaction."""
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Literal
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.corroboration import independent_sources
 from imageshield.intel.proposal_models import ContextSignal
@@ -154,3 +158,125 @@ async def recompute_after_retraction(conn: AsyncConnection[Any], signal_id: UUID
             (independent_sources(active), kind, owner),
         )
     return len(owners)
+
+
+RetireOutcome = Literal["retired", "already_retired", "not_found"]
+
+_LESSON_COLUMNS = """lesson_id, proposal_id, event_id, kind, topic, title, intro, sections,
+    link_url, link_label, tags, is_global, approved_by, approved_at, retired_by, retired_at,
+    retire_reason"""
+
+# Live events with a proposal (so with evidence), no live lesson, and no lesson pending for them.
+_DRAFT_EVENTS_SQL = """
+    SELECT e.event_id, e.kind, e.title, e.body, e.proposal_id FROM (
+      SELECT event_id, 'threat' AS kind, title, body, proposal_id FROM threat_events
+       WHERE status = 'active' AND starts_at <= now() AND expires_at > now()
+         AND proposal_id IS NOT NULL
+      UNION ALL
+      SELECT event_id, 'protection', title, body, proposal_id FROM protection_events
+       WHERE status = 'active' AND starts_at <= now() AND review_by > now()
+    ) e
+     WHERE (cardinality(%(ids)s::uuid[]) = 0 OR e.event_id = ANY(%(ids)s::uuid[]))
+       AND NOT EXISTS (SELECT 1 FROM intel_lessons l
+                        WHERE l.event_id = e.event_id AND l.retired_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM intel_proposals p
+                        WHERE p.kind = 'lesson' AND p.status = 'pending'
+                          AND p.target->>'event_id' = e.event_id::text)
+     ORDER BY e.event_id
+     LIMIT %(limit)s
+"""
+
+
+@dataclass(frozen=True)
+class DraftEvent:
+    """A live event a lesson_draft run may draft for, with its proposal's active evidence."""
+
+    event_id: UUID
+    kind: Literal["threat", "protection"]
+    title: str
+    body: str
+    signals: tuple[ContextSignal, ...]
+
+
+class LessonStore(Protocol):
+    async def queue_draft(self, *, event_ids: Sequence[UUID], operator: str) -> UUID: ...
+    async def list_lessons(
+        self, *, live: bool, limit: int, cursor: tuple[datetime, UUID] | None
+    ) -> list[dict[str, Any]]: ...
+    async def retire(self, lesson_id: UUID, *, operator: str, reason: str) -> RetireOutcome: ...
+    async def draft_events(self, event_ids: Sequence[UUID], *, limit: int) -> list[DraftEvent]: ...
+
+
+class PostgresLessonStore:
+    """The lesson library, retirement, and lesson_draft runs (spec 2026-10-15 §5)."""
+
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        self._pool = pool
+
+    async def queue_draft(self, *, event_ids: Sequence[UUID], operator: str) -> UUID:
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "INSERT INTO intel_runs (kind, request, requested_by)"
+                " VALUES ('lesson_draft', %s, %s) RETURNING run_id",
+                (Jsonb({"event_ids": [str(e) for e in event_ids]}), operator),
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        run_id: UUID = row[0]
+        return run_id
+
+    async def list_lessons(
+        self, *, live: bool, limit: int, cursor: tuple[datetime, UUID] | None
+    ) -> list[dict[str, Any]]:
+        where = "retired_at IS NULL" if live else "retired_at IS NOT NULL"
+        after = " AND (approved_at, lesson_id) < (%(at)s, %(id)s)" if cursor is not None else ""
+        params: dict[str, Any] = {"limit": limit}
+        if cursor is not None:
+            params.update(at=cursor[0], id=cursor[1])
+        async with self._pool.connection() as conn:
+            cur = conn.cursor(row_factory=dict_row)
+            await cur.execute(
+                f"SELECT {_LESSON_COLUMNS} FROM intel_lessons WHERE {where}{after}"
+                " ORDER BY approved_at DESC, lesson_id DESC LIMIT %(limit)s",
+                params,
+            )
+            return await cur.fetchall()
+
+    async def retire(self, lesson_id: UUID, *, operator: str, reason: str) -> RetireOutcome:
+        """Retire a live lesson, audited in the same transaction; it leaves svc.v_lessons at once.
+        A lesson already retired answers already_retired, an unknown id not_found."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "UPDATE intel_lessons SET retired_by = %s, retired_at = now(), retire_reason = %s"
+                " WHERE lesson_id = %s AND retired_at IS NULL RETURNING 1",
+                (operator, reason, lesson_id),
+            )
+            if await cur.fetchone() is not None:
+                await conn.execute(
+                    "INSERT INTO audit_log (actor_type, action, resource_id, metadata)"
+                    " VALUES ('operator', 'intel.lesson_retired', %s, %s)",
+                    (lesson_id, Jsonb({"operator": operator, "reason": reason})),
+                )
+                return "retired"
+            cur = await conn.execute(
+                "SELECT 1 FROM intel_lessons WHERE lesson_id = %s", (lesson_id,)
+            )
+            return "already_retired" if await cur.fetchone() is not None else "not_found"
+
+    async def draft_events(self, event_ids: Sequence[UUID], *, limit: int) -> list[DraftEvent]:
+        from imageshield.intel.proposal_store import fetch_linked_signals
+
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(_DRAFT_EVENTS_SQL, {"ids": list(event_ids), "limit": limit})
+            rows = await cur.fetchall()
+            linked = await fetch_linked_signals(conn, [row[4] for row in rows])
+        return [
+            DraftEvent(
+                event_id=row[0],
+                kind=row[1],
+                title=row[2],
+                body=row[3] or "",
+                signals=tuple(s for s in linked[row[4]] if s.status == "active"),
+            )
+            for row in rows
+        ]

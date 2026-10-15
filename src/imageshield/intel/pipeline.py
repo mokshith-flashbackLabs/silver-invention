@@ -91,6 +91,7 @@ from imageshield.intel.generation import (
     prompt_signal,
     validate_proposals,
 )
+from imageshield.intel.lesson_store import LessonStore
 from imageshield.intel.limits import QuestionLimits, SearchLimits
 from imageshield.intel.metering import metered
 from imageshield.intel.model import IntelModel, ModelCall, WebResult
@@ -193,6 +194,9 @@ class PipelineDeps:
     threat_recency_days: int
     limits: SearchLimits
     question_limits: QuestionLimits
+    # Lessons (spec 2026-10-15-intel-lessons-and-evidence §5): the store a lesson_draft run reads
+    # its events and their evidence from.
+    lessons: LessonStore
 
 
 @dataclass(frozen=True)
@@ -335,6 +339,12 @@ async def run(claimed: Run, deps: PipelineDeps) -> RunResult:
                 ctx.regenerate = GapRegenerateRequest.model_validate(claimed.request)
             except ValidationError:
                 return RunResult("failed", ctx.outcome(), "request_unreadable")
+        elif claimed.kind == "lesson_draft":
+            # One model call and no reading (spec 2026-10-15 §5): the run returns its own result.
+            from imageshield.intel.lessons import run_lesson_draft
+
+            result: RunResult = await run_lesson_draft(ctx)
+            return result
         elif claimed.kind == "renewal_check":
             # No model call at all (spec §4.8): the run returns its own result and never
             # reaches generation below.

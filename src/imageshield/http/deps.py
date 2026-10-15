@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from imageshield.enrolment.store import EnrolmentStore
     from imageshield.intel.decisions import DecisionStore
     from imageshield.intel.evidence_store import EvidenceStore
+    from imageshield.intel.lesson_store import LessonStore
     from imageshield.intel.proposal_store import ProposalStore
     from imageshield.intel.protection_store import ProtectionStore
     from imageshield.intel.question_store import QuestionStore
@@ -162,6 +163,11 @@ def get_crop_client(request: Request) -> FetcherCropClient:
 
 def get_protection_store(request: Request) -> ProtectionStore:
     store: ProtectionStore = _required_state(request, "protection_store")  # type: ignore[assignment]
+    return store
+
+
+def get_lesson_store(request: Request) -> LessonStore:
+    store: LessonStore = _required_state(request, "lesson_store")  # type: ignore[assignment]
     return store
 
 

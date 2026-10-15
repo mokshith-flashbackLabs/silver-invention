@@ -31,6 +31,7 @@ from imageshield.http.deps import (
     get_decision_store,
     get_evidence_store,
     get_intel_store,
+    get_lesson_store,
     get_proposal_store,
     get_protection_store,
     get_question_store,
@@ -41,6 +42,8 @@ from imageshield.http.models import (
     IntelAppliedRequest,
     IntelDecisionRequest,
     IntelDocumentRequest,
+    IntelLessonDraftRequest,
+    IntelLessonStatus,
     IntelOperatorRequest,
     IntelProposalKind,
     IntelProposalStatus,
@@ -58,6 +61,7 @@ from imageshield.http.models import (
 from imageshield.intel.bounds import DEFAULT_SOURCE_CHECK_EVERY_HOURS, PROPOSAL_ORIGIN_DAYS
 from imageshield.intel.decisions import DecisionStore
 from imageshield.intel.evidence_store import EvidenceStore
+from imageshield.intel.lesson_store import LessonStore
 from imageshield.intel.models import Run
 from imageshield.intel.pii import contains_pii
 from imageshield.intel.proposal_models import DecisionRefused
@@ -442,6 +446,49 @@ async def retract_protection_event(
         "also_retracted": list(retraction.also_retracted),
         "renewal_proposals_rejected": list(retraction.renewal_proposals_rejected),
     }
+
+
+# -- lessons (spec 2026-10-15-intel-lessons-and-evidence §5) ------------------
+
+
+@router.post("/lesson-drafts", status_code=202)
+async def draft_lessons(
+    body: IntelLessonDraftRequest, lessons: LessonStore = Depends(get_lesson_store)
+) -> dict[str, UUID]:
+    run_id = await lessons.queue_draft(event_ids=body.event_ids, operator=body.operator)
+    log.info("intel.lesson_draft_queued", run_id=str(run_id), events=len(body.event_ids))
+    return {"run_id": run_id}
+
+
+@router.get("/lessons")
+async def list_intel_lessons(
+    status: IntelLessonStatus = Query(default="live"),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    lessons: LessonStore = Depends(get_lesson_store),
+) -> dict[str, Any]:
+    rows = await lessons.list_lessons(
+        live=status == "live", limit=limit, cursor=_decode_cursor(cursor)
+    )
+    next_cursor = (
+        _encode_cursor(rows[-1]["approved_at"], rows[-1]["lesson_id"])
+        if len(rows) == limit
+        else None
+    )
+    return {"lessons": rows, "next_cursor": next_cursor}
+
+
+@router.post("/lessons/{lesson_id}/retire")
+async def retire_intel_lesson(
+    lesson_id: UUID,
+    body: IntelRetractRequest,
+    lessons: LessonStore = Depends(get_lesson_store),
+) -> dict[str, Any]:
+    outcome = await lessons.retire(lesson_id, operator=body.operator, reason=body.reason)
+    if outcome == "not_found":
+        raise ServiceError(404, "lesson_not_found", "No lesson with this id.", retryable=False)
+    log.info("intel.lesson_retired_via_admin", lesson_id=str(lesson_id), operator=body.operator)
+    return {"lesson_id": lesson_id, "status": "retired"}
 
 
 # -- proposals (step 2) -------------------------------------------------------

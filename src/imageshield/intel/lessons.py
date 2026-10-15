@@ -17,9 +17,13 @@ from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-from imageshield.intel.bounds import LESSON_TOPIC_PATTERN, MAX_RATIONALE_CHARS
+from imageshield.intel.bounds import (
+    LESSON_TOPIC_PATTERN,
+    MAX_LESSON_DRAFT_EVENTS,
+    MAX_RATIONALE_CHARS,
+)
 from imageshield.intel.corroboration import uncorroborated
 from imageshield.intel.pii import mask
 from imageshield.intel.proposal_models import (
@@ -192,3 +196,87 @@ def general_lesson(
         signal_ids=tuple(cited_ids),
         document_keys=tuple(dict.fromkeys(s.document_key for s in cited if s.document_key)),
     )
+
+
+class LessonDraftRequest(BaseModel):
+    """``intel_runs.request`` of a lesson_draft run (spec §5). Never person data."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    event_ids: tuple[UUID, ...] = ()
+
+
+async def run_lesson_draft(ctx: Any) -> Any:
+    """Draft lessons for live events that have none (spec §5). Each becomes a ``lesson``
+    proposal with ``target.event_id``, decided in the queue. One model call, no reading. ``ctx``
+    is pipeline._Ctx and the result a pipeline.RunResult; imported here lazily, as question_runs
+    does, because pipeline imports this module."""
+    from imageshield.intel.generation import prompt_signal
+    from imageshield.intel.pipeline import RunResult, _call_model, _Stop
+    from imageshield.intel.prompts import LESSON_DRAFT_PROMPT_VERSION, lesson_draft_request
+    from imageshield.intel.vocabulary import parse_vocabulary
+
+    try:
+        request = LessonDraftRequest.model_validate(ctx.run.request)
+    except ValidationError:
+        return RunResult("failed", ctx.outcome(), "request_unreadable")
+    events = await ctx.deps.lessons.draft_events(
+        request.event_ids, limit=MAX_LESSON_DRAFT_EVENTS
+    )
+    if not events:
+        ctx.counts["lesson_draft_nothing_to_draft"] += 1
+        return RunResult("completed", ctx.outcome())
+    evidence = {s.signal_id: s for event in events for s in event.signals}
+    system, user = lesson_draft_request(
+        [
+            {
+                "key": str(event.event_id),
+                "kind": event.kind,
+                "title": event.title,
+                "body": event.body,
+                "signal_ids": [str(s.signal_id) for s in event.signals],
+            }
+            for event in events
+        ],
+        [prompt_signal(s) for s in evidence.values()],
+        today=ctx.deps.clock().date().isoformat(),
+    )
+    try:
+        call = await _call_model(
+            ctx, lambda: ctx.deps.model.draft_lessons(system, user), capped=False
+        )
+    except _Stop as stop:
+        return RunResult("refused" if stop.gate else "failed", ctx.outcome(), stop.reason)
+    by_key = {str(event.event_id): event for event in events}
+    proposals: list[NewProposal] = []
+    for item in call.output.event_lessons if call.output is not None else []:
+        event = by_key.get(item.event)
+        if event is None:
+            ctx.counts["lesson_event_unknown"] += 1
+            continue
+        lesson = lesson_from(item.lesson, event.signals, ctx.counts)
+        if lesson is None:
+            continue
+        proposals.append(
+            NewProposal(
+                kind="lesson",
+                target=LessonTarget(event_id=event.event_id).model_dump(
+                    mode="json", exclude_none=True
+                ),
+                suggested=LessonSuggested.model_validate({"lesson": lesson}).model_dump(
+                    mode="json"
+                ),
+                rationale="A lesson drafted for a live event from the evidence it was approved on.",
+                signal_ids=tuple(s.signal_id for s in event.signals),
+            )
+        )
+    vocabulary = parse_vocabulary(ctx.vocabulary) if ctx.vocabulary is not None else None
+    result = await ctx.deps.proposals.write_generated(
+        ctx.run.run_id,
+        proposals,
+        against_scoring_version=vocabulary.scoring_version if vocabulary is not None else "",
+        against_release_no=vocabulary.release_no if vocabulary is not None else 0,
+        model_id=call.answered_by,
+        prompt_version=LESSON_DRAFT_PROMPT_VERSION,
+    )
+    ctx.counts["lessons_drafted"] += 0 if result is None else len(result.written)
+    return RunResult("completed", ctx.outcome())
