@@ -77,7 +77,7 @@ def test_the_thirteen_views_are_all_declared() -> None:
         "v_person_threat_context",
         "v_articles",
         "v_active_scoped_events",
-        # 0055 (spec 2026-10-15-intel-lessons-and-evidence §8): the weekly report's lessons and evidence.
+        # 0055 (spec 2026-10-15-intel-lessons-and-evidence §8): lessons and evidence.
         "v_evidence",
         "v_lessons",
         "v_intel_weekly_totals",
