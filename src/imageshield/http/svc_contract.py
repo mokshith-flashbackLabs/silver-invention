@@ -221,6 +221,44 @@ EXPECTED_VIEWS: dict[str, dict[str, str]] = {
         # 0049 (2026-10-08): the credit a renewal continues, appended; NULL for a threat.
         "renews_event_id": "uuid",
     },
+    # ── 0055: the weekly report's lessons and evidence (spec 2026-10-15) ───────────
+    # Events and lessons, never people. The backend reads all three as optional.
+    "v_evidence": {
+        "owner_kind": "text",
+        "owner_id": "uuid",
+        "document_id": "uuid",
+        "publisher_domain": "text",
+        "document_title": "text",
+        "published_at": "timestamp with time zone",
+        "excerpt_id": "uuid",
+        "quote": "text",
+        "link_url": "text",
+        "independent_sources": "integer",
+        "approved_at": "timestamp with time zone",
+    },
+    "v_lessons": {
+        "lesson_id": "uuid",
+        "event_id": "uuid",
+        "kind": "text",
+        "topic": "text",
+        "title": "text",
+        "intro": "text",
+        "sections": "jsonb",
+        "link_url": "text",
+        "link_label": "text",
+        "tags": "text[]",
+        "is_global": "boolean",
+        "approved_at": "timestamp with time zone",
+    },
+    "v_intel_weekly_totals": {
+        "week_start": "date",
+        "documents_read": "integer",
+        "publishers": "integer",
+        "risks_found": "integer",
+        "proposed": "integer",
+        "approved": "integer",
+        "rejected": "integer",
+    },
 }
 
 # LEFT JOIN to pg_attribute so a relation whose columns have all been dropped
