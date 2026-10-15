@@ -38,9 +38,23 @@ async def _two_signals(pool: AsyncConnectionPool) -> list[UUID]:
     """The live quiz (Instagram mapped to instagram, so an event on it reaches somebody) and two
     corroborating signals on it."""
     await seed_quiz_vocabulary(pool)
+    # Fixed quotes with no digit: unique_quote's hex words can carry one, which would make a
+    # figure in a test lesson read as quoted by chance.
     return [
-        await seed_signal(pool, tags=("instagram",), publisher="a.example", category="incident"),
-        await seed_signal(pool, tags=("instagram",), publisher="b.example", category="incident"),
+        await seed_signal(
+            pool,
+            tags=("instagram",),
+            publisher="a.example",
+            category="incident",
+            quote="Scammers pose as known brands to reach creators with offers.",
+        ),
+        await seed_signal(
+            pool,
+            tags=("instagram",),
+            publisher="b.example",
+            category="incident",
+            quote="A fake sign-in page then steals the account of the channel owner.",
+        ),
     ]
 
 
