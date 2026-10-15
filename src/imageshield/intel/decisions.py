@@ -766,6 +766,7 @@ class PostgresDecisionStore:
                                 to_event_id=event_id,
                                 proposal_id=proposal_id,
                                 operator=operator,
+                                active=active,
                             )
                             if lesson_id is not None:
                                 await snapshot_evidence(

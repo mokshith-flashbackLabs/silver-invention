@@ -567,6 +567,34 @@ async def test_propose_makes_three_calls_and_merges_the_lessons(
     assert call.output is not None and call.output.event_lessons == [lesson]
 
 
+async def test_a_failed_lessons_call_keeps_the_proposals_and_their_spend(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """The lessons call is optional (spec 2026-10-15-intel-lessons-and-evidence §4): when it fails
+    in transport, the quiz and events halves already answered are kept and their spend recorded,
+    never thrown away to be re-run at full cost."""
+    import anthropic  # tests may import it; src may not outside model.py
+    import httpx
+
+    threat = ProposedThreatEvent(
+        kind="leak", title="Fake offers", body="b", severity=2, expires_in_days=10, rationale="r"
+    )
+    model, fake = _model(
+        [
+            _answer(ProposalQuizOutput()),
+            _answer(ProposalEventsOutput(threat_events=[threat])),
+            anthropic.APITimeoutError(request=httpx.Request("POST", "https://x")),
+        ],
+        clean_env,
+    )
+    call = await model.propose("SYSTEM", json.dumps({"new_evidence": []}))
+    assert len(fake.calls) == 3
+    assert call.outcome == "ok"
+    assert call.output is not None and call.output.threat_events == [threat]
+    assert call.output.event_lessons == [] and call.output.lessons == []
+    assert call.cost_usd > Decimal("0")
+
+
 async def test_the_lessons_call_runs_when_the_events_half_answered_nothing(
     clean_env: pytest.MonkeyPatch,
 ) -> None:

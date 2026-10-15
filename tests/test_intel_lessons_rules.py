@@ -102,6 +102,7 @@ def test_a_quoted_figure_is_allowed() -> None:
         "You are safe once it is removed.",
         "If your photo was found, ask for removal.",
         "Visit www.example.com now.",
+        "Nine in ten creators get these offers.",
     ],
 )
 def test_reassurance_a_finding_or_an_address_drops_the_lesson(intro: str) -> None:

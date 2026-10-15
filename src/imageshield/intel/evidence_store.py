@@ -29,7 +29,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from imageshield.intel.bounds import MAX_SOURCE_CONSECUTIVE_FAILURES
-from imageshield.intel.lesson_store import recompute_after_retraction
+from imageshield.intel.lesson_store import recompute_after_retraction, retire_unsupported_lessons
 from imageshield.intel.verify import VerifiedQuote
 from imageshield.search.urlhash import NORMALISATION_VERSION
 
@@ -453,13 +453,22 @@ class PostgresEvidenceStore:
                 # The weekly report's evidence (spec 2026-10-15 §6): every published owner citing
                 # this signal is recounted in this transaction.
                 await recompute_after_retraction(conn, signal_id)
+                # A lesson that rested on it is retired here too, so the retracted article reaches
+                # no report through a lesson's link or a figure only it quoted.
+                retired = await retire_unsupported_lessons(conn, signal_id, operator=operator)
                 await conn.execute(
                     _AUDIT_SQL,
                     {
                         "actor_type": "operator",
                         "action": "intel.signal_retracted",
                         "resource_id": signal_id,
-                        "metadata": Jsonb({"operator": operator, "reason": reason}),
+                        "metadata": Jsonb(
+                            {
+                                "operator": operator,
+                                "reason": reason,
+                                "lessons_retired": [str(lesson) for lesson in retired],
+                            }
+                        ),
                     },
                 )
                 return "retracted"

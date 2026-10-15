@@ -222,3 +222,36 @@ async def test_a_renewal_carries_the_lesson_and_a_null_drops_it(
             UUID(str(decided.applied_ref)),
         )
         assert rows == expected, values
+
+
+async def test_a_renewal_does_not_carry_a_lesson_its_evidence_no_longer_supports(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Spec §3: every figure in a lesson appears in a quote the renewal cites. A carried lesson
+    whose figure only the old evidence quoted is not carried; the operator never touched it, so
+    the approval is not refused either."""
+    signals = await _two_signals(intel_pool)
+    credit = await seed_protection_event(intel_pool, ends_in_days=10)
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO intel_lessons (proposal_id, event_id, kind, title, intro, sections,"
+            " approved_by) SELECT proposal_id, event_id, 'protection', 'Use the removal form',"
+            " 'A request is reviewed within 48 hours.', %s, 'op'"
+            " FROM protection_events WHERE event_id = %s",
+            (Jsonb(LESSON["sections"]), credit),
+        )
+    renewal = await seed_protection_proposal(intel_pool, signal_ids=signals, renews=credit)
+    decided = await _store(intel_pool).decide(
+        renewal,
+        decision="approved",
+        values=None,
+        reason="ok",
+        operator="Op",
+        applies_regardless_of_location=True,
+    )
+    rows = await _rows(
+        intel_pool,
+        "SELECT title FROM intel_lessons WHERE event_id = %s",
+        UUID(str(decided.applied_ref)),
+    )
+    assert rows == []

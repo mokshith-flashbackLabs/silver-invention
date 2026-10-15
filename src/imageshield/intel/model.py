@@ -58,6 +58,7 @@ from typing import Any, Generic, Literal, Protocol, TypeVar
 
 import anthropic
 import httpx2
+import structlog
 from anthropic.lib._parse._transform import transform_schema
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
@@ -87,6 +88,8 @@ from imageshield.intel.schemas import (
     SourceProposalOutput,
     SuggestionOutput,
 )
+
+log = structlog.get_logger("imageshield.intel.model")
 
 T = TypeVar("T", bound=BaseModel)
 Outcome = Literal["ok", "refusal", "max_tokens", "unparseable"]
@@ -594,13 +597,21 @@ class ClaudeIntelModel:
             if proposed is not None and (proposed.threat_events or proposed.protection_events)
             else events_user
         )
-        lessons = await self._send(
-            ProposalLessonsOutput,
-            model=self._config.intel_proposal_model,
-            effort=_PROPOSAL_EFFORT,
-            system=system + PROPOSE_LESSONS_PART,
-            messages=[{"role": "user", "content": lessons_user}],
-        )
+        # The lessons call is OPTIONAL (spec 2026-10-15-intel-lessons-and-evidence §4): its
+        # transport failure must not throw away the halves that already answered and were billed,
+        # nor make the step re-run at full cost. Their output and spend are kept; no lesson.
+        lessons: ModelCall[ProposalLessonsOutput] | None
+        try:
+            lessons = await self._send(
+                ProposalLessonsOutput,
+                model=self._config.intel_proposal_model,
+                effort=_PROPOSAL_EFFORT,
+                system=system + PROPOSE_LESSONS_PART,
+                messages=[{"role": "user", "content": lessons_user}],
+            )
+        except ModelUnavailable as exc:
+            log.warning("intel.lesson_call_failed", status=exc.status)
+            lessons = None
         return merged_proposal(quiz, events, lessons)
 
     async def draft_lessons(self, system: str, user: str) -> ModelCall[ProposalLessonsOutput]:

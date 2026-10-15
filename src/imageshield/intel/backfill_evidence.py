@@ -21,15 +21,19 @@ from imageshield.http.logging import configure_logging
 from imageshield.intel.lesson_store import snapshot_evidence
 from imageshield.intel.proposal_store import fetch_linked_signals
 
+# The approval's own time is shown to people ("Approved by our team on ..."): the proposal's
+# decided_at, else the event's creation, never the day this ran.
 _MISSING_SQL = """
-    SELECT event_id, proposal_id FROM threat_events
-     WHERE proposal_id IS NOT NULL
+    SELECT e.event_id, e.proposal_id, COALESCE(p.decided_at, e.created_at) FROM threat_events e
+      LEFT JOIN intel_proposals p ON p.proposal_id = e.proposal_id
+     WHERE e.proposal_id IS NOT NULL
        AND NOT EXISTS (SELECT 1 FROM intel_published_owners o
-                        WHERE o.owner_kind = 'event' AND o.owner_id = threat_events.event_id)
+                        WHERE o.owner_kind = 'event' AND o.owner_id = e.event_id)
     UNION ALL
-    SELECT event_id, proposal_id FROM protection_events
+    SELECT e.event_id, e.proposal_id, COALESCE(p.decided_at, e.created_at) FROM protection_events e
+      LEFT JOIN intel_proposals p ON p.proposal_id = e.proposal_id
      WHERE NOT EXISTS (SELECT 1 FROM intel_published_owners o
-                        WHERE o.owner_kind = 'event' AND o.owner_id = protection_events.event_id)
+                        WHERE o.owner_kind = 'event' AND o.owner_id = e.event_id)
 """
 
 
@@ -40,10 +44,15 @@ async def backfill(pool: AsyncConnectionPool) -> int:
         cur = await conn.execute(_MISSING_SQL)
         rows = await cur.fetchall()
         linked = await fetch_linked_signals(conn, list({row[1] for row in rows}))
-        for event_id, proposal_id in rows:
+        for event_id, proposal_id, approved_at in rows:
             active = [s for s in linked[proposal_id] if s.status == "active"]
             await snapshot_evidence(
-                conn, owner_kind="event", owner_id=event_id, proposal_id=proposal_id, active=active
+                conn,
+                owner_kind="event",
+                owner_id=event_id,
+                proposal_id=proposal_id,
+                active=active,
+                approved_at=approved_at,
             )
             written += 1
     return written

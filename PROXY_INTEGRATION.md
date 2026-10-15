@@ -1486,7 +1486,7 @@ GRANT SELECT ON svc.v_active_scoped_events TO imageshield_proxy_ro;
 GRANT SELECT ON svc.v_evidence, svc.v_lessons, svc.v_intel_weekly_totals TO imageshield_proxy_ro;
 ```
 
-**`SELECT` on the ten views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
+**`SELECT` on the thirteen views. Nothing else.** No grant on any base table, no `USAGE` on `public`. A
 view's base-table reads are checked against the view *owner*, which is what lets exactly this
 projection through while `enrolments`, `attestations` and `attributed_faces` stay closed. Verify by
 attempting `SELECT * FROM public.enrolments` as that role: it must fail with a permission error, not be

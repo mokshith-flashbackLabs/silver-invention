@@ -111,6 +111,19 @@ one organisation), so it cannot be a view expression. So **the decision snapshot
   `python -m imageshield.intel.backfill_evidence` (idempotent), run once per environment after the
   migration. *Corrected while planning:* this named `scripts/backfill_published_evidence.py`; this
   repo keeps one-shot CLIs as modules, like `search/retention.py`.
+- *Refined 2026-10-15 at final review:*
+  - **A retraction also re-checks every live lesson citing the signal** against its proposal's
+    still-active evidence, in the same transaction. A lesson that no longer passes (a figure or a link
+    only that article carried) or that is left with no evidence is retired as `evidence_retracted`; the
+    retraction's audit row lists them. Without this a retracted article reached reports through a
+    lesson's link and figures.
+  - **A renewal carries its lesson only when the renewal's own active evidence still passes it**
+    (§3's rules). Otherwise the lesson is dropped and logged (`intel.lesson_carry_dropped`), never
+    refusing the renewal: the operator did not touch it.
+  - **The backfill dates each snapshot by the approval** (the proposal's `decided_at`, else the
+    event's creation), because `approved_at` is shown to people as "Approved by our team on ...".
+  - **The lessons call is optional** in the proposal step: its transport failure keeps the quiz and
+    events halves that answered, and their spend, and logs `intel.lesson_call_failed`.
 
 ## 7. The week's research totals
 
