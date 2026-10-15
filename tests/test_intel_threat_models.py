@@ -187,5 +187,6 @@ def test_a_threat_decision_ignores_a_suggested_key_from_a_newer_release() -> Non
         against_release_no=None,
         created_at=datetime.now(UTC),
     )
-    decided = _threat_decided(proposal, scoring(), None)
+    # No lesson, so the evidence the lesson rules read is empty (spec 2026-10-15 §3).
+    decided = _threat_decided(proposal, scoring(), None, ())
     assert "future_field" not in decided and decided["title"] == GOOD["title"]
