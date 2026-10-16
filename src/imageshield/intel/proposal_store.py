@@ -80,6 +80,9 @@ ALL_KINDS: tuple[str, ...] = (
     "weight_suggestion",
     "coverage_gap",
     "quiz_question",
+    # spec 2026-10-15-intel-lessons-and-evidence §5. An unfiltered list must carry it, or the
+    # control room's Home never shows a pending lesson.
+    "lesson",
 )
 
 # Who queues a question's research run (spec 2026-10-13-intel-quiz-questions §4): no operator.

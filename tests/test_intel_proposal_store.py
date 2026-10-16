@@ -152,6 +152,34 @@ async def test_the_list_omits_weight_suggestion_unless_asked(
     assert asked[0]["why_not"] == "not_decidable" and asked[0]["approvable"] is False
 
 
+async def test_the_unfiltered_list_carries_every_kind_but_weight_suggestion(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """The control room's Home asks for pending proposals with no kind at all: every kind an
+    operator decides must be in that answer. A lesson was not (spec
+    2026-10-15-intel-lessons-and-evidence §5), so 23 pending lessons never reached Home."""
+    sid = await seed_signal(intel_pool)
+    lesson = await seed_proposal(
+        intel_pool,
+        signal_ids=[sid],
+        kind="lesson",
+        target={"topic": "spot_fakes"},
+        suggested={
+            "lesson": {
+                "title": "t",
+                "intro": "i",
+                "sections": [{"kind": "what_to_do", "items": ["a"]}],
+                "link": None,
+            },
+            "tags": [],
+            "is_global": True,
+        },
+    )
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
+    default = await store.list_proposals(statuses=["pending"], kinds=None, cursor=None, limit=10)
+    assert lesson in [r["proposal_id"] for r in default]
+
+
 async def test_the_list_filters_by_status_and_pages_by_keyset(
     intel_pool: AsyncConnectionPool,
 ) -> None:
