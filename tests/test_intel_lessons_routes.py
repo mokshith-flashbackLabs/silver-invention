@@ -204,6 +204,10 @@ class FakeLessonStore:
         self.rows: list[dict[str, Any]] = []
         self.queued: list[dict[str, Any]] = []
         self.retired: dict[UUID, Literal["retired", "already_retired", "not_found"]] = {}
+        # 2026-10-22: an operator may hide a published quote.
+        self.evidence: dict[UUID, dict[str, Any]] = {}
+        self.excerpts: dict[UUID, dict[str, Any] | None] = {}
+        self.hides: list[tuple[UUID, str, str]] = []
 
     async def queue_draft(self, *, event_ids: Any, operator: str) -> UUID:
         self.queued.append({"event_ids": list(event_ids), "operator": operator})
@@ -216,6 +220,24 @@ class FakeLessonStore:
         self, lesson_id: UUID, *, operator: str, reason: str
     ) -> Literal["retired", "already_retired", "not_found"]:
         return self.retired.get(lesson_id, "not_found")
+
+    async def published_evidence(self, owner_kind: str, owner_id: UUID) -> dict[str, Any] | None:
+        return self.evidence.get(owner_id)
+
+    async def hide_excerpt(
+        self, excerpt_id: UUID, *, operator: str, reason: str
+    ) -> dict[str, Any] | None:
+        if excerpt_id not in self.excerpts:
+            return None
+        self.hides.append((excerpt_id, operator, reason))
+        return {"excerpt_id": excerpt_id, "hidden": {"by": operator, "reason": reason}}
+
+    async def unhide_excerpt(
+        self, excerpt_id: UUID, *, operator: str, reason: str
+    ) -> dict[str, Any] | None:
+        if excerpt_id not in self.excerpts:
+            return None
+        return {"excerpt_id": excerpt_id, "hidden": None}
 
 
 class RefusingDecisions:
@@ -285,3 +307,51 @@ def test_a_lesson_refusal_names_its_problems() -> None:
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "lesson_invalid"
     assert r.json()["error"]["problems"] == [{"field": "intro", "rule": "reassurance"}]
+
+
+# -- 2026-10-22: hiding a published quote --
+
+
+def test_the_evidence_read_answers_the_owners_quotes_or_evidence_not_found() -> None:
+    client, store = _client()
+    owner = uuid4()
+    store.evidence = {owner: {"owner_kind": "event", "owner_id": str(owner), "excerpts": []}}
+    ok = client.get(
+        "/v1/admin/intel/evidence",
+        params={"owner_kind": "event", "owner_id": str(owner)},
+        headers=ADMIN,
+    )
+    assert ok.status_code == 200 and ok.json()["owner_id"] == str(owner)
+    missing = client.get(
+        "/v1/admin/intel/evidence",
+        params={"owner_kind": "lesson", "owner_id": str(uuid4())},
+        headers=ADMIN,
+    )
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "evidence_not_found"
+    wrong = client.get(
+        "/v1/admin/intel/evidence",
+        params={"owner_kind": "hit", "owner_id": str(owner)},
+        headers=ADMIN,
+    )
+    assert wrong.status_code == 422
+
+
+def test_hiding_and_unhiding_a_quote_name_the_operator_and_refuse_an_unknown_one() -> None:
+    client, store = _client()
+    excerpt = uuid4()
+    store.excerpts = {excerpt: None}
+    body = {"reason": "names a private person", "operator": "Op"}
+    hidden = client.post(f"/v1/admin/intel/excerpts/{excerpt}/hide", json=body, headers=ADMIN)
+    assert hidden.status_code == 200, hidden.text
+    assert hidden.json()["hidden"] == {"by": "Op", "reason": "names a private person"}
+    assert store.hides == [(excerpt, "Op", "names a private person")]
+    shown = client.post(f"/v1/admin/intel/excerpts/{excerpt}/unhide", json=body, headers=ADMIN)
+    assert shown.status_code == 200 and shown.json()["hidden"] is None
+    unknown = client.post(f"/v1/admin/intel/excerpts/{uuid4()}/hide", json=body, headers=ADMIN)
+    assert unknown.status_code == 404 and unknown.json()["error"]["code"] == "excerpt_not_found"
+    short = client.post(
+        f"/v1/admin/intel/excerpts/{excerpt}/hide",
+        json={"reason": "x", "operator": "Op"},
+        headers=ADMIN,
+    )
+    assert short.status_code == 422

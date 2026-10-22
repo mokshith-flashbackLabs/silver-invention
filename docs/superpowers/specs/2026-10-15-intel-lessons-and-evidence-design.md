@@ -202,3 +202,28 @@ database down, so a refusing down would fail the suite.
 - Evidence for weight-change lines (a `weight_change` proposal's evidence); events and lessons only.
 - Any person data, per-person drafting, or a lesson written for one person.
 - Takedown help beyond what a protection lesson explains.
+
+## 13. Amended 2026-10-22: what dev's first drafts showed
+
+The first real lesson drafts on dev (2026-10-16 to 2026-10-21) showed seven problems. Owner decisions are
+marked.
+
+| Found on dev | Cause | Change |
+|---|---|---|
+| Every one of 652 documents had an empty title | Only a feed item passed one | The fetcher reads `og:title`, else the first `<title>` outside an `<svg>` (`page_title`; none over 300 characters, never cut). `/v1/text` answers `title`. Every read stores it, masked. `python -m imageshield.intel.backfill_titles` titles documents read before, cited ones only, through the fetcher, idempotently. |
+| "FTC guidance on the law" labelled a children's-privacy page | The model never saw a page's title | Each evidence item carries `title` (propose-v15, lesson-draft-v2). At draft a link whose label shares no word with its page's title is dropped (`lesson_link_label_mismatch`); an untitled page keeps it. |
+| Near-identical lessons queued (romance scams, face lookup, fake brand deals, fake recovery services) | The model saw topic slugs only; code caught an exact slug only | The model sees `existing_lessons` (topic and title: live lessons, pending or approved lesson proposals, lessons on pending event proposals) in both calls, and is told not to repeat one. Code drops a lesson whose title (`lesson_title_key`: case, punctuation, spacing aside) one already has: a general lesson as `proposal_dropped_lesson_repeat`, an event's as `lesson_dropped_repeat` (the event is kept). A draft run drafts once for two events that are the same incident. |
+| The Take It Down Act lesson (a US law) was marked for everyone | Lessons had no location rule | **Owner: the protection rule.** The lesson rules forbid a lesson resting on a law, regulator, court, hotline or reporting route limited to some places. An approval that publishes a lesson (a `lesson` proposal, or a threat keeping or editing its lesson) needs `applies_regardless_of_location: true`, else `422 values_out_of_bounds` with a message naming it. `values.lesson: null` needs no tick. A protection already needs it. |
+| Two lessons rested on one page of one registered commercial blog | INVARIANTS #50 lets one listed source corroborate | **Owner: two sources for a lesson.** `lesson_uncorroborated`: fewer than `CORROBORATION_MIN_PUBLISHERS` independent sources whatever their trust. A `lesson` proposal reads `why_not = uncorroborated` (`409 proposal_uncorroborated`); an event's lesson fails `lesson_problems` (`{field: "lesson", rule: "uncorroborated"}`, so `422 lesson_invalid`), at draft, decision, renewal carry and retraction alike. An event itself keeps #50. |
+| A quote named a man charged in a criminal case | Extraction never avoided private people in quotes | **Owner: stop at source and let an operator hide one.** extract-v3: never quote a passage naming a private individual. 0056: `intel_excerpts.hidden_at/hidden_by/hide_reason`, and `svc.v_evidence` leaves a hidden quote out (same columns). `GET /v1/admin/intel/evidence?owner_kind=&owner_id=` lists an owner's quotes with their hidden state (`404 evidence_not_found`); `POST /v1/admin/intel/excerpts/{excerpt_id}/hide` and `/unhide` take `{reason, operator}`, are idempotent and audited (`intel.excerpt_hidden` / `intel.excerpt_unhidden`, `404 excerpt_not_found`). A hidden quote stays evidence for corroboration and the figure checks. |
+| The report showed a vendor's "not affiliated" disclaimer | The backend picked a document's shortest quote | Backend: the quote sharing most words with what it backs, never one with a web address; see the backend spec's amendment. |
+
+**Deploy order:** services first (0056, then services, services-worker and the fetcher, which share an
+image), then `python -m imageshield.intel.backfill_titles` once per environment, then the backend.
+Down: the backend first, then 0056's down, which publishes every hidden quote again.
+
+**Tests that must exist:** a page's title is read and stored masked, and a feed or plain text has none; the
+backfill titles cited documents only, once; a lesson on one registered source is dropped at draft and refused
+at decision; a label its page's title does not bear out loses the link; an existing title drops a general and
+an event lesson; an approval publishing a lesson without the tick is refused and one removing it is not; a
+hidden quote leaves `svc.v_evidence` and returns when unhidden, audited both ways; 0056 is reversible.

@@ -105,7 +105,29 @@ def test_a_general_lesson_needs_a_topic_and_no_event(intel_db: str) -> None:
 
 
 def test_0055_down_and_up_again(intel_db: str) -> None:
-    down = run_migrate(intel_db, "down", "--steps", "1")
+    # Two steps: 0056 (hidden quotes) sits on top of it since 2026-10-22.
+    down = run_migrate(intel_db, "down", "--steps", "2")
     assert down.returncode == 0, down.stderr
     up = run_migrate(intel_db, "up")
     assert up.returncode == 0, up.stderr
+
+
+def test_0056_down_publishes_hidden_quotes_again_and_up_restores_the_columns(intel_db: str) -> None:
+    """2026-10-22: 0056 adds the hide state and leaves hidden quotes out of svc.v_evidence; its
+    down drops the state and the view shows every quote, as 0055 made it."""
+    columns = (
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'intel_excerpts'"
+        " AND column_name IN ('hidden_at', 'hidden_by', 'hide_reason')"
+    )
+    with psycopg.connect(intel_db, autocommit=True) as conn:
+        assert conn.execute(columns).fetchone() == (3,)
+        definition = conn.execute("SELECT pg_get_viewdef('svc.v_evidence')").fetchone()
+        assert definition is not None and "hidden_at IS NULL" in definition[0]
+    down = run_migrate(intel_db, "down", "--steps", "1")
+    assert down.returncode == 0, down.stderr
+    with psycopg.connect(intel_db, autocommit=True) as conn:
+        assert conn.execute(columns).fetchone() == (0,)
+    up = run_migrate(intel_db, "up")
+    assert up.returncode == 0, up.stderr
+    with psycopg.connect(intel_db, autocommit=True) as conn:
+        assert conn.execute(columns).fetchone() == (3,)

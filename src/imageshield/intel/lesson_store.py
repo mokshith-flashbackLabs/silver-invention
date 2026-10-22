@@ -279,6 +279,29 @@ class DraftEvent:
     signals: tuple[ContextSignal, ...]
 
 
+# The quotes an owner's published evidence holds, hidden ones included, for the operator who may
+# hide one (2026-10-22, 0056). Only active signals, as svc.v_evidence; a link only to a vetted page.
+_PUBLISHED_EXCERPTS_SQL = """
+    SELECT x.excerpt_id, d.document_id, d.publisher_domain, d.title AS document_title,
+           d.published_at, x.quote_text AS quote,
+           CASE WHEN d.trust = 'listed' THEN d.final_url END AS link_url,
+           x.hidden_at, x.hidden_by, x.hide_reason
+      FROM intel_published_evidence pe
+      JOIN intel_signals s ON s.signal_id = pe.signal_id AND s.status = 'active'
+      JOIN intel_excerpts x ON x.excerpt_id = pe.excerpt_id
+      JOIN intel_documents d ON d.document_id = s.document_id
+     WHERE pe.owner_kind = %s AND pe.owner_id = %s
+     ORDER BY d.document_id, x.char_start, x.excerpt_id
+"""
+
+
+_HIDE_COLUMNS = frozenset({"hidden_at", "hidden_by", "hide_reason"})
+
+
+def _hidden(at: datetime | None, by: str | None, reason: str | None) -> dict[str, Any] | None:
+    return None if at is None else {"at": at, "by": by, "reason": reason}
+
+
 class LessonStore(Protocol):
     async def queue_draft(self, *, event_ids: Sequence[UUID], operator: str) -> UUID: ...
     async def list_lessons(
@@ -286,6 +309,15 @@ class LessonStore(Protocol):
     ) -> list[dict[str, Any]]: ...
     async def retire(self, lesson_id: UUID, *, operator: str, reason: str) -> RetireOutcome: ...
     async def draft_events(self, event_ids: Sequence[UUID], *, limit: int) -> list[DraftEvent]: ...
+    async def published_evidence(
+        self, owner_kind: Literal["event", "lesson"], owner_id: UUID
+    ) -> dict[str, Any] | None: ...
+    async def hide_excerpt(
+        self, excerpt_id: UUID, *, operator: str, reason: str
+    ) -> dict[str, Any] | None: ...
+    async def unhide_excerpt(
+        self, excerpt_id: UUID, *, operator: str, reason: str
+    ) -> dict[str, Any] | None: ...
 
 
 class PostgresLessonStore:
@@ -361,3 +393,88 @@ class PostgresLessonStore:
             )
             for row in rows
         ]
+
+    # -- hiding a published quote (2026-10-22, 0056) --
+
+    async def published_evidence(
+        self, owner_kind: Literal["event", "lesson"], owner_id: UUID
+    ) -> dict[str, Any] | None:
+        """An owner's published evidence as the operator sees it: every quote of its active
+        evidence with whether it is hidden, or None when nothing was published for it."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT independent_sources, approved_at FROM intel_published_owners"
+                " WHERE owner_kind = %s AND owner_id = %s",
+                (owner_kind, owner_id),
+            )
+            owner = await cur.fetchone()
+            if owner is None:
+                return None
+            rows = conn.cursor(row_factory=dict_row)
+            await rows.execute(_PUBLISHED_EXCERPTS_SQL, (owner_kind, owner_id))
+            excerpts = await rows.fetchall()
+        return {
+            "owner_kind": owner_kind,
+            "owner_id": owner_id,
+            "independent_sources": owner[0],
+            "approved_at": owner[1],
+            "excerpts": [
+                {
+                    **{k: v for k, v in row.items() if k not in _HIDE_COLUMNS},
+                    "hidden": _hidden(row["hidden_at"], row["hidden_by"], row["hide_reason"]),
+                }
+                for row in excerpts
+            ],
+        }
+
+    async def hide_excerpt(
+        self, excerpt_id: UUID, *, operator: str, reason: str
+    ) -> dict[str, Any] | None:
+        """Hide one quote from every person (it leaves svc.v_evidence at once), audited in the same
+        transaction. Hiding a hidden quote changes nothing and keeps the first hide's operator and
+        reason. None for an unknown id."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "UPDATE intel_excerpts SET hidden_at = now(), hidden_by = %s, hide_reason = %s"
+                " WHERE excerpt_id = %s AND hidden_at IS NULL RETURNING 1",
+                (operator, reason, excerpt_id),
+            )
+            if await cur.fetchone() is not None:
+                await conn.execute(
+                    "INSERT INTO audit_log (actor_type, action, resource_id, metadata)"
+                    " VALUES ('operator', 'intel.excerpt_hidden', %s, %s)",
+                    (excerpt_id, Jsonb({"operator": operator, "reason": reason})),
+                )
+            cur = await conn.execute(
+                "SELECT hidden_at, hidden_by, hide_reason FROM intel_excerpts"
+                " WHERE excerpt_id = %s",
+                (excerpt_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"excerpt_id": excerpt_id, "hidden": _hidden(*row)}
+
+    async def unhide_excerpt(
+        self, excerpt_id: UUID, *, operator: str, reason: str
+    ) -> dict[str, Any] | None:
+        """Publish a hidden quote again, audited with the operator's reason. None for an unknown
+        id; a quote that is not hidden is answered as it stands."""
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "UPDATE intel_excerpts SET hidden_at = NULL, hidden_by = NULL, hide_reason = NULL"
+                " WHERE excerpt_id = %s AND hidden_at IS NOT NULL RETURNING 1",
+                (excerpt_id,),
+            )
+            if await cur.fetchone() is not None:
+                await conn.execute(
+                    "INSERT INTO audit_log (actor_type, action, resource_id, metadata)"
+                    " VALUES ('operator', 'intel.excerpt_unhidden', %s, %s)",
+                    (excerpt_id, Jsonb({"operator": operator, "reason": reason})),
+                )
+            cur = await conn.execute(
+                "SELECT 1 FROM intel_excerpts WHERE excerpt_id = %s", (excerpt_id,)
+            )
+            exists = await cur.fetchone() is not None
+        return {"excerpt_id": excerpt_id, "hidden": None} if exists else None
+

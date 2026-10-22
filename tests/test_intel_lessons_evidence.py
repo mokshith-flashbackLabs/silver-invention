@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -103,8 +103,8 @@ async def test_the_backfill_snapshots_old_events_once(intel_pool: AsyncConnectio
 async def _approved_with_lesson(
     pool: AsyncConnectionPool, lesson: dict[str, Any]
 ) -> tuple[UUID, list[UUID]]:
-    """A threat approved with ``lesson``, on two signals: A quotes "48 hours" from a vetted page,
-    B carries no figure."""
+    """A threat approved with ``lesson``, on three signals: A quotes "48 hours" from a vetted page,
+    B and C carry no figure. Three, because a lesson needs two independent sources (2026-10-22)."""
     await seed_quiz_vocabulary(pool)
     signals = [
         await seed_signal(
@@ -122,12 +122,24 @@ async def _approved_with_lesson(
             category="incident",
             quote="A fake sign-in page then steals the account of the channel owner.",
         ),
+        await seed_signal(
+            pool,
+            tags=("instagram",),
+            publisher="c.example",
+            category="incident",
+            quote="Creators were told to sign in again on a page that copied the real one.",
+        ),
     ]
     proposal = await seed_threat_proposal(
         pool, signal_ids=signals, suggested={**THREAT_SUGGESTED, "lesson": lesson}
     )
     decided = await PostgresDecisionStore(pool, threat_recency_days=90, clock=lambda: NOW).decide(
-        proposal, decision="approved", values=None, reason="ok", operator="Op"
+        proposal,
+        decision="approved",
+        values=None,
+        reason="ok",
+        operator="Op",
+        applies_regardless_of_location=True,
     )
     return UUID(str(decided.applied_ref)), signals
 
@@ -159,9 +171,11 @@ async def test_a_retraction_retires_a_lesson_that_rested_on_the_retracted_articl
     )
 
 
-async def test_a_lesson_stays_while_its_remaining_evidence_carries_it_and_goes_with_the_last(
+async def test_a_lesson_stays_while_two_sources_carry_it_and_goes_when_one_is_left(
     intel_pool: AsyncConnectionPool,
 ) -> None:
+    """Since 2026-10-22 a lesson needs two independent sources: a retraction leaving one retires
+    it."""
     event, signals = await _approved_with_lesson(
         intel_pool,
         {
@@ -204,3 +218,53 @@ async def test_the_backfill_dates_a_snapshot_by_its_approval_not_by_the_backfill
     await seed_threat_event(intel_pool, proposal_id=proposal)
     assert await backfill(intel_pool) == 1
     assert await _scalar(intel_pool, "SELECT approved_at FROM intel_published_owners") == approved
+
+
+# -- 2026-10-22: an operator may hide a published quote (0056) --
+
+
+async def _first_excerpt(pool: AsyncConnectionPool, event: UUID) -> UUID:
+    excerpt: UUID = await _scalar(
+        pool,
+        "SELECT excerpt_id FROM svc.v_evidence WHERE owner_id = %s ORDER BY excerpt_id LIMIT 1",
+        event,
+    )
+    return excerpt
+
+
+async def test_a_hidden_quote_leaves_the_view_and_comes_back_when_unhidden(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """A quote can name a private person (dev, 2026-10-16): hiding it takes it off svc.v_evidence
+    and nothing else, every hide and unhide audited; the first hide's reason stands."""
+    from imageshield.intel.lesson_store import PostgresLessonStore
+
+    event, _ = await _approved(intel_pool)
+    store = PostgresLessonStore(intel_pool)
+    excerpt = await _first_excerpt(intel_pool, event)
+    shown = "SELECT count(*) FROM svc.v_evidence WHERE excerpt_id = %s"
+
+    hidden = await store.hide_excerpt(excerpt, operator="Op", reason="names a private person")
+    assert hidden is not None and hidden["hidden"]["reason"] == "names a private person"
+    assert await _scalar(intel_pool, shown, excerpt) == 0
+    again = await store.hide_excerpt(excerpt, operator="Other", reason="again")
+    assert again is not None and again["hidden"]["by"] == "Op"
+
+    listed = await store.published_evidence("event", event)
+    assert listed is not None
+    flags = {row["excerpt_id"]: row["hidden"] for row in listed["excerpts"]}
+    assert flags[excerpt] is not None and sum(v is None for v in flags.values()) >= 1
+
+    restored = await store.unhide_excerpt(excerpt, operator="Op", reason="a public official")
+    assert restored == {"excerpt_id": excerpt, "hidden": None}
+    assert await _scalar(intel_pool, shown, excerpt) == 1
+    audits = await _scalar(
+        intel_pool,
+        "SELECT count(*) FROM audit_log WHERE resource_id = %s"
+        " AND action IN ('intel.excerpt_hidden', 'intel.excerpt_unhidden')",
+        excerpt,
+    )
+    assert audits == 2
+
+    assert await store.hide_excerpt(uuid4(), operator="Op", reason="x") is None
+    assert await store.published_evidence("event", uuid4()) is None

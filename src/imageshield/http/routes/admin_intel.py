@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import base64
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import structlog
@@ -489,6 +489,47 @@ async def retire_intel_lesson(
         raise ServiceError(404, "lesson_not_found", "No lesson with this id.", retryable=False)
     log.info("intel.lesson_retired_via_admin", lesson_id=str(lesson_id), operator=body.operator)
     return {"lesson_id": lesson_id, "status": "retired"}
+
+
+# -- hiding a published quote (2026-10-22, 0056) -------------------------------
+
+
+@router.get("/evidence")
+async def published_evidence(
+    owner_kind: Literal["event", "lesson"] = Query(),
+    owner_id: UUID = Query(),
+    lessons: LessonStore = Depends(get_lesson_store),
+) -> dict[str, Any]:
+    found = await lessons.published_evidence(owner_kind, owner_id)
+    if found is None:
+        raise ServiceError(
+            404, "evidence_not_found", "No published evidence for this owner.", retryable=False
+        )
+    return found
+
+
+@router.post("/excerpts/{excerpt_id}/hide")
+async def hide_excerpt(
+    excerpt_id: UUID, body: IntelRetractRequest, lessons: LessonStore = Depends(get_lesson_store)
+) -> dict[str, Any]:
+    state = await lessons.hide_excerpt(excerpt_id, operator=body.operator, reason=body.reason)
+    if state is None:
+        raise ServiceError(404, "excerpt_not_found", "No quote with this id.", retryable=False)
+    log.info("intel.excerpt_hidden_via_admin", excerpt_id=str(excerpt_id), operator=body.operator)
+    return state
+
+
+@router.post("/excerpts/{excerpt_id}/unhide")
+async def unhide_excerpt(
+    excerpt_id: UUID, body: IntelRetractRequest, lessons: LessonStore = Depends(get_lesson_store)
+) -> dict[str, Any]:
+    state = await lessons.unhide_excerpt(excerpt_id, operator=body.operator, reason=body.reason)
+    if state is None:
+        raise ServiceError(404, "excerpt_not_found", "No quote with this id.", retryable=False)
+    log.info(
+        "intel.excerpt_unhidden_via_admin", excerpt_id=str(excerpt_id), operator=body.operator
+    )
+    return state
 
 
 # -- proposals (step 2) -------------------------------------------------------

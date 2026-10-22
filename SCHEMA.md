@@ -883,6 +883,11 @@ while its event is live. `svc.v_intel_weekly_totals` counts documents, publisher
 signals and threat/protection/lesson proposals per Mon–Sun week. All three: events and lessons,
 never people.
 
+*0056 (2026-10-22, that spec §13):* `intel_excerpts` gains `hidden_at`, `hidden_by` and `hide_reason`
+(all set or all NULL, `intel_excerpts_hidden_whole`), and `svc.v_evidence` leaves out a hidden quote,
+same columns. An operator hides a quote that names a private person; it stays evidence for
+corroboration and the figure checks, and the audit log keeps every hide and unhide.
+
 **Open question, deliberately not decided here:** these views translate our vocabulary into the
 proxy's (`infringements` → `hits`, `attestations` → `matches`). Legitimate for a view, and it also
 freezes the split permanently. Worth a deliberate choice while there is no production data — put to
