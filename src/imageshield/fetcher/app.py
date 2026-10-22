@@ -349,6 +349,9 @@ async def text(
         # The page's own publication date from its HTML metadata, ISO-8601, or null (spec
         # 2026-10-04-intel-evidence-quality §2). Never the fetch time.
         "published_at": extracted.published_at,
+        # The page's own title from its HTML, or null (2026-10-22): what a document is called when
+        # its evidence is shown to people and when a lesson's link is labelled.
+        "title": extracted.title,
     }
 
 

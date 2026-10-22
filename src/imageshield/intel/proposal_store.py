@@ -55,6 +55,7 @@ from imageshield.intel.overlap import OVERLAP_KINDS, OverlapCandidate, overlaps_
 from imageshield.intel.proposal_models import (
     Attachment,
     ContextSignal,
+    ExistingLesson,
     LiveEvent,
     LiveProtection,
     NewProposal,
@@ -110,7 +111,7 @@ PROPOSAL_COLUMNS = """proposal_id, kind, status, supersede_reason, target, sugge
 # corroboration's echo collapse.
 _CONTEXT_COLUMNS = """s.signal_id, s.category, s.direction, s.tags, s.unregistered_subjects,
     s.summary, d.trust, d.publisher_domain, s.status, s.created_at, d.url_hash AS document_key,
-    d.published_at, d.final_url AS document_url,
+    d.published_at, d.final_url AS document_url, d.title AS document_title,
     ARRAY(SELECT e.quote_text FROM intel_excerpts e WHERE e.signal_id = s.signal_id
            ORDER BY e.char_start, e.excerpt_id) AS excerpts"""
 _CONTEXT_FROM = "intel_signals s JOIN intel_documents d ON d.document_id = s.document_id"
@@ -245,6 +246,7 @@ def _context(row: dict[str, Any]) -> ContextSignal:
         published_at=row["published_at"],
         excerpts=tuple(row["excerpts"] or ()),
         document_url=row.get("document_url"),
+        document_title=row.get("document_title") or "",
     )
 
 
@@ -578,7 +580,7 @@ class ProposalStore(Protocol):
         question_limits: QuestionLimits | None = None,
     ) -> WriteResult | None: ...
     async def question_context(self, *, dismissed_since: datetime) -> QuestionContext: ...
-    async def open_lesson_topics(self, *, limit: int) -> list[str]: ...
+    async def existing_lessons(self, *, limit: int) -> list[ExistingLesson]: ...
     async def list_proposals(
         self,
         *,
@@ -947,21 +949,27 @@ class PostgresProposalStore:
         async with self._pool.connection() as conn:
             return await read_question_context(conn, dismissed_since=dismissed_since)
 
-    async def open_lesson_topics(self, *, limit: int) -> list[str]:
-        """Topics a new general lesson may not take (spec 2026-10-15 §5): pending, approved or
-        applied lesson proposals, and live lessons. Newest first, for the prompt."""
+    async def existing_lessons(self, *, limit: int) -> list[ExistingLesson]:
+        """Lessons a new one may not repeat (spec 2026-10-15 §5, widened 2026-10-22 §13): pending,
+        approved or applied lesson proposals, the lessons riding on pending event proposals, and
+        live lessons, by topic and title. Newest first, for the prompt and the repeat check."""
         async with self._pool.connection() as conn:
             cur = await conn.execute(
-                "SELECT topic FROM ("
-                "  SELECT target->>'topic' AS topic, created_at AS at FROM intel_proposals"
+                "SELECT topic, title FROM ("
+                "  SELECT target->>'topic' AS topic,"
+                "         COALESCE(decided, suggested)->'lesson'->>'title' AS title,"
+                "         created_at AS at FROM intel_proposals"
                 "   WHERE kind = 'lesson' AND status IN ('pending', 'approved', 'applied')"
-                "     AND target ? 'topic'"
-                "  UNION ALL SELECT topic, approved_at FROM intel_lessons"
-                "   WHERE topic IS NOT NULL AND retired_at IS NULL"
-                ") t GROUP BY topic ORDER BY max(at) DESC LIMIT %s",
+                "  UNION ALL SELECT NULL, suggested->'lesson'->>'title', created_at"
+                "    FROM intel_proposals"
+                "   WHERE kind IN ('threat_event', 'protection_event') AND status = 'pending'"
+                "  UNION ALL SELECT topic, title, approved_at FROM intel_lessons"
+                "   WHERE retired_at IS NULL"
+                ") t WHERE title IS NOT NULL"
+                " GROUP BY topic, title ORDER BY max(at) DESC LIMIT %s",
                 (limit,),
             )
-            return [row[0] for row in await cur.fetchall()]
+            return [ExistingLesson(topic=row[0], title=row[1]) for row in await cur.fetchall()]
 
     async def list_proposals(
         self,

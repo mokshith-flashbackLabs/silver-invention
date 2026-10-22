@@ -251,3 +251,56 @@ def test_a_feed_carries_no_page_date() -> None:
         "/v1/text", json={"url": "https://n.example/feed"}, headers=AUTH
     )
     assert r.json()["published_at"] is None
+
+
+# ── the page's own title (2026-10-22, spec 2026-10-15-intel-lessons-and-evidence §13) ──────────
+
+
+def _title(head: str, body: str = "<p>Story.</p>") -> str | None:
+    html = f"<html><head>{head}</head><body>{body}</body></html>".encode()
+    r = _client(_ok(html, "text/html; charset=utf-8")).post(
+        "/v1/text", json={"url": "https://news.example/story"}, headers=AUTH
+    )
+    assert r.status_code == 200
+    value: str | None = r.json()["title"]
+    return value
+
+
+def test_the_title_element_is_read_with_whitespace_collapsed_and_entities_decoded() -> None:
+    assert _title("<title>\n  Children&#39;s Privacy |\n Federal Trade Commission </title>") == (
+        "Children's Privacy | Federal Trade Commission"
+    )
+
+
+def test_open_graph_title_wins_over_the_title_element() -> None:
+    head = '<title>Story - Site</title><meta property="og:title" content="The Story">'
+    assert _title(head) == "The Story"
+
+
+def test_an_empty_open_graph_title_falls_back_to_the_title_element() -> None:
+    assert _title('<meta property="og:title" content="  "><title>Fallback</title>') == "Fallback"
+
+
+def test_a_title_inside_an_svg_is_not_the_page_title() -> None:
+    body = "<svg><title>icon</title></svg><p>Story.</p>"
+    assert _title("", body=body) is None
+    assert _title("<title>Page</title>", body=body) == "Page"
+
+
+def test_a_page_without_a_title_and_an_overlong_one_answer_null() -> None:
+    assert _title("") is None
+    assert _title(f"<title>{'word ' * 100}</title>") is None
+
+
+def test_a_feed_and_plain_text_carry_no_page_title() -> None:
+    rss = (
+        b"<?xml version='1.0'?><rss><channel><item><title>T</title>"
+        b"<link>https://n.example/1</link></item></channel></rss>"
+    )
+    feed = _client(_ok(rss, "application/rss+xml")).post(
+        "/v1/text", json={"url": "https://n.example/feed"}, headers=AUTH
+    )
+    text = _client(_ok(b"<title>no</title>", "text/plain")).post(
+        "/v1/text", json={"url": "https://n.example/t"}, headers=AUTH
+    )
+    assert feed.json()["title"] is None and text.json()["title"] is None

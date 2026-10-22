@@ -807,6 +807,18 @@ async def test_a_pages_metadata_date_wins_over_the_date_the_model_reports(
     assert result.outcome["published_from_metadata"] == 1
 
 
+async def test_a_pages_own_title_is_stored_masked(intel_pool: AsyncConnectionPool) -> None:
+    """2026-10-22: every page's title is recorded, not only a feed item's, so evidence names its
+    document and a lesson's link label can be checked against it. Masked like any page text."""
+    await PostgresIntelStore(intel_pool).queue_adhoc(ARTICLE, operator="a")
+    page = make_page(POLICY, ARTICLE, title="New AI terms, ask press@example.com")
+    deps = make_deps(intel_pool, FakeFetcher({ARTICLE: page}), FakeModel(make_signal()))
+    await run(await claim(intel_pool), deps)
+    assert await _scalar(intel_pool, "SELECT title FROM intel_documents") == (
+        "New AI terms, ask «masked»"
+    )
+
+
 async def test_a_page_with_no_metadata_takes_the_date_its_text_states(
     intel_pool: AsyncConnectionPool,
 ) -> None:

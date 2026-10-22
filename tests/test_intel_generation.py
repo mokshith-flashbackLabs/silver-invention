@@ -638,7 +638,7 @@ def test_the_prompt_carries_pending_and_live_events_and_the_events_only_rule() -
     regenerate, _ = build(True)
     assert regenerate.startswith(system)
     assert "Propose only threat_events, protection_events and attach" in regenerate
-    assert PROPOSE_PROMPT_VERSION == "propose-v14"
+    assert PROPOSE_PROMPT_VERSION == "propose-v15"
 
 
 def test_the_event_prompt_items_carry_ids_as_strings() -> None:
@@ -683,7 +683,7 @@ def test_the_prompt_carries_live_protections_and_asks_for_protection_events() ->
     assert payload["live_protections"] == [live] and payload["live_events"] == []
     assert "protection_events" in system and "is_global: always false" in system
     assert "only in some countries" in system and "live_protections" in system
-    assert PROPOSE_PROMPT_VERSION == "propose-v14"
+    assert PROPOSE_PROMPT_VERSION == "propose-v15"
 
 
 def _protection(*signals: ContextSignal, **kw: object) -> ProposedProtectionEvent:
@@ -862,7 +862,7 @@ def test_propose_v4_states_the_recency_rule_and_one_kind_per_body_of_evidence() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v14"
+    assert PROPOSE_PROMPT_VERSION == "propose-v15"
     assert "published within threat_recency_days days of today" in flat
     assert "has ended" in flat and "is not a threat" in flat
     assert "ONE BODY OF EVIDENCE, ONE KIND OF PROPOSAL" in flat
@@ -938,7 +938,7 @@ def test_propose_v5_asks_for_a_body_on_both_event_kinds_and_never_a_finding() ->
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v14"
+    assert PROPOSE_PROMPT_VERSION == "propose-v15"
     assert flat.count("- body: what this") == 2
     assert "what this incident means for a person it concerns" in flat
     assert "what this protection means for a person it reaches" in flat
@@ -973,7 +973,7 @@ def test_propose_v6_asks_for_a_reason_that_names_no_platform_or_answer() -> None
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v14"
+    assert PROPOSE_PROMPT_VERSION == "propose-v15"
     assert "the reason for the change in ONE short plain sentence of at most 200 characters" in flat
     assert "Never name a platform, app, service, website, quiz question or quiz answer" in flat
 
@@ -1065,7 +1065,7 @@ def test_propose_v7_asks_for_an_action_only_with_a_real_step_and_a_cited_link() 
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v14"
+    assert PROPOSE_PROMPT_VERSION == "propose-v15"
     assert "Give one only when the evidence names a real step" in flat
     assert "the url of ONE of the evidence items this proposal cites" in flat
     assert "Never write any other address" in flat
@@ -1074,6 +1074,13 @@ def test_propose_v7_asks_for_an_action_only_with_a_real_step_and_a_cited_link() 
 def test_each_prompt_signal_carries_its_page_url_or_empty() -> None:
     assert prompt_signal(replace(_sig(), document_url=HELP))["url"] == HELP
     assert prompt_signal(_sig())["url"] == ""
+
+
+def test_each_prompt_signal_carries_its_page_title_or_empty() -> None:
+    """2026-10-22: the model labels a lesson's link from the page's real title, never a guess."""
+    titled = replace(_sig(), document_title="Children's Privacy | Federal Trade Commission")
+    assert prompt_signal(titled)["title"] == "Children's Privacy | Federal Trade Commission"
+    assert prompt_signal(_sig())["title"] == ""
 
 
 def test_the_model_is_shown_each_signal_s_verbatim_quotes() -> None:
@@ -1097,7 +1104,7 @@ def test_propose_v10_asks_every_threat_for_a_short_card_line() -> None:
         threat_recency_days=90,
     )
     flat = " ".join(system.split())
-    assert PROPOSE_PROMPT_VERSION == "propose-v14"
+    assert PROPOSE_PROMPT_VERSION == "propose-v15"
     assert (
         "- card_line: what the incident is, in ONE short plain sentence of at most 160 characters"
         in flat

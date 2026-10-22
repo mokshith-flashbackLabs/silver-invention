@@ -153,3 +153,11 @@ def uncorroborated(signals: Sequence[ContextSignal]) -> bool:
     if any(s.trust == "listed" for s in active):
         return False
     return independent_sources(active) < CORROBORATION_MIN_PUBLISHERS
+
+
+def lesson_uncorroborated(signals: Sequence[ContextSignal]) -> bool:
+    """A lesson's stricter rule (owner, 2026-10-22): fewer than ``CORROBORATION_MIN_PUBLISHERS``
+    independent sources, WHATEVER their trust. One registered source corroborates an event on its
+    own (``uncorroborated``); it never carries a lesson alone, because a lesson teaches people how
+    to act and two of them rested on one commercial blog."""
+    return independent_sources(signals) < CORROBORATION_MIN_PUBLISHERS

@@ -7,6 +7,16 @@ of those documents that came from a source an operator registered (``trust = 'li
 unvetted page can advertise the very apps an incident is about. At draft an unvetted link is
 dropped and the lesson kept; anything else that fails drops the lesson, never the event it belongs
 to, and is counted on the run's outcome.
+
+*Amended 2026-10-22 (spec §13), after dev's first drafts:*
+
+- **Two independent sources**, whatever their trust (``lesson_uncorroborated``): one registered
+  source carries an event, never a lesson. It is a ``lesson_problems`` rule, so the decision, a
+  renewal's carry and a retraction's re-check all apply it.
+- **A link label its page bears out.** The model now sees each page's title; at draft a label
+  sharing no word with the linked page's title drops the link (an untitled page keeps it).
+- **No repeated title.** A lesson whose title (``lesson_title_key``) an existing or pending lesson
+  already has is dropped, as a repeated topic always was.
 """
 
 from __future__ import annotations
@@ -24,7 +34,7 @@ from imageshield.intel.bounds import (
     MAX_LESSON_DRAFT_EVENTS,
     MAX_RATIONALE_CHARS,
 )
-from imageshield.intel.corroboration import uncorroborated
+from imageshield.intel.corroboration import lesson_uncorroborated
 from imageshield.intel.pii import mask
 from imageshield.intel.proposal_models import (
     ContextSignal,
@@ -46,6 +56,46 @@ def _vetted_pages(cited: Sequence[ContextSignal]) -> set[str]:
     return {s.document_key for s in cited if s.trust == "listed" and s.document_key is not None}
 
 
+_WORD = re.compile(r"[a-z0-9]+")
+# Apostrophes (straight and curly) join a word rather than split it: "children's" is one word.
+_APOSTROPHES = re.compile("[" + chr(0x27) + chr(0x2019) + "]")
+# Words that say nothing about which page a label names.
+_LABEL_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "the", "of", "to", "in", "on", "at", "for", "with", "by", "from", "as",
+        "is", "are", "be", "it", "its", "this", "that", "how", "what", "your", "you", "our",
+        "about", "into", "over",
+    }
+)  # fmt: skip
+_SUFFIXES = ("ing", "es", "ed", "s")
+
+
+def _label_words(text: str) -> set[str]:
+    words: set[str] = set()
+    for word in _WORD.findall(_APOSTROPHES.sub("", text.casefold())):
+        if word in _LABEL_STOPWORDS:
+            continue
+        for suffix in _SUFFIXES:
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                word = word[: -len(suffix)]
+                break
+        words.add(word)
+    return words
+
+
+def label_borne_out(label: str, page_title: str) -> bool:
+    """Whether a link label shares a word with its page's own title. An untitled page cannot be
+    checked, so its label stands."""
+    if not page_title.strip():
+        return True
+    return bool(_label_words(label) & _label_words(page_title))
+
+
+def lesson_title_key(title: str) -> str:
+    """What makes two lesson titles the same title: case, punctuation and spacing aside."""
+    return " ".join(_WORD.findall(title.casefold()))
+
+
 def _texts(draft: LessonDraft) -> list[tuple[str, str]]:
     texts = [("title", draft.title), ("intro", draft.intro)]
     for i, section in enumerate(draft.sections):
@@ -60,6 +110,8 @@ def lesson_problems(draft: LessonDraft, cited: Sequence[ContextSignal]) -> list[
     and a link that is not one of the cited vetted pages. Empty: the lesson may be shown."""
     quotes = [quote for signal in cited for quote in signal.excerpts]
     problems: list[dict[str, str]] = []
+    if lesson_uncorroborated(cited):
+        problems.append({"field": "lesson", "rule": "uncorroborated"})
     for name, text in _texts(draft):
         problems.extend({"field": name, "rule": rule} for rule in copy_problems(text))
         if unquoted_figures(text, quotes):
@@ -83,6 +135,9 @@ def lesson_from(
     if item is None:
         counts["lesson_missing"] += 1
         return None
+    if lesson_uncorroborated(cited):
+        counts["lesson_dropped_uncorroborated"] += 1
+        return None
     link: dict[str, str] | None = None
     raw_link = (item.link_url or "").strip()
     if raw_link:
@@ -91,7 +146,12 @@ def lesson_from(
             and url_hash(raw_link) in _vetted_pages(cited)
             and (item.link_label or "").strip()
         ):
-            link = {"url": raw_link, "label": _masked(item.link_label or "", counts)}
+            label = _masked(item.link_label or "", counts)
+            titles = [s.document_title for s in cited if s.document_key == url_hash(raw_link)]
+            if all(label_borne_out(label, title) for title in titles):
+                link = {"url": raw_link, "label": label}
+            else:
+                counts["lesson_link_label_mismatch"] += 1
         else:
             counts["lesson_link_not_vetted"] += 1
     try:
@@ -145,15 +205,19 @@ def general_lesson(
     *,
     taken_topics: Collection[str],
     recency: Recency,
+    taken_titles: Collection[str] = (),
 ) -> NewProposal | None:
     """A ``lesson`` proposal for a general lesson (spec §5), or None (counted). Its evidence must
-    corroborate as a threat's does and pass the same recency rule (all of it dated and older than
-    ``INTEL_THREAT_RECENCY_DAYS`` is ``evidence_stale``); its tags must be registered and live; and
-    it must reach somebody: tags, or global."""
+    come from two independent sources whatever their trust (§13) and pass the threat recency rule
+    (all of it dated and older than ``INTEL_THREAT_RECENCY_DAYS`` is ``evidence_stale``); its topic
+    and its title must be new (``taken_titles`` holds ``lesson_title_key`` values); its tags must be
+    registered and live; and it must reach somebody: tags, or global."""
     if not re.fullmatch(LESSON_TOPIC_PATTERN, item.topic):
         counts["proposal_dropped_lesson_topic_malformed"] += 1
         return None
-    if item.topic in taken_topics:
+    if item.topic in taken_topics or (
+        item.lesson is not None and lesson_title_key(item.lesson.title) in taken_titles
+    ):
         counts["proposal_dropped_lesson_repeat"] += 1
         return None
     if any(not is_well_formed(t) for t in item.tags) or len(set(item.tags)) != len(item.tags):
@@ -173,7 +237,7 @@ def general_lesson(
     if cited_ids is None:
         return None
     cited = [context[i] for i in cited_ids]
-    if uncorroborated(cited):
+    if lesson_uncorroborated(cited):
         counts["proposal_dropped_uncorroborated"] += 1
         return None
     if evidence_stale(cited, recency):
@@ -210,7 +274,8 @@ async def run_lesson_draft(ctx: Any) -> Any:
     proposal with ``target.event_id``, decided in the queue. One model call, no reading. ``ctx``
     is pipeline._Ctx and the result a pipeline.RunResult; imported here lazily, as question_runs
     does, because pipeline imports this module."""
-    from imageshield.intel.generation import prompt_signal
+    from imageshield.intel.bounds import MAX_PROMPT_EXISTING_LESSONS
+    from imageshield.intel.generation import prompt_existing_lesson, prompt_signal
     from imageshield.intel.pipeline import RunResult, _call_model, _Stop
     from imageshield.intel.prompts import LESSON_DRAFT_PROMPT_VERSION, lesson_draft_request
     from imageshield.intel.vocabulary import parse_vocabulary
@@ -226,6 +291,9 @@ async def run_lesson_draft(ctx: Any) -> Any:
         ctx.counts["lesson_draft_nothing_to_draft"] += 1
         return RunResult("completed", ctx.outcome())
     evidence = {s.signal_id: s for event in events for s in event.signals}
+    # What no draft may repeat (2026-10-22): shown to the model and checked again below.
+    existing = await ctx.deps.proposals.existing_lessons(limit=MAX_PROMPT_EXISTING_LESSONS)
+    titles = {lesson_title_key(lesson.title) for lesson in existing}
     system, user = lesson_draft_request(
         [
             {
@@ -239,6 +307,7 @@ async def run_lesson_draft(ctx: Any) -> Any:
         ],
         [prompt_signal(s) for s in evidence.values()],
         today=ctx.deps.clock().date().isoformat(),
+        existing_lessons=[prompt_existing_lesson(lesson) for lesson in existing],
     )
     try:
         call = await _call_model(
@@ -256,6 +325,11 @@ async def run_lesson_draft(ctx: Any) -> Any:
         lesson = lesson_from(item.lesson, event.signals, ctx.counts)
         if lesson is None:
             continue
+        key = lesson_title_key(lesson["title"])
+        if key in titles:
+            ctx.counts["lesson_dropped_repeat"] += 1
+            continue
+        titles.add(key)
         proposals.append(
             NewProposal(
                 kind="lesson",

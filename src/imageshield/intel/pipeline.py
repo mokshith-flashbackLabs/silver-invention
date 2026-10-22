@@ -64,7 +64,7 @@ from imageshield.intel.bounds import (
     DISCOVERY_DEDUP_DAYS,
     FEED_MAX_ITEM_AGE_DAYS,
     FEED_MAX_ITEMS_PER_RUN,
-    MAX_PROMPT_LESSON_TOPICS,
+    MAX_PROMPT_EXISTING_LESSONS,
     MAX_PROMPT_TAGS,
     MIN_POLICY_TEXT_CHARS,
     PROPOSAL_CONTEXT_DAYS,
@@ -81,6 +81,7 @@ from imageshield.intel.evidence_store import (
 from imageshield.intel.fetch_client import FETCHER_SIDE_CODES, FetchFailure, TextFetch, TextFetcher
 from imageshield.intel.generation import (
     GeneratedBatch,
+    prompt_existing_lesson,
     prompt_live_event,
     prompt_live_protection,
     prompt_open_question,
@@ -881,7 +882,8 @@ async def _extract_unit(
             if (record := _verified_signal(ctx, extracted, text, call.answered_by)) is not None
         ]
 
-    masked_title, title_masks = mask(title)
+    # A feed item's own title, else the page's (2026-10-22): before, only feed items had one.
+    masked_title, title_masks = mask(title or fetched.title or "")
     if title_masks:
         ctx.counts["pii_masked_title"] += 1
     published, published_from = choose_published(
@@ -1047,8 +1049,8 @@ async def _generate(ctx: _Ctx) -> None:
             questions = open_questions
         else:
             ctx.counts["questions_closed_at_cap"] += 1
-    # Topics a general lesson may not take (spec 2026-10-15-intel-lessons-and-evidence §5).
-    open_topics = await store.open_lesson_topics(limit=MAX_PROMPT_LESSON_TOPICS)
+    # Lessons a new one may not repeat, by topic or title (spec 2026-10-15 §5, §13).
+    existing = await store.existing_lessons(limit=MAX_PROMPT_EXISTING_LESSONS)
     system, user = proposal_request(
         [prompt_signal(s) for s in new],
         [prompt_signal(s) for s in related],
@@ -1068,7 +1070,7 @@ async def _generate(ctx: _Ctx) -> None:
         dismissed_questions=(
             [prompt_open_question(q) for q in questions.dismissed] if questions else []
         ),
-        open_lesson_topics=open_topics,
+        existing_lessons=[prompt_existing_lesson(lesson) for lesson in existing],
     )
     # Three API calls behind one metered step since propose-v14 (ClaudeIntelModel.propose).
     call = await _call_model(
@@ -1093,7 +1095,7 @@ async def _generate(ctx: _Ctx) -> None:
             events_only=regenerate is not None,
             questions=questions,
             question_limits=question_limits,
-            open_lesson_topics=open_topics,
+            existing_lessons=existing,
         )
     result = await store.write_generated(
         ctx.run.run_id,

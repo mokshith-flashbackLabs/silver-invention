@@ -125,6 +125,12 @@ _ATTESTATION_REQUIRED = (
     "A protection is approved only with applies_regardless_of_location: true;"
     " one limited to some places is rejected."
 )
+# Owner, 2026-10-22: a lesson holds wherever a person lives, or it is not published. The Take It
+# Down Act lesson (a US law) was drafted for everyone.
+_LESSON_ATTESTATION_REQUIRED = (
+    "A lesson is published only with applies_regardless_of_location: true; remove a lesson that"
+    " holds only in some places (values.lesson: null) or reject it."
+)
 
 _MESSAGES: dict[DecisionRefusal, str] = {
     "proposal_not_found": "No proposal with this id.",
@@ -239,12 +245,17 @@ def _refuse(code: DecisionRefusal) -> DecisionRefused:
     return DecisionRefused(code, _MESSAGES[code])
 
 
-def _check_lesson(raw: dict[str, Any] | None, active: Sequence[ContextSignal]) -> None:
+def _check_lesson(
+    raw: dict[str, Any] | None, active: Sequence[ContextSignal], attested: bool | None
+) -> None:
     """A decided lesson must pass every rule against the evidence it was approved on (spec
-    2026-10-15-intel-lessons-and-evidence §3): the word rules, every figure quoted, and a link only
-    to a cited vetted page."""
+    2026-10-15-intel-lessons-and-evidence §3): the word rules, every figure quoted, a link only to
+    a cited vetted page and, since 2026-10-22, two independent sources and the operator's location
+    attestation (§13)."""
     if raw is None:
         return
+    if attested is not True:
+        raise DecisionRefused("values_out_of_bounds", _LESSON_ATTESTATION_REQUIRED)
     problems = lesson_problems(LessonDraft.model_validate(raw), active)
     if problems:
         raise DecisionRefused(
@@ -257,6 +268,7 @@ def _threat_decided(
     vocabulary: ScoringVocabulary | None,
     values: dict[str, Any] | None,
     active: Sequence[ContextSignal],
+    attested: bool | None,
 ) -> dict[str, Any]:
     """The exact values a threat approval stores: the operator's ``values`` merged over
     ``suggested`` and the proposal's own ``target.tags`` (spec note 2026-09-30), re-checked
@@ -287,7 +299,7 @@ def _threat_decided(
     if all_tags_unmapped({"tags": list(decided.tags)}, vocabulary):
         raise _refuse("proposal_tags_unmapped")
     dumped = decided.model_dump(mode="json")
-    _check_lesson(dumped.get("lesson"), active)
+    _check_lesson(dumped.get("lesson"), active, attested)
     return dumped
 
 
@@ -354,7 +366,7 @@ def _protection_decided(
     if all_tags_unmapped({"tags": list(decided.tags), "is_global": decided.is_global}, vocabulary):
         raise _refuse("proposal_tags_unmapped")
     dumped = decided.model_dump(mode="json")
-    _check_lesson(dumped.get("lesson"), active)
+    _check_lesson(dumped.get("lesson"), active, attested)
     return dumped
 
 
@@ -363,6 +375,7 @@ def _lesson_decided(
     vocabulary: ScoringVocabulary | None,
     values: dict[str, Any] | None,
     active: Sequence[ContextSignal],
+    attested: bool | None,
 ) -> dict[str, Any]:
     """The exact lesson an approval stores (spec 2026-10-15-intel-lessons-and-evidence §5): the
     edit merged over ``suggested``; every tag registered and live; a general lesson reaches
@@ -386,7 +399,7 @@ def _lesson_decided(
     if target.topic is not None and not decided.tags and not decided.is_global:
         raise _refuse("values_out_of_bounds")
     dumped = decided.model_dump(mode="json")
-    _check_lesson(dumped["lesson"], active)
+    _check_lesson(dumped["lesson"], active, attested)
     return dumped
 
 
@@ -596,9 +609,9 @@ def _approval_decided(
     if proposal.kind == "quiz_question":
         return _question_decided(proposal, vocabulary, values, research)
     if proposal.kind == "lesson":
-        return _lesson_decided(proposal, vocabulary, values, active)
+        return _lesson_decided(proposal, vocabulary, values, active, attested)
     if proposal.kind == "threat_event":
-        return _threat_decided(proposal, vocabulary, values, active)
+        return _threat_decided(proposal, vocabulary, values, active, attested)
     if proposal.kind == "protection_event":
         return _protection_decided(proposal, vocabulary, values, attested, active)
     try:

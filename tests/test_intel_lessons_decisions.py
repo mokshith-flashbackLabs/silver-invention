@@ -83,7 +83,8 @@ async def test_a_threat_approval_writes_its_lesson_and_snapshots_both(
         intel_pool, signal_ids=signals, suggested={**THREAT_SUGGESTED, "lesson": LESSON}
     )
     decided = await _store(intel_pool).decide(
-        proposal, decision="approved", values=None, reason="ok", operator="Op"
+        proposal, decision="approved", values=None, reason="ok", operator="Op",
+        applies_regardless_of_location=True,
     )
     event_id = UUID(str(decided.applied_ref))
     lessons = await _rows(
@@ -125,6 +126,7 @@ async def test_an_edited_lesson_that_breaks_a_rule_is_refused(
             reason="ok",
             operator="Op",
             values={"lesson": {**LESSON, "intro": "You are safe after 9 days."}},
+            applies_regardless_of_location=True,
         )
     assert refused.value.code == "lesson_invalid"
     assert {"field": "intro", "rule": "reassurance"} in refused.value.problems
@@ -144,7 +146,8 @@ async def test_a_general_lesson_approval_is_applied_with_its_lesson_id(
         suggested={"lesson": LESSON, "tags": ["instagram"], "is_global": False},
     )
     decided = await _store(intel_pool).decide(
-        proposal, decision="approved", values=None, reason="ok", operator="Op"
+        proposal, decision="approved", values=None, reason="ok", operator="Op",
+        applies_regardless_of_location=True,
     )
     assert decided.status == "applied"
     rows = await _rows(intel_pool, "SELECT lesson_id, kind, topic FROM intel_lessons")
@@ -163,7 +166,8 @@ async def test_an_unscoped_general_lesson_is_refused(intel_pool: AsyncConnection
     )
     with pytest.raises(DecisionRefused) as refused:
         await _store(intel_pool).decide(
-            proposal, decision="approved", values=None, reason="ok", operator="Op"
+            proposal, decision="approved", values=None, reason="ok", operator="Op",
+        applies_regardless_of_location=True,
         )
     assert refused.value.code == "values_out_of_bounds"
 
@@ -177,7 +181,8 @@ async def test_a_lesson_for_an_event_replaces_its_live_lesson(
     )
     event = (
         await _store(intel_pool).decide(
-            event_proposal, decision="approved", values=None, reason="ok", operator="Op"
+            event_proposal, decision="approved", values=None, reason="ok", operator="Op",
+        applies_regardless_of_location=True,
         )
     ).applied_ref
     redraft = await seed_proposal(
@@ -192,7 +197,8 @@ async def test_a_lesson_for_an_event_replaces_its_live_lesson(
         },
     )
     await _store(intel_pool).decide(
-        redraft, decision="approved", values=None, reason="ok", operator="Op"
+        redraft, decision="approved", values=None, reason="ok", operator="Op",
+        applies_regardless_of_location=True,
     )
     live = await _rows(
         intel_pool, "SELECT title FROM svc.v_lessons WHERE event_id = %s", UUID(str(event))
@@ -255,3 +261,135 @@ async def test_a_renewal_does_not_carry_a_lesson_its_evidence_no_longer_supports
         UUID(str(decided.applied_ref)),
     )
     assert rows == []
+
+
+
+# -- 2026-10-22: the location tick, and two sources for a lesson --
+
+
+async def test_an_approval_publishing_a_lesson_needs_the_location_tick(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Owner, 2026-10-22: the Take It Down Act lesson (a US law) was drafted for everyone. A lesson
+    is published only when the operator attests it holds wherever a person lives, as a protection
+    is; an approval that publishes none needs no tick."""
+    signals = await _two_signals(intel_pool)
+    threat = await seed_threat_proposal(
+        intel_pool, signal_ids=signals, suggested={**THREAT_SUGGESTED, "lesson": LESSON}
+    )
+    with pytest.raises(DecisionRefused) as refused:
+        await _store(intel_pool).decide(
+            threat, decision="approved", values=None, reason="ok", operator="Op"
+        )
+    assert refused.value.code == "values_out_of_bounds"
+    assert "applies_regardless_of_location" in refused.value.message
+    assert await _rows(intel_pool, "SELECT 1 FROM threat_events") == []
+
+    await _store(intel_pool).decide(
+        threat, decision="approved", values={"lesson": None}, reason="ok", operator="Op"
+    )
+    assert await _rows(intel_pool, "SELECT 1 FROM intel_lessons") == []
+
+    general = await seed_proposal(
+        intel_pool,
+        signal_ids=signals,
+        kind="lesson",
+        target={"topic": "fake_sponsorships"},
+        suggested={"lesson": LESSON, "tags": ["instagram"], "is_global": False},
+    )
+    with pytest.raises(DecisionRefused) as refused:
+        await _store(intel_pool).decide(
+            general,
+            decision="approved",
+            values=None,
+            reason="ok",
+            operator="Op",
+            applies_regardless_of_location=False,
+        )
+    assert refused.value.code == "values_out_of_bounds"
+    assert await _rows(intel_pool, "SELECT 1 FROM intel_lessons") == []
+
+
+async def _one_registered_source(pool: AsyncConnectionPool) -> list[UUID]:
+    await seed_quiz_vocabulary(pool)
+    return [
+        await seed_signal(
+            pool,
+            tags=("instagram",),
+            publisher="a.example",
+            trust="listed",
+            category="incident",
+            quote="Scammers pose as known brands to reach creators with offers.",
+        )
+    ]
+
+
+async def test_a_lesson_on_one_registered_source_is_never_approved(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """Owner, 2026-10-22: one registered source carries a threat, never its lesson."""
+    signals = await _one_registered_source(intel_pool)
+    general = await seed_proposal(
+        intel_pool,
+        signal_ids=signals,
+        kind="lesson",
+        target={"topic": "fake_sponsorships"},
+        suggested={"lesson": LESSON, "tags": ["instagram"], "is_global": False},
+    )
+    with pytest.raises(DecisionRefused) as refused:
+        await _store(intel_pool).decide(
+            general,
+            decision="approved",
+            values=None,
+            reason="ok",
+            operator="Op",
+            applies_regardless_of_location=True,
+        )
+    assert refused.value.code == "proposal_uncorroborated"
+
+    threat = await seed_threat_proposal(
+        intel_pool, signal_ids=signals, suggested={**THREAT_SUGGESTED, "lesson": LESSON}
+    )
+    with pytest.raises(DecisionRefused) as refused:
+        await _store(intel_pool).decide(
+            threat,
+            decision="approved",
+            values=None,
+            reason="ok",
+            operator="Op",
+            applies_regardless_of_location=True,
+        )
+    assert refused.value.code == "lesson_invalid"
+    assert {"field": "lesson", "rule": "uncorroborated"} in refused.value.problems
+    decided = await _store(intel_pool).decide(
+        threat, decision="approved", values={"lesson": None}, reason="ok", operator="Op"
+    )
+    assert decided.status == "applied"
+    assert await _rows(intel_pool, "SELECT 1 FROM intel_lessons") == []
+
+
+async def test_existing_lessons_lists_live_and_pending_lessons_of_every_origin(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """What the model is shown and code checks a new lesson against (2026-10-22): live lessons,
+    pending or approved lesson proposals, and the lessons riding on pending event proposals."""
+    from imageshield.intel.proposal_models import ExistingLesson
+    from imageshield.intel.proposal_store import PostgresProposalStore
+
+    signals = await _two_signals(intel_pool)
+    await seed_threat_proposal(
+        intel_pool, signal_ids=signals, suggested={**THREAT_SUGGESTED, "lesson": LESSON}
+    )
+    await seed_proposal(
+        intel_pool,
+        signal_ids=signals,
+        kind="lesson",
+        target={"topic": "fake_sponsorships"},
+        suggested={"lesson": {**LESSON, "title": "Library lesson"}, "tags": [], "is_global": True},
+    )
+    store = PostgresProposalStore(intel_pool, threat_recency_days=90)
+    existing = await store.existing_lessons(limit=50)
+    assert set(existing) == {
+        ExistingLesson(topic=None, title="Spot a fake sponsorship offer"),
+        ExistingLesson(topic="fake_sponsorships", title="Library lesson"),
+    }

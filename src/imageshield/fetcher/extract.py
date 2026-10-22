@@ -68,12 +68,14 @@ class FeedItem(BaseModel):
 class ExtractedText(BaseModel):
     """``published_at`` is the page's OWN statement of when it was published, read from its HTML
     metadata (``published_metadata``), as ISO-8601, or None. Never the fetch time, and never
-    anything for a feed, JSON or plain text (a feed's items carry their own dates)."""
+    anything for a feed, JSON or plain text (a feed's items carry their own dates). ``title`` is
+    the page's own title (``page_title``), or None, by the same rule."""
 
     model_config = ConfigDict(frozen=True)
     text: str
     items: list[FeedItem] | None
     published_at: str | None = None
+    title: str | None = None
 
 
 class _Visible(HTMLParser):
@@ -256,6 +258,61 @@ def published_metadata(html: str) -> str | None:
     return None
 
 
+# ── the page's own title (2026-10-22, spec 2026-10-15-intel-lessons-and-evidence §13) ──────────
+#
+# ``og:title`` first (publishers write it without the site suffix), then the first ``<title>``
+# outside an ``<svg>`` (an icon's title is not the page's). Whitespace collapsed; one longer than
+# ``_MAX_TITLE_CHARS`` is no title at all rather than a cut one, because a cut title can change
+# what it says, the rule the evidence quotes keep.
+
+_MAX_TITLE_CHARS = 300
+
+
+class _TitleMeta(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.open_graph: list[str] = []
+        self.titles: list[str] = []
+        self._svg = 0
+        self._title: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "svg":
+            self._svg += 1
+        elif tag == "title" and not self._svg:
+            self._title = []
+        elif tag == "meta":
+            values = {key.lower(): (value or "") for key, value in attrs}
+            if values.get("property", "").strip().lower() == "og:title":
+                self.open_graph.append(values.get("content", ""))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "svg" and self._svg:
+            self._svg -= 1
+        elif tag == "title" and self._title is not None:
+            self.titles.append("".join(self._title))
+            self._title = None
+
+    def handle_data(self, data: str) -> None:
+        if self._title is not None:
+            self._title.append(data)
+
+
+def page_title(html: str) -> str | None:
+    """The page's own title from its HTML, whitespace collapsed, or None."""
+    meta = _TitleMeta()
+    try:
+        meta.feed(html)
+        meta.close()
+    except (AssertionError, ValueError):  # badly broken markup: no title, no failure
+        return None
+    for candidate in [*meta.open_graph, *meta.titles]:
+        title = " ".join(candidate.split())
+        if title:
+            return title if len(title) <= _MAX_TITLE_CHARS else None
+    return None
+
+
 def _charset(content_type: str) -> str:
     for part in content_type.split(";")[1:]:
         key, _, value = part.strip().partition("=")
@@ -322,7 +379,10 @@ def to_text(content_type: str, raw: bytes) -> ExtractedText:
         parser = _Visible()
         parser.feed(text)
         return ExtractedText(
-            text="".join(parser.parts), items=None, published_at=published_metadata(text)
+            text="".join(parser.parts),
+            items=None,
+            published_at=published_metadata(text),
+            title=page_title(text),
         )
     if base in ("application/rss+xml", "application/atom+xml", "application/xml", "text/xml"):
         try:

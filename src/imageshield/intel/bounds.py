@@ -200,6 +200,6 @@ MAX_LESSON_LINK_CHARS = 500
 MAX_LESSON_LINK_LABEL_CHARS = 40
 LESSON_TOPIC_PATTERN = r"^[a-z][a-z0-9_]{1,59}$"
 # Open lesson topics a generation call is shown, newest first. A prompt bound, never a rule.
-MAX_PROMPT_LESSON_TOPICS = 200
+MAX_PROMPT_EXISTING_LESSONS = 200
 # Events one lesson_draft run drafts for; a request naming more ids is refused at the route.
 MAX_LESSON_DRAFT_EVENTS = 20

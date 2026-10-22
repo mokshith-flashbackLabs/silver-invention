@@ -179,7 +179,7 @@ def test_extract_v2_asks_only_for_a_date_the_text_states() -> None:
     from imageshield.intel.prompts import EXTRACT_PROMPT_VERSION, extraction_request
     from imageshield.intel.schemas import ExtractionOutput
 
-    assert EXTRACT_PROMPT_VERSION == "extract-v2"
+    assert EXTRACT_PROMPT_VERSION == "extract-v3"
     system, _ = extraction_request("text", source_kind="news", tag_hints=(), registry_tags=())
     flat = " ".join(system.split())
     assert "published_date" in flat and "YYYY-MM-DD" in flat and "never guess" in flat

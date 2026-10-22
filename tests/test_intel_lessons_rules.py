@@ -10,7 +10,12 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from imageshield.intel.lessons import general_lesson, lesson_from, lesson_problems
+from imageshield.intel.lessons import (
+    general_lesson,
+    lesson_from,
+    lesson_problems,
+    lesson_title_key,
+)
 from imageshield.intel.proposal_models import ContextSignal, LessonDraft
 from imageshield.intel.recency import Recency
 from imageshield.intel.schemas import (
@@ -216,3 +221,89 @@ def test_a_general_lesson_on_stale_evidence_is_dropped() -> None:
         is None
     )
     assert counts["proposal_dropped_evidence_stale"] == 1
+
+
+# -- 2026-10-22: two sources, a link label its page bears out, and no repeated title --
+
+
+def test_a_lesson_on_one_registered_source_alone_is_dropped_at_draft() -> None:
+    """Owner, 2026-10-22: a lesson needs two independent sources even when one is registered,
+    stricter than a threat (INVARIANTS #50 lets one listed source corroborate an event)."""
+    counts: Counter[str] = Counter()
+    assert lesson_from(_lesson(), CITED[:1], counts) is None
+    assert counts["lesson_dropped_uncorroborated"] == 1
+    draft = LessonDraft.model_validate(
+        {"title": "t", "intro": "i", "sections": [{"kind": "how_to_use", "items": ["a"]}]}
+    )
+    assert {"field": "lesson", "rule": "uncorroborated"} in lesson_problems(draft, CITED[:1])
+    assert {"field": "lesson", "rule": "uncorroborated"} not in lesson_problems(draft, CITED)
+
+
+def test_a_general_lesson_on_one_registered_source_is_dropped() -> None:
+    counts: Counter[str] = Counter()
+    item = ProposedGeneralLesson(
+        topic="remove_ai_videos",
+        tags=["instagram"],
+        lesson=_lesson(),
+        rationale="r",
+        signal_ids=[str(CITED[0].signal_id)],
+    )
+    context = {CITED[0].signal_id: CITED[0]}
+    assert (
+        general_lesson(item, context, V, counts, taken_topics=set(), recency=Recency(NOW, 90))
+        is None
+    )
+    assert counts["proposal_dropped_uncorroborated"] == 1
+
+
+def _titled(title: str) -> list[ContextSignal]:
+    return [replace(CITED[0], document_title=title), CITED[1]]
+
+
+def test_a_link_whose_label_its_page_title_does_not_bear_out_is_dropped() -> None:
+    """Dev, 2026-10-16: "FTC guidance on the law" labelled a children's-privacy page. The model
+    now sees the title, and code drops a label sharing no word with it."""
+    counts: Counter[str] = Counter()
+    cited = _titled("Children's Privacy | Federal Trade Commission")
+    kept = lesson_from(_lesson(link_label="FTC guidance on the law"), cited, counts)
+    assert kept is not None and kept["link"] is None
+    assert counts["lesson_link_label_mismatch"] == 1
+    fine = lesson_from(_lesson(link_label="Children's privacy guidance"), cited, Counter())
+    assert fine is not None and fine["link"] is not None
+
+
+def test_a_label_matches_its_title_through_plurals_and_case() -> None:
+    cited = _titled("Remove AI videos | Help Center")
+    kept = lesson_from(_lesson(link_label="Removing an AI video"), cited, Counter())
+    assert kept is not None and kept["link"] is not None
+
+
+def test_a_link_to_an_untitled_page_keeps_its_label() -> None:
+    kept = lesson_from(_lesson(link_label="Anything at all"), CITED, Counter())
+    assert kept is not None and kept["link"] is not None
+
+
+def test_a_general_lesson_repeating_an_existing_title_is_dropped() -> None:
+    """Dev, 2026-10-21: a library draft took an event lesson's title word for word."""
+    counts: Counter[str] = Counter()
+    item = ProposedGeneralLesson(
+        topic="a_new_topic",
+        tags=["instagram"],
+        lesson=_lesson(title="Ask for an AI video of you to be removed!"),
+        rationale="r",
+        signal_ids=[str(s.signal_id) for s in CITED],
+    )
+    taken = {lesson_title_key("ask for an AI video of you to be  removed")}
+    assert (
+        general_lesson(
+            item,
+            {s.signal_id: s for s in CITED},
+            V,
+            counts,
+            taken_topics=set(),
+            taken_titles=taken,
+            recency=Recency(NOW, 90),
+        )
+        is None
+    )
+    assert counts["proposal_dropped_lesson_repeat"] == 1

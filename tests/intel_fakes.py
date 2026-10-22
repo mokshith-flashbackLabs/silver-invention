@@ -279,6 +279,7 @@ def make_page(
     items: list[dict[str, Any]] | None = None,
     *,
     published_at: datetime | None = None,
+    title: str | None = None,
 ) -> TextFetch:
     return TextFetch(
         text=text,
@@ -287,6 +288,7 @@ def make_page(
         truncated=False,
         items=items,
         published_at=published_at,
+        title=title,
     )
 
 

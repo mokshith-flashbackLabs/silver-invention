@@ -101,6 +101,36 @@ async def test_an_event_with_a_pending_lesson_is_not_drafted_again(
     assert len(model.lesson_users) == 1
 
 
+async def test_a_draft_repeating_a_live_lessons_title_is_dropped_and_shown_the_library(
+    intel_pool: AsyncConnectionPool,
+) -> None:
+    """2026-10-22: the run shows the model every existing lesson, and code drops a draft whose
+    title one already has: dev's two near-identical nudify events each got a lesson."""
+    event = await _live_event(intel_pool)
+    other = await _live_event(intel_pool)
+    async with intel_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO intel_lessons (proposal_id, event_id, kind, topic, title, intro,"
+            " sections, approved_by) SELECT proposal_id, NULL, 'general', 'fake_offers', %s,"
+            " 'i', %s, 'op' FROM threat_events WHERE event_id = %s",
+            (
+                "Spot a fake sponsorship offer",
+                Jsonb([{"kind": "what_to_do", "items": ["a"]}]),
+                other,
+            ),
+        )
+    model = FakeModel(lessons_with=_answer_every_event)
+    await PostgresLessonStore(intel_pool).queue_draft(event_ids=(event,), operator="Op")
+    result = await run_once(intel_pool, make_deps(intel_pool, FakeFetcher({}), model))
+    assert result.outcome.get("lesson_dropped_repeat") == 1
+    assert '"existing_lessons"' in model.lesson_users[0]
+    assert "Spot a fake sponsorship offer" in model.lesson_users[0]
+    async with intel_pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) FROM intel_proposals WHERE kind = 'lesson'")
+        row = await cur.fetchone()
+    assert row is not None and row[0] == 0
+
+
 async def test_a_hand_created_threat_is_never_drafted(intel_pool: AsyncConnectionPool) -> None:
     await seed_threat_event(intel_pool)  # no proposal, so no evidence
     model = FakeModel(lessons_with=_answer_every_event)

@@ -73,10 +73,11 @@ from imageshield.intel.bounds import (
 )
 from imageshield.intel.cells import cell_problem
 from imageshield.intel.corroboration import uncorroborated
-from imageshield.intel.lessons import general_lesson, lesson_from
+from imageshield.intel.lessons import general_lesson, lesson_from, lesson_title_key
 from imageshield.intel.limits import QuestionLimits
 from imageshield.intel.pii import contains_pii, mask
 from imageshield.intel.prompts import (
+    PromptExistingLesson,
     PromptLiveEvent,
     PromptLiveProtection,
     PromptOpenQuestion,
@@ -91,6 +92,7 @@ from imageshield.intel.proposal_models import (
     Attachment,
     ContextSignal,
     CoverageGapTarget,
+    ExistingLesson,
     LiveEvent,
     LiveProtection,
     NewProposal,
@@ -172,7 +174,7 @@ def validate_proposals(
     events_only: bool = False,
     questions: QuestionContext | None = None,
     question_limits: QuestionLimits | None = None,
-    open_lesson_topics: Collection[str] = (),
+    existing_lessons: Sequence[ExistingLesson] = (),
 ) -> GeneratedBatch:
     """``pending_events`` are the pending event proposals of both kinds the run loaded (those the
     prompt showed): attach targets and duplicate candidates. ``new_signal_ids`` are the run's own
@@ -180,7 +182,9 @@ def validate_proposals(
     run, which writes event proposals and attachments and nothing else (spec §4.9). ``recency``
     is ``INTEL_THREAT_RECENCY_DAYS`` now: a threat whose evidence is all older is dropped.
     ``questions`` (2026-10-13) is set only for a pass that may propose quiz questions, with
-    ``question_limits``; without it every proposed question is dropped (``questions_closed``)."""
+    ``question_limits``; without it every proposed question is dropped (``questions_closed``).
+    ``existing_lessons`` (2026-10-22) are the lessons none of this run's may repeat, by topic or
+    title: a repeated event lesson is dropped and its event kept."""
     batch = GeneratedBatch()
     if questions is None or question_limits is None or events_only:
         if output.quiz_questions:
@@ -246,35 +250,61 @@ def validate_proposals(
     unknown_keys = [key for key in event_lessons if key not in keys]
     if unknown_keys:
         counts["lesson_event_unknown"] += len(unknown_keys)
+    topics = {lesson.topic for lesson in existing_lessons if lesson.topic is not None}
+    titles = {lesson_title_key(lesson.title) for lesson in existing_lessons}
     for index, event in enumerate(output.threat_events, start=1):
         proposal = _threat_event(
             event, context, vocabulary, counts, recency, lesson=event_lessons.get(f"T{index}")
         )
         if proposal is not None:
+            proposal = _unrepeated_lesson(proposal, titles, counts)
             _keep_event(proposal, batch.threat_events, batch, pending, new_signal_ids, counts)
     for index, credit in enumerate(output.protection_events, start=1):
         proposal = _protection_event(
             credit, context, vocabulary, counts, lesson=event_lessons.get(f"P{index}")
         )
         if proposal is not None:
+            proposal = _unrepeated_lesson(proposal, titles, counts)
             _keep_event(proposal, batch.protection_events, batch, pending, new_signal_ids, counts)
     if events_only:
         if output.lessons:
             counts["proposal_dropped_not_an_event"] += len(output.lessons)
     else:
-        topics = set(open_lesson_topics)
         for general in output.lessons:
             lesson = general_lesson(
-                general, context, vocabulary, counts, taken_topics=topics, recency=recency
+                general,
+                context,
+                vocabulary,
+                counts,
+                taken_topics=topics,
+                taken_titles=titles,
+                recency=recency,
             )
             if lesson is not None:
                 topics.add(lesson.target["topic"])
+                titles.add(lesson_title_key(lesson.suggested["lesson"]["title"]))
                 batch.lessons.append(lesson)
     for attach in output.attach:
         attachment = _attachment(attach, pending, context, new_signal_ids, counts)
         if attachment is not None:
             batch.attachments.append(attachment)
     return batch
+
+
+def _unrepeated_lesson(
+    proposal: NewProposal, titles: set[str], counts: Counter[str]
+) -> NewProposal:
+    """An event proposal whose drafted lesson has a title an existing or earlier lesson already
+    has keeps the event and loses the lesson (2026-10-22). A kept title is taken from then on."""
+    lesson = proposal.suggested.get("lesson")
+    if not isinstance(lesson, dict):
+        return proposal
+    key = lesson_title_key(str(lesson.get("title", "")))
+    if key in titles:
+        counts["lesson_dropped_repeat"] += 1
+        return replace(proposal, suggested={**proposal.suggested, "lesson": None})
+    titles.add(key)
+    return proposal
 
 
 def same_scope(a: Iterable[str], b: Iterable[str]) -> bool:
@@ -971,10 +1001,15 @@ def prompt_signal(signal: ContextSignal) -> PromptSignal:
         summary=signal.summary,
         publisher=signal.publisher_domain,
         url=signal.document_url or "",
+        title=signal.document_title,
         trust=signal.trust,
         published=published,
         quotes=list(signal.excerpts),
     )
+
+
+def prompt_existing_lesson(lesson: ExistingLesson) -> PromptExistingLesson:
+    return PromptExistingLesson(topic=lesson.topic, title=lesson.title)
 
 
 def prompt_pending_event(event: PendingEvent) -> PromptPendingEvent:

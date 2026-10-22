@@ -617,6 +617,18 @@ class ContextSignal:
     # The document's final URL (2026-10-06): shown to the model so a drafted action's link can be
     # one of the cited pages, and only those (spec 2026-10-06-intel-threat-action).
     document_url: str | None = None
+    # The document's own title (2026-10-22), "" when it has none: shown to the model, and what a
+    # drafted lesson's link label is checked against (intel/lessons.py).
+    document_title: str = ""
+
+
+@dataclass(frozen=True)
+class ExistingLesson:
+    """A lesson a new one may not repeat (2026-10-22): live, pending or approved, standalone or
+    riding on a pending event proposal. ``topic`` is None for an event's lesson."""
+
+    topic: str | None
+    title: str
 
 
 @dataclass(frozen=True)

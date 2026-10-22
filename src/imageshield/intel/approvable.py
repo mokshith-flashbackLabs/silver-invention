@@ -2,6 +2,9 @@
 read time, in a fixed order: not_decidable, renewed_credit_ended, evidence_retracted,
 evidence_stale, uncorroborated, tags_unmapped.
 
+``uncorroborated`` is stricter for a ``lesson`` (owner, 2026-10-22): two independent sources
+whatever their trust, where one registered source corroborates any other kind.
+
 ``evidence_stale`` (2026-10-04, spec 2026-10-04-intel-evidence-quality §3) is a threat_event
 whose active evidence is all dated and all older than ``INTEL_THREAT_RECENCY_DAYS``
 (intel/recency.py): an old or ended incident is not a threat. Undated evidence never makes a
@@ -31,7 +34,11 @@ from typing import Any, Literal
 from pydantic import ValidationError
 
 from imageshield.intel.cells import StaleReason, published_unacknowledged, stale_reason
-from imageshield.intel.corroboration import independent_sources, uncorroborated
+from imageshield.intel.corroboration import (
+    independent_sources,
+    lesson_uncorroborated,
+    uncorroborated,
+)
 from imageshield.intel.proposal_models import (
     ContextSignal,
     ProposalRecord,
@@ -114,6 +121,9 @@ def why_not(
     if proposal.kind == "threat_event" and evidence_stale(active_signals, recency):
         return "evidence_stale"
     if uncorroborated(active_signals):
+        return "uncorroborated"
+    # A lesson needs two independent sources whatever their trust (owner, 2026-10-22).
+    if proposal.kind == "lesson" and lesson_uncorroborated(active_signals):
         return "uncorroborated"
     if proposal.kind in EVENT_KINDS and all_tags_unmapped(proposal.target, vocabulary):
         return "tags_unmapped"

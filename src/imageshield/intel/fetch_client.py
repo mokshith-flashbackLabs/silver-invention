@@ -55,7 +55,10 @@ class TextFetch(BaseModel):
     ``published_at`` (2026-10-04, spec 2026-10-04-intel-evidence-quality §2) is the page's own
     publication date from its HTML metadata, or None. Lenient on purpose: an absent key (a fetcher
     deployed before it) or a value that does not parse is None, never a failed fetch, because a
-    page with no readable date is still a page."""
+    page with no readable date is still a page.
+
+    ``title`` (2026-10-22) is the page's own title from its HTML, or None, equally lenient: absent
+    (an older fetcher), not a string, or blank is None."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -65,6 +68,12 @@ class TextFetch(BaseModel):
     truncated: bool
     items: list[dict[str, Any]] | None
     published_at: datetime | None = None
+    title: str | None = None
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _lenient_title(cls, value: object) -> str | None:
+        return value.strip() or None if isinstance(value, str) else None
 
     @field_validator("published_at", mode="before")
     @classmethod
